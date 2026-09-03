@@ -12,6 +12,7 @@ js-sys = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde-wasm-bindgen = "0.6"
 console_error_panic_hook = "0.1.7"
+web-sys = { version = "0.3.104", features = ["Window", "Document", "HtmlElement", "Element"] }
 
 [workspace]
 members = ["src-tauri", "plugins/stub", "plugins/wasm-stub"]
