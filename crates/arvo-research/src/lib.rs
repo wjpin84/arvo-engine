@@ -218,6 +218,18 @@ pub struct Experiment {
 /// The equity curve is the primitive on purpose: Sharpe, drawdown, hit rate
 /// and the rest all derive from it, so evaluation can grow without the engine
 /// boundary changing shape every time a new metric is wanted.
+/// Account equity on one day.
+///
+/// Dated, not just ordered. A bare `Vec<f64>` was enough to compute a return
+/// and is not enough to draw one, to align two runs against each other, or to
+/// say when a drawdown happened — and the engine knows the dates already, so
+/// discarding them was throwing away something free.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct EquityPoint {
+    pub date: NaiveDate,
+    pub equity: f64,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SimulationResult {
     pub experiment: ExperimentId,
@@ -226,8 +238,8 @@ pub struct SimulationResult {
     /// another from the same engine version.
     pub engine: String,
     pub trades: u32,
-    /// Account equity, one point per bar, starting at the opening balance.
-    pub equity_curve: Vec<f64>,
+    /// Account equity, one point per bar, opening at the starting balance.
+    pub equity_curve: Vec<EquityPoint>,
 }
 
 impl SimulationResult {
@@ -240,8 +252,8 @@ impl SimulationResult {
         if self.equity_curve.len() < 2 {
             return None;
         }
-        let first = *self.equity_curve.first()?;
-        let last = *self.equity_curve.last()?;
+        let first = self.equity_curve.first()?.equity;
+        let last = self.equity_curve.last()?.equity;
         if first == 0.0 {
             return None;
         }
@@ -329,11 +341,17 @@ mod tests {
             experiment: ExperimentId::from("e-1"),
             engine: "test 0".to_owned(),
             trades: 0,
-            equity_curve: vec![100_000.0],
+            equity_curve: vec![EquityPoint {
+                date: NaiveDate::from_ymd_opt(2024, 1, 1).expect("valid"),
+                equity: 100_000.0,
+            }],
         };
         assert_eq!(result.total_return(), None, "one point is not a return");
 
-        result.equity_curve.push(110_000.0);
+        result.equity_curve.push(EquityPoint {
+            date: NaiveDate::from_ymd_opt(2024, 1, 2).expect("valid"),
+            equity: 110_000.0,
+        });
         let total = result.total_return().expect("two points is a return");
         assert!((total - 0.1).abs() < 1e-12, "{total}");
     }

@@ -104,6 +104,34 @@ impl From<&Metrics> for MetricsView {
     }
 }
 
+/// One point on a curve, in the shape a chart library wants: an ISO date and
+/// a value.
+#[derive(Serialize)]
+pub struct CurvePoint {
+    pub time: String,
+    pub value: f64,
+}
+
+/// Flattens an equity curve for charting, collapsing any repeated day.
+///
+/// Charting libraries reject non-ascending or duplicated times, and typically
+/// by throwing — which in a webview means a blank panel and no explanation.
+/// Cheaper to guarantee the shape here than to debug it there.
+fn curve_points(curve: &[arvo_research::EquityPoint]) -> Vec<CurvePoint> {
+    let mut points: Vec<CurvePoint> = Vec::with_capacity(curve.len());
+    for point in curve {
+        let time = point.date.to_string();
+        match points.last_mut() {
+            Some(last) if last.time == time => last.value = point.equity,
+            _ => points.push(CurvePoint {
+                time,
+                value: point.equity,
+            }),
+        }
+    }
+    points
+}
+
 /// The full result of a study, flattened for display.
 #[derive(Serialize)]
 pub struct StudyView {
@@ -126,6 +154,12 @@ pub struct StudyView {
     pub strategy: MetricsView,
     pub benchmark: MetricsView,
     pub excess_return: f64,
+
+    /// The two curves behind the numbers. A table says a strategy returned
+    /// less than the market; a chart says whether it did so steadily or lost
+    /// it all in one month, and those are different findings.
+    pub strategy_curve: Vec<CurvePoint>,
+    pub benchmark_curve: Vec<CurvePoint>,
 
     // Stated assumptions, because a verdict without them is decoration.
     /// The dataset this result was produced from, as a content hash. Compared
@@ -486,6 +520,8 @@ fn study_view(found: &arvo_research::FamilyEvidence, engine: &str) -> StudyView 
         strategy: MetricsView::from(&evaluation.strategy),
         benchmark: MetricsView::from(&evaluation.benchmark),
         excess_return: evaluation.excess_return,
+        strategy_curve: curve_points(&evaluation.strategy_curve),
+        benchmark_curve: curve_points(&evaluation.benchmark_curve),
         dataset_version: found.selected.dataset.version.clone(),
         strategy_name: found.selected.strategy.name.clone(),
         starting_cash: found.selected.starting_cash,

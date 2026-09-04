@@ -39,6 +39,12 @@ extern "C" {
     #[wasm_bindgen(js_namespace = window, js_name = openStudyPanel)]
     fn open_study_panel(id: &str, title: &str);
 
+    // Draws both equity curves into an element. Defined in index.html against
+    // the vendored charting library, so the chart's palette can be read from
+    // the same CSS variables everything else uses.
+    #[wasm_bindgen(js_namespace = window, js_name = renderEquityChart)]
+    fn render_equity_chart(el: &web_sys::HtmlElement, strategy: JsValue, benchmark: JsValue);
+
     // app-shell ticket 12 — Output moved into the View menu; same
     // add/remove-panel toggle as the sidebar's.
     #[wasm_bindgen(js_namespace = window, js_name = setOutputVisible)]
@@ -164,11 +170,19 @@ struct StudyView {
     strategy: MetricsView,
     benchmark: MetricsView,
     excess_return: f64,
+    strategy_curve: Vec<CurvePoint>,
+    benchmark_curve: Vec<CurvePoint>,
     dataset_version: String,
     strategy_name: String,
     starting_cash: f64,
     commission_bps: f64,
     engine: String,
+}
+
+#[derive(Clone, Deserialize, serde::Serialize)]
+struct CurvePoint {
+    time: String,
+    value: f64,
 }
 
 #[derive(Clone, Deserialize)]
@@ -930,6 +944,30 @@ fn PanelReport(panel: PanelView) -> impl IntoView {
                 {panel.reasons.iter().map(|r| view! { <li>{r.clone()}</li> }).collect_view()}
             </ul>
 
+            <div class="metric-cards">
+                <MetricCard
+                    label="Mean excess return"
+                    value=percent(panel.mean_excess_return)
+                    tone=panel.mean_excess_return
+                    note="vs buy and hold".to_owned()
+                />
+                <MetricCard
+                    label="Consistency"
+                    value=format!("{}/{}", panel.beat_benchmark, panel.instruments)
+                    note="instruments beat their benchmark".to_owned()
+                />
+                <MetricCard
+                    label="Trades (pooled)"
+                    value=panel.total_trades.to_string()
+                    note=format!("{} configurations tried", panel.trials)
+                />
+                <MetricCard
+                    label="Mean drawdown"
+                    value=percent(panel.mean_max_drawdown)
+                    note=format!("worst {}", percent(panel.worst_max_drawdown))
+                />
+            </div>
+
             <h4>"Pooled out of sample"</h4>
             <table class="research-metrics">
                 <tbody>
@@ -1034,6 +1072,61 @@ fn PanelReport(panel: PanelView) -> impl IntoView {
     }
 }
 
+/// A headline number with its label, and a sign-coloured variant for the ones
+/// where up and down mean good and bad.
+#[component]
+fn MetricCard(
+    label: &'static str,
+    value: String,
+    #[prop(optional)] tone: Option<f64>,
+    #[prop(optional)] note: Option<String>,
+) -> impl IntoView {
+    // Only where a sign genuinely carries meaning. Colouring a drawdown or a
+    // trade count red would be decoration pretending to be information.
+    let tone_class = match tone {
+        Some(v) if v > 0.0 => "metric-card-value up",
+        Some(v) if v < 0.0 => "metric-card-value down",
+        _ => "metric-card-value",
+    };
+    view! {
+        <div class="metric-card">
+            <div class="metric-card-label">{label}</div>
+            <div class=tone_class>{value}</div>
+            {note.map(|note| view! { <div class="metric-card-note">{note}</div> })}
+        </div>
+    }
+}
+
+/// The equity curve, strategy against benchmark.
+///
+/// Mounts into a real element and hands it to the charting library, rather
+/// than trying to describe a chart in `view!`. The effect re-runs when the
+/// data changes, so an open tab redraws when its study is re-run.
+#[component]
+fn EquityChart(strategy: Vec<CurvePoint>, benchmark: Vec<CurvePoint>) -> impl IntoView {
+    let holder = NodeRef::<leptos::html::Div>::new();
+
+    Effect::new(move |_| {
+        let Some(el) = holder.get() else {
+            return;
+        };
+        let to_js = |points: &Vec<CurvePoint>| {
+            serde_wasm_bindgen::to_value(points).unwrap_or(JsValue::NULL)
+        };
+        render_equity_chart(&el, to_js(&strategy), to_js(&benchmark));
+    });
+
+    view! {
+        <div class="equity-chart">
+            <div class="equity-chart-legend">
+                <span class="equity-chart-key strategy">"Strategy"</span>
+                <span class="equity-chart-key benchmark">"Buy and hold"</span>
+            </div>
+            <div class="equity-chart-canvas" node_ref=holder></div>
+        </div>
+    }
+}
+
 /// One study, rendered with its caveats attached rather than beside it.
 #[component]
 fn StudyReport(study: StudyView) -> impl IntoView {
@@ -1069,6 +1162,42 @@ fn StudyReport(study: StudyView) -> impl IntoView {
             <ul class="research-reasons">
                 {study.reasons.iter().map(|r| view! { <li>{r.clone()}</li> }).collect_view()}
             </ul>
+
+            <div class="metric-cards">
+                <MetricCard
+                    label="Excess return"
+                    value=percent(study.excess_return)
+                    tone=study.excess_return
+                    note="vs buy and hold".to_owned()
+                />
+                <MetricCard
+                    label="Strategy"
+                    value=percent(study.strategy.total_return)
+                    tone=study.strategy.total_return
+                />
+                <MetricCard
+                    label="Buy and hold"
+                    value=percent(study.benchmark.total_return)
+                    tone=study.benchmark.total_return
+                />
+                <MetricCard label="Sharpe" value=ratio(study.strategy.sharpe) />
+                <MetricCard
+                    label="Max drawdown"
+                    value=percent(study.strategy.max_drawdown)
+                />
+                <MetricCard
+                    label="Trades"
+                    value=study.strategy.trades.to_string()
+                    note=format!("{} configurations tried", study.trials)
+                />
+            </div>
+
+            {(!study.strategy_curve.is_empty())
+                .then({
+                    let strategy = study.strategy_curve.clone();
+                    let benchmark = study.benchmark_curve.clone();
+                    move || view! { <EquityChart strategy=strategy benchmark=benchmark /> }
+                })}
 
             <h4>"Out of sample"</h4>
             <table class="research-metrics">

@@ -47,3 +47,16 @@ NautilusTrader — GNU Lesser General Public License v3.0 (LGPL-3.0-only)
 
   This is a record of the mechanism, not legal advice. Confirm with counsel
   before any commercial distribution.
+
+--------------------------------------------------------------------------------
+
+TradingView Lightweight Charts — Apache License 2.0
+  https://github.com/tradingview/lightweight-charts
+
+  Vendored at public/vendor/lightweight-charts.standalone.production.js
+  (v4.2.3). Its copyright header is preserved in that file, which is what
+  Apache-2.0 section 4 requires of a redistributed copy.
+
+  Unlike the NautilusTrader entry above, this imposes no obligation on Arvo's
+  own licensing: Apache-2.0 is the licence Arvo already uses, and shipping a
+  copy needs only the notice and the retained header.

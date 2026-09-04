@@ -18,8 +18,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Experiment, ExperimentId, HypothesisId, SimulationError, SimulationProvider, SimulationResult,
-    StrategySpec,
+    EquityPoint, Experiment, ExperimentId, HypothesisId, SimulationError, SimulationProvider,
+    SimulationResult, StrategySpec,
 };
 
 /// Trading days in a year, for annualising daily-bar results.
@@ -63,12 +63,12 @@ impl Metrics {
     /// starts at zero — there is no return to speak of, and inventing one
     /// would put a number where there is no measurement.
     #[must_use]
-    pub fn from_curve(curve: &[f64], trades: u32, periods_per_year: f64) -> Option<Self> {
+    pub fn from_curve(curve: &[EquityPoint], trades: u32, periods_per_year: f64) -> Option<Self> {
         if curve.len() < 2 || periods_per_year <= 0.0 {
             return None;
         }
-        let first = *curve.first()?;
-        let last = *curve.last()?;
+        let first = curve.first()?.equity;
+        let last = curve.last()?.equity;
         if first <= 0.0 {
             return None;
         }
@@ -76,10 +76,10 @@ impl Metrics {
         let returns: Vec<f64> = curve
             .windows(2)
             .map(|pair| {
-                if pair[0] == 0.0 {
+                if pair[0].equity == 0.0 {
                     0.0
                 } else {
-                    (pair[1] - pair[0]) / pair[0]
+                    (pair[1].equity - pair[0].equity) / pair[0].equity
                 }
             })
             .collect();
@@ -118,15 +118,15 @@ impl Metrics {
     }
 }
 
-fn max_drawdown(curve: &[f64]) -> f64 {
+fn max_drawdown(curve: &[EquityPoint]) -> f64 {
     let mut peak = f64::MIN;
     let mut worst: f64 = 0.0;
-    for &value in curve {
-        if value > peak {
-            peak = value;
+    for point in curve {
+        if point.equity > peak {
+            peak = point.equity;
         }
         if peak > 0.0 {
-            worst = worst.max((peak - value) / peak);
+            worst = worst.max((peak - point.equity) / peak);
         }
     }
     worst
@@ -180,6 +180,20 @@ pub enum Verdict {
 pub struct Evaluation {
     pub strategy: Metrics,
     pub benchmark: Metrics,
+    /// The curves behind the numbers, kept so a finding can be *drawn* and not
+    /// only summarised — including one read back out of research memory long
+    /// after the run. Metrics are a lossy projection of these; a chart of the
+    /// two side by side says things no table does, like whether an edge was
+    /// steady or one lucky month.
+    ///
+    /// `default` because this is a persisted format: a finding recorded before
+    /// curves were kept should still load, as a finding with no chart, rather
+    /// than becoming unreadable. Every field added here from now on needs the
+    /// same courtesy.
+    #[serde(default)]
+    pub strategy_curve: Vec<EquityPoint>,
+    #[serde(default)]
+    pub benchmark_curve: Vec<EquityPoint>,
     /// Strategy return minus benchmark return. The number that matters:
     /// absolute return mostly measures whether the market went up.
     pub excess_return: f64,
@@ -191,7 +205,13 @@ pub struct Evaluation {
 impl Evaluation {
     /// Scores a strategy against its benchmark under stated criteria.
     #[must_use]
-    pub fn new(strategy: Metrics, benchmark: Metrics, criteria: &EvaluationCriteria) -> Self {
+    pub fn new(
+        strategy: Metrics,
+        benchmark: Metrics,
+        strategy_curve: Vec<EquityPoint>,
+        benchmark_curve: Vec<EquityPoint>,
+        criteria: &EvaluationCriteria,
+    ) -> Self {
         let excess_return = strategy.total_return - benchmark.total_return;
         let mut reasons = Vec::new();
 
@@ -225,6 +245,8 @@ impl Evaluation {
         Self {
             strategy,
             benchmark,
+            strategy_curve,
+            benchmark_curve,
             excess_return,
             verdict,
             reasons,
@@ -286,9 +308,12 @@ pub fn evaluate_against_benchmark(
         )
     };
 
+    let engine = strategy_result.engine.clone();
     let evaluation = Evaluation::new(
         metrics(&strategy_result, "strategy")?,
         metrics(&benchmark_result, "benchmark")?,
+        strategy_result.equity_curve,
+        benchmark_result.equity_curve,
         criteria,
     );
 
@@ -296,7 +321,7 @@ pub fn evaluate_against_benchmark(
         hypothesis: experiment.hypothesis.clone(),
         experiment: experiment.clone(),
         benchmark: benchmark_experiment.id,
-        engine: strategy_result.engine,
+        engine,
         criteria: *criteria,
         evaluation,
     })
@@ -333,9 +358,23 @@ mod tests {
         }
     }
 
+    /// Dates are irrelevant to every statistic here, so the fixtures walk one
+    /// day at a time and the tests stay about the numbers.
+    fn curve(values: &[f64]) -> Vec<EquityPoint> {
+        let start = chrono::NaiveDate::from_ymd_opt(2024, 1, 1).expect("valid");
+        values
+            .iter()
+            .enumerate()
+            .map(|(index, equity)| EquityPoint {
+                date: start + chrono::Duration::days(index as i64),
+                equity: *equity,
+            })
+            .collect()
+    }
+
     #[test]
     fn a_flat_curve_has_no_sharpe_rather_than_a_sharpe_of_zero() {
-        let flat = Metrics::from_curve(&[100.0, 100.0, 100.0], 0, TRADING_DAYS_PER_YEAR)
+        let flat = Metrics::from_curve(&curve(&[100.0, 100.0, 100.0]), 0, TRADING_DAYS_PER_YEAR)
             .expect("three points is enough");
         assert_eq!(flat.sharpe, None);
         assert_eq!(flat.volatility, 0.0);
@@ -344,18 +383,22 @@ mod tests {
 
     #[test]
     fn a_curve_too_short_to_measure_yields_nothing() {
-        assert!(Metrics::from_curve(&[100.0], 0, TRADING_DAYS_PER_YEAR).is_none());
-        assert!(Metrics::from_curve(&[], 0, TRADING_DAYS_PER_YEAR).is_none());
+        assert!(Metrics::from_curve(&curve(&[100.0]), 0, TRADING_DAYS_PER_YEAR).is_none());
+        assert!(Metrics::from_curve(&curve(&[]), 0, TRADING_DAYS_PER_YEAR).is_none());
         assert!(
-            Metrics::from_curve(&[0.0, 100.0], 0, TRADING_DAYS_PER_YEAR).is_none(),
+            Metrics::from_curve(&curve(&[0.0, 100.0]), 0, TRADING_DAYS_PER_YEAR).is_none(),
             "a curve starting at zero has no defined return"
         );
     }
 
     #[test]
     fn drawdown_measures_peak_to_trough_not_start_to_end() {
-        let recovered = Metrics::from_curve(&[100.0, 150.0, 75.0, 120.0], 1, TRADING_DAYS_PER_YEAR)
-            .expect("four points");
+        let recovered = Metrics::from_curve(
+            &curve(&[100.0, 150.0, 75.0, 120.0]),
+            1,
+            TRADING_DAYS_PER_YEAR,
+        )
+        .expect("four points");
         assert!(
             (recovered.max_drawdown - 0.5).abs() < 1e-12,
             "150 to 75 is a 50% fall even though the curve ends up: {}",
@@ -373,6 +416,8 @@ mod tests {
         let evaluation = Evaluation::new(
             metrics(5.0, 0.01, criteria.min_trades - 1),
             metrics(0.01, 0.01, 1),
+            Vec::new(),
+            Vec::new(),
             &criteria,
         );
 
@@ -392,8 +437,13 @@ mod tests {
     fn beating_the_market_is_the_test_not_making_money() {
         let criteria = EvaluationCriteria::default();
         // Made 20% in a market that made 50%.
-        let evaluation =
-            Evaluation::new(metrics(0.20, 0.05, 100), metrics(0.50, 0.05, 1), &criteria);
+        let evaluation = Evaluation::new(
+            metrics(0.20, 0.05, 100),
+            metrics(0.50, 0.05, 1),
+            Vec::new(),
+            Vec::new(),
+            &criteria,
+        );
 
         assert_eq!(evaluation.verdict, Verdict::NotSupported);
         assert!((evaluation.excess_return - -0.30).abs() < 1e-12);
@@ -402,8 +452,13 @@ mod tests {
     #[test]
     fn an_unholdable_drawdown_disqualifies_a_winning_strategy() {
         let criteria = EvaluationCriteria::default();
-        let evaluation =
-            Evaluation::new(metrics(0.40, 0.55, 100), metrics(0.10, 0.05, 1), &criteria);
+        let evaluation = Evaluation::new(
+            metrics(0.40, 0.55, 100),
+            metrics(0.10, 0.05, 1),
+            Vec::new(),
+            Vec::new(),
+            &criteria,
+        );
 
         assert_eq!(evaluation.verdict, Verdict::NotSupported);
         assert!(
@@ -416,8 +471,13 @@ mod tests {
     #[test]
     fn a_clean_win_over_the_benchmark_is_supported() {
         let criteria = EvaluationCriteria::default();
-        let evaluation =
-            Evaluation::new(metrics(0.40, 0.10, 100), metrics(0.10, 0.05, 1), &criteria);
+        let evaluation = Evaluation::new(
+            metrics(0.40, 0.10, 100),
+            metrics(0.10, 0.05, 1),
+            Vec::new(),
+            Vec::new(),
+            &criteria,
+        );
 
         assert_eq!(evaluation.verdict, Verdict::Supported);
         assert!((evaluation.excess_return - 0.30).abs() < 1e-12);

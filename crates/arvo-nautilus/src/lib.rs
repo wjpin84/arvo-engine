@@ -44,7 +44,7 @@ use std::sync::Once;
 
 use arvo_data::BarProvider;
 use arvo_research::{
-    Experiment, SimulationError, SimulationProvider, SimulationResult, StrategySpec,
+    EquityPoint, Experiment, SimulationError, SimulationProvider, SimulationResult, StrategySpec,
 };
 use chrono::{NaiveDate, NaiveTime};
 use nautilus_backtest::{
@@ -352,7 +352,11 @@ fn run_backtest(
         .map_err(|err| SimulationError::Engine(Box::new(BacktestFailed(err.to_string()))))?;
 
     let result = engine.get_result();
-    let equity_curve = compound(experiment.starting_cash, result.returns_series.values());
+    let equity_curve = compound(
+        experiment.starting_cash,
+        experiment.window.from,
+        result.returns_series.iter(),
+    );
     engine.dispose();
 
     Ok(SimulationResult {
@@ -433,20 +437,43 @@ fn close_of_day(date: NaiveDate) -> Option<UnixNanos> {
     u64::try_from(nanos).ok().map(UnixNanos::from)
 }
 
-/// Turns a series of period returns into an equity curve.
+/// Turns Nautilus's dated period returns into a dated equity curve.
 ///
 /// Nautilus reports returns; evaluation wants equity, and everything else
 /// (drawdown, Sharpe, hit rate) derives from equity. The curve opens at the
 /// starting balance so a run with no trades is a flat single point rather than
 /// an empty vector that reads like a failure.
-fn compound<'a>(starting_cash: f64, returns: impl Iterator<Item = &'a f64>) -> Vec<f64> {
+///
+/// The dates come along. Nautilus keys its returns by timestamp and this used
+/// to drop them on the floor, which made the curve impossible to draw, to
+/// align against another run, or to ask *when* a drawdown happened. Keeping
+/// them costs a conversion.
+fn compound<'a>(
+    starting_cash: f64,
+    opened: NaiveDate,
+    returns: impl Iterator<Item = (&'a UnixNanos, &'a f64)>,
+) -> Vec<EquityPoint> {
     let mut equity = starting_cash;
-    let mut curve = vec![equity];
-    for value in returns {
+    let mut curve = vec![EquityPoint {
+        date: opened,
+        equity,
+    }];
+    for (at, value) in returns {
         equity *= 1.0 + value;
-        curve.push(equity);
+        curve.push(EquityPoint {
+            date: date_of(*at).unwrap_or(opened),
+            equity,
+        });
     }
     curve
+}
+
+/// The UTC calendar day a Nautilus timestamp falls on.
+fn date_of(at: UnixNanos) -> Option<NaiveDate> {
+    let nanos = i64::try_from(at.as_u64()).ok()?;
+    chrono::DateTime::from_timestamp_nanos(nanos)
+        .date_naive()
+        .into()
 }
 
 /// Wraps a Nautilus engine failure so it can cross the boundary as a plain
@@ -547,7 +574,7 @@ mod tests {
             "a completed run always has at least its opening balance"
         );
         assert!(
-            (result.equity_curve[0] - experiment.starting_cash).abs() < f64::EPSILON,
+            (result.equity_curve[0].equity - experiment.starting_cash).abs() < f64::EPSILON,
             "the curve opens at the starting balance"
         );
         assert!(result.trades > 0, "a crossing path should trade");
@@ -653,8 +680,11 @@ mod tests {
 
     #[test]
     fn an_empty_return_series_still_yields_the_opening_balance() {
-        let curve = compound(100_000.0, [].iter());
-        assert_eq!(curve, vec![100_000.0]);
+        let empty: std::collections::BTreeMap<UnixNanos, f64> = std::collections::BTreeMap::new();
+        let curve = compound(100_000.0, date(2024, 1, 1), empty.iter());
+        assert_eq!(curve.len(), 1, "the opening balance is always a point");
+        assert!((curve[0].equity - 100_000.0).abs() < f64::EPSILON);
+        assert_eq!(curve[0].date, date(2024, 1, 1));
     }
 
     /// A steadily rising market, so buy-and-hold must show a gain. If the
@@ -782,7 +812,19 @@ mod tests {
 
     #[test]
     fn returns_compound_rather_than_summing() {
-        let curve = compound(100.0, [0.1, 0.1].iter());
-        assert!((curve[2] - 121.0).abs() < 1e-9, "{curve:?}");
+        let returns: std::collections::BTreeMap<UnixNanos, f64> = [
+            (close_of_day(date(2024, 1, 1)).expect("representable"), 0.1),
+            (close_of_day(date(2024, 1, 2)).expect("representable"), 0.1),
+        ]
+        .into_iter()
+        .collect();
+
+        let curve = compound(100.0, date(2024, 1, 1), returns.iter());
+        assert!((curve[2].equity - 121.0).abs() < 1e-9, "{curve:?}");
+        assert_eq!(
+            curve[2].date,
+            date(2024, 1, 3),
+            "a bar timestamped at its close lands on the following calendar day"
+        );
     }
 }
