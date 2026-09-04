@@ -9,8 +9,13 @@ use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen]
 extern "C" {
-    #[wasm_bindgen(js_namespace = ["window", "__TAURI__", "core"])]
-    async fn invoke(cmd: &str, args: JsValue) -> JsValue;
+    // `catch` is load-bearing. A Tauri command returning `Err` rejects the
+    // promise, and without it wasm-bindgen rethrows into the wasm boundary and
+    // abandons the calling future — so a failed command left the UI spinning
+    // forever with the reason thrown away. With it the rejection is a value we
+    // can read and show.
+    #[wasm_bindgen(catch, js_namespace = ["window", "__TAURI__", "core"])]
+    async fn invoke(cmd: &str, args: JsValue) -> Result<JsValue, JsValue>;
 
     // app-shell ticket 04 — glue defined in index.html. on_panel_created
     // is a JS-callable closure invoked with (panel_name, element) at the
@@ -87,21 +92,28 @@ struct PluginView {
 /// `None` means the call or the decode failed — distinct from a successful
 /// call returning something empty. Those two used to be indistinguishable
 /// once rendered, with nothing logged anywhere.
-async fn call_typed<T: serde::de::DeserializeOwned>(cmd: &str, args: JsValue) -> Option<T> {
-    let result = invoke(cmd, args).await;
-    match serde_wasm_bindgen::from_value(result) {
-        Ok(value) => Some(value),
-        Err(err) => {
-            web_sys::console::error_1(&format!("failed to decode `{cmd}` response: {err}").into());
-            None
-        }
-    }
+async fn call_typed<T: serde::de::DeserializeOwned>(cmd: &str, args: JsValue) -> Result<T, String> {
+    let result = invoke(cmd, args).await.map_err(|err| {
+        // The command itself failed. Tauri serialises `CommandError` as a
+        // plain string, so this is the reason the backend gave.
+        err.as_string()
+            .unwrap_or_else(|| format!("`{cmd}` failed with a non-text error"))
+    })?;
+
+    serde_wasm_bindgen::from_value(result)
+        .map_err(|err| format!("could not read the `{cmd}` reply: {err}"))
 }
 
+/// Logs and discards the reason. Only for calls with no error surface of their
+/// own — anything a user initiated should show them what went wrong instead.
 async fn call(cmd: &str) -> Vec<PluginView> {
-    call_typed(cmd, JsValue::UNDEFINED)
-        .await
-        .unwrap_or_default()
+    match call_typed(cmd, JsValue::UNDEFINED).await {
+        Ok(value) => value,
+        Err(reason) => {
+            web_sys::console::error_1(&reason.clone().into());
+            Vec::new()
+        }
+    }
 }
 
 #[derive(Clone, Deserialize)]
@@ -383,14 +395,19 @@ fn ExtensionsView(
 /// assumed. A verdict shown alone is a number that looks like a fact, and the
 /// whole reason this platform exists is that backtests are easy to believe.
 #[component]
-fn ResearchView() -> impl IntoView {
+fn ResearchView(
+    study: ReadSignal<Option<StudyView>>,
+    set_study: WriteSignal<Option<StudyView>>,
+) -> impl IntoView {
     let (library, set_library) = signal(None::<DataLibraryView>);
-    let (study, set_study) = signal(None::<StudyView>);
     let (running, set_running) = signal(false);
     let (error, set_error) = signal(None::<String>);
 
     spawn_local(async move {
-        set_library.set(call_typed("list_instruments", JsValue::UNDEFINED).await);
+        match call_typed::<DataLibraryView>("list_instruments", JsValue::UNDEFINED).await {
+            Ok(value) => set_library.set(Some(value)),
+            Err(reason) => set_error.set(Some(reason)),
+        }
     });
 
     let run = move |instrument: String| {
@@ -403,11 +420,11 @@ fn ResearchView() -> impl IntoView {
             }))
             .unwrap_or(JsValue::UNDEFINED);
             match call_typed::<StudyView>("run_study", args).await {
-                Some(result) => set_study.set(Some(result)),
-                None => set_error.set(Some(
-                    "The study did not complete. See the developer console for the reason."
-                        .to_owned(),
-                )),
+                Ok(result) => set_study.set(Some(result)),
+                // Show the backend's own words. The previous version could not
+                // even reach this branch: the rejected promise killed the
+                // future above, leaving the spinner up and nothing logged.
+                Err(reason) => set_error.set(Some(reason)),
             }
             set_running.set(false);
         });
@@ -482,7 +499,11 @@ fn ResearchView() -> impl IntoView {
 
             {move || error.get().map(|message| view! { <p class="research-error">{message}</p> })}
 
-            {move || study.get().map(|study| view! { <StudyReport study=study /> })}
+            {move || {
+                study
+                    .get()
+                    .map(|study| view! { <p class="research-hint">{format!("Showing {} in the main panel.", study.instrument)}</p> })
+            }}
         </div>
     }
 }
@@ -643,6 +664,8 @@ fn SidebarPanel(
     set_plugins: WriteSignal<Vec<PluginView>>,
     theme: ReadSignal<Theme>,
     set_theme: WriteSignal<Theme>,
+    study: ReadSignal<Option<StudyView>>,
+    set_study: WriteSignal<Option<StudyView>>,
 ) -> impl IntoView {
     view! {
         // Needs a real height: .sidebar-view inside it is `height: 100%`,
@@ -651,7 +674,9 @@ fn SidebarPanel(
         // `overflow: hidden` instead of scrolling (ticket 14).
         <div class="sidebar-panel-root">
             {move || match active_view.get() {
-                Some(ActivityView::Research) => view! { <ResearchView /> }.into_any(),
+                Some(ActivityView::Research) => {
+                    view! { <ResearchView study=study set_study=set_study /> }.into_any()
+                }
                 Some(ActivityView::Extensions) => {
                     view! { <ExtensionsView plugins=plugins set_plugins=set_plugins /> }
                         .into_any()
@@ -1113,9 +1138,14 @@ fn StatusBar(plugins: ReadSignal<Vec<PluginView>>) -> impl IntoView {
 /// is a simplified line-art take on the same logo (peak + underlying
 /// sweep), not a pixel copy of its 3D-rendered artwork.
 #[component]
-fn MainPanel() -> impl IntoView {
+fn MainPanel(study: ReadSignal<Option<StudyView>>) -> impl IntoView {
     view! {
-        <div class="welcome">
+        {move || {
+            study
+                .get()
+                .map(|study| view! { <div class="study-panel"><StudyReport study=study /></div> })
+        }}
+        <div class="welcome" class:hidden=move || study.get().is_some()>
             <svg class="welcome-mark" viewBox="0 0 100 100" aria-hidden="true">
                 <path d="M28 82 L50 16 L72 82" />
                 <path class="welcome-mark-sweep" d="M30 54 Q50 76 70 66" />
@@ -1154,6 +1184,10 @@ pub fn App() -> impl IntoView {
     // Output moved out of the default layout into the View menu.
     let (output_visible, set_output_visible) = signal(false);
     let (palette_open, set_palette_open) = signal(false);
+    // Hoisted out of ResearchView: the sidebar starts the study, the main
+    // panel shows the report. The sidebar is a picker, the way an explorer is
+    // — results belong in the space built for reading.
+    let (study, set_study) = signal(None::<StudyView>);
 
     Effect::new(move |_| {
         spawn_local(async move {
@@ -1206,13 +1240,15 @@ pub fn App() -> impl IntoView {
                                 set_plugins=set_plugins
                                 theme=theme
                                 set_theme=set_theme
+                                study=study
+                                set_study=set_study
                             />
                         }
                     });
                     *sidebar_mount_created.borrow_mut() = Some(handle);
                 }
                 "main" => {
-                    mount_to(el, || view! { <MainPanel /> }).forget();
+                    mount_to(el, move || view! { <MainPanel study=study /> }).forget();
                 }
                 "bottom" => {
                     let handle = mount_to(el, || view! { <BottomPanel /> });

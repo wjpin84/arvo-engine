@@ -45,11 +45,24 @@ fn init_tracing(log_dir: std::path::PathBuf) {
 
     // If the log file cannot be opened, carry on with stderr only — losing
     // diagnostics is not a reason to refuse to start.
-    tracing_subscriber::registry()
+    let subscriber = tracing_subscriber::registry()
         .with(filter)
         .with(fmt::layer())
-        .with(file_layer)
-        .init();
+        .with(file_layer);
+
+    // `set_global_default`, deliberately, NOT `SubscriberInitExt::init()`.
+    //
+    // `init()` additionally installs `tracing-log`'s `LogTracer` as the `log`
+    // crate's global logger. NautilusTrader's kernel then cannot install its
+    // own, and rather than shrugging it fails the whole engine construction
+    // with "A non-Nautilus logger is already registered" — so every backtest
+    // died at startup while the tests, which install no subscriber, all
+    // passed. This cost the `log` bridge, which only mattered for
+    // dependencies that log through `log` rather than `tracing`; Nautilus is
+    // the significant one and `arvo-nautilus` silences it anyway.
+    if let Err(err) = tracing::subscriber::set_global_default(subscriber) {
+        eprintln!("could not install the tracing subscriber: {err}");
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -145,4 +158,39 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    /// Guards the exact failure that shipped: `init_tracing` used to install
+    /// `tracing-log`'s bridge as the `log` crate's global logger, and
+    /// NautilusTrader's kernel then refuses to build an engine at all, with
+    /// "A non-Nautilus logger is already registered". Every backtest in the
+    /// desktop app failed while every test passed, because tests install no
+    /// subscriber.
+    ///
+    /// The invariant is one-directional and belongs here rather than in
+    /// `arvo-nautilus`: whoever sets up diagnostics must leave the `log`
+    /// global free for the engine to claim.
+    #[test]
+    fn tracing_setup_leaves_the_log_global_free_for_the_engine() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        super::init_tracing(dir.path().to_path_buf());
+
+        struct Discard;
+        impl log::Log for Discard {
+            fn enabled(&self, _: &log::Metadata<'_>) -> bool {
+                false
+            }
+            fn log(&self, _: &log::Record<'_>) {}
+            fn flush(&self) {}
+        }
+
+        // Succeeds only while nothing else holds the `log` global — which is
+        // precisely what Nautilus needs to be true when it starts up.
+        assert!(
+            log::set_boxed_logger(Box::new(Discard)).is_ok(),
+            "init_tracing claimed the `log` global; Nautilus cannot install              its logger and will refuse to build an engine"
+        );
+    }
 }
