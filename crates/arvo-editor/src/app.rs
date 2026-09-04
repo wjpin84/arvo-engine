@@ -81,7 +81,20 @@ struct PluginView {
 
 async fn call(cmd: &str) -> Vec<PluginView> {
     let result = invoke(cmd, JsValue::UNDEFINED).await;
-    serde_wasm_bindgen::from_value(result).unwrap_or_default()
+    match serde_wasm_bindgen::from_value(result) {
+        Ok(plugins) => plugins,
+        Err(err) => {
+            // An empty list and a decode failure look identical once rendered,
+            // so say which happened. This used to be `.unwrap_or_default()`,
+            // which made a shape mismatch between `PluginView` here and the
+            // command's own type indistinguishable from "no plugins
+            // configured" — with nothing logged anywhere.
+            web_sys::console::error_1(
+                &format!("failed to decode `{cmd}` response: {err}").into(),
+            );
+            Vec::new()
+        }
+    }
 }
 
 /// app-shell ticket 12 follow-up: a third baked-in palette (Catppuccin

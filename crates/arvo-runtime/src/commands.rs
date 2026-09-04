@@ -1,6 +1,28 @@
 use arvo_plugin_host::registry::{PluginEntry, PluginRegistry, PluginStatus};
-use serde::Serialize;
+use serde::{Serialize, Serializer};
 use std::sync::Arc;
+
+/// Error surface for Tauri commands.
+///
+/// Tauri requires an async command that borrows `State<'_, _>` to return a
+/// `Result`, so these signatures cannot simply return `T` — but `()` as the
+/// error type means a future failure reaches the UI carrying nothing at all.
+/// Both commands happen to be infallible today; this exists so that the first
+/// one that isn't has somewhere to put the reason.
+///
+/// Serialises as a plain string, because that is what the front end can
+/// actually render.
+#[derive(Debug, thiserror::Error)]
+pub enum CommandError {
+    #[error("{0}")]
+    Failed(String),
+}
+
+impl Serialize for CommandError {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_string())
+    }
+}
 
 #[derive(Serialize)]
 pub struct PluginView {
@@ -50,14 +72,14 @@ impl From<&PluginEntry> for PluginView {
 #[tauri::command]
 pub async fn list_plugins(
     registry: tauri::State<'_, Arc<PluginRegistry>>,
-) -> Result<Vec<PluginView>, ()> {
+) -> Result<Vec<PluginView>, CommandError> {
     Ok(registry.snapshot().await.iter().map(PluginView::from).collect())
 }
 
 #[tauri::command]
 pub async fn refresh_plugins(
     registry: tauri::State<'_, Arc<PluginRegistry>>,
-) -> Result<Vec<PluginView>, ()> {
+) -> Result<Vec<PluginView>, CommandError> {
     registry.refresh().await;
     Ok(registry.snapshot().await.iter().map(PluginView::from).collect())
 }

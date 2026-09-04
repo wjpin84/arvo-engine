@@ -17,12 +17,49 @@ use std::time::Duration;
 use tauri::Manager;
 use tauri_plugin_notification::NotificationExt;
 
+/// Sets up diagnostics, writing to both stderr and a file under Tauri's app
+/// log directory.
+///
+/// The file sink is the point. `main.rs` sets `windows_subsystem = "windows"`
+/// for release builds, so a released app has no console and anything written
+/// to stderr goes nowhere — which is precisely the situation where a user
+/// hits a malformed `plugins.toml` and needs to know why it was ignored.
+///
+/// Truncates on each launch rather than rolling: the interesting log is the
+/// one for the session that just misbehaved, and this keeps the file from
+/// growing without bound. Swap in `tracing-appender` if retention across
+/// sessions is ever wanted.
+fn init_tracing(log_dir: std::path::PathBuf) {
+    use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+
+    // RUST_LOG wins if set; otherwise info for our own crates, warn elsewhere.
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        EnvFilter::new("warn,arvo_runtime=info,arvo_core=info,arvo_plugin_host=info")
+    });
+
+    let file_layer = std::fs::create_dir_all(&log_dir)
+        .and_then(|()| std::fs::File::create(log_dir.join("arvo.log")))
+        .map(|file| fmt::layer().with_ansi(false).with_writer(file))
+        .ok();
+
+    // If the log file cannot be opened, carry on with stderr only — losing
+    // diagnostics is not a reason to refuse to start.
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(fmt::layer())
+        .with(file_layer)
+        .init();
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
         .setup(|app| {
+            // Before anything that can fail, so config errors are captured.
+            init_tracing(app.path().app_log_dir()?);
+
             let config_path = app.path().app_config_dir()?.join("plugins.toml");
             let plugins_config = match config::load(&config_path) {
                 Ok(config) => config,
@@ -31,7 +68,11 @@ pub fn run() {
                     // the plugin list only shows what the registry probed. Log
                     // loudly and continue with zero plugins rather than blocking
                     // startup on a hand-edited file.
-                    eprintln!("plugin config error, continuing with no plugins: {err}");
+                    tracing::error!(
+                        error = %err,
+                        path = %config_path.display(),
+                        "plugin config unreadable, continuing with no plugins"
+                    );
                     config::PluginsConfig::default()
                 }
             };
@@ -58,7 +99,7 @@ pub fn run() {
                                 .body(notification.body)
                                 .show()
                             {
-                                eprintln!("failed to show notification: {err}");
+                                tracing::warn!(error = %err, "failed to show notification");
                             }
                         }
                         // A slow subscriber missed some events — keep going,
