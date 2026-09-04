@@ -138,6 +138,7 @@ struct InstrumentView {
     from: Option<String>,
     to: Option<String>,
     bars: usize,
+    fingerprint: Option<String>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -163,6 +164,7 @@ struct StudyView {
     strategy: MetricsView,
     benchmark: MetricsView,
     excess_return: f64,
+    dataset_version: String,
     strategy_name: String,
     starting_cash: f64,
     commission_bps: f64,
@@ -171,6 +173,12 @@ struct StudyView {
 
 fn percent(value: f64) -> String {
     format!("{:+.2}%", value * 100.0)
+}
+
+/// First twelve characters of a content hash. Enough to compare two by eye
+/// and to spot that they differ; the full value lives in the record.
+fn short_hash(hash: &str) -> String {
+    hash.chars().take(12).collect()
 }
 
 fn ratio(value: Option<f64>) -> String {
@@ -485,6 +493,7 @@ fn ResearchView(
                                     };
                                     let runnable = instrument.bars > 0;
                                     let id_again = instrument.id.clone();
+                                    let live_hash = instrument.fingerprint.clone();
                                     // Two closures rather than one shared: each
                                     // owns a String, so the predicate is not
                                     // `Copy` and cannot be moved into two views.
@@ -498,6 +507,28 @@ fn ResearchView(
                                     let held_rerun = {
                                         let id = instrument.id.clone();
                                         move || studies.with(|studies| studies.contains_key(&id))
+                                    };
+                                    // A held result is stale when the data it
+                                    // was produced from no longer hashes to
+                                    // what is on disk. This is the whole point
+                                    // of recording a dataset version: without
+                                    // it a cached result is trusted forever.
+                                    let stale = {
+                                        let id = instrument.id.clone();
+                                        let live = live_hash.clone();
+                                        move || {
+                                            studies.with(|studies| {
+                                                match (studies.get(&id), live.as_deref()) {
+                                                    (Some(study), Some(live)) => {
+                                                        study.dataset_version != live
+                                                    }
+                                                    // No held result, or no
+                                                    // readable data: nothing to
+                                                    // call stale.
+                                                    _ => false,
+                                                }
+                                            })
+                                        }
                                     };
                                     view! {
                                         <li class="research-row">
@@ -540,6 +571,17 @@ fn ResearchView(
                                                 <span class="research-instrument-meta">
                                                     {coverage}
                                                 </span>
+                                                {move || {
+                                                    stale()
+                                                        .then(|| {
+                                                            view! {
+                                                                <span class="research-stale">
+                                                                    "held result is out of date \
+                                                                     \u{2014} the data has changed"
+                                                                </span>
+                                                            }
+                                                        })
+                                                }}
                                             </button>
                                             // Only once there is something to redo. Without it a
                                             // held result could never be refreshed, which would be
@@ -706,6 +748,8 @@ fn StudyReport(study: StudyView) -> impl IntoView {
                 <dd class=deflation_class>{deflation}</dd>
                 <dt>"Winning parameters"</dt>
                 <dd>{params}</dd>
+                <dt>"Dataset"</dt>
+                <dd class="research-hash">{short_hash(&study.dataset_version)}</dd>
                 <dt>"Strategy"</dt>
                 <dd>{study.strategy_name.clone()}</dd>
                 <dt>"Starting cash"</dt>

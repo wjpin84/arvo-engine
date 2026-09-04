@@ -17,7 +17,7 @@
 //! mirror it. Venue adapters, execution feeds and live streaming remain
 //! Nautilus's, reached through `arvo-nautilus`.
 
-use chrono::NaiveDate;
+use chrono::{Datelike, NaiveDate};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -102,6 +102,49 @@ pub trait BarProvider: Send + Sync {
             (Some(first), Some(last)) => Some((first.date, last.date)),
             _ => None,
         })
+    }
+
+    /// A content hash of every bar this source holds for `instrument`.
+    ///
+    /// This is what makes a result reproducible rather than merely repeatable.
+    /// An experiment records the *identity* of the data it ran against, so a
+    /// stored result can later be checked against the data still on disk and
+    /// found stale instead of being quietly trusted.
+    ///
+    /// Hashes the parsed bars, not the file bytes, and that distinction is
+    /// deliberate: reformatting a CSV, changing its line endings or resaving it
+    /// does not invalidate a result, because none of that changes what the
+    /// experiment saw. Changing a single price does.
+    ///
+    /// Covers the instrument's whole history rather than any one window. A
+    /// dataset is the data; which slice of it an experiment used is recorded
+    /// separately, and conflating the two would make every window look like a
+    /// different dataset.
+    ///
+    /// `None` for a known instrument holding no bars.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataError`] on the same conditions as [`Self::daily_bars`].
+    fn fingerprint(&self, instrument: &str) -> Result<Option<String>, DataError> {
+        let bars = self.daily_bars(instrument, NaiveDate::MIN, NaiveDate::MAX)?;
+        if bars.is_empty() {
+            return Ok(None);
+        }
+
+        let mut hasher = blake3::Hasher::new();
+        for bar in &bars {
+            // Raw bit patterns and a day count, not formatted text: exact,
+            // and identical on every platform and toolchain. `DefaultHasher`
+            // would have been easier and is explicitly not stable across Rust
+            // releases, which would make a fingerprint meaningless the moment
+            // the compiler moved.
+            hasher.update(&bar.date.num_days_from_ce().to_le_bytes());
+            for value in [bar.open, bar.high, bar.low, bar.close, bar.volume] {
+                hasher.update(&value.to_bits().to_le_bytes());
+            }
+        }
+        Ok(Some(hasher.finalize().to_hex().to_string()))
     }
 }
 
@@ -452,6 +495,45 @@ mod tests {
 
         let empty = InMemoryBars::new().with_instrument("EMPTY.X", vec![]);
         assert_eq!(empty.coverage("EMPTY.X").expect("known"), None);
+    }
+
+    #[test]
+    fn a_fingerprint_changes_when_a_price_changes_and_not_otherwise() {
+        let original = InMemoryBars::new()
+            .with_instrument("AAPL.NASDAQ", vec![bar(1, 1.0), bar(2, 2.0), bar(3, 3.0)]);
+        let reordered = InMemoryBars::new()
+            .with_instrument("AAPL.NASDAQ", vec![bar(3, 3.0), bar(1, 1.0), bar(2, 2.0)]);
+        let edited = InMemoryBars::new()
+            .with_instrument("AAPL.NASDAQ", vec![bar(1, 1.0), bar(2, 2.5), bar(3, 3.0)]);
+
+        let of = |source: &InMemoryBars| {
+            source
+                .fingerprint("AAPL.NASDAQ")
+                .expect("known instrument")
+                .expect("holds bars")
+        };
+
+        assert_eq!(
+            of(&original),
+            of(&reordered),
+            "the same bars in a different input order are the same dataset"
+        );
+        assert_ne!(
+            of(&original),
+            of(&edited),
+            "one changed price must invalidate every result that used it"
+        );
+    }
+
+    #[test]
+    fn an_empty_instrument_has_no_fingerprint_to_report() {
+        let empty = InMemoryBars::new().with_instrument("EMPTY.X", vec![]);
+        assert_eq!(empty.fingerprint("EMPTY.X").expect("known"), None);
+
+        let err = empty
+            .fingerprint("NEVER.HEARD")
+            .expect_err("unknown instrument");
+        assert!(matches!(err, DataError::UnknownInstrument(_)), "{err}");
     }
 
     #[test]

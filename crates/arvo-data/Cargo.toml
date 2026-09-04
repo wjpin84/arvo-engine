@@ -6,6 +6,9 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+# Already in the graph via nautilus-backtest; a real content hash that is
+# stable across platforms and toolchains, which `DefaultHasher` is not.
+blake3 = "1.8.7"
 chrono.workspace = true
 serde.workspace = true
 thiserror.workspace = true

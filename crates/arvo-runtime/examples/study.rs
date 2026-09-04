@@ -43,7 +43,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let window = DateRange::new(from, to)?;
         println!("  {} .. {} ({} days)", from, to, window.days());
 
-        let family = arvo_runtime_lib::research::study_for(&instrument, window);
+        let fingerprint = bars
+            .fingerprint(&instrument)?
+            .ok_or("instrument holds no bars")?;
+        println!("  dataset {}", &fingerprint[..16]);
+        let family = arvo_runtime_lib::research::study_for(&instrument, window, &fingerprint);
         match arvo_research::run_family(&simulation, &family, &criteria) {
             Err(err) => println!("  FAILED: {err}"),
             Ok(found) => {

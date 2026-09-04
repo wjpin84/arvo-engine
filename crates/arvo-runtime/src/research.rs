@@ -69,6 +69,10 @@ pub struct InstrumentView {
     pub from: Option<String>,
     pub to: Option<String>,
     pub bars: usize,
+    /// Content hash of the data as it stands right now. The workbench compares
+    /// this against the hash recorded in a held result to tell whether that
+    /// result still describes the data on disk.
+    pub fingerprint: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -118,6 +122,9 @@ pub struct StudyView {
     pub excess_return: f64,
 
     // Stated assumptions, because a verdict without them is decoration.
+    /// The dataset this result was produced from, as a content hash. Compared
+    /// against the live one to decide whether the result is still current.
+    pub dataset_version: String,
     pub strategy_name: String,
     pub starting_cash: f64,
     pub commission_bps: f64,
@@ -150,11 +157,13 @@ pub async fn list_instruments(
                         .map_or(0, |bars| bars.len())
                 })
                 .unwrap_or_default();
+            let fingerprint = service.bars.fingerprint(&id).ok().flatten();
             InstrumentView {
                 id,
                 from: coverage.map(|(from, _)| from.to_string()),
                 to: coverage.map(|(_, to)| to.to_string()),
                 bars,
+                fingerprint,
             }
         })
         .collect();
@@ -183,11 +192,16 @@ pub async fn run_study(
         .ok_or_else(|| CommandError::Failed(format!("{instrument} holds no bars")))?;
 
     let engine = simulation.engine().to_owned();
+    let fingerprint = service
+        .bars
+        .fingerprint(&instrument)
+        .map_err(|err| CommandError::Failed(format!("hashing {instrument}: {err}")))?
+        .ok_or_else(|| CommandError::Failed(format!("{instrument} holds no bars")))?;
 
     tauri::async_runtime::spawn_blocking(move || {
         let window = DateRange::new(coverage.0, coverage.1)
             .map_err(|err| CommandError::Failed(err.to_string()))?;
-        let family = study_for(&instrument, window);
+        let family = study_for(&instrument, window, &fingerprint);
 
         let found = arvo_research::run_family(
             simulation.as_ref(),
@@ -222,6 +236,7 @@ pub async fn run_study(
             strategy: MetricsView::from(&evaluation.strategy),
             benchmark: MetricsView::from(&evaluation.benchmark),
             excess_return: evaluation.excess_return,
+            dataset_version: found.selected.dataset.version.clone(),
             strategy_name: found.selected.strategy.name.clone(),
             starting_cash: found.selected.starting_cash,
             commission_bps: found.selected.costs.commission_bps,
@@ -242,7 +257,7 @@ pub async fn run_study(
 /// The grid is fixed at nine configurations. That number is itself part of the
 /// claim — [`arvo_research::run_family`] deflates the result by it — so it is
 /// written here in the open rather than tuned per run.
-pub fn study_for(instrument: &str, window: DateRange) -> ExperimentFamily {
+pub fn study_for(instrument: &str, window: DateRange, dataset_version: &str) -> ExperimentFamily {
     let template = Experiment {
         id: ExperimentId(format!("study-{instrument}")),
         hypothesis: HypothesisId(format!("trend-following predicts returns in {instrument}")),
@@ -250,11 +265,11 @@ pub fn study_for(instrument: &str, window: DateRange) -> ExperimentFamily {
         window,
         dataset: DatasetRef {
             id: instrument.to_owned(),
-            // ponytail: the CSV file's own contents are the version. A real
-            // content hash goes here when datasets can be updated in place —
-            // until then, edit the file and you have a different dataset with
-            // the same name, which the record cannot yet detect.
-            version: "local-csv".to_owned(),
+            // A content hash of the bars, so a stored result knows exactly
+            // which data produced it. This used to be the fixed string
+            // "local-csv", which meant editing a CSV left every earlier result
+            // still claiming to be reproducible against it.
+            version: dataset_version.to_owned(),
         },
         strategy: StrategySpec {
             name: STRATEGY.to_owned(),
@@ -301,13 +316,17 @@ mod tests {
         )
         .expect("ordered");
 
-        let family = study_for("AAPL.NASDAQ", window);
+        let family = study_for("AAPL.NASDAQ", window, "test-fingerprint");
         assert_eq!(
             family.grid.size(),
             9,
             "the trial count is deflated against, so it must be what it claims"
         );
         assert_eq!(family.template.strategy.name, STRATEGY);
+        assert_eq!(
+            family.template.dataset.version, "test-fingerprint",
+            "the dataset identity must reach the record, or nothing can be found stale"
+        );
         assert!(
             (family.template.costs.slippage_bps - 0.0).abs() < f64::EPSILON,
             "non-zero slippage is not honoured by the engine yet and would fail the run"
