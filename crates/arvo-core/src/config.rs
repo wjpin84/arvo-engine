@@ -65,17 +65,18 @@ pub fn load(path: &Path) -> Result<PluginsConfig, ConfigError> {
         }
     };
 
-    let config: PluginsConfig =
-        toml::from_str(&contents).map_err(|source| ConfigError::Parse {
-            path: path.display().to_string(),
-            source,
-        })?;
+    let config: PluginsConfig = toml::from_str(&contents).map_err(|source| ConfigError::Parse {
+        path: path.display().to_string(),
+        source,
+    })?;
 
     for entry in &config.plugin {
         let reason = match (&entry.address, &entry.path) {
             (Some(_), None) | (None, Some(_)) => continue,
-            (Some(_), Some(_)) => "both address and path set; a plugin is exactly one of \
-                gRPC (address) or WASM (path)",
+            (Some(_), Some(_)) => {
+                "both address and path set; a plugin is exactly one of \
+                gRPC (address) or WASM (path)"
+            }
             (None, None) => "neither address nor path set",
         };
         return Err(ConfigError::InvalidPluginEntry {

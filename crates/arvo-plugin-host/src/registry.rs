@@ -1,8 +1,8 @@
-use arvo_core::config::PluginsConfig;
-use arvo_core::events::{Event, StatusKind};
 use crate::plugin::plugin_client::PluginClient;
 use crate::plugin::{GetManifestRequest, Manifest};
 use crate::wasm::WasmHost;
+use arvo_core::config::PluginsConfig;
+use arvo_core::events::{Event, StatusKind};
 use std::path::Path;
 use tokio::sync::{broadcast, RwLock};
 
@@ -48,7 +48,12 @@ impl PluginRegistry {
         // meaningful status change. See ticket 02 of the arvo-core map.
         let mut entries = Vec::with_capacity(config.plugin.len());
         for plugin in &config.plugin {
-            let status = probe(plugin.address.as_deref(), plugin.path.as_deref(), &wasm_host).await;
+            let status = probe(
+                plugin.address.as_deref(),
+                plugin.path.as_deref(),
+                &wasm_host,
+            )
+            .await;
             entries.push(PluginEntry {
                 id: plugin.id.clone(),
                 address: plugin.address.clone(),
@@ -84,7 +89,8 @@ impl PluginRegistry {
 
         let mut refreshed = Vec::with_capacity(known.len());
         for old in known {
-            let new_status = probe(old.address.as_deref(), old.path.as_deref(), &self.wasm_host).await;
+            let new_status =
+                probe(old.address.as_deref(), old.path.as_deref(), &self.wasm_host).await;
 
             if status_kind(&new_status) != status_kind(&old.status) {
                 let _ = self.events.send(Event::PluginStatusChanged {

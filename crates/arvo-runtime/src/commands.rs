@@ -73,7 +73,12 @@ impl From<&PluginEntry> for PluginView {
 pub async fn list_plugins(
     registry: tauri::State<'_, Arc<PluginRegistry>>,
 ) -> Result<Vec<PluginView>, CommandError> {
-    Ok(registry.snapshot().await.iter().map(PluginView::from).collect())
+    Ok(registry
+        .snapshot()
+        .await
+        .iter()
+        .map(PluginView::from)
+        .collect())
 }
 
 #[tauri::command]
@@ -81,5 +86,10 @@ pub async fn refresh_plugins(
     registry: tauri::State<'_, Arc<PluginRegistry>>,
 ) -> Result<Vec<PluginView>, CommandError> {
     registry.refresh().await;
-    Ok(registry.snapshot().await.iter().map(PluginView::from).collect())
+    Ok(registry
+        .snapshot()
+        .await
+        .iter()
+        .map(PluginView::from)
+        .collect())
 }

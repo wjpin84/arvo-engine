@@ -89,9 +89,7 @@ async fn call(cmd: &str) -> Vec<PluginView> {
             // which made a shape mismatch between `PluginView` here and the
             // command's own type indistinguishable from "no plugins
             // configured" — with nothing logged anywhere.
-            web_sys::console::error_1(
-                &format!("failed to decode `{cmd}` response: {err}").into(),
-            );
+            web_sys::console::error_1(&format!("failed to decode `{cmd}` response: {err}").into());
             Vec::new()
         }
     }
@@ -528,7 +526,11 @@ pub fn App() -> impl IntoView {
     let (active_view, set_active_view) = signal(None::<ActivityView>);
     // Catppuccin Mocha is never the OS-preference default — only light/dark
     // follow that; Catppuccin is opt-in from Settings.
-    let (theme, set_theme) = signal(if prefers_dark() { Theme::Dark } else { Theme::Light });
+    let (theme, set_theme) = signal(if prefers_dark() {
+        Theme::Dark
+    } else {
+        Theme::Light
+    });
     // Output moved out of the default layout into the View menu.
     let (output_visible, set_output_visible) = signal(false);
 
@@ -597,7 +599,11 @@ pub fn App() -> impl IntoView {
             }
         });
 
-        init_shell("shell-host", on_panel_created.as_ref(), on_panel_removed.as_ref());
+        init_shell(
+            "shell-host",
+            on_panel_created.as_ref(),
+            on_panel_removed.as_ref(),
+        );
         on_panel_created.forget();
         on_panel_removed.forget();
     });

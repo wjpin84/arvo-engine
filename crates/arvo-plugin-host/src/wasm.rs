@@ -74,7 +74,9 @@ impl WasmHost {
     }
 }
 
-fn into_proto_manifest(manifest: exports::arvo::plugin::manifest_api::Manifest) -> crate::plugin::Manifest {
+fn into_proto_manifest(
+    manifest: exports::arvo::plugin::manifest_api::Manifest,
+) -> crate::plugin::Manifest {
     crate::plugin::Manifest {
         id: manifest.id,
         name: manifest.name,
