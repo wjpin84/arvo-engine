@@ -14,12 +14,12 @@ these are obligations on what we ship, not on what we write.
 NautilusTrader — GNU Lesser General Public License v3.0 (LGPL-3.0-only)
   https://github.com/nautechsystems/nautilus_trader
 
-  STATUS: planned, not yet a dependency. This entry is a placeholder so the
-  obligation is recorded before the dependency lands, rather than discovered
-  at packaging time. Remove this status line when the dependency is added.
+  STATUS: active dependency. `crates/arvo-nautilus` depends on
+  `nautilus-model` (pinned `=0.63.0`) and is the only crate permitted to do
+  so. Everything below now applies to real distributed artifacts.
 
   Arvo links NautilusTrader's Rust crates in-process (see
-  arvo-desktop/.scratch/nautilus-bridge/map.md). A statically linked binary is
+  arvo-desktop/.scratch/arvo-architecture/map.md). A statically linked binary is
   therefore a "Combined Work" under LGPL-3.0 section 4, and the obligations
   attach to distributed binaries — notably the Tauri installer — not to Arvo's
   own Apache-2.0 source.

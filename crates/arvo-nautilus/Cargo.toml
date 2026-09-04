@@ -1,0 +1,10 @@
+[package]
+name = "arvo-nautilus"
+description = "The single boundary between Arvo and NautilusTrader. No other crate may name a Nautilus type."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nautilus-model = "=0.63.0"   # pinned exactly: Nautilus is 0.x, every release may break
+thiserror.workspace = true

@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/arvo-core",
     "crates/arvo-plugin-host",
+    "crates/arvo-nautilus",
     "crates/arvo-editor",
     "crates/arvo-runtime",
     "plugins/stub",
