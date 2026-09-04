@@ -41,8 +41,10 @@ impl PortfolioService {
 #[derive(Serialize)]
 pub struct HoldingView {
     pub instrument: String,
-    pub quantity: f64,
-    pub price: f64,
+    /// `None` when the source reported money without units — a collective
+    /// trust in a 401(k) does exactly that.
+    pub quantity: Option<f64>,
+    pub price: Option<f64>,
     pub market_value: f64,
     pub cost_basis: Option<f64>,
     pub unrealized: Option<f64>,

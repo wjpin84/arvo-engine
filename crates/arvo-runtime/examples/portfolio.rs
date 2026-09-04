@@ -66,10 +66,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         for holding in &valued.holdings {
             println!(
-                "    {:<14} qty {:>10.2}  px {:>9.2}  value {:>11.2}  {:>5.1}%  [{}]",
+                "    {:<40} qty {:>10}  px {:>9}  value {:>11.2}  {:>5.1}%  [{}]",
                 holding.instrument,
-                holding.quantity,
-                holding.price,
+                holding
+                    .quantity
+                    .map_or_else(|| "-".to_owned(), |q| format!("{q:.2}")),
+                holding
+                    .price
+                    .map_or_else(|| "-".to_owned(), |p| format!("{p:.2}")),
                 holding.market_value,
                 holding.weight * 100.0,
                 match holding.priced_by {

@@ -236,8 +236,8 @@ struct PanelView {
 #[derive(Clone, Deserialize)]
 struct HoldingView {
     instrument: String,
-    quantity: f64,
-    price: f64,
+    quantity: Option<f64>,
+    price: Option<f64>,
     market_value: f64,
     cost_basis: Option<f64>,
     unrealized: Option<f64>,
@@ -1690,11 +1690,20 @@ fn PortfolioReport(portfolio: PortfolioView) -> impl IntoView {
                             let cost_text = holding
                                 .cost_basis
                                 .map_or_else(|| "—".to_owned(), money);
+                            // A collective trust reports a balance and no unit
+                            // count; an em dash says "not reported" where a 0
+                            // would claim the position is empty.
+                            let qty_text = holding
+                                .quantity
+                                .map_or_else(|| "—".to_owned(), |q| format!("{q:.4}"));
+                            let price_text = holding
+                                .price
+                                .map_or_else(|| "—".to_owned(), money);
                             view! {
                                 <tr>
                                     <td>{holding.instrument.clone()}</td>
-                                    <td>{format!("{:.4}", holding.quantity)}</td>
-                                    <td>{money(holding.price)}</td>
+                                    <td>{qty_text}</td>
+                                    <td>{price_text}</td>
                                     <td>{money(holding.market_value)}</td>
                                     <td>{cost_text}</td>
                                     <td class=gain_class>{gain_text}</td>

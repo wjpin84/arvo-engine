@@ -39,7 +39,11 @@ pub struct Holding {
     /// The same identifier the data library uses, so a holding and its price
     /// history are the same instrument rather than two things that look alike.
     pub instrument: String,
-    pub quantity: f64,
+    /// Units held. `None` when the source reports only money — a collective
+    /// investment trust inside a 401(k) commonly does, giving a balance and
+    /// no unit count at all. A holding is "some amount of something worth
+    /// some money", and different sources report different parts of that.
+    pub quantity: Option<f64>,
     /// Total paid, not per share. Per-share cost is a division; total is what
     /// a statement reports, and deriving down is safer than up.
     ///
@@ -53,6 +57,12 @@ pub struct Holding {
     /// the last close in the data library, and failing that the holding is
     /// reported as unpriced rather than silently valued at zero.
     pub price: Option<f64>,
+    /// Market value as the source reported it, when it did.
+    ///
+    /// Preferred over multiplying quantity by price: it is what the statement
+    /// actually says, and it is the only thing available when there is no
+    /// unit count to multiply.
+    pub value: Option<f64>,
 }
 
 /// A set of holdings as of a date.
@@ -67,8 +77,10 @@ pub struct Portfolio {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ValuedHolding {
     pub instrument: String,
-    pub quantity: f64,
-    pub price: f64,
+    /// `None` when the source reported money without units.
+    pub quantity: Option<f64>,
+    /// `None` when there is a value but no unit count to divide it by.
+    pub price: Option<f64>,
     pub market_value: f64,
     /// `None` when the source did not report one.
     pub cost_basis: Option<f64>,
@@ -136,26 +148,50 @@ impl Portfolio {
         let mut cash = 0.0;
 
         for holding in &self.holdings {
-            let (price, source) = if holding.instrument.eq_ignore_ascii_case(CASH) {
-                (Some(1.0), PriceSource::Face)
-            } else if let Some(price) = holding.price {
-                (Some(price), PriceSource::Statement)
-            } else {
+            let is_cash = holding.instrument.eq_ignore_ascii_case(CASH);
+
+            // In order of authority: what the statement said the position was
+            // worth, then what it said a unit was worth, then our own last
+            // close. A reported value beats a computed one — it is the number
+            // the custodian stands behind.
+            let (market_value, source) = if let Some(value) = holding.value {
                 (
-                    last_close.get(&holding.instrument).copied(),
-                    PriceSource::LastClose,
+                    Some(value),
+                    if is_cash {
+                        PriceSource::Face
+                    } else {
+                        PriceSource::Statement
+                    },
                 )
+            } else if is_cash {
+                (holding.quantity, PriceSource::Face)
+            } else if let (Some(quantity), Some(price)) = (holding.quantity, holding.price) {
+                (Some(quantity * price), PriceSource::Statement)
+            } else if let (Some(quantity), Some(close)) = (
+                holding.quantity,
+                last_close.get(&holding.instrument).copied(),
+            ) {
+                (Some(quantity * close), PriceSource::LastClose)
+            } else {
+                (None, PriceSource::LastClose)
             };
 
-            let Some(price) = price else {
+            let Some(market_value) = market_value else {
                 unpriced.push(holding.instrument.clone());
                 continue;
             };
 
-            let market_value = holding.quantity * price;
             if source == PriceSource::Face {
                 cash += market_value;
             }
+
+            // Only derivable when there are units to divide by.
+            let price = holding.price.or_else(|| {
+                holding
+                    .quantity
+                    .filter(|quantity| *quantity != 0.0)
+                    .map(|quantity| market_value / quantity)
+            });
 
             priced.push((
                 ValuedHolding {
@@ -229,9 +265,10 @@ mod tests {
     fn holding(instrument: &str, quantity: f64, cost: f64, price: Option<f64>) -> Holding {
         Holding {
             instrument: instrument.to_owned(),
-            quantity,
+            quantity: Some(quantity),
             cost_basis: Some(cost),
             price,
+            value: None,
         }
     }
 
@@ -326,9 +363,10 @@ mod tests {
             holding("A.X", 10.0, 500.0, Some(100.0)),
             Holding {
                 instrument: "B.X".to_owned(),
-                quantity: 10.0,
+                quantity: Some(10.0),
                 cost_basis: None,
                 price: Some(50.0),
+                value: None,
             },
         ])
         .value(&BTreeMap::new());
@@ -340,6 +378,46 @@ mod tests {
         assert_eq!(valued.total_cost, None, "cost is not");
         assert_eq!(valued.unrealized, None);
         assert_eq!(valued.without_cost_basis, 1, "and it says how many");
+    }
+
+    #[test]
+    fn a_balance_with_no_unit_count_still_values() {
+        // The real 401(k) case: a collective investment trust reports a
+        // dollar balance and a cost basis, and no share count anywhere.
+        // Requiring units would have refused the entire account.
+        let valued = portfolio(vec![Holding {
+            instrument: "JPMCB SRPB 2050 CFX1".to_owned(),
+            quantity: None,
+            cost_basis: Some(154_350.78),
+            price: None,
+            value: Some(224_630.21),
+        }])
+        .value(&BTreeMap::new());
+
+        assert!((valued.total_value - 224_630.21).abs() < 1e-9);
+        assert!((valued.unrealized.expect("cost reported") - 70_279.43).abs() < 1e-6);
+        assert_eq!(valued.holdings[0].quantity, None);
+        assert_eq!(
+            valued.holdings[0].price, None,
+            "no units to divide by, so there is no unit price to report"
+        );
+        assert!(valued.unpriced.is_empty());
+    }
+
+    #[test]
+    fn a_reported_value_beats_a_computed_one() {
+        // The custodian's own number wins: it accounts for accruals and
+        // fractional units we cannot see.
+        let valued = portfolio(vec![Holding {
+            instrument: "A.X".to_owned(),
+            quantity: Some(10.0),
+            cost_basis: Some(500.0),
+            price: Some(100.0),
+            value: Some(1_050.0),
+        }])
+        .value(&BTreeMap::new());
+
+        assert!((valued.total_value - 1_050.0).abs() < 1e-9, "not 10 x 100");
     }
 
     #[test]

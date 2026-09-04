@@ -198,7 +198,38 @@ impl CsvHoldings {
 ///
 /// Handles the doubled-quote escape (`""`) because that is how a quote inside
 /// a quoted field is written.
-fn split(line: &str) -> Vec<String> {
+/// Rows that are summaries, not holdings.
+///
+/// Matched exactly rather than by prefix: plenty of real funds are called
+/// "Total Stock Market Index", and skipping those would quietly delete a
+/// position. "Account Total" is never a fund.
+const SUMMARY_ROWS: &[&str] = &[
+    "total",
+    "totals",
+    "account total",
+    "grand total",
+    "subtotal",
+    "sub total",
+    "portfolio total",
+    "plan total",
+];
+
+/// Whether a file is comma- or tab-separated.
+///
+/// Copying a holdings table out of a web page gives tabs, and that is a
+/// perfectly reasonable way to get data out of a platform whose only export
+/// is a PDF. Guessing wrong finds no columns and refuses the file.
+fn delimiter_of(text: &str) -> char {
+    let head: Vec<&str> = text.lines().take(5).collect();
+    let count = |sep: char| -> usize { head.iter().map(|line| line.matches(sep).count()).sum() };
+    if count('\t') > count(',') {
+        '\t'
+    } else {
+        ','
+    }
+}
+
+fn split_on(line: &str, delimiter: char) -> Vec<String> {
     let mut fields = Vec::new();
     let mut current = String::new();
     let mut quoted = false;
@@ -211,7 +242,7 @@ fn split(line: &str) -> Vec<String> {
                 chars.next();
             }
             '"' => quoted = !quoted,
-            ',' if !quoted => {
+            c if c == delimiter && !quoted => {
                 fields.push(current.trim().to_owned());
                 current = String::new();
             }
@@ -220,6 +251,11 @@ fn split(line: &str) -> Vec<String> {
     }
     fields.push(current.trim().to_owned());
     fields
+}
+
+#[cfg(test)]
+fn split(line: &str) -> Vec<String> {
+    split_on(line, ',')
 }
 
 /// Normalises a heading for matching: lowercase, and underscores treated as
@@ -277,7 +313,7 @@ fn find(header: &[String], aliases: &[&str]) -> Option<usize> {
 struct Mapping {
     instrument: Option<usize>,
     description: Option<usize>,
-    quantity: usize,
+    quantity: Option<usize>,
     price: Option<usize>,
     value: Option<usize>,
     cost_total: Option<usize>,
@@ -288,15 +324,18 @@ struct Mapping {
 fn map_header(header: &[String]) -> Option<Mapping> {
     let instrument = find(header, roles::INSTRUMENT);
     let description = find(header, roles::DESCRIPTION);
-    let quantity = find(header, roles::QUANTITY)?;
+    let quantity = find(header, roles::QUANTITY);
     let price = find(header, roles::PRICE);
     let value = find(header, roles::VALUE);
 
-    // Something to name the holding, and something to size it by.
+    // Something to name the holding by.
     if instrument.is_none() && description.is_none() {
         return None;
     }
-    if price.is_none() && value.is_none() {
+    // And something to size it in money. A reported value is enough on its
+    // own: a collective investment trust in a 401(k) reports a balance and no
+    // unit count at all, and demanding units would refuse the whole account.
+    if value.is_none() && !(quantity.is_some() && price.is_some()) {
         return None;
     }
 
@@ -353,12 +392,13 @@ fn read_file(path: &Path, as_of: NaiveDate) -> Result<Vec<Imported>, CsvError> {
 
     // The header is not always the first line: exports often open with a
     // title or a blank. Take the first line that maps.
+    let delimiter = delimiter_of(&text);
     let lines: Vec<&str> = text.lines().collect();
     let (header_at, header, mapping) = lines
         .iter()
         .enumerate()
         .find_map(|(index, line)| {
-            let columns = split(line);
+            let columns = split_on(line, delimiter);
             map_header(&columns).map(|mapping| (index, columns, mapping))
         })
         .ok_or_else(|| CsvError::Unrecognised {
@@ -377,7 +417,7 @@ fn read_file(path: &Path, as_of: NaiveDate) -> Result<Vec<Imported>, CsvError> {
     };
     note("instrument", mapping.instrument, &mut report);
     note("description", mapping.description, &mut report);
-    note("quantity", Some(mapping.quantity), &mut report);
+    note("quantity", mapping.quantity, &mut report);
     note("price", mapping.price, &mut report);
     note("value", mapping.value, &mut report);
     note("cost basis (total)", mapping.cost_total, &mut report);
@@ -412,7 +452,7 @@ fn read_file(path: &Path, as_of: NaiveDate) -> Result<Vec<Imported>, CsvError> {
         if line.is_empty() {
             continue;
         }
-        let fields = split(line);
+        let fields = split_on(line, delimiter);
 
         match holding_from(&fields, &mapping) {
             Some(holding) => {
@@ -471,38 +511,42 @@ fn holding_from(fields: &[String], mapping: &Mapping) -> Option<Holding> {
         .or_else(|| text(mapping.description))?
         .to_owned();
 
-    let quantity = number(fields.get(mapping.quantity)?)?;
-    if quantity < 0.0 {
+    // A summary line is not a holding, and importing one double-counts the
+    // whole account.
+    if SUMMARY_ROWS.contains(&normalise(&instrument).as_str()) {
         return None;
     }
 
+    let quantity = mapping
+        .quantity
+        .and_then(|index| number(fields.get(index)?))
+        .filter(|quantity| *quantity >= 0.0);
     let price = mapping.price.and_then(|index| number(fields.get(index)?));
     let value = mapping.value.and_then(|index| number(fields.get(index)?));
 
-    // Whichever is present; if both, price wins and value is a cross-check we
-    // do not currently make. A value with no price is divided out, which is
-    // how a fund position with only a balance is handled.
-    let price = match (price, value) {
-        (Some(price), _) => Some(price),
-        (None, Some(value)) if quantity != 0.0 => Some(value / quantity),
-        _ => None,
-    }?;
+    // Money, one way or another, or this is not a position we can report.
+    if value.is_none() && !(quantity.is_some() && price.is_some()) {
+        return None;
+    }
 
     let cost_basis = mapping
         .cost_total
         .and_then(|index| number(fields.get(index)?))
         .or_else(|| {
+            // Per share only means anything when there are shares.
             mapping
                 .cost_per_share
                 .and_then(|index| number(fields.get(index)?))
-                .map(|per_share| per_share * quantity)
+                .zip(quantity)
+                .map(|(per_share, quantity)| per_share * quantity)
         });
 
     Some(Holding {
         instrument,
         quantity,
         cost_basis,
-        price: Some(price),
+        price,
+        value,
     })
 }
 
@@ -532,6 +576,7 @@ mod tests {
         assert_eq!(holding.instrument, "AAPL.NASDAQ");
         assert_eq!(holding.cost_basis, Some(4210.50));
         assert_eq!(holding.price, Some(191.24));
+        assert_eq!(holding.quantity, Some(25.0));
     }
 
     #[test]
@@ -598,7 +643,10 @@ mod tests {
     #[test]
     fn a_value_column_with_no_price_is_divided_out() {
         let imported = load("Investment,Units,Balance\nTARGET 2050,100,25000\n");
-        assert_eq!(imported[0].portfolio.holdings[0].price, Some(250.0));
+        // Value with no price: the value is kept as reported and the unit
+        // price is derived at valuation time, where the units live.
+        assert_eq!(imported[0].portfolio.holdings[0].value, Some(25_000.0));
+        assert_eq!(imported[0].portfolio.holdings[0].quantity, Some(100.0));
     }
 
     #[test]
@@ -645,7 +693,7 @@ mod tests {
             holding.instrument,
             "VANGUARD TARGET RETIREMENT 2050 FUND, INVESTOR SHARES"
         );
-        assert_eq!(holding.quantity, 100.0);
+        assert_eq!(holding.quantity, Some(100.0));
         assert_eq!(holding.price, Some(25.0));
     }
 
@@ -668,6 +716,43 @@ AAPL,not-a-number,oops
         assert!(imported[0].portfolio.holdings.is_empty());
         assert_eq!(imported[0].report.rows_imported, 0);
         assert_eq!(imported[0].report.rows_skipped.len(), 1);
+    }
+
+    #[test]
+    fn a_tab_separated_table_pasted_from_a_web_page_reads() {
+        // A 401(k) platform whose only export is a PDF still lets you copy
+        // the holdings table, and what you get is tab separated.
+        let imported = load(
+            "Name\tAsset Class\t% Invested\tBalance\tCost Basis\n\
+             JPMCB SRPB 2050 CFX1\tBlended Fund Investments*\t100.00%\t$224,630.21\t$154,350.78\n\
+             Account Total\t\t100%\t$224,630.21\t\n",
+        );
+
+        assert_eq!(
+            imported[0].portfolio.holdings.len(),
+            1,
+            "the Account Total row must not become a second position"
+        );
+        let holding = &imported[0].portfolio.holdings[0];
+        assert_eq!(holding.instrument, "JPMCB SRPB 2050 CFX1");
+        assert_eq!(holding.quantity, None, "no unit count is reported");
+        assert_eq!(holding.value, Some(224_630.21));
+        assert_eq!(holding.cost_basis, Some(154_350.78));
+    }
+
+    #[test]
+    fn a_total_row_is_skipped_but_a_fund_named_total_is_not() {
+        let imported = load(
+            "Symbol,Description,Quantity,Last Price\n\
+             VTI,VANGUARD TOTAL STOCK MARKET,10,100\n\
+             Account Total,,,\n",
+        );
+        assert_eq!(
+            imported[0].portfolio.holdings.len(),
+            1,
+            "a real fund with 'total' in its name must survive"
+        );
+        assert_eq!(imported[0].portfolio.holdings[0].instrument, "VTI");
     }
 
     #[test]
