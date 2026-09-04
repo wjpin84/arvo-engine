@@ -1,26 +1,38 @@
-[package]
-name = "arvo-desktop-ui"
-version = "0.1.0"
-license = "Apache-2.0"
-edition = "2021"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-[dependencies]
-leptos = { version = "0.8", features = ["csr"] }
-wasm-bindgen = "0.2"
-wasm-bindgen-futures = "0.4"
-js-sys = "0.3"
-serde = { version = "1", features = ["derive"] }
-serde-wasm-bindgen = "0.6"
-console_error_panic_hook = "0.1.7"
-web-sys = { version = "0.3.104", features = ["Window", "Document", "HtmlElement", "Element", "MediaQueryList"] }
-
 [workspace]
-members = ["src-tauri", "plugins/stub", "plugins/wasm-stub"]
+resolver = "2"
+members = [
+    "crates/arvo-core",
+    "crates/arvo-plugin-host",
+    "crates/arvo-editor",
+    "crates/arvo-runtime",
+    "plugins/stub",
+    "plugins/wasm-stub",
+]
+
+# Single source of truth for versions shared across crates, so a bump happens
+# once rather than per-manifest.
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+arvo-core = { path = "crates/arvo-core" }
+arvo-plugin-host = { path = "crates/arvo-plugin-host" }
+
+anyhow = "1.0.104"
+prost = "0.14.4"
+serde = { version = "1", features = ["derive"] }
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros"] }
+tonic = "0.14.6"
+tonic-prost = "0.14.6"
+tonic-prost-build = "0.14.6"
+protoc-bin-vendored = "3.2.0"
 
 # Must live in the *workspace root* manifest. Cargo ignores `[profile.*]` in
-# member crates and warns about it — these settings sat in src-tauri/Cargo.toml
-# and were silently doing nothing, so every release build so far ran at
+# member crates and warns about it — these settings sat in the app crate's own
+# manifest and were silently doing nothing, so every release build ran at
 # defaults. See tauri.app/concept/size/#cargo-configuration.
 [profile.release]
 codegen-units = 1

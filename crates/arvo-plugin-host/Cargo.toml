@@ -1,0 +1,22 @@
+[package]
+name = "arvo-plugin-host"
+description = "Loads and probes Arvo plugins across both execution tiers: gRPC subprocess and in-process WASM component."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+arvo-core.workspace = true
+anyhow.workspace = true
+prost.workspace = true
+tokio.workspace = true
+tonic.workspace = true
+tonic-prost.workspace = true
+wasmtime = "38.0.4"
+
+[build-dependencies]
+protoc-bin-vendored.workspace = true
+tonic-prost-build.workspace = true
+
+[dev-dependencies]
+arvo-plugin-stub = { path = "../../plugins/stub" }

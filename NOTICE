@@ -1,0 +1,45 @@
+Arvo
+Copyright 2026 The Arvo Authors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+--------------------------------------------------------------------------------
+Third-party components
+--------------------------------------------------------------------------------
+
+This file records third-party licence obligations that attach to distributed
+Arvo artifacts. Arvo's own source remains Apache-2.0 in every case below —
+these are obligations on what we ship, not on what we write.
+
+NautilusTrader — GNU Lesser General Public License v3.0 (LGPL-3.0-only)
+  https://github.com/nautechsystems/nautilus_trader
+
+  STATUS: planned, not yet a dependency. This entry is a placeholder so the
+  obligation is recorded before the dependency lands, rather than discovered
+  at packaging time. Remove this status line when the dependency is added.
+
+  Arvo links NautilusTrader's Rust crates in-process (see
+  arvo-desktop/.scratch/nautilus-bridge/map.md). A statically linked binary is
+  therefore a "Combined Work" under LGPL-3.0 section 4, and the obligations
+  attach to distributed binaries — notably the Tauri installer — not to Arvo's
+  own Apache-2.0 source.
+
+  What that requires of anything we distribute:
+
+    * Ship this notice and copies of the LGPL-3.0 and GPL-3.0 licence texts.
+    * State prominently that NautilusTrader is used and is covered by LGPL-3.0.
+    * Give recipients the means to relink against a modified NautilusTrader.
+      Arvo satisfies this by publishing complete corresponding source and
+      working build instructions: a recipient can substitute their own
+      NautilusTrader and rebuild. (Rust has no stable Rust-to-Rust ABI, so the
+      shared-library route in section 4(d)(0) is not practical here.)
+    * Do not prohibit reverse engineering for debugging such modifications.
+
+  Practical consequence: Arvo must remain buildable from published source. If
+  Arvo ever ships a binary whose source is not published, this arrangement no
+  longer discharges the obligation and the boundary must be revisited — moving
+  NautilusTrader out of process would restore it, since arms-length IPC is not
+  linking.
+
+  This is a record of the mechanism, not legal advice. Confirm with counsel
+  before any commercial distribution.
