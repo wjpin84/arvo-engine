@@ -738,6 +738,49 @@ mod tests {
     }
 
     #[test]
+    fn a_family_selects_in_sample_and_is_judged_out_of_sample() {
+        use arvo_research::{ExperimentFamily, ParameterGrid};
+
+        let bars = sawtooth(600);
+        let template = experiment(params(10.0, 30.0), &bars);
+        let family = ExperimentFamily::new(
+            template.clone(),
+            ParameterGrid::new()
+                .axis("fast", vec![5.0, 10.0, 15.0])
+                .axis("slow", vec![30.0, 50.0]),
+        );
+
+        let found = arvo_research::run_family(
+            &provider(bars),
+            &family,
+            &arvo_research::EvaluationCriteria::default(),
+        )
+        .expect("the family should run");
+
+        assert_eq!(
+            found.selection.trials, 6,
+            "every grid point should have run"
+        );
+        assert!(
+            found.in_sample.to < found.out_of_sample.from,
+            "the winner must be judged on days it was not chosen on"
+        );
+        assert_eq!(
+            found.selected.window, found.out_of_sample,
+            "the reported run is the out-of-sample one"
+        );
+        assert!(
+            found.out_of_sample_evidence.experiment.window == found.out_of_sample,
+            "and its evidence agrees"
+        );
+        assert!(
+            !matches!(found.verdict, arvo_research::Verdict::Supported),
+            "a moving-average grid should not beat buy-and-hold out of sample: {:?}",
+            found.reasons
+        );
+    }
+
+    #[test]
     fn returns_compound_rather_than_summing() {
         let curve = compound(100.0, [0.1, 0.1].iter());
         assert!((curve[2] - 121.0).abs() < 1e-9, "{curve:?}");

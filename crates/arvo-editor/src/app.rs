@@ -45,6 +45,7 @@ extern "C" {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ActivityView {
+    Research,
     Extensions,
     Alerts,
     Settings,
@@ -79,20 +80,82 @@ struct PluginView {
     status: PluginStatusView,
 }
 
-async fn call(cmd: &str) -> Vec<PluginView> {
-    let result = invoke(cmd, JsValue::UNDEFINED).await;
+/// Invokes a command and decodes its reply, logging rather than swallowing a
+/// decode failure.
+///
+/// `None` means the call or the decode failed — distinct from a successful
+/// call returning something empty. Those two used to be indistinguishable
+/// once rendered, with nothing logged anywhere.
+async fn call_typed<T: serde::de::DeserializeOwned>(cmd: &str, args: JsValue) -> Option<T> {
+    let result = invoke(cmd, args).await;
     match serde_wasm_bindgen::from_value(result) {
-        Ok(plugins) => plugins,
+        Ok(value) => Some(value),
         Err(err) => {
-            // An empty list and a decode failure look identical once rendered,
-            // so say which happened. This used to be `.unwrap_or_default()`,
-            // which made a shape mismatch between `PluginView` here and the
-            // command's own type indistinguishable from "no plugins
-            // configured" — with nothing logged anywhere.
             web_sys::console::error_1(&format!("failed to decode `{cmd}` response: {err}").into());
-            Vec::new()
+            None
         }
     }
+}
+
+async fn call(cmd: &str) -> Vec<PluginView> {
+    call_typed(cmd, JsValue::UNDEFINED)
+        .await
+        .unwrap_or_default()
+}
+
+#[derive(Clone, Deserialize)]
+struct MetricsView {
+    total_return: f64,
+    cagr: f64,
+    max_drawdown: f64,
+    volatility: f64,
+    sharpe: Option<f64>,
+    trades: u32,
+}
+
+#[derive(Clone, Deserialize)]
+struct InstrumentView {
+    id: String,
+    from: Option<String>,
+    to: Option<String>,
+    bars: usize,
+}
+
+#[derive(Clone, Deserialize)]
+struct DataLibraryView {
+    directory: String,
+    instruments: Vec<InstrumentView>,
+}
+
+/// Mirrors `arvo_runtime::research::StudyView`. Nothing here names an engine,
+/// a broker or an order — the workbench works in research concepts only.
+#[derive(Clone, Deserialize)]
+struct StudyView {
+    instrument: String,
+    verdict: String,
+    reasons: Vec<String>,
+    trials: usize,
+    best_sharpe: f64,
+    expected_best_under_null: Option<f64>,
+    survived_deflation: bool,
+    in_sample: String,
+    out_of_sample: String,
+    selected_params: Vec<(String, f64)>,
+    strategy: MetricsView,
+    benchmark: MetricsView,
+    excess_return: f64,
+    strategy_name: String,
+    starting_cash: f64,
+    commission_bps: f64,
+    engine: String,
+}
+
+fn percent(value: f64) -> String {
+    format!("{:+.2}%", value * 100.0)
+}
+
+fn ratio(value: Option<f64>) -> String {
+    value.map_or_else(|| "—".to_owned(), |v| format!("{v:.2}"))
 }
 
 /// app-shell ticket 12 follow-up: a third baked-in palette (Catppuccin
@@ -159,6 +222,17 @@ fn toggle_view(
 /// Extensions (puzzle piece) and Alerts (bell) — the same silhouettes VS
 /// Code's own activity bar uses for these, hand-drawn as plain `currentColor`
 /// paths rather than vendoring an icon font/library for two glyphs.
+/// A conical flask — the research view runs experiments, and the icon should
+/// say experiment rather than chart.
+#[component]
+fn ResearchIcon() -> impl IntoView {
+    view! {
+        <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+            <path d="M9 2h6v2h-1v5.2l5.6 9.3A2 2 0 0 1 17.9 22H6.1a2 2 0 0 1-1.7-3.5L10 9.2V4H9V2Zm3 9.6-2.6 4.4h5.2L12 11.6Z" />
+        </svg>
+    }
+}
+
 #[component]
 fn ExtensionsIcon() -> impl IntoView {
     view! {
@@ -193,6 +267,14 @@ fn ActivityBar(
 ) -> impl IntoView {
     view! {
         <nav class="activity-bar" class:integrated=move || active_view.get().is_some()>
+            <button
+                class="activity-bar-item"
+                class:active=move || active_view.get() == Some(ActivityView::Research)
+                title="Research"
+                on:click=move |_| toggle_view(ActivityView::Research, active_view, set_active_view)
+            >
+                <ResearchIcon />
+            </button>
             <button
                 class="activity-bar-item"
                 class:active=move || active_view.get() == Some(ActivityView::Extensions)
@@ -292,6 +374,230 @@ fn ExtensionsView(
     }
 }
 
+/// The research view: pick an instrument, run a parameter study, read what
+/// survived.
+///
+/// The display is deliberately loaded with caveats — the split, the number of
+/// configurations tried, the bar a no-skill search would clear, the costs
+/// assumed. A verdict shown alone is a number that looks like a fact, and the
+/// whole reason this platform exists is that backtests are easy to believe.
+#[component]
+fn ResearchView() -> impl IntoView {
+    let (library, set_library) = signal(None::<DataLibraryView>);
+    let (study, set_study) = signal(None::<StudyView>);
+    let (running, set_running) = signal(false);
+    let (error, set_error) = signal(None::<String>);
+
+    spawn_local(async move {
+        set_library.set(call_typed("list_instruments", JsValue::UNDEFINED).await);
+    });
+
+    let run = move |instrument: String| {
+        set_running.set(true);
+        set_error.set(None);
+        set_study.set(None);
+        spawn_local(async move {
+            let args = serde_wasm_bindgen::to_value(&serde_json::json!({
+                "instrument": instrument,
+            }))
+            .unwrap_or(JsValue::UNDEFINED);
+            match call_typed::<StudyView>("run_study", args).await {
+                Some(result) => set_study.set(Some(result)),
+                None => set_error.set(Some(
+                    "The study did not complete. See the developer console for the reason."
+                        .to_owned(),
+                )),
+            }
+            set_running.set(false);
+        });
+    };
+
+    view! {
+        <div class="sidebar-view">
+            <h3>"Research"</h3>
+
+            {move || match library.get() {
+                None => view! { <p class="sidebar-empty">"Looking for data…"</p> }.into_any(),
+                Some(library) if library.instruments.is_empty() => {
+                    view! {
+                        <div>
+                            <p class="sidebar-empty">"No instruments yet"</p>
+                            <p class="research-hint">
+                                "Drop daily-bar CSV files here, one per instrument, named "
+                                <code>"SYMBOL.VENUE.csv"</code>
+                                " with the header "
+                                <code>"date,open,high,low,close,volume"</code>
+                            </p>
+                            <p class="research-path">{library.directory.clone()}</p>
+                        </div>
+                    }
+                    .into_any()
+                }
+                Some(library) => {
+                    view! {
+                        <ul class="research-instruments">
+                            {library
+                                .instruments
+                                .into_iter()
+                                .map(|instrument| {
+                                    let id = instrument.id.clone();
+                                    let coverage = match (&instrument.from, &instrument.to) {
+                                        (Some(from), Some(to)) => {
+                                            format!("{} bars · {from} → {to}", instrument.bars)
+                                        }
+                                        // A file that parsed to nothing is shown rather
+                                        // than hidden: silence would look like it was
+                                        // never added.
+                                        _ => "no usable bars".to_owned(),
+                                    };
+                                    let runnable = instrument.bars > 0;
+                                    view! {
+                                        <li>
+                                            <button
+                                                class="research-instrument"
+                                                disabled=move || running.get() || !runnable
+                                                on:click=move |_| run(id.clone())
+                                            >
+                                                <span class="research-instrument-id">
+                                                    {instrument.id.clone()}
+                                                </span>
+                                                <span class="research-instrument-meta">
+                                                    {coverage}
+                                                </span>
+                                            </button>
+                                        </li>
+                                    }
+                                })
+                                .collect_view()}
+                        </ul>
+                    }
+                    .into_any()
+                }
+            }}
+
+            {move || {
+                running.get().then(|| view! { <p class="sidebar-empty">"Running study…"</p> })
+            }}
+
+            {move || error.get().map(|message| view! { <p class="research-error">{message}</p> })}
+
+            {move || study.get().map(|study| view! { <StudyReport study=study /> })}
+        </div>
+    }
+}
+
+/// One study, rendered with its caveats attached rather than beside it.
+#[component]
+fn StudyReport(study: StudyView) -> impl IntoView {
+    let verdict_class = match study.verdict.as_str() {
+        "Supported" => "research-verdict supported",
+        "Not supported" => "research-verdict refuted",
+        _ => "research-verdict inconclusive",
+    };
+
+    let params = study
+        .selected_params
+        .iter()
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let deflation = study.expected_best_under_null.map_or_else(
+        || "not applicable: every configuration scored alike".to_owned(),
+        |bar| {
+            format!(
+                "best in-sample Sharpe {:.2} against {bar:.2} expected from {} no-skill trials",
+                study.best_sharpe, study.trials
+            )
+        },
+    );
+    let deflation_class = if study.survived_deflation {
+        ""
+    } else {
+        "research-flag"
+    };
+
+    view! {
+        <div class="research-report">
+            <div class=verdict_class>{study.verdict.clone()}</div>
+            <p class="research-subject">{study.instrument.clone()}</p>
+
+            <ul class="research-reasons">
+                {study.reasons.iter().map(|r| view! { <li>{r.clone()}</li> }).collect_view()}
+            </ul>
+
+            <h4>"Out of sample"</h4>
+            <table class="research-metrics">
+                <thead>
+                    <tr>
+                        <th></th>
+                        <th>"Strategy"</th>
+                        <th>"Buy and hold"</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>"Return"</td>
+                        <td>{percent(study.strategy.total_return)}</td>
+                        <td>{percent(study.benchmark.total_return)}</td>
+                    </tr>
+                    <tr>
+                        <td>"CAGR"</td>
+                        <td>{percent(study.strategy.cagr)}</td>
+                        <td>{percent(study.benchmark.cagr)}</td>
+                    </tr>
+                    <tr>
+                        <td>"Max drawdown"</td>
+                        <td>{percent(study.strategy.max_drawdown)}</td>
+                        <td>{percent(study.benchmark.max_drawdown)}</td>
+                    </tr>
+                    <tr>
+                        <td>"Volatility"</td>
+                        <td>{percent(study.strategy.volatility)}</td>
+                        <td>{percent(study.benchmark.volatility)}</td>
+                    </tr>
+                    <tr>
+                        <td>"Sharpe"</td>
+                        <td>{ratio(study.strategy.sharpe)}</td>
+                        <td>{ratio(study.benchmark.sharpe)}</td>
+                    </tr>
+                    <tr>
+                        <td>"Trades"</td>
+                        <td>{study.strategy.trades}</td>
+                        <td>{study.benchmark.trades}</td>
+                    </tr>
+                    <tr class="research-excess">
+                        <td>"Excess return"</td>
+                        <td colspan="2">{percent(study.excess_return)}</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <h4>"How this was arrived at"</h4>
+            <dl class="research-provenance">
+                <dt>"Chosen on"</dt>
+                <dd>{study.in_sample.clone()}</dd>
+                <dt>"Judged on"</dt>
+                <dd>{study.out_of_sample.clone()}</dd>
+                <dt>"Configurations tried"</dt>
+                <dd>{study.trials}</dd>
+                <dt>"Multiple-testing check"</dt>
+                <dd class=deflation_class>{deflation}</dd>
+                <dt>"Winning parameters"</dt>
+                <dd>{params}</dd>
+                <dt>"Strategy"</dt>
+                <dd>{study.strategy_name.clone()}</dd>
+                <dt>"Starting cash"</dt>
+                <dd>{format!("{:.0}", study.starting_cash)}</dd>
+                <dt>"Commission"</dt>
+                <dd>{format!("{} bps, slippage not modelled", study.commission_bps)}</dd>
+                <dt>"Engine"</dt>
+                <dd>{study.engine.clone()}</dd>
+            </dl>
+        </div>
+    }
+}
+
 #[component]
 fn AlertsView() -> impl IntoView {
     view! {
@@ -344,6 +650,7 @@ fn SidebarPanel(
         // `overflow: hidden` instead of scrolling (ticket 14).
         <div class="sidebar-panel-root">
             {move || match active_view.get() {
+                Some(ActivityView::Research) => view! { <ResearchView /> }.into_any(),
                 Some(ActivityView::Extensions) => {
                     view! { <ExtensionsView plugins=plugins set_plugins=set_plugins /> }
                         .into_any()

@@ -84,6 +84,25 @@ pub trait BarProvider: Send + Sync {
         from: NaiveDate,
         to: NaiveDate,
     ) -> Result<Vec<Bar>, DataError>;
+
+    /// The first and last day this source holds for `instrument`.
+    ///
+    /// Callers need this to state a *real* window in an experiment. Reaching
+    /// for an obviously-too-wide range instead would put a date in the
+    /// reproducibility record that no data ever covered.
+    ///
+    /// `None` for a known instrument with no bars at all.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataError`] on the same conditions as [`Self::daily_bars`].
+    fn coverage(&self, instrument: &str) -> Result<Option<(NaiveDate, NaiveDate)>, DataError> {
+        let bars = self.daily_bars(instrument, NaiveDate::MIN, NaiveDate::MAX)?;
+        Ok(match (bars.first(), bars.last()) {
+            (Some(first), Some(last)) => Some((first.date, last.date)),
+            _ => None,
+        })
+    }
 }
 
 /// Bars held in memory.
@@ -171,6 +190,46 @@ impl CsvBars {
             return Err(DataError::UnsafeInstrument(instrument.to_owned()));
         }
         Ok(self.root.join(format!("{instrument}.csv")))
+    }
+}
+
+impl CsvBars {
+    /// Every instrument this directory holds, from the file names.
+    ///
+    /// Sorted, so a UI listing them does not reshuffle between launches.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataError::Io`] if the directory cannot be read. A missing
+    /// directory is not an error — it is an empty library, which is the
+    /// ordinary state before anyone has added data.
+    pub fn instruments(&self) -> Result<Vec<String>, DataError> {
+        let entries = match std::fs::read_dir(&self.root) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(source) => {
+                return Err(DataError::Io {
+                    path: self.root.clone(),
+                    source,
+                })
+            }
+        };
+
+        let mut instruments: Vec<String> = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("csv"))
+            })
+            .filter_map(|path| {
+                path.file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .map(ToOwned::to_owned)
+            })
+            .collect();
+        instruments.sort();
+        Ok(instruments)
     }
 }
 
@@ -377,6 +436,54 @@ mod tests {
             }
             other => panic!("expected a malformed-row error, got {other}"),
         }
+    }
+
+    #[test]
+    fn coverage_reports_the_real_extent_of_the_data() {
+        let source = InMemoryBars::new()
+            .with_instrument("AAPL.NASDAQ", vec![bar(3, 3.0), bar(1, 1.0), bar(2, 2.0)]);
+
+        let (first, last) = source
+            .coverage("AAPL.NASDAQ")
+            .expect("known instrument")
+            .expect("it holds bars");
+        assert_eq!(first, date(2024, 1, 1));
+        assert_eq!(last, date(2024, 1, 3));
+
+        let empty = InMemoryBars::new().with_instrument("EMPTY.X", vec![]);
+        assert_eq!(empty.coverage("EMPTY.X").expect("known"), None);
+    }
+
+    #[test]
+    fn an_absent_data_directory_is_an_empty_library_not_an_error() {
+        let missing = CsvBars::new("/no/such/directory/anywhere");
+        assert_eq!(
+            missing.instruments().expect("absence is not failure"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn instruments_come_from_the_csv_file_names_sorted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_csv(
+            dir.path(),
+            "MSFT.NASDAQ.csv",
+            "date,open,high,low,close,volume
+",
+        );
+        write_csv(
+            dir.path(),
+            "AAPL.NASDAQ.csv",
+            "date,open,high,low,close,volume
+",
+        );
+        write_csv(dir.path(), "notes.txt", "ignore me");
+
+        assert_eq!(
+            CsvBars::new(dir.path()).instruments().expect("readable"),
+            vec!["AAPL.NASDAQ".to_owned(), "MSFT.NASDAQ".to_owned()]
+        );
     }
 
     #[test]

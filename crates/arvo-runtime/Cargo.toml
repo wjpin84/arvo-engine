@@ -15,6 +15,10 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+arvo-data.workspace = true
+arvo-nautilus.workspace = true
+arvo-research.workspace = true
+chrono.workspace = true
 arvo-core.workspace = true
 arvo-plugin-host.workspace = true
 serde.workspace = true

@@ -25,10 +25,12 @@
 //! anticipating an implementation nobody has asked for.
 
 pub mod evaluation;
+pub mod family;
 
 pub use evaluation::{
     evaluate_against_benchmark, Evaluation, EvaluationCriteria, Evidence, Metrics, Verdict,
 };
+pub use family::{run_family, ExperimentFamily, FamilyEvidence, ParameterGrid, Selection};
 
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
@@ -133,6 +135,53 @@ impl DateRange {
     #[must_use]
     pub fn contains(&self, date: NaiveDate) -> bool {
         date >= self.from && date <= self.to
+    }
+
+    /// Days spanned, counting both ends.
+    #[must_use]
+    pub fn days(&self) -> i64 {
+        (self.to - self.from).num_days() + 1
+    }
+
+    /// Splits into an in-sample head and an out-of-sample tail.
+    ///
+    /// `head_fraction` is of the calendar span, not of the bar count — a
+    /// split on trading days would move when the exchange calendar does, and
+    /// the boundary has to be reproducible from the record alone.
+    ///
+    /// Returns `None` if the range is too short to split, or the fraction
+    /// would leave either side empty. A degenerate split silently producing
+    /// a one-day out-of-sample period is worse than refusing.
+    #[must_use]
+    pub fn split(&self, head_fraction: f64) -> Option<(Self, Self)> {
+        if !(0.0..=1.0).contains(&head_fraction) {
+            return None;
+        }
+        let days = self.days();
+        if days < 2 {
+            return None;
+        }
+
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "days is bounded by the window, and the result is clamped below"
+        )]
+        let head_days = (days as f64 * head_fraction) as i64;
+        if head_days < 1 || head_days >= days {
+            return None;
+        }
+
+        let boundary = self.from + chrono::Duration::days(head_days - 1);
+        Some((
+            Self {
+                from: self.from,
+                to: boundary,
+            },
+            Self {
+                from: boundary + chrono::Duration::days(1),
+                to: self.to,
+            },
+        ))
     }
 }
 

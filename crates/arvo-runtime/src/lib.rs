@@ -8,6 +8,7 @@
 //! implementation is bound to `tauri::async_runtime` — see [`scheduler`].
 
 pub mod commands;
+pub mod research;
 pub mod scheduler;
 
 use arvo_core::{config, notifications};
@@ -118,13 +119,29 @@ pub fn run() {
                 async move { registry.refresh().await }
             });
 
+            // Daily bars live under the app data dir so a user can drop CSV
+            // exports in without touching the install. The directory is
+            // created up front, because an empty folder that exists is a
+            // clearer instruction than a path in an error message.
+            let data_dir = app.path().app_data_dir()?.join(research::DATA_SUBDIR);
+            if let Err(err) = std::fs::create_dir_all(&data_dir) {
+                tracing::warn!(
+                    error = %err,
+                    path = %data_dir.display(),
+                    "could not create the research data directory; studies will find no instruments"
+                );
+            }
+            app.manage(research::ResearchService::new(data_dir));
+
             app.manage(plugins_config);
             app.manage(plugin_registry);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             commands::list_plugins,
-            commands::refresh_plugins
+            commands::refresh_plugins,
+            research::list_instruments,
+            research::run_study
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
