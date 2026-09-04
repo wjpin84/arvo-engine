@@ -208,6 +208,24 @@ struct PanelView {
     engine: String,
 }
 
+#[derive(Clone, Deserialize)]
+struct HistoryEntryView {
+    id: String,
+    kind: String,
+    subject: String,
+    verdict: String,
+    recorded_at: String,
+    stale: Option<bool>,
+}
+
+/// Mirrors `arvo_runtime::research::RecordView`.
+#[derive(Clone, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum RecordView {
+    Study(StudyView),
+    Panel(PanelView),
+}
+
 fn percent(value: f64) -> String {
     format!("{:+.2}%", value * 100.0)
 }
@@ -459,6 +477,19 @@ fn ResearchView(
     // already been bitten by once.
     let (running, set_running) = signal(None::<String>);
     let (error, set_error) = signal(None::<String>);
+    let (history, set_history) = signal(Vec::<HistoryEntryView>::new());
+
+    // Refetched after every run, so a finding appears in the history the
+    // moment it is recorded rather than only after a restart.
+    let refresh_history = move || {
+        spawn_local(async move {
+            if let Ok(entries) =
+                call_typed::<Vec<HistoryEntryView>>("list_history", JsValue::UNDEFINED).await
+            {
+                set_history.set(entries);
+            }
+        });
+    };
 
     spawn_local(async move {
         match call_typed::<DataLibraryView>("list_instruments", JsValue::UNDEFINED).await {
@@ -466,6 +497,7 @@ fn ResearchView(
             Err(reason) => set_error.set(Some(reason)),
         }
     });
+    refresh_history();
 
     let run = move |instrument: String| {
         set_running.set(Some(format!("Running study on {instrument}: 11 backtests")));
@@ -493,6 +525,7 @@ fn ResearchView(
                 Err(reason) => set_error.set(Some(reason)),
             }
             set_running.set(None);
+            refresh_history();
         });
     };
 
@@ -518,6 +551,7 @@ fn ResearchView(
                 Err(reason) => set_error.set(Some(reason)),
             }
             set_running.set(None);
+            refresh_history();
         });
     };
 
@@ -705,7 +739,103 @@ fn ResearchView(
 
             {move || error.get().map(|message| view! { <p class="research-error">{message}</p> })}
 
+            // Findings outlive the window they were produced in. Reopening one
+            // costs nothing; producing it cost dozens of backtests.
+            {move || {
+                let entries = history.get();
+                (!entries.is_empty())
+                    .then(|| {
+                        view! {
+                            <h4 class="research-section">"History"</h4>
+                            <ul class="research-history">
+                                {entries
+                                    .into_iter()
+                                    .map(|entry| {
+                                        let id = entry.id.clone();
+                                        let open = move |_| {
+                                            let id = id.clone();
+                                            spawn_local(async move {
+                                                let args = serde_wasm_bindgen::to_value(
+                                                        &serde_json::json!({ "id" : id }),
+                                                    )
+                                                    .unwrap_or(JsValue::UNDEFINED);
+                                                match call_typed::<
+                                                    RecordView,
+                                                >("open_record", args)
+                                                    .await
+                                                {
+                                                    Ok(RecordView::Study(study)) => {
+                                                        let instrument = study.instrument.clone();
+                                                        set_studies
+                                                            .update(|studies| {
+                                                                studies.insert(instrument.clone(), study);
+                                                            });
+                                                        open_study_panel(
+                                                            &format!("{STUDY_PANEL_PREFIX}{instrument}"),
+                                                            &instrument,
+                                                        );
+                                                    }
+                                                    Ok(RecordView::Panel(panel)) => {
+                                                        set_panel.set(Some(panel));
+                                                        open_study_panel(PANEL_PANEL_ID, "Panel");
+                                                    }
+                                                    Err(reason) => set_error.set(Some(reason)),
+                                                }
+                                            });
+                                        };
+                                        // `Some(false)` is current, `Some(true)` is stale, and
+                                        // `None` means the data it referenced is gone entirely —
+                                        // three different things, shown as three different things.
+                                        let mark = match entry.stale {
+                                            Some(true) => "data changed since",
+                                            None => "data no longer present",
+                                            Some(false) => "",
+                                        };
+                                        view! {
+                                            <li>
+                                                <button class="research-history-entry" on:click=open>
+                                                    <span class="research-history-line">
+                                                        <span class=verdict_dot(&entry.verdict) />
+                                                        <span class="research-history-subject">
+                                                            {entry.subject.clone()}
+                                                        </span>
+                                                        <span class="research-history-kind">
+                                                            {entry.kind.clone()}
+                                                        </span>
+                                                    </span>
+                                                    <span class="research-instrument-meta">
+                                                        {format!(
+                                                            "{} · {}",
+                                                            entry.recorded_at.clone(),
+                                                            entry.verdict.clone(),
+                                                        )}
+                                                    </span>
+                                                    {(!mark.is_empty())
+                                                        .then(|| {
+                                                            view! {
+                                                                <span class="research-stale">{mark}</span>
+                                                            }
+                                                        })}
+                                                </button>
+                                            </li>
+                                        }
+                                    })
+                                    .collect_view()}
+                            </ul>
+                        }
+                    })
+            }}
         </div>
+    }
+}
+
+/// A coloured dot carrying the verdict, so a history list scans at a glance
+/// without reading every line.
+fn verdict_dot(verdict: &str) -> &'static str {
+    match verdict {
+        "Supported" => "research-dot supported",
+        "Not supported" => "research-dot refuted",
+        _ => "research-dot inconclusive",
     }
 }
 

@@ -101,6 +101,10 @@ pub struct PooledOutcome {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PanelEvidence {
     pub hypothesis: HypothesisId,
+    /// The data every member was run against, combined. Carried so a stored
+    /// panel can be checked against the files still on disk — without it a
+    /// persisted result could never be found stale.
+    pub dataset: crate::DatasetRef,
     pub in_sample: DateRange,
     pub out_of_sample: DateRange,
     /// The one configuration chosen for the whole panel.
@@ -260,6 +264,7 @@ pub fn run_panel(
 
     Ok(PanelEvidence {
         hypothesis: study.hypothesis.clone(),
+        dataset: study.template.dataset.clone(),
         in_sample,
         out_of_sample,
         selected_params,

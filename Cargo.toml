@@ -28,7 +28,7 @@ arvo-plugin-host = { path = "crates/arvo-plugin-host" }
 
 anyhow = "1.0.104"
 # Already in the graph via Nautilus; sharing the version keeps one copy.
-chrono = { version = "0.4.45", default-features = false, features = ["std", "serde"] }
+chrono = { version = "0.4.45", default-features = false, features = ["std", "serde", "clock"] }
 prost = "0.14.4"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2.0.20"

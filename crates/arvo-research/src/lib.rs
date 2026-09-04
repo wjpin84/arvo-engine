@@ -26,12 +26,14 @@
 
 pub mod evaluation;
 pub mod family;
+pub mod memory;
 pub mod panel;
 
 pub use evaluation::{
     evaluate_against_benchmark, Evaluation, EvaluationCriteria, Evidence, Metrics, Verdict,
 };
 pub use family::{run_family, ExperimentFamily, FamilyEvidence, ParameterGrid, Selection};
+pub use memory::{EvidenceStore, Loaded, MemoryError, Record, StoredRecord};
 pub use panel::{run_panel, InstrumentOutcome, PanelEvidence, PanelStudy, PooledOutcome};
 
 use chrono::NaiveDate;

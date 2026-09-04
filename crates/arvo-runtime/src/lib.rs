@@ -144,7 +144,10 @@ pub fn run() {
                     "could not create the research data directory; studies will find no instruments"
                 );
             }
-            app.manage(research::ResearchService::new(data_dir));
+            // Findings live beside the data they were produced from, under the
+            // app data dir, so a user can back up or inspect both together.
+            let evidence_dir = app.path().app_data_dir()?.join(research::EVIDENCE_SUBDIR);
+            app.manage(research::ResearchService::new(data_dir, evidence_dir));
 
             app.manage(plugins_config);
             app.manage(plugin_registry);
@@ -155,7 +158,9 @@ pub fn run() {
             commands::refresh_plugins,
             research::list_instruments,
             research::run_study,
-            research::run_panel
+            research::run_panel,
+            research::list_history,
+            research::open_record
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -15,6 +15,7 @@ use std::sync::Arc;
 use arvo_data::{BarProvider, CsvBars};
 use arvo_nautilus::NautilusSimulation;
 use arvo_research::{
+    memory::{EvidenceStore, Record, StoredRecord},
     CostModel, DatasetRef, DateRange, Experiment, ExperimentFamily, ExperimentId, HypothesisId,
     Metrics, ParameterGrid, SimulationProvider, StrategySpec, Verdict,
 };
@@ -25,6 +26,9 @@ use crate::commands::CommandError;
 /// Where the workbench looks for daily bars: `<app data dir>/data`, one
 /// `SYMBOL.VENUE.csv` per instrument.
 pub const DATA_SUBDIR: &str = "data";
+
+/// Where findings are kept, one JSON file each.
+pub const EVIDENCE_SUBDIR: &str = "evidence";
 
 /// The starting assumptions for a workbench-launched study.
 ///
@@ -41,15 +45,17 @@ pub struct ResearchService {
     simulation: Arc<NautilusSimulation<CsvBars>>,
     bars: CsvBars,
     data_dir: PathBuf,
+    memory: EvidenceStore,
 }
 
 impl ResearchService {
     #[must_use]
-    pub fn new(data_dir: PathBuf) -> Self {
+    pub fn new(data_dir: PathBuf, evidence_dir: PathBuf) -> Self {
         Self {
             simulation: Arc::new(NautilusSimulation::new(CsvBars::new(data_dir.clone()))),
             bars: CsvBars::new(data_dir.clone()),
             data_dir,
+            memory: EvidenceStore::new(evidence_dir),
         }
     }
 }
@@ -131,6 +137,104 @@ pub struct StudyView {
     pub engine: String,
 }
 
+/// A stored finding, summarised for the history list.
+#[derive(Serialize)]
+pub struct HistoryEntryView {
+    pub id: String,
+    pub kind: String,
+    pub subject: String,
+    pub verdict: String,
+    pub recorded_at: String,
+    /// True when the data this was produced from no longer matches disk.
+    /// `None` when the data it referenced can no longer be found at all.
+    pub stale: Option<bool>,
+}
+
+/// A stored finding, reopened.
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RecordView {
+    Study(Box<StudyView>),
+    Panel(Box<PanelView>),
+}
+
+/// Everything held in research memory, newest first.
+#[tauri::command]
+pub async fn list_history(
+    service: tauri::State<'_, ResearchService>,
+) -> Result<Vec<HistoryEntryView>, CommandError> {
+    let loaded = service
+        .memory
+        .load()
+        .map_err(|err| CommandError::Failed(err.to_string()))?;
+
+    // Reported, not swallowed: a record that cannot be read is a lost finding
+    // and should look like one.
+    for problem in &loaded.problems {
+        tracing::warn!(problem, "could not read a stored finding");
+    }
+
+    Ok(loaded
+        .records
+        .iter()
+        .map(|stored| {
+            let live = live_dataset_version(&service, &stored.record);
+            HistoryEntryView {
+                id: stored.id.clone(),
+                kind: match stored.record {
+                    Record::Study(_) => "study",
+                    Record::Panel(_) => "panel",
+                }
+                .to_owned(),
+                subject: stored.record.subject(),
+                verdict: verdict_label(stored.record.verdict()).to_owned(),
+                recorded_at: stored.recorded_at.format("%Y-%m-%d %H:%M").to_string(),
+                stale: live.map(|live| live != stored.record.dataset_version()),
+            }
+        })
+        .collect())
+}
+
+/// Reopens one stored finding.
+#[tauri::command]
+pub async fn open_record(
+    id: String,
+    service: tauri::State<'_, ResearchService>,
+) -> Result<RecordView, CommandError> {
+    let loaded = service
+        .memory
+        .load()
+        .map_err(|err| CommandError::Failed(err.to_string()))?;
+    let stored = loaded
+        .records
+        .into_iter()
+        .find(|stored| stored.id == id)
+        .ok_or_else(|| CommandError::Failed(format!("no stored finding {id:?}")))?;
+
+    let engine = service.simulation.engine();
+    Ok(match stored.record {
+        Record::Study(evidence) => RecordView::Study(Box::new(study_view(&evidence, engine))),
+        Record::Panel(evidence) => RecordView::Panel(Box::new(panel_view(&evidence, engine))),
+    })
+}
+
+/// What the data behind a finding hashes to *now*, or `None` if it is gone.
+///
+/// A panel's identity is every member's hash combined, so it is recomputed the
+/// same way it was produced — over the instruments present today. An
+/// instrument added or removed since therefore also reads as stale, which is
+/// correct: the panel would not run the same way twice.
+fn live_dataset_version(service: &ResearchService, record: &Record) -> Option<String> {
+    match record {
+        Record::Study(evidence) => service
+            .bars
+            .fingerprint(&evidence.selected.instrument)
+            .ok()
+            .flatten(),
+        Record::Panel(_) => panel_dataset_version(&service.bars).map(|(version, _, _, _)| version),
+    }
+}
+
 /// Lists the instruments the workbench can study.
 #[tauri::command]
 pub async fn list_instruments(
@@ -210,36 +314,71 @@ pub async fn run_study(
         )
         .map_err(|err| CommandError::Failed(err.to_string()))?;
 
-        let evaluation = &found.out_of_sample_evidence.evaluation;
-        Ok(StudyView {
-            instrument,
-            verdict: verdict_label(found.verdict).to_owned(),
-            reasons: found.reasons.clone(),
-            trials: found.selection.trials,
-            best_sharpe: found.selection.best_sharpe,
-            expected_best_under_null: found.selection.expected_best_under_null,
-            survived_deflation: found.selection.survived_deflation,
-            in_sample: format!("{} → {}", found.in_sample.from, found.in_sample.to),
-            out_of_sample: format!("{} → {}", found.out_of_sample.from, found.out_of_sample.to),
-            selected_params: found
-                .selected
-                .strategy
-                .params
-                .iter()
-                .map(|(name, value)| (name.clone(), *value))
-                .collect(),
-            strategy: MetricsView::from(&evaluation.strategy),
-            benchmark: MetricsView::from(&evaluation.benchmark),
-            excess_return: evaluation.excess_return,
-            dataset_version: found.selected.dataset.version.clone(),
-            strategy_name: found.selected.strategy.name.clone(),
-            starting_cash: found.selected.starting_cash,
-            commission_bps: found.selected.costs.commission_bps,
-            engine,
-        })
+        let view = study_view(&found, &engine);
+        Ok((view, Record::Study(Box::new(found))))
     })
     .await
-    .map_err(|err| CommandError::Failed(format!("the study did not finish: {err}")))?
+    .map_err(|err| CommandError::Failed(format!("the study did not finish: {err}")))
+    .and_then(|outcome| outcome.and_then(|outcome| remember(&service, outcome)))
+}
+
+/// Persists a finding and hands back its view.
+///
+/// A failed write does not fail the run: the result is real and already on
+/// screen, and refusing to show it because a file could not be written would
+/// throw away the expensive half over the cheap half. It is logged loudly
+/// instead, since a store that silently stops recording is worse than one that
+/// never started.
+fn remember<V>(
+    service: &tauri::State<'_, ResearchService>,
+    (view, record): (V, Record),
+) -> Result<V, CommandError> {
+    let stored = StoredRecord::new(record, chrono::Utc::now());
+    match service.memory.save(&stored) {
+        Ok(path) => tracing::info!(id = %stored.id, path = %path.display(), "recorded a finding"),
+        Err(err) => tracing::error!(error = %err, id = %stored.id, "could not record a finding"),
+    }
+    Ok(view)
+}
+
+/// The panel's window and combined dataset identity, over whatever
+/// instruments currently have data.
+///
+/// The window is the *overlap* of what the members cover, not the union:
+/// instruments judged over different periods are not a cross-section, and a
+/// mean across them would compare different markets.
+///
+/// The identity is every member's hash combined, so editing any one file — or
+/// adding or removing an instrument — marks the whole panel result stale.
+fn panel_dataset_version(
+    bars: &CsvBars,
+) -> Option<(String, Vec<String>, chrono::NaiveDate, chrono::NaiveDate)> {
+    let mut from = chrono::NaiveDate::MIN;
+    let mut to = chrono::NaiveDate::MAX;
+    let mut hasher = blake3::Hasher::new();
+    let mut instruments = Vec::new();
+
+    for id in bars.instruments().ok()? {
+        let Ok(Some((first, last))) = bars.coverage(&id) else {
+            continue;
+        };
+        if let Ok(Some(fingerprint)) = bars.fingerprint(&id) {
+            hasher.update(fingerprint.as_bytes());
+        }
+        from = from.max(first);
+        to = to.min(last);
+        instruments.push(id);
+    }
+
+    if instruments.is_empty() {
+        return None;
+    }
+    Some((
+        hasher.finalize().to_hex().to_string(),
+        instruments,
+        from,
+        to,
+    ))
 }
 
 /// One instrument's out-of-sample outcome under the panel's configuration.
@@ -293,40 +432,9 @@ pub struct PanelView {
 pub async fn run_panel(
     service: tauri::State<'_, ResearchService>,
 ) -> Result<PanelView, CommandError> {
-    let ids = service
-        .bars
-        .instruments()
-        .map_err(|err| CommandError::Failed(err.to_string()))?;
+    let (dataset, instruments, from, to) = panel_dataset_version(&service.bars)
+        .ok_or_else(|| CommandError::Failed("no instruments with usable data".to_owned()))?;
 
-    // The overlap of what every instrument covers, not the union: instruments
-    // judged over different periods are not a cross-section, and a mean across
-    // them would compare different markets.
-    let mut from = chrono::NaiveDate::MIN;
-    let mut to = chrono::NaiveDate::MAX;
-    let mut hasher = blake3::Hasher::new();
-    let mut instruments = Vec::new();
-
-    for id in ids {
-        let Ok(Some((first, last))) = service.bars.coverage(&id) else {
-            continue;
-        };
-        // The panel's dataset identity is every member's identity combined, so
-        // editing any one file marks the whole panel result stale.
-        if let Ok(Some(fingerprint)) = service.bars.fingerprint(&id) {
-            hasher.update(fingerprint.as_bytes());
-        }
-        from = from.max(first);
-        to = to.min(last);
-        instruments.push(id);
-    }
-
-    if instruments.is_empty() {
-        return Err(CommandError::Failed(
-            "no instruments with usable data".to_owned(),
-        ));
-    }
-
-    let dataset = hasher.finalize().to_hex().to_string();
     let simulation = service.simulation.clone();
     let engine = simulation.engine().to_owned();
 
@@ -342,48 +450,91 @@ pub async fn run_panel(
         )
         .map_err(|err| CommandError::Failed(err.to_string()))?;
 
-        Ok(PanelView {
-            verdict: verdict_label(found.verdict).to_owned(),
-            reasons: found.reasons.clone(),
-            instruments: found.pooled.instruments,
-            total_trades: found.pooled.total_trades,
-            mean_excess_return: found.pooled.mean_excess_return,
-            beat_benchmark: found.pooled.beat_benchmark,
-            mean_max_drawdown: found.pooled.mean_max_drawdown,
-            worst_max_drawdown: found.pooled.worst_max_drawdown,
-            trials: found.selection.trials,
-            best_sharpe: found.selection.best_sharpe,
-            expected_best_under_null: found.selection.expected_best_under_null,
-            survived_deflation: found.selection.survived_deflation,
-            in_sample: format!("{} → {}", found.in_sample.from, found.in_sample.to),
-            out_of_sample: format!("{} → {}", found.out_of_sample.from, found.out_of_sample.to),
-            selected_params: found
-                .selected_params
-                .iter()
-                .map(|(name, value)| (name.clone(), *value))
-                .collect(),
-            per_instrument: found
-                .per_instrument
-                .iter()
-                .map(|outcome| OutcomeView {
-                    instrument: outcome.instrument.clone(),
-                    strategy_return: outcome.strategy.total_return,
-                    benchmark_return: outcome.benchmark.total_return,
-                    excess_return: outcome.excess_return,
-                    max_drawdown: outcome.strategy.max_drawdown,
-                    trades: outcome.strategy.trades,
-                })
-                .collect(),
-            failures: found.failures.clone(),
-            dataset_version: dataset,
-            strategy_name: STRATEGY.to_owned(),
-            starting_cash: STARTING_CASH,
-            commission_bps: COMMISSION_BPS,
-            engine,
-        })
+        let view = panel_view(&found, &engine);
+        Ok((view, Record::Panel(Box::new(found))))
     })
     .await
-    .map_err(|err| CommandError::Failed(format!("the panel did not finish: {err}")))?
+    .map_err(|err| CommandError::Failed(format!("the panel did not finish: {err}")))
+    .and_then(|outcome| outcome.and_then(|outcome| remember(&service, outcome)))
+}
+
+/// Flattens a stored study for display.
+///
+/// Separate from the command so a finding read back from memory renders
+/// identically to one just produced. Two projections would drift, and a
+/// history that showed something subtly different from the live run would be
+/// worse than no history.
+fn study_view(found: &arvo_research::FamilyEvidence, engine: &str) -> StudyView {
+    let evaluation = &found.out_of_sample_evidence.evaluation;
+    StudyView {
+        instrument: found.selected.instrument.clone(),
+        verdict: verdict_label(found.verdict).to_owned(),
+        reasons: found.reasons.clone(),
+        trials: found.selection.trials,
+        best_sharpe: found.selection.best_sharpe,
+        expected_best_under_null: found.selection.expected_best_under_null,
+        survived_deflation: found.selection.survived_deflation,
+        in_sample: format!("{} → {}", found.in_sample.from, found.in_sample.to),
+        out_of_sample: format!("{} → {}", found.out_of_sample.from, found.out_of_sample.to),
+        selected_params: found
+            .selected
+            .strategy
+            .params
+            .iter()
+            .map(|(name, value)| (name.clone(), *value))
+            .collect(),
+        strategy: MetricsView::from(&evaluation.strategy),
+        benchmark: MetricsView::from(&evaluation.benchmark),
+        excess_return: evaluation.excess_return,
+        dataset_version: found.selected.dataset.version.clone(),
+        strategy_name: found.selected.strategy.name.clone(),
+        starting_cash: found.selected.starting_cash,
+        commission_bps: found.selected.costs.commission_bps,
+        engine: engine.to_owned(),
+    }
+}
+
+/// Flattens a stored panel for display. Same reasoning as [`study_view`].
+fn panel_view(found: &arvo_research::PanelEvidence, engine: &str) -> PanelView {
+    PanelView {
+        verdict: verdict_label(found.verdict).to_owned(),
+        reasons: found.reasons.clone(),
+        instruments: found.pooled.instruments,
+        total_trades: found.pooled.total_trades,
+        mean_excess_return: found.pooled.mean_excess_return,
+        beat_benchmark: found.pooled.beat_benchmark,
+        mean_max_drawdown: found.pooled.mean_max_drawdown,
+        worst_max_drawdown: found.pooled.worst_max_drawdown,
+        trials: found.selection.trials,
+        best_sharpe: found.selection.best_sharpe,
+        expected_best_under_null: found.selection.expected_best_under_null,
+        survived_deflation: found.selection.survived_deflation,
+        in_sample: format!("{} → {}", found.in_sample.from, found.in_sample.to),
+        out_of_sample: format!("{} → {}", found.out_of_sample.from, found.out_of_sample.to),
+        selected_params: found
+            .selected_params
+            .iter()
+            .map(|(name, value)| (name.clone(), *value))
+            .collect(),
+        per_instrument: found
+            .per_instrument
+            .iter()
+            .map(|outcome| OutcomeView {
+                instrument: outcome.instrument.clone(),
+                strategy_return: outcome.strategy.total_return,
+                benchmark_return: outcome.benchmark.total_return,
+                excess_return: outcome.excess_return,
+                max_drawdown: outcome.strategy.max_drawdown,
+                trades: outcome.strategy.trades,
+            })
+            .collect(),
+        failures: found.failures.clone(),
+        dataset_version: found.dataset.version.clone(),
+        strategy_name: STRATEGY.to_owned(),
+        starting_cash: STARTING_CASH,
+        commission_bps: COMMISSION_BPS,
+        engine: engine.to_owned(),
+    }
 }
 
 const fn verdict_label(verdict: Verdict) -> &'static str {
