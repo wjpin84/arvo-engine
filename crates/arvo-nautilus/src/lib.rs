@@ -40,6 +40,7 @@
 mod strategy;
 
 use std::str::FromStr;
+use std::sync::Once;
 
 use arvo_data::BarProvider;
 use arvo_research::{
@@ -50,6 +51,7 @@ use nautilus_backtest::{
     config::{BacktestEngineConfig, SimulatedVenueConfig},
     engine::BacktestEngine,
 };
+use nautilus_common::logging::logging_set_bypass;
 use nautilus_core::UnixNanos;
 use nautilus_model::{
     data::{Bar, BarSpecification, BarType, Data},
@@ -67,8 +69,9 @@ use rust_decimal::Decimal;
 /// version is part of the evidence rather than a build detail.
 const ENGINE: &str = "nautilus 0.63.0";
 
-/// The only strategy wired up so far. See [`strategy`] for why there is one.
+/// The strategies wired up so far. See [`strategy`] for why these two.
 const SMA_CROSS: &str = "sma_cross";
+const BUY_AND_HOLD: &str = arvo_research::evaluation::BUY_AND_HOLD;
 
 /// US equity conventions. Daily bars from the free exports are quoted in cents
 /// and traded in whole shares; nothing yet needs another instrument class, and
@@ -98,7 +101,7 @@ impl<P: BarProvider> SimulationProvider for NautilusSimulation<P> {
     }
 
     fn run(&self, experiment: &Experiment) -> Result<SimulationResult, SimulationError> {
-        let plan = SmaCrossParams::from_spec(&experiment.strategy)?;
+        let plan = Plan::from_spec(&experiment.strategy)?;
 
         // Slippage is pinned in the experiment but not yet wired into a fill
         // model. Failing here is the point: quietly running with an assumption
@@ -132,12 +135,14 @@ impl<P: BarProvider> SimulationProvider for NautilusSimulation<P> {
             });
         }
 
-        // A crossover needs both windows filled before it can signal at all.
-        if bars.len() <= plan.slow_period {
+        // A strategy that cannot even warm up has not been tested, and a run
+        // that produces no signal is not evidence that there was none.
+        if bars.len() <= plan.min_bars() {
             return Err(SimulationError::Rejected(format!(
-                "{} bars is not enough to fill a {}-period average",
+                "{} bars is not enough for {}, which needs more than {}",
                 bars.len(),
-                plan.slow_period
+                experiment.strategy.name,
+                plan.min_bars()
             )));
         }
 
@@ -145,62 +150,116 @@ impl<P: BarProvider> SimulationProvider for NautilusSimulation<P> {
     }
 }
 
-/// The parameters `sma_cross` needs, parsed out of the untyped spec.
-struct SmaCrossParams {
-    fast_period: usize,
-    slow_period: usize,
-    trade_size: f64,
+/// A strategy request, parsed out of the untyped spec and validated before
+/// anything expensive starts.
+enum Plan {
+    SmaCross {
+        fast_period: usize,
+        slow_period: usize,
+        trade_size: f64,
+    },
+    BuyAndHold {
+        trade_size: f64,
+    },
 }
 
-impl SmaCrossParams {
+impl Plan {
     fn from_spec(spec: &StrategySpec) -> Result<Self, SimulationError> {
-        if spec.name != SMA_CROSS {
-            return Err(SimulationError::UnknownStrategy(spec.name.clone()));
-        }
-
         let param = |name: &str| -> Result<f64, SimulationError> {
             spec.params.get(name).copied().ok_or_else(|| {
-                SimulationError::Rejected(format!("{SMA_CROSS} requires a {name:?} parameter"))
+                SimulationError::Rejected(format!("{} requires a {name:?} parameter", spec.name))
             })
         };
         let period = |name: &str| -> Result<usize, SimulationError> {
             let value = param(name)?;
-            if value < 1.0 || value.fract() != 0.0 || value > 10_000.0 {
+            if !value.is_finite() || value < 1.0 || value.fract() != 0.0 || value > 10_000.0 {
                 return Err(SimulationError::Rejected(format!(
                     "{name} must be a whole number of bars between 1 and 10000, got {value}"
                 )));
             }
             Ok(value as usize)
         };
+        let trade_size = || -> Result<f64, SimulationError> {
+            let value = param("trade_size")?;
+            // `is_finite` first: every comparison against NaN is false, so a
+            // bare `<= 0.0` would wave NaN straight through into sizing.
+            if !value.is_finite() || value <= 0.0 {
+                return Err(SimulationError::Rejected(format!(
+                    "trade_size must be positive, got {value}"
+                )));
+            }
+            Ok(value)
+        };
 
-        let fast_period = period("fast")?;
-        let slow_period = period("slow")?;
-        if fast_period >= slow_period {
-            return Err(SimulationError::Rejected(format!(
-                "fast period {fast_period} must be shorter than slow period {slow_period}"
-            )));
+        match spec.name.as_str() {
+            SMA_CROSS => {
+                let fast_period = period("fast")?;
+                let slow_period = period("slow")?;
+                if fast_period >= slow_period {
+                    return Err(SimulationError::Rejected(format!(
+                        "fast period {fast_period} must be shorter than slow period {slow_period}"
+                    )));
+                }
+                Ok(Self::SmaCross {
+                    fast_period,
+                    slow_period,
+                    trade_size: trade_size()?,
+                })
+            }
+            BUY_AND_HOLD => Ok(Self::BuyAndHold {
+                trade_size: trade_size()?,
+            }),
+            _ => Err(SimulationError::UnknownStrategy(spec.name.clone())),
         }
-
-        let trade_size = param("trade_size")?;
-        // `is_finite` first: every comparison against NaN is false, so a
-        // bare `<= 0.0` would wave NaN straight through into position sizing.
-        if !trade_size.is_finite() || trade_size <= 0.0 {
-            return Err(SimulationError::Rejected(format!(
-                "trade_size must be positive, got {trade_size}"
-            )));
-        }
-
-        Ok(Self {
-            fast_period,
-            slow_period,
-            trade_size,
-        })
     }
+
+    /// Bars needed before the strategy can act at all.
+    const fn min_bars(&self) -> usize {
+        match self {
+            Self::SmaCross { slow_period, .. } => *slow_period,
+            // One to buy on, and at least one more for the position to have
+            // done anything.
+            Self::BuyAndHold { .. } => 1,
+        }
+    }
+
+    const fn trade_size(&self) -> f64 {
+        match self {
+            Self::SmaCross { trade_size, .. } | Self::BuyAndHold { trade_size } => *trade_size,
+        }
+    }
+}
+
+/// Stops Nautilus writing its own log to stdout.
+///
+/// Nautilus installs a process-wide logger and emits a line per order and per
+/// bar. Arvo already owns observability (`arvo_runtime::init_tracing`), and a
+/// release build has no console at all — `windows_subsystem = "windows"` — so
+/// that output goes nowhere while still costing the run.
+///
+/// `BacktestEngineConfig::bypass_logging` looks like the knob for this and is
+/// not: nothing in the Rust kernel reads that field, it is honoured on the
+/// Python side. `logging_set_bypass` is the switch that works.
+///
+/// It is a global, so this is deliberately process-wide and set once. Engine
+/// failures are unaffected — they come back as `Err` from `run`, not as a log
+/// line somebody has to notice.
+fn silence_nautilus_logging() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        // `NAUTILUS_LOG` is Nautilus's own escape hatch. If it is set, someone
+        // is deliberately debugging an engine run, so leave their logging
+        // alone — a silence with no way out is how integration faults stay
+        // hidden.
+        if std::env::var_os("NAUTILUS_LOG").is_none() {
+            logging_set_bypass();
+        }
+    });
 }
 
 fn run_backtest(
     experiment: &Experiment,
-    plan: &SmaCrossParams,
+    plan: &Plan,
     instrument_id: InstrumentId,
     bars: &[arvo_data::Bar],
 ) -> Result<SimulationResult, SimulationError> {
@@ -208,17 +267,10 @@ fn run_backtest(
         SimulationError::Rejected(format!("{context}: {err}"))
     };
 
-    // Nautilus installs its own logger and writes a line per bar to stdout.
-    // Arvo already owns observability (`arvo_runtime::init_tracing`), and a
-    // release build has no console at all — `windows_subsystem = "windows"` —
-    // so that output would go nowhere while still costing the run. Engine
-    // failures are unaffected: they come back as `Err` from `run` below.
-    let config = BacktestEngineConfig {
-        bypass_logging: true,
-        ..BacktestEngineConfig::default()
-    };
-    let mut engine =
-        BacktestEngine::new(config).map_err(|err| rejected("creating the engine", &err))?;
+    silence_nautilus_logging();
+
+    let mut engine = BacktestEngine::new(BacktestEngineConfig::default())
+        .map_err(|err| rejected("creating the engine", &err))?;
 
     let currency = Currency::USD();
     let starting_balance = Money::new_checked(experiment.starting_cash, currency)
@@ -263,20 +315,34 @@ fn run_backtest(
         strategy_id: None,
         order_id_tag: Some("001".to_owned()),
         oms_type: Some(OmsType::Netting),
+        // Deliberately NOT `manage_stop`. It looks like the right thing — flatten
+        // open positions when the run ends so nothing is left unrealised — but
+        // Nautilus already marks open positions to market in its returns series,
+        // so it changes no number, and its market-exit loop never completes in a
+        // backtest with no data left to fill against. The trader then never
+        // reaches STOPPED and disposal fails on every single run.
         ..StrategyConfig::default()
     });
-    let trade_size = Quantity::new_checked(plan.trade_size, SIZE_PRECISION)
+    let trade_size = Quantity::new_checked(plan.trade_size(), SIZE_PRECISION)
         .map_err(|err| rejected("trade size", &err))?;
 
-    engine
-        .add_strategy(strategy::SmaCross::new(
+    match *plan {
+        Plan::SmaCross {
+            fast_period,
+            slow_period,
+            ..
+        } => engine.add_strategy(strategy::SmaCross::new(
             core,
             bar_type,
             trade_size,
-            plan.fast_period,
-            plan.slow_period,
-        ))
-        .map_err(|err| rejected("adding the strategy", &err))?;
+            fast_period,
+            slow_period,
+        )),
+        Plan::BuyAndHold { .. } => {
+            engine.add_strategy(strategy::BuyAndHold::new(core, bar_type, trade_size))
+        }
+    }
+    .map_err(|err| rejected("adding the strategy", &err))?;
 
     // The window is already expressed by the data: bars were filtered to it on
     // the way in, so bounding the run again would only add a way to disagree
@@ -589,6 +655,86 @@ mod tests {
     fn an_empty_return_series_still_yields_the_opening_balance() {
         let curve = compound(100_000.0, [].iter());
         assert_eq!(curve, vec![100_000.0]);
+    }
+
+    /// A steadily rising market, so buy-and-hold must show a gain. If the
+    /// benchmark comes back flat here, the position is being left open and
+    /// unrealised and every comparison drawn against it is worthless.
+    fn rising(days: usize) -> Vec<arvo_data::Bar> {
+        let mut start = date(2024, 1, 1);
+        let mut bars = Vec::with_capacity(days);
+        for index in 0..days {
+            let close = 100.0 + index as f64 * 0.25;
+            bars.push(arvo_data::Bar {
+                date: start,
+                open: close,
+                high: close + 0.5,
+                low: close - 0.5,
+                close,
+                volume: 10_000.0,
+            });
+            start = start.succ_opt().expect("date stays in range");
+        }
+        bars
+    }
+
+    #[test]
+    fn the_benchmark_holds_the_market_rather_than_sitting_in_cash() {
+        let bars = rising(120);
+        let mut experiment = experiment(params(5.0, 20.0), &bars);
+        experiment.strategy = arvo_research::evaluation::benchmark_for(&experiment).strategy;
+
+        let result = provider(bars)
+            .run(&experiment)
+            .expect("benchmark should run");
+        let metrics = arvo_research::Metrics::from_curve(
+            &result.equity_curve,
+            result.trades,
+            arvo_research::evaluation::TRADING_DAYS_PER_YEAR,
+        )
+        .expect("a held position moves the curve");
+
+        assert!(
+            metrics.total_return > 0.0,
+            "buy-and-hold in a rising market must gain; got {:?}",
+            metrics
+        );
+    }
+
+    #[test]
+    fn the_research_loop_runs_end_to_end_and_produces_evidence() {
+        let bars = sawtooth(400);
+        let experiment = experiment(params(10.0, 30.0), &bars);
+        let criteria = arvo_research::EvaluationCriteria::default();
+
+        let evidence =
+            arvo_research::evaluate_against_benchmark(&provider(bars), &experiment, &criteria)
+                .expect("both runs should complete");
+
+        assert_eq!(evidence.hypothesis, experiment.hypothesis);
+        assert_eq!(
+            evidence.experiment, experiment,
+            "the record pins the whole run"
+        );
+        assert_eq!(evidence.engine, ENGINE);
+        assert_ne!(
+            evidence.benchmark, experiment.id,
+            "the benchmark is a separate run"
+        );
+        assert!(
+            !evidence.evaluation.reasons.is_empty(),
+            "a verdict without a reason is not evidence"
+        );
+        // The control is not expected to beat the market; what matters is that
+        // the loop reached a stated verdict rather than an accident.
+        assert!(
+            matches!(
+                evidence.evaluation.verdict,
+                arvo_research::Verdict::NotSupported | arvo_research::Verdict::Inconclusive
+            ),
+            "a moving-average crossover should not beat buy-and-hold here: {:?}",
+            evidence.evaluation
+        );
     }
 
     #[test]

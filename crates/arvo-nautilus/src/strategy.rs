@@ -5,6 +5,10 @@
 //! the right instrument for that. A moving-average crossover is not a good
 //! trading idea; it is a good control.
 //!
+//! The second is [`BuyAndHold`], which exists so evaluation has something to
+//! score against. It is not decoration: absolute return mostly measures
+//! whether the market went up, so a result with no benchmark is not a result.
+//!
 //! A strategy here is a Nautilus component, which is why it lives on this side
 //! of the boundary. `arvo-research` names it by string in `StrategySpec` and
 //! never sees the type.
@@ -176,5 +180,76 @@ mod tests {
         }
         assert_eq!(sma.update(6.0), Some(11.0 / 3.0), "oldest value drops out");
         assert_eq!(sma.window.len(), 3);
+    }
+}
+
+/// Buys once on the first bar it sees and holds to the end of the run.
+///
+/// The benchmark every experiment is scored against. It pays the same
+/// commission and runs through the same engine, so the difference between its
+/// curve and a strategy's is the strategy — not the market, and not the fees.
+pub(crate) struct BuyAndHold {
+    core: StrategyCore,
+    bar_type: BarType,
+    instrument_id: InstrumentId,
+    trade_size: Quantity,
+    entered: bool,
+}
+
+impl BuyAndHold {
+    pub(crate) fn new(core: StrategyCore, bar_type: BarType, trade_size: Quantity) -> Self {
+        Self {
+            core,
+            bar_type,
+            instrument_id: bar_type.instrument_id(),
+            trade_size,
+            entered: false,
+        }
+    }
+}
+
+nautilus_strategy!(BuyAndHold);
+
+impl Debug for BuyAndHold {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct(stringify!(BuyAndHold))
+            .field("instrument_id", &self.instrument_id)
+            .field("trade_size", &self.trade_size)
+            .finish()
+    }
+}
+
+impl DataActor for BuyAndHold {
+    fn on_start(&mut self) -> anyhow::Result<()> {
+        self.subscribe_bars(self.bar_type, None, None);
+        Ok(())
+    }
+
+    fn on_stop(&mut self) -> anyhow::Result<()> {
+        self.unsubscribe_bars(self.bar_type, None, None);
+        Ok(())
+    }
+
+    fn on_bar(&mut self, _bar: &Bar) -> anyhow::Result<()> {
+        if self.entered {
+            return Ok(());
+        }
+        self.entered = true;
+
+        let instrument_id = self.instrument_id;
+        let trade_size = self.trade_size;
+        let order = self.order().market(
+            instrument_id,
+            OrderSide::Buy,
+            trade_size,
+            None, // time_in_force
+            None, // reduce_only
+            None, // quote_quantity
+            None, // exec_algorithm_id
+            None, // exec_algorithm_params
+            None, // tags
+            None, // client_order_id
+        );
+        self.submit_order(order, None, None, None)
     }
 }

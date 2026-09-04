@@ -4,6 +4,10 @@
 //! Hypothesis → Experiment → Simulation → Evaluation → Evidence
 //! ```
 //!
+//! Simulation is delegated; **evaluation is not**. Deciding whether a result
+//! means anything is the part no trading engine provides, and it lives in
+//! [`evaluation`] alongside the evidence it produces.
+//!
 //! Everything here is Arvo-owned. Nothing here names a trading primitive:
 //! no orders, no fills, no positions, no accounts. Those live entirely on the
 //! Nautilus side of [`SimulationProvider`], which is what lets Arvo avoid
@@ -19,6 +23,12 @@
 //!
 //! An abstraction earns its place by removing a dependency or a panic, not by
 //! anticipating an implementation nobody has asked for.
+
+pub mod evaluation;
+
+pub use evaluation::{
+    evaluate_against_benchmark, Evaluation, EvaluationCriteria, Evidence, Metrics, Verdict,
+};
 
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
