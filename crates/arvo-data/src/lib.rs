@@ -218,13 +218,24 @@ fn parse_row(path: &Path, line_no: usize, line: &str) -> Result<Bar, DataError> 
         volume: number("volume")?,
     };
 
-    // A high below the low is corrupt data, not an unusual day. Catching it
-    // here keeps it out of an equity curve that would otherwise look fine.
-    if bar.high < bar.low {
-        return Err(malformed(format!(
-            "high {} is below low {}",
-            bar.high, bar.low
-        )));
+    // Full OHLC consistency, not just high >= low. These are exactly the
+    // predicates Nautilus checks when a bar reaches the engine, asserted here
+    // instead so corrupt data fails at the trust boundary with a line number
+    // rather than deep inside a backtest.
+    for (name, ok) in [
+        ("high is below low", bar.high >= bar.low),
+        ("high is below open", bar.high >= bar.open),
+        ("high is below close", bar.high >= bar.close),
+        ("low is above open", bar.low <= bar.open),
+        ("low is above close", bar.low <= bar.close),
+        ("volume is negative", bar.volume >= 0.0),
+    ] {
+        if !ok {
+            return Err(malformed(format!(
+                "{name} (o={} h={} l={} c={} v={})",
+                bar.open, bar.high, bar.low, bar.close, bar.volume
+            )));
+        }
     }
 
     Ok(bar)

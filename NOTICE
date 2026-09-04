@@ -14,9 +14,13 @@ these are obligations on what we ship, not on what we write.
 NautilusTrader — GNU Lesser General Public License v3.0 (LGPL-3.0-only)
   https://github.com/nautechsystems/nautilus_trader
 
-  STATUS: active dependency. `crates/arvo-nautilus` depends on
-  `nautilus-model` (pinned `=0.63.0`) and is the only crate permitted to do
-  so. Everything below now applies to real distributed artifacts.
+  STATUS: active dependency. `crates/arvo-nautilus` is the only crate
+  permitted to depend on it, and depends on `nautilus-backtest`,
+  `nautilus-common`, `nautilus-core`, `nautilus-model` and
+  `nautilus-trading` (all pinned `=0.63.0`), which in turn pull in
+  `nautilus-analysis`, `-data`, `-execution`, `-portfolio`, `-risk` and
+  `-system`. The whole backtest engine is now linked, not just the domain
+  model. Everything below applies to real distributed artifacts.
 
   Arvo links NautilusTrader's Rust crates in-process (see
   arvo-desktop/.scratch/arvo-architecture/map.md). A statically linked binary is

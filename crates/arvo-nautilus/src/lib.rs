@@ -8,16 +8,27 @@
 //! internal infrastructure. That is survivable only while the blast radius is
 //! one crate, and the rule is what keeps it there.
 //!
-//! Concretely: nothing in this crate's public API mentions a Nautilus type.
-//! Callers hand over plain Rust values and receive Arvo-owned types back.
-//! There is a test at the bottom of this file that states that intent.
+//! The rule is enforced by the direction of the dependency rather than by
+//! anyone remembering it: [`arvo_research`] defines [`SimulationProvider`] and
+//! this crate implements it, so the research domain cannot name a Nautilus
+//! type even by accident. Nothing in this crate's public API mentions one
+//! either — the only exported item is [`NautilusSimulation`], whose whole
+//! surface is Arvo types.
 //!
 //! # What crosses the boundary
 //!
-//! Experiments and outcomes — never trading primitives. Arvo does not model
-//! orders, fills, positions or accounts, because Arvo never manipulates them;
-//! they live entirely on the Nautilus side of this line. That is what lets
-//! containment coexist with *not* duplicating Nautilus's domain model.
+//! Experiments down, results up — never trading primitives. Orders, fills,
+//! positions and accounts exist only inside this crate and below. That is what
+//! lets containment coexist with *not* duplicating Nautilus's domain model:
+//! Arvo never manipulates a trading primitive, so it never needs to model one.
+//!
+//! # Panics are converted here, not propagated
+//!
+//! Nautilus's ergonomic constructors (`Price::new`, `Quantity::new`,
+//! `BarSpecification::new`, ...) panic on invalid input; only the `_checked`
+//! variants return a result. Everything below uses the checked forms, because
+//! a bad number from a config file or a UI field is ordinary input, not a bug
+//! worth aborting the process over.
 //!
 //! # Licensing
 //!
@@ -26,145 +37,563 @@
 //! obligation attaches to the distributed binary — but keeping the dependency
 //! to this one crate keeps the fact obvious rather than diffuse.
 
-use nautilus_model::identifiers::InstrumentId;
-use nautilus_model::types::{Price, Quantity};
+mod strategy;
+
 use std::str::FromStr;
 
-/// Why a value could not be admitted into the trading domain.
+use arvo_data::BarProvider;
+use arvo_research::{
+    Experiment, SimulationError, SimulationProvider, SimulationResult, StrategySpec,
+};
+use chrono::{NaiveDate, NaiveTime};
+use nautilus_backtest::{
+    config::{BacktestEngineConfig, SimulatedVenueConfig},
+    engine::BacktestEngine,
+};
+use nautilus_core::UnixNanos;
+use nautilus_model::{
+    data::{Bar, BarSpecification, BarType, Data},
+    enums::{AccountType, AggregationSource, BarAggregation, BookType, OmsType, PriceType},
+    identifiers::{InstrumentId, Symbol},
+    instruments::{Equity, InstrumentAny},
+    types::{Currency, Money, Price, Quantity},
+};
+use nautilus_trading::strategy::{StrategyConfig, StrategyCore};
+use rust_decimal::Decimal;
+
+/// The Nautilus version this crate is pinned to, recorded on every result.
 ///
-/// Nautilus reports these as `anyhow::Error` (via its `CorrectnessResult`) or
-/// as its own error enums. Both are flattened here, deliberately: the whole
-/// point of this crate is that its callers never see a Nautilus type, and an
-/// error type is part of the public API like any other.
-#[derive(Debug, thiserror::Error)]
-pub enum BoundaryError {
-    #[error("invalid instrument id {value:?}: {reason}")]
-    InstrumentId { value: String, reason: String },
-    #[error("invalid price {value} at precision {precision}: {reason}")]
-    Price {
-        value: f64,
-        precision: u8,
-        reason: String,
-    },
-    #[error("invalid quantity {value} at precision {precision}: {reason}")]
-    Quantity {
-        value: f64,
-        precision: u8,
-        reason: String,
-    },
+/// A result is only comparable to another produced by the same engine, so the
+/// version is part of the evidence rather than a build detail.
+const ENGINE: &str = "nautilus 0.63.0";
+
+/// The only strategy wired up so far. See [`strategy`] for why there is one.
+const SMA_CROSS: &str = "sma_cross";
+
+/// US equity conventions. Daily bars from the free exports are quoted in cents
+/// and traded in whole shares; nothing yet needs another instrument class, and
+/// guessing at one would mean guessing wrong.
+const PRICE_PRECISION: u8 = 2;
+const SIZE_PRECISION: u8 = 0;
+
+/// Runs Arvo experiments on Nautilus's backtest engine.
+///
+/// Owns its data source so an experiment carries only a *reference* to its
+/// dataset: reproducibility needs the identity of the input, and which
+/// provider resolves that identity is a wiring decision, not a research one.
+#[derive(Debug)]
+pub struct NautilusSimulation<P> {
+    bars: P,
 }
 
-/// A price and size for an instrument, validated by Nautilus's own domain
-/// rules but expressed in plain Rust.
-///
-/// The fields are the *normalised* values — Nautilus rounds to the requested
-/// precision — so this is what Nautilus would actually trade on, not what the
-/// caller typed.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ValidatedQuote {
-    /// Canonical `SYMBOL.VENUE` form, as Nautilus renders it.
-    pub instrument: String,
-    pub price: f64,
-    pub quantity: f64,
+impl<P: BarProvider> NautilusSimulation<P> {
+    pub const fn new(bars: P) -> Self {
+        Self { bars }
+    }
 }
 
-/// Validates a quote through Nautilus's domain types.
-///
-/// This is the spike that proves the bridge: it links Nautilus's Rust crates,
-/// constructs real domain values, and hands back an Arvo type.
-///
-/// # Errors
-///
-/// Returns [`BoundaryError`] if the instrument id is not `SYMBOL.VENUE`, or if
-/// the price or quantity violate Nautilus's own correctness rules (precision
-/// out of range, non-finite, negative size, and so on).
-///
-/// # Panics
-///
-/// Never. Note that Nautilus's ergonomic constructors — `Price::new`,
-/// `Quantity::new` — *do* panic on invalid input; only the `_checked` variants
-/// return a result. Everything crossing this boundary uses the checked forms,
-/// because a bad value from a config file or a UI field is ordinary input, not
-/// a bug worth aborting the process over.
-pub fn validate_quote(
-    instrument: &str,
-    price: f64,
-    quantity: f64,
-    precision: u8,
-) -> Result<ValidatedQuote, BoundaryError> {
-    let instrument_id =
-        InstrumentId::from_str(instrument).map_err(|err| BoundaryError::InstrumentId {
-            value: instrument.to_owned(),
-            reason: err.to_string(),
+impl<P: BarProvider> SimulationProvider for NautilusSimulation<P> {
+    fn engine(&self) -> &str {
+        ENGINE
+    }
+
+    fn run(&self, experiment: &Experiment) -> Result<SimulationResult, SimulationError> {
+        let plan = SmaCrossParams::from_spec(&experiment.strategy)?;
+
+        // Slippage is pinned in the experiment but not yet wired into a fill
+        // model. Failing here is the point: quietly running with an assumption
+        // the record claims was applied would make the evidence a lie.
+        if experiment.costs.slippage_bps != 0.0 {
+            return Err(SimulationError::Unsupported(format!(
+                "slippage_bps is recorded but not yet applied to fills; \
+                 got {}, only 0 can be honoured",
+                experiment.costs.slippage_bps
+            )));
+        }
+
+        let instrument_id = InstrumentId::from_str(&experiment.instrument).map_err(|err| {
+            SimulationError::Rejected(format!("instrument {:?}: {err}", experiment.instrument))
         })?;
 
-    let price = Price::new_checked(price, precision).map_err(|err| BoundaryError::Price {
-        value: price,
-        precision,
-        reason: err.to_string(),
-    })?;
+        let bars = self
+            .bars
+            .daily_bars(
+                &experiment.instrument,
+                experiment.window.from,
+                experiment.window.to,
+            )
+            .map_err(|err| SimulationError::Engine(Box::new(err)))?;
 
-    let quantity =
-        Quantity::new_checked(quantity, precision).map_err(|err| BoundaryError::Quantity {
-            value: quantity,
-            precision,
-            reason: err.to_string(),
-        })?;
+        if bars.is_empty() {
+            return Err(SimulationError::NoData {
+                instrument: experiment.instrument.clone(),
+                from: experiment.window.from,
+                to: experiment.window.to,
+            });
+        }
 
-    Ok(ValidatedQuote {
-        instrument: instrument_id.to_string(),
-        price: price.as_f64(),
-        quantity: quantity.as_f64(),
+        // A crossover needs both windows filled before it can signal at all.
+        if bars.len() <= plan.slow_period {
+            return Err(SimulationError::Rejected(format!(
+                "{} bars is not enough to fill a {}-period average",
+                bars.len(),
+                plan.slow_period
+            )));
+        }
+
+        run_backtest(experiment, &plan, instrument_id, &bars)
+    }
+}
+
+/// The parameters `sma_cross` needs, parsed out of the untyped spec.
+struct SmaCrossParams {
+    fast_period: usize,
+    slow_period: usize,
+    trade_size: f64,
+}
+
+impl SmaCrossParams {
+    fn from_spec(spec: &StrategySpec) -> Result<Self, SimulationError> {
+        if spec.name != SMA_CROSS {
+            return Err(SimulationError::UnknownStrategy(spec.name.clone()));
+        }
+
+        let param = |name: &str| -> Result<f64, SimulationError> {
+            spec.params.get(name).copied().ok_or_else(|| {
+                SimulationError::Rejected(format!("{SMA_CROSS} requires a {name:?} parameter"))
+            })
+        };
+        let period = |name: &str| -> Result<usize, SimulationError> {
+            let value = param(name)?;
+            if value < 1.0 || value.fract() != 0.0 || value > 10_000.0 {
+                return Err(SimulationError::Rejected(format!(
+                    "{name} must be a whole number of bars between 1 and 10000, got {value}"
+                )));
+            }
+            Ok(value as usize)
+        };
+
+        let fast_period = period("fast")?;
+        let slow_period = period("slow")?;
+        if fast_period >= slow_period {
+            return Err(SimulationError::Rejected(format!(
+                "fast period {fast_period} must be shorter than slow period {slow_period}"
+            )));
+        }
+
+        let trade_size = param("trade_size")?;
+        // `is_finite` first: every comparison against NaN is false, so a
+        // bare `<= 0.0` would wave NaN straight through into position sizing.
+        if !trade_size.is_finite() || trade_size <= 0.0 {
+            return Err(SimulationError::Rejected(format!(
+                "trade_size must be positive, got {trade_size}"
+            )));
+        }
+
+        Ok(Self {
+            fast_period,
+            slow_period,
+            trade_size,
+        })
+    }
+}
+
+fn run_backtest(
+    experiment: &Experiment,
+    plan: &SmaCrossParams,
+    instrument_id: InstrumentId,
+    bars: &[arvo_data::Bar],
+) -> Result<SimulationResult, SimulationError> {
+    let rejected = |context: &str, err: &dyn std::fmt::Display| {
+        SimulationError::Rejected(format!("{context}: {err}"))
+    };
+
+    // Nautilus installs its own logger and writes a line per bar to stdout.
+    // Arvo already owns observability (`arvo_runtime::init_tracing`), and a
+    // release build has no console at all — `windows_subsystem = "windows"` —
+    // so that output would go nowhere while still costing the run. Engine
+    // failures are unaffected: they come back as `Err` from `run` below.
+    let config = BacktestEngineConfig {
+        bypass_logging: true,
+        ..BacktestEngineConfig::default()
+    };
+    let mut engine =
+        BacktestEngine::new(config).map_err(|err| rejected("creating the engine", &err))?;
+
+    let currency = Currency::USD();
+    let starting_balance = Money::new_checked(experiment.starting_cash, currency)
+        .map_err(|err| rejected("starting cash", &err))?;
+
+    engine
+        .add_venue(
+            SimulatedVenueConfig::builder()
+                .venue(instrument_id.venue)
+                .oms_type(OmsType::Netting)
+                .account_type(AccountType::Cash)
+                .book_type(BookType::L1_MBP)
+                .starting_balances(vec![starting_balance])
+                .bar_execution(true)
+                .build()
+                .map_err(|err| rejected("venue config", &err))?,
+        )
+        .map_err(|err| rejected("adding the venue", &err))?;
+
+    let instrument = equity(instrument_id, currency, experiment.costs.commission_bps)
+        .map_err(|err| rejected("building the instrument", &err))?;
+    engine
+        .add_instrument(&instrument)
+        .map_err(|err| rejected("adding the instrument", &err))?;
+
+    let spec = BarSpecification::new_checked(1, BarAggregation::Day, PriceType::Last)
+        .map_err(|err| rejected("bar specification", &err))?;
+    // `External` says these bars arrived already aggregated rather than being
+    // built by the engine from ticks, which is what a daily export is.
+    let bar_type = BarType::new(instrument_id, spec, AggregationSource::External);
+
+    let data = bars
+        .iter()
+        .map(|bar| to_nautilus_bar(bar_type, bar).map(Data::Bar))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    engine
+        .add_data(data, None, true, true)
+        .map_err(|err| rejected("adding bar data", &err))?;
+
+    let core = StrategyCore::new(StrategyConfig {
+        strategy_id: None,
+        order_id_tag: Some("001".to_owned()),
+        oms_type: Some(OmsType::Netting),
+        ..StrategyConfig::default()
+    });
+    let trade_size = Quantity::new_checked(plan.trade_size, SIZE_PRECISION)
+        .map_err(|err| rejected("trade size", &err))?;
+
+    engine
+        .add_strategy(strategy::SmaCross::new(
+            core,
+            bar_type,
+            trade_size,
+            plan.fast_period,
+            plan.slow_period,
+        ))
+        .map_err(|err| rejected("adding the strategy", &err))?;
+
+    // The window is already expressed by the data: bars were filtered to it on
+    // the way in, so bounding the run again would only add a way to disagree
+    // with itself.
+    engine
+        .run(None, None, Some(experiment.id.to_string()), false)
+        .map_err(|err| SimulationError::Engine(Box::new(BacktestFailed(err.to_string()))))?;
+
+    let result = engine.get_result();
+    let equity_curve = compound(experiment.starting_cash, result.returns_series.values());
+    engine.dispose();
+
+    Ok(SimulationResult {
+        experiment: experiment.id.clone(),
+        engine: ENGINE.to_owned(),
+        trades: u32::try_from(result.total_positions).unwrap_or(u32::MAX),
+        equity_curve,
     })
 }
+
+/// Builds the traded instrument, with the experiment's commission applied as
+/// the venue fee.
+///
+/// The cost model has to reach the engine or pinning it in the experiment is
+/// theatre — this is the half that does reach it.
+fn equity(
+    instrument_id: InstrumentId,
+    currency: Currency,
+    commission_bps: f64,
+) -> anyhow::Result<InstrumentAny> {
+    let fee = Decimal::try_from(commission_bps / 10_000.0)?;
+    let tick = Price::new_checked(0.01, PRICE_PRECISION)?;
+
+    // Optional fields are left unset rather than passed as `None`: the builder
+    // applies the same defaults checked construction would.
+    let equity = Equity::builder()
+        .instrument_id(instrument_id)
+        .raw_symbol(Symbol::from(instrument_id.symbol.as_str()))
+        .currency(currency)
+        .price_precision(PRICE_PRECISION)
+        .price_increment(tick)
+        .maker_fee(fee)
+        .taker_fee(fee)
+        .ts_event(UnixNanos::default())
+        .ts_init(UnixNanos::default())
+        .build()?;
+
+    Ok(InstrumentAny::Equity(equity))
+}
+
+fn to_nautilus_bar(bar_type: BarType, bar: &arvo_data::Bar) -> Result<Bar, SimulationError> {
+    let rejected = |what: &str, err: &dyn std::fmt::Display| {
+        SimulationError::Rejected(format!("bar {}: {what}: {err}", bar.date))
+    };
+
+    let price = |name: &str, value: f64| {
+        Price::new_checked(value, PRICE_PRECISION).map_err(|err| rejected(name, &err))
+    };
+
+    // A daily bar is only knowable once its day has closed. Timestamping it at
+    // the *end* of the day is what stops a strategy acting on a close it could
+    // not have seen yet — the look-ahead bias this platform exists to catch.
+    let ts = close_of_day(bar.date).ok_or_else(|| {
+        SimulationError::Rejected(format!(
+            "bar date {} is outside the representable range",
+            bar.date
+        ))
+    })?;
+
+    Bar::new_checked(
+        bar_type,
+        price("open", bar.open)?,
+        price("high", bar.high)?,
+        price("low", bar.low)?,
+        price("close", bar.close)?,
+        Quantity::new_checked(bar.volume, SIZE_PRECISION)
+            .map_err(|err| rejected("volume", &err))?,
+        ts,
+        ts,
+    )
+    .map_err(|err| rejected("failed Nautilus's OHLC checks", &err))
+}
+
+/// The instant a trading day ends, as UNIX nanoseconds.
+fn close_of_day(date: NaiveDate) -> Option<UnixNanos> {
+    let end = date.succ_opt()?.and_time(NaiveTime::MIN).and_utc();
+    let nanos = end.timestamp_nanos_opt()?;
+    u64::try_from(nanos).ok().map(UnixNanos::from)
+}
+
+/// Turns a series of period returns into an equity curve.
+///
+/// Nautilus reports returns; evaluation wants equity, and everything else
+/// (drawdown, Sharpe, hit rate) derives from equity. The curve opens at the
+/// starting balance so a run with no trades is a flat single point rather than
+/// an empty vector that reads like a failure.
+fn compound<'a>(starting_cash: f64, returns: impl Iterator<Item = &'a f64>) -> Vec<f64> {
+    let mut equity = starting_cash;
+    let mut curve = vec![equity];
+    for value in returns {
+        equity *= 1.0 + value;
+        curve.push(equity);
+    }
+    curve
+}
+
+/// Wraps a Nautilus engine failure so it can cross the boundary as a plain
+/// `std::error::Error` without exporting a Nautilus type.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct BacktestFailed(String);
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arvo_data::InMemoryBars;
+    use arvo_research::{
+        CostModel, DatasetRef, DateRange, ExperimentId, HypothesisId, StrategySpec,
+    };
+    use std::collections::BTreeMap;
 
-    #[test]
-    fn validates_a_well_formed_quote_through_nautilus() {
-        let quote = validate_quote("AAPL.NASDAQ", 191.25, 100.0, 2).expect("should be valid");
+    fn date(y: i32, m: u32, d: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, d).expect("test date is valid")
+    }
 
-        assert_eq!(quote.instrument, "AAPL.NASDAQ");
-        assert!((quote.price - 191.25).abs() < f64::EPSILON);
-        assert!((quote.quantity - 100.0).abs() < f64::EPSILON);
+    /// A deterministic price path that crosses in both directions, so the
+    /// strategy has something to react to.
+    fn sawtooth(days: usize) -> Vec<arvo_data::Bar> {
+        let mut start = date(2024, 1, 1);
+        let mut bars = Vec::with_capacity(days);
+        for index in 0..days {
+            // Slow drift up, with a cycle superimposed to force crossings.
+            let phase = (index % 40) as f64;
+            let cycle = if phase < 20.0 { phase } else { 40.0 - phase };
+            let close = 100.0 + index as f64 * 0.05 + cycle * 0.5;
+            bars.push(arvo_data::Bar {
+                date: start,
+                open: close,
+                high: close + 0.5,
+                low: close - 0.5,
+                close,
+                volume: 10_000.0,
+            });
+            start = start.succ_opt().expect("date stays in range");
+        }
+        bars
+    }
+
+    fn experiment(params: BTreeMap<String, f64>, bars: &[arvo_data::Bar]) -> Experiment {
+        Experiment {
+            id: ExperimentId::from("e-1"),
+            hypothesis: HypothesisId::from("h-1"),
+            instrument: "AAPL.NASDAQ".to_owned(),
+            window: DateRange::new(
+                bars.first().expect("fixture is not empty").date,
+                bars.last().expect("fixture is not empty").date,
+            )
+            .expect("fixture window is ordered"),
+            dataset: DatasetRef {
+                id: "fixture".to_owned(),
+                version: "1".to_owned(),
+            },
+            strategy: StrategySpec {
+                name: SMA_CROSS.to_owned(),
+                params,
+            },
+            costs: CostModel {
+                commission_bps: 1.0,
+                slippage_bps: 0.0,
+            },
+            starting_cash: 100_000.0,
+            seed: 42,
+        }
+    }
+
+    fn params(fast: f64, slow: f64) -> BTreeMap<String, f64> {
+        BTreeMap::from([
+            ("fast".to_owned(), fast),
+            ("slow".to_owned(), slow),
+            ("trade_size".to_owned(), 100.0),
+        ])
+    }
+
+    fn provider(bars: Vec<arvo_data::Bar>) -> NautilusSimulation<InMemoryBars> {
+        NautilusSimulation::new(InMemoryBars::new().with_instrument("AAPL.NASDAQ", bars))
     }
 
     #[test]
-    fn instrument_id_without_a_venue_is_an_error_not_a_panic() {
-        // Nautilus requires SYMBOL.VENUE; a bare symbol is ordinary bad input.
-        let err = validate_quote("AAPL", 191.25, 100.0, 2).expect_err("should reject");
-        assert!(matches!(err, BoundaryError::InstrumentId { .. }), "{err}");
-    }
+    fn an_experiment_runs_end_to_end_through_nautilus() {
+        let bars = sawtooth(200);
+        let experiment = experiment(params(10.0, 30.0), &bars);
+        let simulation = provider(bars);
 
-    #[test]
-    fn invalid_price_is_an_error_not_a_panic() {
-        // Precision beyond what Nautilus supports. `Price::new` would panic
-        // here; the boundary uses `new_checked` precisely so it does not.
-        let err = validate_quote("AAPL.NASDAQ", 191.25, 100.0, 200).expect_err("should reject");
+        let result = simulation
+            .run(&experiment)
+            .expect("the backtest should run");
+
+        assert_eq!(result.experiment, experiment.id);
+        assert_eq!(result.engine, ENGINE);
         assert!(
-            matches!(
-                err,
-                BoundaryError::Price { .. } | BoundaryError::Quantity { .. }
-            ),
+            !result.equity_curve.is_empty(),
+            "a completed run always has at least its opening balance"
+        );
+        assert!(
+            (result.equity_curve[0] - experiment.starting_cash).abs() < f64::EPSILON,
+            "the curve opens at the starting balance"
+        );
+        assert!(result.trades > 0, "a crossing path should trade");
+    }
+
+    #[test]
+    fn the_same_experiment_twice_gives_the_same_answer() {
+        let bars = sawtooth(200);
+        let experiment = experiment(params(10.0, 30.0), &bars);
+
+        let first = provider(bars.clone())
+            .run(&experiment)
+            .expect("first run should succeed");
+        let second = provider(bars)
+            .run(&experiment)
+            .expect("second run should succeed");
+
+        assert_eq!(
+            first.equity_curve, second.equity_curve,
+            "reproducibility is the whole point; two identical experiments must agree"
+        );
+        assert_eq!(first.trades, second.trades);
+    }
+
+    #[test]
+    fn an_unknown_strategy_is_named_back() {
+        let bars = sawtooth(50);
+        let mut experiment = experiment(params(5.0, 10.0), &bars);
+        experiment.strategy.name = "buy_the_dip".to_owned();
+
+        let err = provider(bars)
+            .run(&experiment)
+            .expect_err("nothing implements that");
+        assert!(
+            matches!(err, SimulationError::UnknownStrategy(ref name) if name == "buy_the_dip"),
             "{err}"
         );
     }
 
     #[test]
-    fn nan_price_is_an_error_not_a_panic() {
-        let err = validate_quote("AAPL.NASDAQ", f64::NAN, 100.0, 2).expect_err("should reject");
-        assert!(matches!(err, BoundaryError::Price { .. }), "{err}");
+    fn an_unwired_cost_assumption_fails_rather_than_being_ignored() {
+        let bars = sawtooth(50);
+        let mut experiment = experiment(params(5.0, 10.0), &bars);
+        experiment.costs.slippage_bps = 2.0;
+
+        let err = provider(bars)
+            .run(&experiment)
+            .expect_err("slippage is recorded but not applied");
+        assert!(matches!(err, SimulationError::Unsupported(_)), "{err}");
     }
 
-    /// The containment rule, stated as a test rather than only as prose: this
-    /// crate's public surface is expressible without naming a Nautilus type.
-    /// If someone later leaks one into a signature, this stops compiling in a
-    /// way that points at why.
     #[test]
-    fn public_api_is_free_of_nautilus_types() {
-        fn assert_arvo_only(_: fn(&str, f64, f64, u8) -> Result<ValidatedQuote, BoundaryError>) {}
-        assert_arvo_only(validate_quote);
+    fn a_window_with_no_data_is_distinguished_from_a_bad_one() {
+        let bars = sawtooth(50);
+        let mut experiment = experiment(params(5.0, 10.0), &bars);
+        experiment.window =
+            DateRange::new(date(2030, 1, 1), date(2030, 2, 1)).expect("window is ordered");
+
+        let err = provider(bars).run(&experiment).expect_err("no bars there");
+        assert!(matches!(err, SimulationError::NoData { .. }), "{err}");
+    }
+
+    #[test]
+    fn too_little_history_to_fill_the_slow_average_is_rejected() {
+        let bars = sawtooth(10);
+        let experiment = experiment(params(5.0, 30.0), &bars);
+
+        let err = provider(bars)
+            .run(&experiment)
+            .expect_err("30-period average cannot fill from 10 bars");
+        assert!(matches!(err, SimulationError::Rejected(_)), "{err}");
+    }
+
+    #[test]
+    fn nonsensical_periods_are_rejected_before_the_engine_starts() {
+        let bars = sawtooth(200);
+
+        for (fast, slow, why) in [
+            (30.0, 10.0, "fast must be shorter than slow"),
+            (0.0, 10.0, "a zero period is not a period"),
+            (10.5, 30.0, "a period is a whole number of bars"),
+        ] {
+            let experiment = experiment(params(fast, slow), &bars);
+            let err = provider(bars.clone()).run(&experiment).expect_err(why);
+            assert!(matches!(err, SimulationError::Rejected(_)), "{why}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_daily_bar_is_timestamped_at_the_close_of_its_day() {
+        let ts = close_of_day(date(2024, 1, 2)).expect("date is representable");
+        let expected = date(2024, 1, 3)
+            .and_time(NaiveTime::MIN)
+            .and_utc()
+            .timestamp_nanos_opt()
+            .expect("date is representable");
+        assert_eq!(
+            ts.as_u64(),
+            u64::try_from(expected).expect("timestamp is positive"),
+            "a close must not be visible before its day has ended"
+        );
+    }
+
+    #[test]
+    fn an_empty_return_series_still_yields_the_opening_balance() {
+        let curve = compound(100_000.0, [].iter());
+        assert_eq!(curve, vec![100_000.0]);
+    }
+
+    #[test]
+    fn returns_compound_rather_than_summing() {
+        let curve = compound(100.0, [0.1, 0.1].iter());
+        assert!((curve[2] - 121.0).abs() < 1e-9, "{curve:?}");
     }
 }

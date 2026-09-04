@@ -1,10 +1,22 @@
 [package]
 name = "arvo-nautilus"
-description = "The single boundary between Arvo and NautilusTrader. No other crate may name a Nautilus type."
+description = "The single boundary between Arvo and NautilusTrader."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-nautilus-model = "=0.63.0"   # pinned exactly: Nautilus is 0.x, every release may break
+anyhow.workspace = true
+arvo-data.workspace = true
+arvo-research.workspace = true
+chrono.workspace = true
 thiserror.workspace = true
+
+# Pinned exactly: Nautilus's Rust crates are 0.x and every release may break.
+# This crate exists to absorb that, so the pin lives here and nowhere else.
+nautilus-backtest = "=0.63.0"
+nautilus-common = "=0.63.0"
+nautilus-core = "=0.63.0"
+nautilus-model = "=0.63.0"
+nautilus-trading = "=0.63.0"
+rust_decimal = "1.43.0"

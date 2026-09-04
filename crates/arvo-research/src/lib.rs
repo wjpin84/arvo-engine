@@ -142,6 +142,10 @@ pub struct Experiment {
     pub dataset: DatasetRef,
     pub strategy: StrategySpec,
     pub costs: CostModel,
+    /// Opening account balance. Pinned because position sizing and therefore
+    /// the whole equity curve depend on it — a return is not interpretable
+    /// without the capital it was earned on.
+    pub starting_cash: f64,
     /// Pinned so a stochastic strategy replays identically.
     pub seed: u64,
 }
@@ -195,6 +199,12 @@ pub enum SimulationError {
     UnknownStrategy(String),
     #[error("experiment rejected by the engine: {0}")]
     Rejected(String),
+    /// The experiment is well-formed but asks for something the engine does
+    /// not yet honour. Distinct from [`SimulationError::Rejected`] on purpose:
+    /// silently ignoring a pinned input would make the reproducibility record
+    /// a lie, so an unwired assumption fails loudly instead.
+    #[error("not supported by this engine: {0}")]
+    Unsupported(String),
     #[error("engine failed during the run")]
     Engine(#[source] Box<dyn std::error::Error + Send + Sync>),
 }
