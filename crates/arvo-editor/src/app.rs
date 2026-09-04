@@ -402,6 +402,7 @@ fn ExtensionsView(
 /// whole reason this platform exists is that backtests are easy to believe.
 #[component]
 fn ResearchView(
+    studies: ReadSignal<std::collections::HashMap<String, StudyView>>,
     set_studies: WriteSignal<std::collections::HashMap<String, StudyView>>,
 ) -> impl IntoView {
     let (library, set_library) = signal(None::<DataLibraryView>);
@@ -483,12 +484,55 @@ fn ResearchView(
                                         _ => "no usable bars".to_owned(),
                                     };
                                     let runnable = instrument.bars > 0;
+                                    let id_again = instrument.id.clone();
+                                    // Two closures rather than one shared: each
+                                    // owns a String, so the predicate is not
+                                    // `Copy` and cannot be moved into two views.
+                                    // `with`, not `get` — this re-runs per row on
+                                    // every change and only needs a yes/no, not a
+                                    // clone of the whole map.
+                                    let held_title = {
+                                        let id = instrument.id.clone();
+                                        move || studies.with(|studies| studies.contains_key(&id))
+                                    };
+                                    let held_rerun = {
+                                        let id = instrument.id.clone();
+                                        move || studies.with(|studies| studies.contains_key(&id))
+                                    };
                                     view! {
-                                        <li>
+                                        <li class="research-row">
                                             <button
                                                 class="research-instrument"
+                                                title=move || {
+                                                    if held_title() {
+                                                        "Open the result already held"
+                                                    } else {
+                                                        "Run a study"
+                                                    }
+                                                }
                                                 disabled=move || running.get() || !runnable
-                                                on:click=move |_| run(id.clone())
+                                                on:click={
+                                                    let id = id.clone();
+                                                    move |_| {
+                                                        // Reopen what we already have rather than
+                                                        // spending eleven backtests to recompute a
+                                                        // result that has not changed. Closing a
+                                                        // tab is a display decision, not a reason
+                                                        // to throw the finding away.
+                                                        if studies
+                                                            .with_untracked(|s| s.contains_key(&id))
+                                                        {
+                                                            open_study_panel(
+                                                                &format!(
+                                                                    "{STUDY_PANEL_PREFIX}{id}",
+                                                                ),
+                                                                &id,
+                                                            );
+                                                        } else {
+                                                            run(id.clone());
+                                                        }
+                                                    }
+                                                }
                                             >
                                                 <span class="research-instrument-id">
                                                     {instrument.id.clone()}
@@ -497,6 +541,26 @@ fn ResearchView(
                                                     {coverage}
                                                 </span>
                                             </button>
+                                            // Only once there is something to redo. Without it a
+                                            // held result could never be refreshed, which would be
+                                            // worse than always recomputing — the data on disk can
+                                            // change underneath it, and nothing detects that yet.
+                                            {move || {
+                                                held_rerun()
+                                                    .then(|| {
+                                                        let id = id_again.clone();
+                                                        view! {
+                                                            <button
+                                                                class="research-rerun"
+                                                                title="Run again"
+                                                                disabled=move || running.get()
+                                                                on:click=move |_| run(id.clone())
+                                                            >
+                                                                "\u{21bb}"
+                                                            </button>
+                                                        }
+                                                    })
+                                            }}
                                         </li>
                                     }
                                 })
@@ -699,6 +763,7 @@ fn SidebarPanel(
     set_plugins: WriteSignal<Vec<PluginView>>,
     theme: ReadSignal<Theme>,
     set_theme: WriteSignal<Theme>,
+    studies: ReadSignal<std::collections::HashMap<String, StudyView>>,
     set_studies: WriteSignal<std::collections::HashMap<String, StudyView>>,
 ) -> impl IntoView {
     view! {
@@ -709,7 +774,7 @@ fn SidebarPanel(
         <div class="sidebar-panel-root">
             {move || match active_view.get() {
                 Some(ActivityView::Research) => {
-                    view! { <ResearchView set_studies=set_studies /> }.into_any()
+                    view! { <ResearchView studies=studies set_studies=set_studies /> }.into_any()
                 }
                 Some(ActivityView::Extensions) => {
                     view! { <ExtensionsView plugins=plugins set_plugins=set_plugins /> }
@@ -1275,6 +1340,7 @@ pub fn App() -> impl IntoView {
                                 set_plugins=set_plugins
                                 theme=theme
                                 set_theme=set_theme
+                                studies=studies
                                 set_studies=set_studies
                             />
                         }
