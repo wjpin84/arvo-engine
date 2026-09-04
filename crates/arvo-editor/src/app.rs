@@ -4,6 +4,7 @@ use leptos::task::spawn_local;
 use serde::Deserialize;
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::Arc;
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen]
@@ -706,6 +707,293 @@ fn MenuDropdown(
     }
 }
 
+/// One thing the palette can do.
+///
+/// The action is a closure over the app's own signals rather than a message
+/// enum: every command here is something a menu item or a button already does,
+/// so a parallel dispatch layer would be a second way to describe the same
+/// action and a second place for the two to disagree.
+#[derive(Clone)]
+struct Command {
+    /// Shown as "Category: Title", and matched against in that combined form
+    /// so typing "theme dark" finds "Theme: Dark".
+    category: &'static str,
+    title: &'static str,
+    run: Arc<dyn Fn() + Send + Sync>,
+}
+
+impl Command {
+    fn label(&self) -> String {
+        format!("{}: {}", self.category, self.title)
+    }
+}
+
+/// Subsequence match, the way a command palette is expected to behave: every
+/// character of `query` must appear in order, not necessarily adjacently, so
+/// "tgo" finds "Toggle Output".
+///
+/// Returns a score where **lower is better**, or `None` for no match. The
+/// score charges for distance — a match that starts late, or is scattered
+/// across the string, ranks below a tight one near the front.
+fn fuzzy_score(haystack: &str, query: &str) -> Option<u32> {
+    let hay: Vec<char> = haystack.to_lowercase().chars().collect();
+    let mut score = 0_u32;
+    let mut cursor = 0_usize;
+    let mut previous: Option<usize> = None;
+
+    for needle in query.to_lowercase().chars() {
+        // Spaces are how people separate words they half-remember; requiring
+        // them to match literally would break "theme mocha".
+        if needle.is_whitespace() {
+            continue;
+        }
+        let found = hay[cursor..].iter().position(|c| *c == needle)? + cursor;
+        score += u32::try_from(match previous {
+            // A gap between matched characters costs; an adjacent run is free.
+            Some(prev) => found - prev - 1,
+            // The first match costs its distance from the start.
+            None => found,
+        })
+        .unwrap_or(u32::MAX);
+        previous = Some(found);
+        cursor = found + 1;
+    }
+
+    Some(score)
+}
+
+/// Everything the palette can run.
+///
+/// Only actions that already exist elsewhere in the shell. A palette listing
+/// commands that do nothing is worse than a short palette.
+fn commands(
+    set_active_view: WriteSignal<Option<ActivityView>>,
+    output_visible: ReadSignal<bool>,
+    set_output_visible: WriteSignal<bool>,
+    set_theme: WriteSignal<Theme>,
+) -> Vec<Command> {
+    let show = move |view: ActivityView| {
+        Arc::new(move || set_active_view.set(Some(view))) as Arc<dyn Fn() + Send + Sync>
+    };
+
+    vec![
+        Command {
+            category: "View",
+            title: "Toggle Sidebar",
+            run: Arc::new(move || {
+                set_active_view.update(|current| {
+                    *current = match *current {
+                        Some(_) => None,
+                        None => Some(ActivityView::Research),
+                    };
+                });
+            }),
+        },
+        Command {
+            category: "View",
+            title: "Toggle Output Panel",
+            run: Arc::new(move || set_output_visible.set(!output_visible.get_untracked())),
+        },
+        Command {
+            category: "View",
+            title: "Research",
+            run: show(ActivityView::Research),
+        },
+        Command {
+            category: "View",
+            title: "Extensions",
+            run: show(ActivityView::Extensions),
+        },
+        Command {
+            category: "View",
+            title: "Alerts",
+            run: show(ActivityView::Alerts),
+        },
+        Command {
+            category: "Preferences",
+            title: "Settings",
+            run: show(ActivityView::Settings),
+        },
+        Command {
+            category: "Theme",
+            title: "Light",
+            run: Arc::new(move || set_theme.set(Theme::Light)),
+        },
+        Command {
+            category: "Theme",
+            title: "Dark",
+            run: Arc::new(move || set_theme.set(Theme::Dark)),
+        },
+        Command {
+            category: "Theme",
+            title: "Catppuccin Mocha",
+            run: Arc::new(move || set_theme.set(Theme::CatppuccinMocha)),
+        },
+        Command {
+            category: "Window",
+            title: "Minimize",
+            run: Arc::new(minimize_window),
+        },
+        Command {
+            category: "Window",
+            title: "Toggle Maximize",
+            run: Arc::new(toggle_maximize_window),
+        },
+        Command {
+            category: "Window",
+            title: "Close",
+            run: Arc::new(close_window),
+        },
+    ]
+}
+
+/// VS Code's command palette: a filter box over everything the shell can do.
+///
+/// Opens on Ctrl+Shift+P or F1, filters as you type, moves with the arrow
+/// keys, runs on Enter, dismisses on Escape or a click outside.
+#[component]
+fn CommandPalette(
+    open: ReadSignal<bool>,
+    set_open: WriteSignal<bool>,
+    commands: Vec<Command>,
+) -> impl IntoView {
+    let (query, set_query) = signal(String::new());
+    let (selected, set_selected) = signal(0_usize);
+    let input_ref = NodeRef::<leptos::html::Input>::new();
+
+    let matches = {
+        let commands = commands.clone();
+        move || {
+            let query = query.get();
+            let mut scored: Vec<(u32, Command)> = commands
+                .iter()
+                .filter_map(|command| {
+                    fuzzy_score(&command.label(), &query).map(|score| (score, command.clone()))
+                })
+                .collect();
+            // `sort_by_key` is stable, so equally-scored commands keep the
+            // declaration order above — which is a deliberate ordering, not an
+            // arbitrary one.
+            scored.sort_by_key(|(score, _)| *score);
+            scored
+                .into_iter()
+                .map(|(_, command)| command)
+                .collect::<Vec<_>>()
+        }
+    };
+
+    // A fresh query means the old highlight points at a different command.
+    Effect::new(move |_| {
+        query.track();
+        set_selected.set(0);
+    });
+
+    // Focus on open, and clear whatever was typed last time: a palette that
+    // reopens holding a stale filter hides the commands you just asked for.
+    Effect::new(move |_| {
+        if open.get() {
+            set_query.set(String::new());
+            set_selected.set(0);
+            if let Some(input) = input_ref.get() {
+                let _ = input.focus();
+            }
+        }
+    });
+
+    let run_selected = {
+        let matches = matches.clone();
+        move || {
+            if let Some(command) = matches().get(selected.get_untracked()) {
+                set_open.set(false);
+                (command.run)();
+            }
+        }
+    };
+
+    let on_key = {
+        let matches = matches.clone();
+        let run_selected = run_selected.clone();
+        move |ev: leptos::ev::KeyboardEvent| match ev.key().as_str() {
+            "Escape" => set_open.set(false),
+            "Enter" => run_selected(),
+            "ArrowDown" => {
+                ev.prevent_default();
+                let count = matches().len();
+                if count > 0 {
+                    set_selected.update(|i| *i = (*i + 1) % count);
+                }
+            }
+            "ArrowUp" => {
+                ev.prevent_default();
+                let count = matches().len();
+                if count > 0 {
+                    set_selected.update(|i| *i = (*i + count - 1) % count);
+                }
+            }
+            _ => {}
+        }
+    };
+
+    view! {
+        <div class="palette-layer" class:hidden=move || !open.get()>
+            // Same backdrop trick the menus use: dismissal by a real element
+            // underneath, rather than a document listener that has to work out
+            // whether the click landed inside the palette.
+            <div class="palette-backdrop" on:click=move |_| set_open.set(false) />
+            <div class="palette">
+                <input
+                    node_ref=input_ref
+                    class="palette-input"
+                    type="text"
+                    placeholder="Type a command…"
+                    autocomplete="off"
+                    spellcheck="false"
+                    prop:value=move || query.get()
+                    on:input=move |ev| set_query.set(event_target_value(&ev))
+                    on:keydown=on_key
+                />
+                <ul class="palette-results">
+                    {move || {
+                        let found = matches();
+                        if found.is_empty() {
+                            return view! {
+                                <li class="palette-empty">"No matching commands"</li>
+                            }
+                            .into_any();
+                        }
+                        found
+                            .into_iter()
+                            .enumerate()
+                            .map(|(index, command)| {
+                                let run = command.run.clone();
+                                view! {
+                                    <li
+                                        class="palette-result"
+                                        class:selected=move || selected.get() == index
+                                        // Pointer, not click: the input would
+                                        // lose focus on mousedown and the
+                                        // backdrop would win the click.
+                                        on:pointerdown=move |ev| {
+                                            ev.prevent_default();
+                                            set_open.set(false);
+                                            run();
+                                        }
+                                        on:pointerenter=move |_| set_selected.set(index)
+                                    >
+                                        <span class="palette-category">{command.category}</span>
+                                        <span class="palette-title">{command.title}</span>
+                                    </li>
+                                }
+                            })
+                            .collect_view()
+                            .into_any()
+                    }}
+                </ul>
+            </div>
+        </div>
+    }
+}
+
 /// Fixed chrome, same category as `ActivityBar` — not a dockview panel.
 /// Doubles as the OS title bar (`tauri.conf.json`'s `decorations: false`):
 /// the app icon and the empty stretch between the menu and window controls
@@ -719,6 +1007,7 @@ fn MenuDropdown(
 fn TopMenuBar(
     output_visible: ReadSignal<bool>,
     set_output_visible: WriteSignal<bool>,
+    set_palette_open: WriteSignal<bool>,
 ) -> impl IntoView {
     let (open_menu, set_open_menu) = signal(None::<MenuId>);
 
@@ -749,11 +1038,35 @@ fn TopMenuBar(
                     >
                         {move || if output_visible.get() { "\u{2713} Output" } else { "Output" }}
                     </button>
+                    <button
+                        class="menu-item"
+                        on:click=move |_| {
+                            set_open_menu.set(None);
+                            set_palette_open.set(true);
+                        }
+                    >
+                        "Command Palette…"
+                    </button>
                 </MenuDropdown>
                 <MenuDropdown id=MenuId::Help label="Help" open_menu=open_menu set_open_menu=set_open_menu>
                     <div class="menu-item-static">"Arvo Desktop"</div>
                 </MenuDropdown>
             </nav>
+            // The palette trigger sits centred, VS Code style. Flanking
+            // spacers (not a margin) keep it centred in the *window* rather
+            // than in the leftover room beside the menus, and both carry the
+            // drag region so the title bar still drags either side of it.
+            <div class="title-bar-spacer" data-tauri-drag-region="true" />
+            <button class="palette-trigger" on:click=move |_| set_palette_open.set(true)>
+                <svg class="palette-trigger-icon" viewBox="0 0 16 16" aria-hidden="true">
+                    <path
+                        d="M7 2a5 5 0 1 0 3.1 8.9l3 3 1.4-1.4-3-3A5 5 0 0 0 7 2Zm0 2a3 3 0 1 1 0 6 3 3 0 0 1 0-6Z"
+                        fill="currentColor"
+                    />
+                </svg>
+                <span class="palette-trigger-label">"Search commands"</span>
+                <span class="palette-trigger-hint">"Ctrl+Shift+P"</span>
+            </button>
             <div class="title-bar-spacer" data-tauri-drag-region="true" />
             <div class="window-controls">
                 <button class="window-control" title="Minimize" on:click=move |_| minimize_window()>
@@ -840,6 +1153,7 @@ pub fn App() -> impl IntoView {
     });
     // Output moved out of the default layout into the View menu.
     let (output_visible, set_output_visible) = signal(false);
+    let (palette_open, set_palette_open) = signal(false);
 
     Effect::new(move |_| {
         spawn_local(async move {
@@ -848,6 +1162,21 @@ pub fn App() -> impl IntoView {
     });
 
     Effect::new(move |_| apply_theme(theme.get()));
+
+    // Window-level, not on an element: the shortcut has to work whatever has
+    // focus, including inside a dockview panel that Leptos does not own.
+    Effect::new(move |_| {
+        let handle = window_event_listener(leptos::ev::keydown, move |ev| {
+            let palette = (ev.ctrl_key() || ev.meta_key()) && ev.shift_key() && ev.key() == "P";
+            if palette || ev.key() == "F1" {
+                ev.prevent_default();
+                set_palette_open.set(true);
+            }
+        });
+        // Returned so Leptos drops the listener with the effect rather than
+        // leaving it bound to a torn-down closure.
+        on_cleanup(move || handle.remove());
+    });
 
     // Sidebar and Output's mount handles are tracked (not `.forget()`-ten,
     // unlike the permanent main panel) so removing either actually unmounts
@@ -926,7 +1255,21 @@ pub fn App() -> impl IntoView {
 
     view! {
         <div class="shell-root">
-            <TopMenuBar output_visible=output_visible set_output_visible=set_output_visible />
+            <TopMenuBar
+                output_visible=output_visible
+                set_output_visible=set_output_visible
+                set_palette_open=set_palette_open
+            />
+            <CommandPalette
+                open=palette_open
+                set_open=set_palette_open
+                commands=commands(
+                    set_active_view,
+                    output_visible,
+                    set_output_visible,
+                    set_theme,
+                )
+            />
             <div class="shell">
                 <ActivityBar active_view=active_view set_active_view=set_active_view />
                 <div
@@ -937,5 +1280,53 @@ pub fn App() -> impl IntoView {
             </div>
             <StatusBar plugins=plugins />
         </div>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fuzzy_score;
+
+    #[test]
+    fn an_empty_query_matches_everything_equally() {
+        assert_eq!(fuzzy_score("View: Toggle Sidebar", ""), Some(0));
+    }
+
+    #[test]
+    fn characters_need_not_be_adjacent() {
+        assert!(
+            fuzzy_score("View: Toggle Output Panel", "tgo").is_some(),
+            "a palette that only does substrings is not worth having"
+        );
+    }
+
+    #[test]
+    fn order_still_matters() {
+        assert_eq!(
+            fuzzy_score("View: Toggle Output Panel", "otggle"),
+            None,
+            "a subsequence match is not an anagram match"
+        );
+    }
+
+    #[test]
+    fn matching_is_case_insensitive_and_ignores_query_spaces() {
+        assert!(fuzzy_score("Theme: Catppuccin Mocha", "THEME MOCHA").is_some());
+        assert!(fuzzy_score("Theme: Catppuccin Mocha", "theme mocha").is_some());
+    }
+
+    #[test]
+    fn a_tighter_earlier_match_scores_better() {
+        let exact = fuzzy_score("Theme: Dark", "theme").expect("matches");
+        let scattered = fuzzy_score("View: Toggle Output Panel", "toe").expect("matches");
+        assert!(
+            exact < scattered,
+            "a contiguous prefix must outrank a scattered one: {exact} vs {scattered}"
+        );
+    }
+
+    #[test]
+    fn a_missing_character_is_no_match() {
+        assert_eq!(fuzzy_score("Theme: Dark", "zzz"), None);
     }
 }
