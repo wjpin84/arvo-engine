@@ -17,3 +17,14 @@ web-sys = { version = "0.3.104", features = ["Window", "Document", "HtmlElement"
 
 [workspace]
 members = ["src-tauri", "plugins/stub", "plugins/wasm-stub"]
+
+# Must live in the *workspace root* manifest. Cargo ignores `[profile.*]` in
+# member crates and warns about it — these settings sat in src-tauri/Cargo.toml
+# and were silently doing nothing, so every release build so far ran at
+# defaults. See tauri.app/concept/size/#cargo-configuration.
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true
