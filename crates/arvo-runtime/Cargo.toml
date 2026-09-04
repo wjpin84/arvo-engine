@@ -17,6 +17,7 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 arvo-data.workspace = true
 arvo-nautilus.workspace = true
+arvo-portfolio.workspace = true
 arvo-research.workspace = true
 blake3 = "1.8.7"
 chrono.workspace = true

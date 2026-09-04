@@ -8,6 +8,7 @@
 //! implementation is bound to `tauri::async_runtime` — see [`scheduler`].
 
 pub mod commands;
+pub mod portfolio;
 pub mod research;
 pub mod scheduler;
 
@@ -147,7 +148,22 @@ pub fn run() {
             // Findings live beside the data they were produced from, under the
             // app data dir, so a user can back up or inspect both together.
             let evidence_dir = app.path().app_data_dir()?.join(research::EVIDENCE_SUBDIR);
-            app.manage(research::ResearchService::new(data_dir, evidence_dir));
+            app.manage(research::ResearchService::new(
+                data_dir.clone(),
+                evidence_dir,
+            ));
+
+            // Holdings you export yourself. Created up front so the empty
+            // folder is the instruction, rather than a path in an error.
+            let portfolio_dir = app.path().app_data_dir()?.join(portfolio::PORTFOLIO_SUBDIR);
+            if let Err(err) = std::fs::create_dir_all(&portfolio_dir) {
+                tracing::warn!(
+                    error = %err,
+                    path = %portfolio_dir.display(),
+                    "could not create the portfolios directory"
+                );
+            }
+            app.manage(portfolio::PortfolioService::new(portfolio_dir, data_dir));
 
             app.manage(plugins_config);
             app.manage(plugin_registry);
@@ -160,7 +176,8 @@ pub fn run() {
             research::run_study,
             research::run_panel,
             research::list_history,
-            research::open_record
+            research::open_record,
+            portfolio::list_portfolios
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

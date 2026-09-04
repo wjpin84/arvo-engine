@@ -63,6 +63,7 @@ extern "C" {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ActivityView {
+    Portfolio,
     Research,
     Extensions,
     Alerts,
@@ -233,6 +234,38 @@ struct PanelView {
 }
 
 #[derive(Clone, Deserialize)]
+struct HoldingView {
+    instrument: String,
+    quantity: f64,
+    price: f64,
+    market_value: f64,
+    cost_basis: f64,
+    unrealized: f64,
+    unrealized_pct: Option<f64>,
+    weight: f64,
+    priced_by: String,
+}
+
+#[derive(Clone, Deserialize)]
+struct PortfolioView {
+    name: String,
+    as_of: String,
+    total_value: f64,
+    total_cost: f64,
+    unrealized: f64,
+    unrealized_pct: Option<f64>,
+    cash: f64,
+    holdings: Vec<HoldingView>,
+    unpriced: Vec<String>,
+}
+
+#[derive(Clone, Deserialize)]
+struct PortfolioLibraryView {
+    directory: String,
+    portfolios: Vec<PortfolioView>,
+}
+
+#[derive(Clone, Deserialize)]
 struct HistoryEntryView {
     id: String,
     kind: String,
@@ -248,6 +281,26 @@ struct HistoryEntryView {
 enum RecordView {
     Study(StudyView),
     Panel(PanelView),
+}
+
+/// Grouped to thousands. A portfolio total is read as a quantity of money,
+/// and `128450.75` is materially harder to read at a glance than
+/// `128,450.75` — which matters more here than anywhere else in the app.
+fn money(value: f64) -> String {
+    let negative = value < 0.0;
+    let whole = value.abs().trunc();
+    let cents = ((value.abs() - whole) * 100.0).round() as u64;
+    let digits: Vec<char> = format!("{whole:.0}").chars().collect();
+
+    let mut grouped = String::new();
+    for (index, digit) in digits.iter().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(*digit);
+    }
+
+    format!("{}${grouped}.{cents:02}", if negative { "-" } else { "" })
 }
 
 fn percent(value: f64) -> String {
@@ -328,6 +381,17 @@ fn toggle_view(
 /// Extensions (puzzle piece) and Alerts (bell) — the same silhouettes VS
 /// Code's own activity bar uses for these, hand-drawn as plain `currentColor`
 /// paths rather than vendoring an icon font/library for two glyphs.
+/// A stacked-bars mark: the portfolio view is about composition, not a price
+/// line, and the icon should say allocation rather than chart.
+#[component]
+fn PortfolioIcon() -> impl IntoView {
+    view! {
+        <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+            <path d="M3 20h18v2H3v-2Zm2-8h3v7H5v-7Zm5-6h3v13h-3V6Zm5 3h3v10h-3V9Z" />
+        </svg>
+    }
+}
+
 /// A conical flask — the research view runs experiments, and the icon should
 /// say experiment rather than chart.
 #[component]
@@ -373,6 +437,14 @@ fn ActivityBar(
 ) -> impl IntoView {
     view! {
         <nav class="activity-bar" class:integrated=move || active_view.get().is_some()>
+            <button
+                class="activity-bar-item"
+                class:active=move || active_view.get() == Some(ActivityView::Portfolio)
+                title="Portfolio"
+                on:click=move |_| toggle_view(ActivityView::Portfolio, active_view, set_active_view)
+            >
+                <PortfolioIcon />
+            </button>
             <button
                 class="activity-bar-item"
                 class:active=move || active_view.get() == Some(ActivityView::Research)
@@ -873,6 +945,9 @@ fn verdict_class(verdict: &str) -> &'static str {
 
 /// The panel's own tab. One at a time — there is only one panel.
 const PANEL_PANEL_ID: &str = "panel";
+
+/// The portfolio overview's tab.
+const PORTFOLIO_PANEL_ID: &str = "portfolio";
 
 /// Dockview panel ids for study tabs are this plus the instrument.
 const STUDY_PANEL_PREFIX: &str = "study:";
@@ -1390,6 +1465,237 @@ fn StudyReport(study: StudyView) -> impl IntoView {
     }
 }
 
+/// What you hold: the sidebar picker, and the overview it opens.
+///
+/// Read-only, and there is no credential anywhere in this path. Holdings come
+/// from a file you export yourself — see `arvo_portfolio::csv` for why that is
+/// the deliberate choice rather than a placeholder.
+#[component]
+fn PortfolioSidebar(
+    portfolios: ReadSignal<Option<PortfolioLibraryView>>,
+    set_open_portfolio: WriteSignal<Option<PortfolioView>>,
+) -> impl IntoView {
+    view! {
+        <div class="sidebar-view">
+            <h3>"Portfolio"</h3>
+            {move || match portfolios.get() {
+                None => view! { <p class="sidebar-empty">"Looking for holdings…"</p> }.into_any(),
+                Some(library) if library.portfolios.is_empty() => {
+                    view! {
+                        <div>
+                            <p class="sidebar-empty">"No holdings yet"</p>
+                            <p class="research-hint">
+                                "Drop a CSV here, one per portfolio, with the header "
+                                <code>"instrument,quantity,cost_basis,price"</code>
+                                ". Cost basis is the total paid, not per share; price may be blank \
+                                 to use the last close from your data. "
+                                <code>"CASH"</code>
+                                " is worth face value."
+                            </p>
+                            <p class="research-path">{library.directory.clone()}</p>
+                        </div>
+                    }
+                        .into_any()
+                }
+                Some(library) => {
+                    view! {
+                        <ul class="research-instruments">
+                            {library
+                                .portfolios
+                                .into_iter()
+                                .map(|portfolio| {
+                                    let name = portfolio.name.clone();
+                                    let summary = format!(
+                                        "{} · {} holdings",
+                                        money(portfolio.total_value),
+                                        portfolio.holdings.len(),
+                                    );
+                                    let gain = portfolio.unrealized;
+                                    // Hoisted: the view macro wants a value or
+                                    // a closure in an attribute, not a bare
+                                    // `if` expression.
+                                    let gain_class = if gain >= 0.0 {
+                                        "portfolio-delta up"
+                                    } else {
+                                        "portfolio-delta down"
+                                    };
+                                    view! {
+                                        <li>
+                                            <button
+                                                class="research-instrument"
+                                                on:click=move |_| {
+                                                    set_open_portfolio.set(Some(portfolio.clone()));
+                                                    open_study_panel(
+                                                        PORTFOLIO_PANEL_ID,
+                                                        "Portfolio",
+                                                    );
+                                                }
+                                            >
+                                                <span class="research-instrument-id">{name}</span>
+                                                <span class="research-instrument-meta">
+                                                    {summary}
+                                                </span>
+                                                <span class=gain_class>{money(gain)}</span>
+                                            </button>
+                                        </li>
+                                    }
+                                })
+                                .collect_view()}
+                        </ul>
+                    }
+                        .into_any()
+                }
+            }}
+        </div>
+    }
+}
+
+/// The portfolio tab, read back out of the signal so it refreshes in place.
+#[component]
+fn PortfolioTab(portfolio: ReadSignal<Option<PortfolioView>>) -> impl IntoView {
+    view! {
+        <div class="study-panel">
+            {move || {
+                portfolio.get().map(|portfolio| view! { <PortfolioReport portfolio=portfolio /> })
+            }}
+        </div>
+    }
+}
+
+/// Holdings, what they are worth, and how the money is distributed.
+#[component]
+fn PortfolioReport(portfolio: PortfolioView) -> impl IntoView {
+    let invested = portfolio.total_value - portfolio.cash;
+    view! {
+        <div class="research-report">
+            <p class="research-subject">{portfolio.name.clone()}</p>
+            <p class="research-instrument-meta">
+                {format!("Valued {}", portfolio.as_of.clone())}
+            </p>
+
+            <div class="metric-cards">
+                <MetricCard label="Total value" value=money(portfolio.total_value) />
+                <MetricCard
+                    label="Unrealised"
+                    value=money(portfolio.unrealized)
+                    tone=portfolio.unrealized
+                    note=portfolio
+                        .unrealized_pct
+                        .map_or_else(|| "no cost basis".to_owned(), percent)
+                />
+                <MetricCard label="Cost basis" value=money(portfolio.total_cost) />
+                <MetricCard
+                    label="Cash"
+                    value=money(portfolio.cash)
+                    note=if portfolio.total_value == 0.0 {
+                        String::new()
+                    } else {
+                        format!("{} of total", percent(portfolio.cash / portfolio.total_value))
+                    }
+                />
+                <MetricCard label="Invested" value=money(invested) />
+                <MetricCard
+                    label="Positions"
+                    value=portfolio.holdings.len().to_string()
+                />
+            </div>
+
+            <h4>"Allocation"</h4>
+            <div class="allocation">
+                {portfolio
+                    .holdings
+                    .iter()
+                    .map(|holding| {
+                        let width = format!("{:.2}%", holding.weight * 100.0);
+                        view! {
+                            <div class="allocation-row">
+                                <span class="allocation-label">{holding.instrument.clone()}</span>
+                                <span class="allocation-track">
+                                    <span class="allocation-bar" style=format!("width:{width}") />
+                                </span>
+                                <span class="allocation-weight">{percent(holding.weight)}</span>
+                            </div>
+                        }
+                    })
+                    .collect_view()}
+            </div>
+
+            <h4>"Holdings"</h4>
+            <table class="research-metrics">
+                <thead>
+                    <tr>
+                        <th>"Instrument"</th>
+                        <th>"Qty"</th>
+                        <th>"Price"</th>
+                        <th>"Value"</th>
+                        <th>"Cost"</th>
+                        <th>"Unrealised"</th>
+                        <th>"Priced by"</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {portfolio
+                        .holdings
+                        .iter()
+                        .map(|holding| {
+                            let gain_class = if holding.unrealized >= 0.0 {
+                                "gain-up"
+                            } else {
+                                "gain-down"
+                            };
+                            view! {
+                                <tr>
+                                    <td>{holding.instrument.clone()}</td>
+                                    <td>{format!("{:.4}", holding.quantity)}</td>
+                                    <td>{money(holding.price)}</td>
+                                    <td>{money(holding.market_value)}</td>
+                                    <td>{money(holding.cost_basis)}</td>
+                                    <td class=gain_class>
+                                        {format!(
+                                            "{} {}",
+                                            money(holding.unrealized),
+                                            holding
+                                                .unrealized_pct
+                                                .map_or_else(String::new, |pct| format!(
+                                                    "({})",
+                                                    percent(pct),
+                                                )),
+                                        )}
+                                    </td>
+                                    <td class="priced-by">{holding.priced_by.clone()}</td>
+                                </tr>
+                            }
+                        })
+                        .collect_view()}
+                </tbody>
+            </table>
+
+            {(!portfolio.unpriced.is_empty())
+                .then({
+                    let unpriced = portfolio.unpriced.clone();
+                    move || {
+                        view! {
+                            <div>
+                                <h4>"Not included"</h4>
+                                <p class="research-hint">
+                                    "No price was available for these, so they are excluded from \
+                                     every total above rather than counted as zero. Add a price \
+                                     column, or add their daily bars to the data library."
+                                </p>
+                                <ul class="research-reasons">
+                                    {unpriced
+                                        .iter()
+                                        .map(|id| view! { <li>{id.clone()}</li> })
+                                        .collect_view()}
+                                </ul>
+                            </div>
+                        }
+                    }
+                })}
+        </div>
+    }
+}
+
 #[component]
 fn AlertsView() -> impl IntoView {
     view! {
@@ -1438,6 +1744,8 @@ fn SidebarPanel(
     set_studies: WriteSignal<std::collections::HashMap<String, StudyView>>,
     panel: ReadSignal<Option<PanelView>>,
     set_panel: WriteSignal<Option<PanelView>>,
+    portfolios: ReadSignal<Option<PortfolioLibraryView>>,
+    set_open_portfolio: WriteSignal<Option<PortfolioView>>,
 ) -> impl IntoView {
     view! {
         // Needs a real height: .sidebar-view inside it is `height: 100%`,
@@ -1446,6 +1754,15 @@ fn SidebarPanel(
         // `overflow: hidden` instead of scrolling (ticket 14).
         <div class="sidebar-panel-root">
             {move || match active_view.get() {
+                Some(ActivityView::Portfolio) => {
+                    view! {
+                        <PortfolioSidebar
+                            portfolios=portfolios
+                            set_open_portfolio=set_open_portfolio
+                        />
+                    }
+                        .into_any()
+                }
                 Some(ActivityView::Research) => {
                     view! {
                         <ResearchView
@@ -1967,10 +2284,21 @@ pub fn App() -> impl IntoView {
     // One panel at a time: there is only one panel, and re-running it should
     // replace what the tab shows rather than accumulate tabs.
     let (panel, set_panel) = signal(None::<PanelView>);
+    let (portfolios, set_portfolios) = signal(None::<PortfolioLibraryView>);
+    let (open_portfolio, set_open_portfolio) = signal(None::<PortfolioView>);
 
     Effect::new(move |_| {
         spawn_local(async move {
             set_plugins.set(call("list_plugins").await);
+        });
+    });
+
+    Effect::new(move |_| {
+        spawn_local(async move {
+            match call_typed::<PortfolioLibraryView>("list_portfolios", JsValue::UNDEFINED).await {
+                Ok(library) => set_portfolios.set(Some(library)),
+                Err(reason) => web_sys::console::error_1(&reason.into()),
+            }
         });
     });
 
@@ -2028,6 +2356,8 @@ pub fn App() -> impl IntoView {
                                 set_studies=set_studies
                                 panel=panel
                                 set_panel=set_panel
+                                portfolios=portfolios
+                                set_open_portfolio=set_open_portfolio
                             />
                         }
                     });
@@ -2042,6 +2372,14 @@ pub fn App() -> impl IntoView {
                 }
                 // `into_any` on both: a study tab and the panel tab are
                 // different opaque view types, and one map has to hold both.
+                PORTFOLIO_PANEL_ID => {
+                    let handle = mount_to(el, move || {
+                        view! { <PortfolioTab portfolio=open_portfolio /> }.into_any()
+                    });
+                    study_mounts_created
+                        .borrow_mut()
+                        .insert(PORTFOLIO_PANEL_ID.to_owned(), handle);
+                }
                 PANEL_PANEL_ID => {
                     let handle =
                         mount_to(el, move || view! { <PanelTab panel=panel /> }.into_any());
@@ -2074,7 +2412,10 @@ pub fn App() -> impl IntoView {
                 // Closing a study tab unmounts it but keeps the result in the
                 // map, so reopening the same instrument is instant and does
                 // not re-run eleven backtests.
-                id if id == PANEL_PANEL_ID || id.starts_with(STUDY_PANEL_PREFIX) => {
+                id if id == PANEL_PANEL_ID
+                    || id == PORTFOLIO_PANEL_ID
+                    || id.starts_with(STUDY_PANEL_PREFIX) =>
+                {
                     study_mounts_removed.borrow_mut().remove(id);
                 }
                 _ => {}

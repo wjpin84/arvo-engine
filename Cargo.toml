@@ -6,6 +6,7 @@ members = [
     "crates/arvo-research",
     "crates/arvo-plugin-host",
     "crates/arvo-nautilus",
+    "crates/arvo-portfolio",
     "crates/arvo-editor",
     "crates/arvo-runtime",
     "plugins/stub",
@@ -23,6 +24,7 @@ license = "Apache-2.0"
 arvo-core = { path = "crates/arvo-core" }
 arvo-data = { path = "crates/arvo-data" }
 arvo-nautilus = { path = "crates/arvo-nautilus" }
+arvo-portfolio = { path = "crates/arvo-portfolio" }
 arvo-research = { path = "crates/arvo-research" }
 arvo-plugin-host = { path = "crates/arvo-plugin-host" }
 
