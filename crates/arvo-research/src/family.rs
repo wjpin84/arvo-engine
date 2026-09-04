@@ -32,6 +32,7 @@ use crate::{
 
 /// Fraction of the window used to choose a configuration. The rest is held
 /// back and not looked at until the choice is made.
+/// Also used by [`crate::panel`], which splits its window the same way.
 pub const DEFAULT_IN_SAMPLE_FRACTION: f64 = 0.7;
 
 /// A set of parameter values to sweep.

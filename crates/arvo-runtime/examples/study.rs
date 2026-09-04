@@ -34,6 +34,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let simulation = NautilusSimulation::new(CsvBars::new(&root));
     let criteria = EvaluationCriteria::default();
 
+    run_panel_over(&bars, &simulation, &instruments, &criteria)?;
+
     for instrument in instruments {
         println!("\n=== {instrument} ===");
         let Some((from, to)) = bars.coverage(&instrument)? else {
@@ -100,5 +102,87 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    Ok(())
+}
+
+/// The panel: one configuration chosen across every instrument, judged on all
+/// of them. This is the run that can actually reach a verdict, so it goes
+/// first.
+fn run_panel_over(
+    bars: &CsvBars,
+    simulation: &NautilusSimulation<CsvBars>,
+    instruments: &[String],
+    criteria: &EvaluationCriteria,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // The overlap, not the union: instruments judged on different periods are
+    // not a cross-section.
+    let mut from = chrono::NaiveDate::MIN;
+    let mut to = chrono::NaiveDate::MAX;
+    let mut hasher = blake3::Hasher::new();
+    let mut usable = Vec::new();
+
+    for instrument in instruments {
+        let Some((first, last)) = bars.coverage(instrument)? else {
+            continue;
+        };
+        from = from.max(first);
+        to = to.min(last);
+        if let Some(fingerprint) = bars.fingerprint(instrument)? {
+            hasher.update(fingerprint.as_bytes());
+        }
+        usable.push(instrument.clone());
+    }
+    if usable.is_empty() {
+        return Ok(());
+    }
+
+    let window = DateRange::new(from, to)?;
+    let dataset = hasher.finalize().to_hex().to_string();
+    println!("\n=== PANEL: {} instruments ===", usable.len());
+    println!("  {} .. {}  dataset {}", from, to, &dataset[..16]);
+
+    let study = arvo_runtime_lib::research::panel_for(usable, window, &dataset);
+    match arvo_research::run_panel(simulation, &study, criteria) {
+        Err(err) => println!("  FAILED: {err}"),
+        Ok(found) => {
+            println!("  verdict: {:?}", found.verdict);
+            println!(
+                "  chose on {}..{}, judged on {}..{}",
+                found.in_sample.from,
+                found.in_sample.to,
+                found.out_of_sample.from,
+                found.out_of_sample.to
+            );
+            println!(
+                "  one configuration for the panel: {:?} (pooled in-sample Sharpe {:.2} vs {:?})",
+                found.selected_params,
+                found.selection.best_sharpe,
+                found
+                    .selection
+                    .expected_best_under_null
+                    .map(|v| format!("{v:.2}"))
+            );
+            println!(
+                "  pooled: {} trades, mean excess {:+.2}%, beat benchmark on {}/{}",
+                found.pooled.total_trades,
+                found.pooled.mean_excess_return * 100.0,
+                found.pooled.beat_benchmark,
+                found.pooled.instruments
+            );
+            for outcome in &found.per_instrument {
+                println!(
+                    "    {:<12} strategy {:+7.2}%  benchmark {:+7.2}%  excess {:+7.2}%  {} trades",
+                    outcome.instrument,
+                    outcome.strategy.total_return * 100.0,
+                    outcome.benchmark.total_return * 100.0,
+                    outcome.excess_return * 100.0,
+                    outcome.strategy.trades
+                );
+            }
+            for reason in &found.reasons {
+                println!("  - {reason}");
+            }
+        }
+    }
     Ok(())
 }

@@ -213,12 +213,7 @@ pub async fn run_study(
         let evaluation = &found.out_of_sample_evidence.evaluation;
         Ok(StudyView {
             instrument,
-            verdict: match found.verdict {
-                Verdict::Supported => "Supported",
-                Verdict::NotSupported => "Not supported",
-                Verdict::Inconclusive => "Inconclusive",
-            }
-            .to_owned(),
+            verdict: verdict_label(found.verdict).to_owned(),
             reasons: found.reasons.clone(),
             trials: found.selection.trials,
             best_sharpe: found.selection.best_sharpe,
@@ -247,24 +242,199 @@ pub async fn run_study(
     .map_err(|err| CommandError::Failed(format!("the study did not finish: {err}")))?
 }
 
-/// The study the workbench runs: a moving-average grid over the instrument's
-/// whole history.
+/// One instrument's out-of-sample outcome under the panel's configuration.
+#[derive(Serialize)]
+pub struct OutcomeView {
+    pub instrument: String,
+    pub strategy_return: f64,
+    pub benchmark_return: f64,
+    pub excess_return: f64,
+    pub max_drawdown: f64,
+    pub trades: u32,
+}
+
+/// A panel study, flattened for display.
+#[derive(Serialize)]
+pub struct PanelView {
+    pub verdict: String,
+    pub reasons: Vec<String>,
+
+    pub instruments: usize,
+    pub total_trades: u32,
+    pub mean_excess_return: f64,
+    pub beat_benchmark: usize,
+    pub mean_max_drawdown: f64,
+    pub worst_max_drawdown: f64,
+
+    pub trials: usize,
+    pub best_sharpe: f64,
+    pub expected_best_under_null: Option<f64>,
+    pub survived_deflation: bool,
+
+    pub in_sample: String,
+    pub out_of_sample: String,
+    pub selected_params: Vec<(String, f64)>,
+    pub per_instrument: Vec<OutcomeView>,
+    pub failures: Vec<String>,
+
+    pub dataset_version: String,
+    pub strategy_name: String,
+    pub starting_cash: f64,
+    pub commission_bps: f64,
+    pub engine: String,
+}
+
+/// Runs one configuration across every instrument that has data.
 ///
-/// Public so the `study` example can run exactly what the view runs. A second
-/// definition of "the study" that drifted from this one would make headless
-/// verification worthless.
+/// This is the study that can actually reach a verdict: a single instrument
+/// produces a dozen or two round trips against a thirty-trade bar, and no
+/// amount of history fixes that. Pooling across instruments does.
+#[tauri::command]
+pub async fn run_panel(
+    service: tauri::State<'_, ResearchService>,
+) -> Result<PanelView, CommandError> {
+    let ids = service
+        .bars
+        .instruments()
+        .map_err(|err| CommandError::Failed(err.to_string()))?;
+
+    // The overlap of what every instrument covers, not the union: instruments
+    // judged over different periods are not a cross-section, and a mean across
+    // them would compare different markets.
+    let mut from = chrono::NaiveDate::MIN;
+    let mut to = chrono::NaiveDate::MAX;
+    let mut hasher = blake3::Hasher::new();
+    let mut instruments = Vec::new();
+
+    for id in ids {
+        let Ok(Some((first, last))) = service.bars.coverage(&id) else {
+            continue;
+        };
+        // The panel's dataset identity is every member's identity combined, so
+        // editing any one file marks the whole panel result stale.
+        if let Ok(Some(fingerprint)) = service.bars.fingerprint(&id) {
+            hasher.update(fingerprint.as_bytes());
+        }
+        from = from.max(first);
+        to = to.min(last);
+        instruments.push(id);
+    }
+
+    if instruments.is_empty() {
+        return Err(CommandError::Failed(
+            "no instruments with usable data".to_owned(),
+        ));
+    }
+
+    let dataset = hasher.finalize().to_hex().to_string();
+    let simulation = service.simulation.clone();
+    let engine = simulation.engine().to_owned();
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let window =
+            DateRange::new(from, to).map_err(|err| CommandError::Failed(err.to_string()))?;
+        let study = panel_for(instruments, window, &dataset);
+
+        let found = arvo_research::run_panel(
+            simulation.as_ref(),
+            &study,
+            &arvo_research::EvaluationCriteria::default(),
+        )
+        .map_err(|err| CommandError::Failed(err.to_string()))?;
+
+        Ok(PanelView {
+            verdict: verdict_label(found.verdict).to_owned(),
+            reasons: found.reasons.clone(),
+            instruments: found.pooled.instruments,
+            total_trades: found.pooled.total_trades,
+            mean_excess_return: found.pooled.mean_excess_return,
+            beat_benchmark: found.pooled.beat_benchmark,
+            mean_max_drawdown: found.pooled.mean_max_drawdown,
+            worst_max_drawdown: found.pooled.worst_max_drawdown,
+            trials: found.selection.trials,
+            best_sharpe: found.selection.best_sharpe,
+            expected_best_under_null: found.selection.expected_best_under_null,
+            survived_deflation: found.selection.survived_deflation,
+            in_sample: format!("{} → {}", found.in_sample.from, found.in_sample.to),
+            out_of_sample: format!("{} → {}", found.out_of_sample.from, found.out_of_sample.to),
+            selected_params: found
+                .selected_params
+                .iter()
+                .map(|(name, value)| (name.clone(), *value))
+                .collect(),
+            per_instrument: found
+                .per_instrument
+                .iter()
+                .map(|outcome| OutcomeView {
+                    instrument: outcome.instrument.clone(),
+                    strategy_return: outcome.strategy.total_return,
+                    benchmark_return: outcome.benchmark.total_return,
+                    excess_return: outcome.excess_return,
+                    max_drawdown: outcome.strategy.max_drawdown,
+                    trades: outcome.strategy.trades,
+                })
+                .collect(),
+            failures: found.failures.clone(),
+            dataset_version: dataset,
+            strategy_name: STRATEGY.to_owned(),
+            starting_cash: STARTING_CASH,
+            commission_bps: COMMISSION_BPS,
+            engine,
+        })
+    })
+    .await
+    .map_err(|err| CommandError::Failed(format!("the panel did not finish: {err}")))?
+}
+
+const fn verdict_label(verdict: Verdict) -> &'static str {
+    match verdict {
+        Verdict::Supported => "Supported",
+        Verdict::NotSupported => "Not supported",
+        Verdict::Inconclusive => "Inconclusive",
+    }
+}
+
+/// The panel the workbench runs: the same grid, one configuration chosen
+/// across every instrument that has data.
 ///
-/// The grid is fixed at nine configurations. That number is itself part of the
-/// claim — [`arvo_research::run_family`] deflates the result by it — so it is
-/// written here in the open rather than tuned per run.
-pub fn study_for(instrument: &str, window: DateRange, dataset_version: &str) -> ExperimentFamily {
-    let template = Experiment {
-        id: ExperimentId(format!("study-{instrument}")),
-        hypothesis: HypothesisId(format!("trend-following predicts returns in {instrument}")),
-        instrument: instrument.to_owned(),
+/// The window is the *intersection* of what the instruments cover. Running
+/// each over its own span would mean the panel's instruments were judged on
+/// different market conditions, and a mean across those is not a
+/// cross-sectional result.
+#[must_use]
+pub fn panel_for(
+    instruments: Vec<String>,
+    window: DateRange,
+    dataset_version: &str,
+) -> arvo_research::PanelStudy {
+    let template = template_for("panel", window, dataset_version);
+    arvo_research::PanelStudy::new(template, instruments, grid())
+}
+
+/// The grid both the single-instrument study and the panel sweep.
+///
+/// One definition, because the trial count is deflated against and two
+/// definitions that drifted apart would make one of the two verdicts a lie.
+fn grid() -> ParameterGrid {
+    // Sized so the study can actually reach a conclusion. The first version of
+    // this grid ran out to a 200-day average, which crosses roughly ten times
+    // in twenty years of held-back data — against a 30-trade minimum, that
+    // made every possible verdict Inconclusive before the return and drawdown
+    // checks were even reached. A bar that nothing can clear is not
+    // conservative, it is inert.
+    ParameterGrid::new()
+        .axis("fast", vec![5.0, 10.0, 20.0])
+        .axis("slow", vec![30.0, 60.0, 120.0])
+}
+
+fn template_for(subject: &str, window: DateRange, dataset_version: &str) -> Experiment {
+    Experiment {
+        id: ExperimentId(format!("study-{subject}")),
+        hypothesis: HypothesisId(format!("trend-following predicts returns in {subject}")),
+        instrument: subject.to_owned(),
         window,
         dataset: DatasetRef {
-            id: instrument.to_owned(),
+            id: subject.to_owned(),
             // A content hash of the bars, so a stored result knows exactly
             // which data produced it. This used to be the fixed string
             // "local-csv", which meant editing a CSV left every earlier result
@@ -283,24 +453,21 @@ pub fn study_for(instrument: &str, window: DateRange, dataset_version: &str) -> 
         },
         starting_cash: STARTING_CASH,
         seed: 1,
-    };
+    }
+}
 
-    ExperimentFamily::new(
-        template,
-        // Sized so the study can actually reach a conclusion. The first
-        // version of this grid ran out to a 200-day average, which crosses
-        // roughly ten times in twenty years of held-back data — against a
-        // 30-trade minimum, that made every possible verdict Inconclusive
-        // before the return and drawdown checks were even reached. A bar that
-        // nothing can clear is not conservative, it is inert.
-        //
-        // The honest reading of that: slow trend following cannot be
-        // validated on one instrument's history at all. It needs breadth
-        // across many instruments, which the machinery does not do yet.
-        ParameterGrid::new()
-            .axis("fast", vec![5.0, 10.0, 20.0])
-            .axis("slow", vec![30.0, 60.0, 120.0]),
-    )
+/// The study the workbench runs: a moving-average grid over the instrument's
+/// whole history.
+///
+/// Public so the `study` example can run exactly what the view runs. A second
+/// definition of "the study" that drifted from this one would make headless
+/// verification worthless.
+///
+/// The grid is fixed at nine configurations. That number is itself part of the
+/// claim — [`arvo_research::run_family`] deflates the result by it — so it is
+/// written here in the open rather than tuned per run.
+pub fn study_for(instrument: &str, window: DateRange, dataset_version: &str) -> ExperimentFamily {
+    ExperimentFamily::new(template_for(instrument, window, dataset_version), grid())
 }
 
 #[cfg(test)]

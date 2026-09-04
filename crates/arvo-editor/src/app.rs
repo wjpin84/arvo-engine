@@ -171,6 +171,43 @@ struct StudyView {
     engine: String,
 }
 
+#[derive(Clone, Deserialize)]
+struct OutcomeView {
+    instrument: String,
+    strategy_return: f64,
+    benchmark_return: f64,
+    excess_return: f64,
+    max_drawdown: f64,
+    trades: u32,
+}
+
+/// Mirrors `arvo_runtime::research::PanelView`.
+#[derive(Clone, Deserialize)]
+struct PanelView {
+    verdict: String,
+    reasons: Vec<String>,
+    instruments: usize,
+    total_trades: u32,
+    mean_excess_return: f64,
+    beat_benchmark: usize,
+    mean_max_drawdown: f64,
+    worst_max_drawdown: f64,
+    trials: usize,
+    best_sharpe: f64,
+    expected_best_under_null: Option<f64>,
+    survived_deflation: bool,
+    in_sample: String,
+    out_of_sample: String,
+    selected_params: Vec<(String, f64)>,
+    per_instrument: Vec<OutcomeView>,
+    failures: Vec<String>,
+    dataset_version: String,
+    strategy_name: String,
+    starting_cash: f64,
+    commission_bps: f64,
+    engine: String,
+}
+
 fn percent(value: f64) -> String {
     format!("{:+.2}%", value * 100.0)
 }
@@ -412,9 +449,15 @@ fn ExtensionsView(
 fn ResearchView(
     studies: ReadSignal<std::collections::HashMap<String, StudyView>>,
     set_studies: WriteSignal<std::collections::HashMap<String, StudyView>>,
+    panel: ReadSignal<Option<PanelView>>,
+    set_panel: WriteSignal<Option<PanelView>>,
 ) -> impl IntoView {
     let (library, set_library) = signal(None::<DataLibraryView>);
-    let (running, set_running) = signal(false);
+    // What is running, not merely that something is. A panel is a few dozen
+    // backtests and takes tens of seconds in a debug build; a bare spinner for
+    // that long is indistinguishable from a hang, which this codebase has
+    // already been bitten by once.
+    let (running, set_running) = signal(None::<String>);
     let (error, set_error) = signal(None::<String>);
 
     spawn_local(async move {
@@ -425,7 +468,7 @@ fn ResearchView(
     });
 
     let run = move |instrument: String| {
-        set_running.set(true);
+        set_running.set(Some(format!("Running study on {instrument}: 11 backtests")));
         set_error.set(None);
         // No clearing of previous results: open tabs stay open, which is the
         // point of having them.
@@ -449,13 +492,56 @@ fn ResearchView(
                 // future above, leaving the spinner up and nothing logged.
                 Err(reason) => set_error.set(Some(reason)),
             }
-            set_running.set(false);
+            set_running.set(None);
+        });
+    };
+
+    let run_panel = move |_| {
+        let count = library.with_untracked(|library| {
+            library.as_ref().map_or(0, |library| {
+                library.instruments.iter().filter(|i| i.bars > 0).count()
+            })
+        });
+        // 9 configurations in-sample on every instrument, then the winner and
+        // its benchmark out-of-sample on each: 11 runs per instrument.
+        set_running.set(Some(format!(
+            "Running panel: {count} instruments, {} backtests",
+            count * 11
+        )));
+        set_error.set(None);
+        spawn_local(async move {
+            match call_typed::<PanelView>("run_panel", JsValue::UNDEFINED).await {
+                Ok(result) => {
+                    set_panel.set(Some(result));
+                    open_study_panel(PANEL_PANEL_ID, "Panel");
+                }
+                Err(reason) => set_error.set(Some(reason)),
+            }
+            set_running.set(None);
         });
     };
 
     view! {
         <div class="sidebar-view">
             <h3>"Research"</h3>
+
+            // The panel is the run that can actually conclude something: one
+            // instrument yields a dozen round trips against a thirty-trade
+            // bar, and no amount of history fixes that.
+            <button
+                class="research-panel-run"
+                title="Choose one configuration across every instrument, then judge it on data it                        has not seen"
+                disabled=move || running.get().is_some()
+                on:click=run_panel
+            >
+                {move || {
+                    if panel.get().is_some() {
+                        "Re-run panel across all instruments"
+                    } else {
+                        "Run panel across all instruments"
+                    }
+                }}
+            </button>
 
             {move || match library.get() {
                 None => view! { <p class="sidebar-empty">"Looking for data…"</p> }.into_any(),
@@ -541,7 +627,7 @@ fn ResearchView(
                                                         "Run a study"
                                                     }
                                                 }
-                                                disabled=move || running.get() || !runnable
+                                                disabled=move || running.get().is_some() || !runnable
                                                 on:click={
                                                     let id = id.clone();
                                                     move |_| {
@@ -595,7 +681,7 @@ fn ResearchView(
                                                             <button
                                                                 class="research-rerun"
                                                                 title="Run again"
-                                                                disabled=move || running.get()
+                                                                disabled=move || running.get().is_some()
                                                                 on:click=move |_| run(id.clone())
                                                             >
                                                                 "\u{21bb}"
@@ -614,7 +700,7 @@ fn ResearchView(
             }}
 
             {move || {
-                running.get().then(|| view! { <p class="sidebar-empty">"Running study…"</p> })
+                running.get().map(|what| view! { <p class="research-running">{what}</p> })
             }}
 
             {move || error.get().map(|message| view! { <p class="research-error">{message}</p> })}
@@ -622,6 +708,17 @@ fn ResearchView(
         </div>
     }
 }
+
+fn verdict_class(verdict: &str) -> &'static str {
+    match verdict {
+        "Supported" => "research-verdict supported",
+        "Not supported" => "research-verdict refuted",
+        _ => "research-verdict inconclusive",
+    }
+}
+
+/// The panel's own tab. One at a time — there is only one panel.
+const PANEL_PANEL_ID: &str = "panel";
 
 /// Dockview panel ids for study tabs are this plus the instrument.
 const STUDY_PANEL_PREFIX: &str = "study:";
@@ -649,14 +746,168 @@ fn StudyTab(
     }
 }
 
+/// The panel tab's content, read back out of the signal so a re-run refreshes
+/// the tab that is already open.
+#[component]
+fn PanelTab(panel: ReadSignal<Option<PanelView>>) -> impl IntoView {
+    view! {
+        <div class="study-panel">
+            {move || panel.get().map(|panel| view! { <PanelReport panel=panel /> })}
+        </div>
+    }
+}
+
+/// A panel study: one configuration, many instruments, and what the spread
+/// across them says that any single one could not.
+#[component]
+fn PanelReport(panel: PanelView) -> impl IntoView {
+    let verdict_class = verdict_class(&panel.verdict);
+    let params = panel
+        .selected_params
+        .iter()
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let deflation = panel.expected_best_under_null.map_or_else(
+        || "not applicable: every configuration scored alike".to_owned(),
+        |bar| {
+            format!(
+                "best pooled in-sample Sharpe {:.2} against {bar:.2} expected from {} no-skill \
+                 trials",
+                panel.best_sharpe, panel.trials
+            )
+        },
+    );
+    let deflation_class = if panel.survived_deflation {
+        ""
+    } else {
+        "research-flag"
+    };
+    let consistency = format!(
+        "{} of {} instruments beat their own benchmark",
+        panel.beat_benchmark, panel.instruments
+    );
+    let consistent = panel.instruments > 0 && panel.beat_benchmark * 2 > panel.instruments;
+
+    view! {
+        <div class="research-report">
+            <div class=verdict_class>{panel.verdict.clone()}</div>
+            <p class="research-subject">
+                {format!("Panel of {} instruments", panel.instruments)}
+            </p>
+
+            <ul class="research-reasons">
+                {panel.reasons.iter().map(|r| view! { <li>{r.clone()}</li> }).collect_view()}
+            </ul>
+
+            <h4>"Pooled out of sample"</h4>
+            <table class="research-metrics">
+                <tbody>
+                    <tr>
+                        <td>"Mean excess return"</td>
+                        <td>{percent(panel.mean_excess_return)}</td>
+                    </tr>
+                    <tr>
+                        <td>"Consistency"</td>
+                        <td class=if consistent { "" } else { "research-flag" }>{consistency}</td>
+                    </tr>
+                    <tr>
+                        <td>"Trades (pooled)"</td>
+                        <td>{panel.total_trades}</td>
+                    </tr>
+                    <tr>
+                        <td>"Mean drawdown"</td>
+                        <td>{percent(panel.mean_max_drawdown)}</td>
+                    </tr>
+                    <tr>
+                        <td>"Worst drawdown"</td>
+                        <td>{percent(panel.worst_max_drawdown)}</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <h4>"Per instrument"</h4>
+            <table class="research-metrics">
+                <thead>
+                    <tr>
+                        <th>"Instrument"</th>
+                        <th>"Strategy"</th>
+                        <th>"Buy and hold"</th>
+                        <th>"Excess"</th>
+                        <th>"Drawdown"</th>
+                        <th>"Trades"</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {panel
+                        .per_instrument
+                        .iter()
+                        .map(|outcome| {
+                            let beat = outcome.excess_return > 0.0;
+                            view! {
+                                <tr>
+                                    <td>{outcome.instrument.clone()}</td>
+                                    <td>{percent(outcome.strategy_return)}</td>
+                                    <td>{percent(outcome.benchmark_return)}</td>
+                                    <td class=if beat { "" } else { "research-flag" }>
+                                        {percent(outcome.excess_return)}
+                                    </td>
+                                    <td>{percent(outcome.max_drawdown)}</td>
+                                    <td>{outcome.trades}</td>
+                                </tr>
+                            }
+                        })
+                        .collect_view()}
+                </tbody>
+            </table>
+
+            <h4>"How this was arrived at"</h4>
+            <dl class="research-provenance">
+                <dt>"Chosen on"</dt>
+                <dd>{panel.in_sample.clone()}</dd>
+                <dt>"Judged on"</dt>
+                <dd>{panel.out_of_sample.clone()}</dd>
+                <dt>"Configurations tried"</dt>
+                <dd>{panel.trials}</dd>
+                <dt>"Multiple-testing check"</dt>
+                <dd class=deflation_class>{deflation}</dd>
+                <dt>"One configuration for all"</dt>
+                <dd>{params}</dd>
+                <dt>"Dataset"</dt>
+                <dd class="research-hash">{short_hash(&panel.dataset_version)}</dd>
+                <dt>"Strategy"</dt>
+                <dd>{panel.strategy_name.clone()}</dd>
+                <dt>"Starting cash"</dt>
+                <dd>{format!("{:.0} per instrument", panel.starting_cash)}</dd>
+                <dt>"Commission"</dt>
+                <dd>{format!("{} bps, slippage not modelled", panel.commission_bps)}</dd>
+                <dt>"Engine"</dt>
+                <dd>{panel.engine.clone()}</dd>
+            </dl>
+
+            {(!panel.failures.is_empty())
+                .then(|| {
+                    view! {
+                        <div>
+                            <h4>"Runs that did not complete"</h4>
+                            <ul class="research-reasons">
+                                {panel
+                                    .failures
+                                    .iter()
+                                    .map(|f| view! { <li>{f.clone()}</li> })
+                                    .collect_view()}
+                            </ul>
+                        </div>
+                    }
+                })}
+        </div>
+    }
+}
+
 /// One study, rendered with its caveats attached rather than beside it.
 #[component]
 fn StudyReport(study: StudyView) -> impl IntoView {
-    let verdict_class = match study.verdict.as_str() {
-        "Supported" => "research-verdict supported",
-        "Not supported" => "research-verdict refuted",
-        _ => "research-verdict inconclusive",
-    };
+    let verdict_class = verdict_class(&study.verdict);
 
     let params = study
         .selected_params
@@ -809,6 +1060,8 @@ fn SidebarPanel(
     set_theme: WriteSignal<Theme>,
     studies: ReadSignal<std::collections::HashMap<String, StudyView>>,
     set_studies: WriteSignal<std::collections::HashMap<String, StudyView>>,
+    panel: ReadSignal<Option<PanelView>>,
+    set_panel: WriteSignal<Option<PanelView>>,
 ) -> impl IntoView {
     view! {
         // Needs a real height: .sidebar-view inside it is `height: 100%`,
@@ -818,7 +1071,15 @@ fn SidebarPanel(
         <div class="sidebar-panel-root">
             {move || match active_view.get() {
                 Some(ActivityView::Research) => {
-                    view! { <ResearchView studies=studies set_studies=set_studies /> }.into_any()
+                    view! {
+                        <ResearchView
+                            studies=studies
+                            set_studies=set_studies
+                            panel=panel
+                            set_panel=set_panel
+                        />
+                    }
+                        .into_any()
                 }
                 Some(ActivityView::Extensions) => {
                     view! { <ExtensionsView plugins=plugins set_plugins=set_plugins /> }
@@ -1327,6 +1588,9 @@ pub fn App() -> impl IntoView {
     // already open refreshes rather than duplicating, and so a panel can find
     // its own study when dockview mounts it.
     let (studies, set_studies) = signal(std::collections::HashMap::<String, StudyView>::new());
+    // One panel at a time: there is only one panel, and re-running it should
+    // replace what the tab shows rather than accumulate tabs.
+    let (panel, set_panel) = signal(None::<PanelView>);
 
     Effect::new(move |_| {
         spawn_local(async move {
@@ -1386,6 +1650,8 @@ pub fn App() -> impl IntoView {
                                 set_theme=set_theme
                                 studies=studies
                                 set_studies=set_studies
+                                panel=panel
+                                set_panel=set_panel
                             />
                         }
                     });
@@ -1398,10 +1664,19 @@ pub fn App() -> impl IntoView {
                     let handle = mount_to(el, || view! { <BottomPanel /> });
                     *bottom_mount_created.borrow_mut() = Some(handle);
                 }
+                // `into_any` on both: a study tab and the panel tab are
+                // different opaque view types, and one map has to hold both.
+                PANEL_PANEL_ID => {
+                    let handle =
+                        mount_to(el, move || view! { <PanelTab panel=panel /> }.into_any());
+                    study_mounts_created
+                        .borrow_mut()
+                        .insert(PANEL_PANEL_ID.to_owned(), handle);
+                }
                 id if id.starts_with(STUDY_PANEL_PREFIX) => {
                     let instrument = id[STUDY_PANEL_PREFIX.len()..].to_owned();
                     let handle = mount_to(el, move || {
-                        view! { <StudyTab instrument=instrument studies=studies /> }
+                        view! { <StudyTab instrument=instrument studies=studies /> }.into_any()
                     });
                     study_mounts_created
                         .borrow_mut()
@@ -1423,7 +1698,7 @@ pub fn App() -> impl IntoView {
                 // Closing a study tab unmounts it but keeps the result in the
                 // map, so reopening the same instrument is instant and does
                 // not re-run eleven backtests.
-                id if id.starts_with(STUDY_PANEL_PREFIX) => {
+                id if id == PANEL_PANEL_ID || id.starts_with(STUDY_PANEL_PREFIX) => {
                     study_mounts_removed.borrow_mut().remove(id);
                 }
                 _ => {}

@@ -154,7 +154,8 @@ pub fn run() {
             commands::list_plugins,
             commands::refresh_plugins,
             research::list_instruments,
-            research::run_study
+            research::run_study,
+            research::run_panel
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

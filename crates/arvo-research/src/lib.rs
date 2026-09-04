@@ -26,11 +26,13 @@
 
 pub mod evaluation;
 pub mod family;
+pub mod panel;
 
 pub use evaluation::{
     evaluate_against_benchmark, Evaluation, EvaluationCriteria, Evidence, Metrics, Verdict,
 };
 pub use family::{run_family, ExperimentFamily, FamilyEvidence, ParameterGrid, Selection};
+pub use panel::{run_panel, InstrumentOutcome, PanelEvidence, PanelStudy, PooledOutcome};
 
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
