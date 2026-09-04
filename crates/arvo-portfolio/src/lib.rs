@@ -41,8 +41,14 @@ pub struct Holding {
     pub instrument: String,
     pub quantity: f64,
     /// Total paid, not per share. Per-share cost is a division; total is what
-    /// a statement actually reports, and deriving down is safer than up.
-    pub cost_basis: f64,
+    /// a statement reports, and deriving down is safer than up.
+    ///
+    /// `None` when the source does not report one, which is normal for a
+    /// tax-deferred account: a 401(k) export often omits cost basis entirely
+    /// because no capital gain is ever realised on it. Treating that absence
+    /// as zero would report the entire balance as an unrealised gain, which
+    /// is a lie rather than an approximation.
+    pub cost_basis: Option<f64>,
     /// Price from the statement, when it carried one. `None` falls back to
     /// the last close in the data library, and failing that the holding is
     /// reported as unpriced rather than silently valued at zero.
@@ -64,10 +70,12 @@ pub struct ValuedHolding {
     pub quantity: f64,
     pub price: f64,
     pub market_value: f64,
-    pub cost_basis: f64,
-    pub unrealized: f64,
-    /// `None` when cost basis is zero — a percentage gain on nothing is not a
-    /// number, and rendering it as 0% or ∞ would both be lies.
+    /// `None` when the source did not report one.
+    pub cost_basis: Option<f64>,
+    /// `None` when there is no cost basis to compare against.
+    pub unrealized: Option<f64>,
+    /// `None` when cost basis is absent or zero — a percentage gain on
+    /// nothing is not a number, and 0% or ∞ would both be lies.
     pub unrealized_pct: Option<f64>,
     /// Share of the portfolio's total value.
     pub weight: f64,
@@ -93,9 +101,18 @@ pub struct ValuedPortfolio {
     pub name: String,
     pub as_of: NaiveDate,
     pub total_value: f64,
-    pub total_cost: f64,
-    pub unrealized: f64,
+    /// `None` unless *every* priced holding reported a cost basis.
+    ///
+    /// Summing the ones that did and ignoring the rest would produce a total
+    /// that looks complete and understates cost by however much was missing —
+    /// and nothing about the number would show it. Better to have no total
+    /// than a quietly wrong one; [`Self::without_cost_basis`] says how many
+    /// were responsible.
+    pub total_cost: Option<f64>,
+    pub unrealized: Option<f64>,
     pub unrealized_pct: Option<f64>,
+    /// How many priced holdings reported no cost basis.
+    pub without_cost_basis: usize,
     pub cash: f64,
     pub holdings: Vec<ValuedHolding>,
     /// Holdings no price could be found for. Listed rather than dropped: a
@@ -147,9 +164,11 @@ impl Portfolio {
                     price,
                     market_value,
                     cost_basis: holding.cost_basis,
-                    unrealized: market_value - holding.cost_basis,
-                    unrealized_pct: (holding.cost_basis != 0.0)
-                        .then(|| (market_value - holding.cost_basis) / holding.cost_basis),
+                    unrealized: holding.cost_basis.map(|cost| market_value - cost),
+                    unrealized_pct: holding
+                        .cost_basis
+                        .filter(|cost| *cost != 0.0)
+                        .map(|cost| (market_value - cost) / cost),
                     weight: 0.0,
                     priced_by: source,
                 },
@@ -158,7 +177,13 @@ impl Portfolio {
         }
 
         let total_value: f64 = priced.iter().map(|(h, ())| h.market_value).sum();
-        let total_cost: f64 = priced.iter().map(|(h, ())| h.cost_basis).sum();
+        let without_cost_basis = priced
+            .iter()
+            .filter(|(h, ())| h.cost_basis.is_none())
+            .count();
+        // All or nothing, deliberately — see the field docs.
+        let total_cost: Option<f64> = (without_cost_basis == 0)
+            .then(|| priced.iter().filter_map(|(h, ())| h.cost_basis).sum());
 
         let mut holdings: Vec<ValuedHolding> = priced
             .into_iter()
@@ -181,8 +206,11 @@ impl Portfolio {
             as_of: self.as_of,
             total_value,
             total_cost,
-            unrealized: total_value - total_cost,
-            unrealized_pct: (total_cost != 0.0).then(|| (total_value - total_cost) / total_cost),
+            unrealized: total_cost.map(|cost| total_value - cost),
+            unrealized_pct: total_cost
+                .filter(|cost| *cost != 0.0)
+                .map(|cost| (total_value - cost) / cost),
+            without_cost_basis,
             cash,
             holdings,
             unpriced,
@@ -202,7 +230,7 @@ mod tests {
         Holding {
             instrument: instrument.to_owned(),
             quantity,
-            cost_basis: cost,
+            cost_basis: Some(cost),
             price,
         }
     }
@@ -224,7 +252,7 @@ mod tests {
         assert_eq!(valued.holdings[0].priced_by, PriceSource::Statement);
         assert!((valued.total_value - 1500.0).abs() < 1e-9);
         assert!(
-            (valued.unrealized - 600.0).abs() < 1e-9,
+            (valued.unrealized.expect("cost was reported") - 600.0).abs() < 1e-9,
             "the statement is closer to the truth than a daily close"
         );
     }
@@ -281,7 +309,7 @@ mod tests {
         let valued =
             portfolio(vec![holding("GIFT.X", 10.0, 0.0, Some(5.0))]).value(&BTreeMap::new());
 
-        assert!((valued.holdings[0].unrealized - 50.0).abs() < 1e-9);
+        assert!((valued.holdings[0].unrealized.expect("cost known") - 50.0).abs() < 1e-9);
         assert_eq!(
             valued.holdings[0].unrealized_pct, None,
             "a percentage gain on nothing is not a number"
@@ -290,10 +318,40 @@ mod tests {
     }
 
     #[test]
+    fn one_holding_with_no_cost_basis_withholds_the_whole_total() {
+        // The 401(k) case: a tax-deferred account often reports no cost basis
+        // at all. Summing the holdings that do report one would give a total
+        // that looks complete and understates cost, with nothing to show it.
+        let valued = portfolio(vec![
+            holding("A.X", 10.0, 500.0, Some(100.0)),
+            Holding {
+                instrument: "B.X".to_owned(),
+                quantity: 10.0,
+                cost_basis: None,
+                price: Some(50.0),
+            },
+        ])
+        .value(&BTreeMap::new());
+
+        assert!(
+            (valued.total_value - 1500.0).abs() < 1e-9,
+            "value is still known"
+        );
+        assert_eq!(valued.total_cost, None, "cost is not");
+        assert_eq!(valued.unrealized, None);
+        assert_eq!(valued.without_cost_basis, 1, "and it says how many");
+    }
+
+    #[test]
     fn an_empty_portfolio_values_to_nothing_without_dividing_by_zero() {
         let valued = portfolio(Vec::new()).value(&BTreeMap::new());
         assert!((valued.total_value - 0.0).abs() < f64::EPSILON);
         assert_eq!(valued.unrealized_pct, None);
         assert!(valued.holdings.is_empty());
+        assert_eq!(
+            valued.total_cost,
+            Some(0.0),
+            "nothing missing a cost basis, so the total is known and zero"
+        );
     }
 }

@@ -239,11 +239,20 @@ struct HoldingView {
     quantity: f64,
     price: f64,
     market_value: f64,
-    cost_basis: f64,
-    unrealized: f64,
+    cost_basis: Option<f64>,
+    unrealized: Option<f64>,
     unrealized_pct: Option<f64>,
     weight: f64,
     priced_by: String,
+}
+
+#[derive(Clone, Deserialize)]
+struct ImportView {
+    columns: Vec<(String, String)>,
+    ignored: Vec<String>,
+    rows_imported: usize,
+    rows_skipped: Vec<String>,
+    cost_basis_derived: bool,
 }
 
 #[derive(Clone, Deserialize)]
@@ -251,12 +260,14 @@ struct PortfolioView {
     name: String,
     as_of: String,
     total_value: f64,
-    total_cost: f64,
-    unrealized: f64,
+    total_cost: Option<f64>,
+    unrealized: Option<f64>,
     unrealized_pct: Option<f64>,
+    without_cost_basis: usize,
     cash: f64,
     holdings: Vec<HoldingView>,
     unpriced: Vec<String>,
+    import: ImportView,
 }
 
 #[derive(Clone, Deserialize)]
@@ -1510,15 +1521,18 @@ fn PortfolioSidebar(
                                         money(portfolio.total_value),
                                         portfolio.holdings.len(),
                                     );
+                                    // A 401(k) usually reports no cost basis,
+                                    // so there may be no gain to show at all.
                                     let gain = portfolio.unrealized;
-                                    // Hoisted: the view macro wants a value or
-                                    // a closure in an attribute, not a bare
-                                    // `if` expression.
-                                    let gain_class = if gain >= 0.0 {
-                                        "portfolio-delta up"
-                                    } else {
-                                        "portfolio-delta down"
+                                    let gain_class = match gain {
+                                        Some(gain) if gain < 0.0 => "portfolio-delta down",
+                                        Some(_) => "portfolio-delta up",
+                                        None => "portfolio-delta",
                                     };
+                                    let gain_text = gain.map_or_else(
+                                        || "cost basis not reported".to_owned(),
+                                        money,
+                                    );
                                     view! {
                                         <li>
                                             <button
@@ -1535,7 +1549,7 @@ fn PortfolioSidebar(
                                                 <span class="research-instrument-meta">
                                                     {summary}
                                                 </span>
-                                                <span class=gain_class>{money(gain)}</span>
+                                                <span class=gain_class>{gain_text}</span>
                                             </button>
                                         </li>
                                     }
@@ -1566,6 +1580,32 @@ fn PortfolioTab(portfolio: ReadSignal<Option<PortfolioView>>) -> impl IntoView {
 #[component]
 fn PortfolioReport(portfolio: PortfolioView) -> impl IntoView {
     let invested = portfolio.total_value - portfolio.cash;
+    // Hoisted out of the view: the macro wants a value or a closure in an
+    // attribute, never a bare `if`.
+    let unrealized_value = portfolio.unrealized.map_or_else(|| "—".to_owned(), money);
+    let unrealized_note = portfolio.unrealized_pct.map_or_else(
+        || {
+            format!(
+                "no cost basis on {} holding(s)",
+                portfolio.without_cost_basis
+            )
+        },
+        percent,
+    );
+    let cost_value = portfolio.total_cost.map_or_else(|| "—".to_owned(), money);
+    let cost_note = if portfolio.without_cost_basis > 0 {
+        "not reported by the source".to_owned()
+    } else {
+        String::new()
+    };
+    let cash_note = if portfolio.total_value == 0.0 {
+        String::new()
+    } else {
+        format!(
+            "{} of total",
+            percent(portfolio.cash / portfolio.total_value)
+        )
+    };
     view! {
         <div class="research-report">
             <p class="research-subject">{portfolio.name.clone()}</p>
@@ -1577,21 +1617,15 @@ fn PortfolioReport(portfolio: PortfolioView) -> impl IntoView {
                 <MetricCard label="Total value" value=money(portfolio.total_value) />
                 <MetricCard
                     label="Unrealised"
-                    value=money(portfolio.unrealized)
-                    tone=portfolio.unrealized
-                    note=portfolio
-                        .unrealized_pct
-                        .map_or_else(|| "no cost basis".to_owned(), percent)
+                    value=unrealized_value
+                    tone=portfolio.unrealized.unwrap_or(0.0)
+                    note=unrealized_note
                 />
-                <MetricCard label="Cost basis" value=money(portfolio.total_cost) />
+                <MetricCard label="Cost basis" value=cost_value note=cost_note />
                 <MetricCard
                     label="Cash"
                     value=money(portfolio.cash)
-                    note=if portfolio.total_value == 0.0 {
-                        String::new()
-                    } else {
-                        format!("{} of total", percent(portfolio.cash / portfolio.total_value))
-                    }
+                    note=cash_note
                 />
                 <MetricCard label="Invested" value=money(invested) />
                 <MetricCard
@@ -1638,30 +1672,32 @@ fn PortfolioReport(portfolio: PortfolioView) -> impl IntoView {
                         .holdings
                         .iter()
                         .map(|holding| {
-                            let gain_class = if holding.unrealized >= 0.0 {
-                                "gain-up"
-                            } else {
-                                "gain-down"
+                            let gain_class = match holding.unrealized {
+                                Some(gain) if gain < 0.0 => "gain-down",
+                                Some(_) => "gain-up",
+                                None => "",
                             };
+                            let gain_text = match holding.unrealized {
+                                None => "—".to_owned(),
+                                Some(gain) => format!(
+                                    "{} {}",
+                                    money(gain),
+                                    holding
+                                        .unrealized_pct
+                                        .map_or_else(String::new, |pct| format!("({})", percent(pct))),
+                                ),
+                            };
+                            let cost_text = holding
+                                .cost_basis
+                                .map_or_else(|| "—".to_owned(), money);
                             view! {
                                 <tr>
                                     <td>{holding.instrument.clone()}</td>
                                     <td>{format!("{:.4}", holding.quantity)}</td>
                                     <td>{money(holding.price)}</td>
                                     <td>{money(holding.market_value)}</td>
-                                    <td>{money(holding.cost_basis)}</td>
-                                    <td class=gain_class>
-                                        {format!(
-                                            "{} {}",
-                                            money(holding.unrealized),
-                                            holding
-                                                .unrealized_pct
-                                                .map_or_else(String::new, |pct| format!(
-                                                    "({})",
-                                                    percent(pct),
-                                                )),
-                                        )}
-                                    </td>
+                                    <td>{cost_text}</td>
+                                    <td class=gain_class>{gain_text}</td>
                                     <td class="priced-by">{holding.priced_by.clone()}</td>
                                 </tr>
                             }
@@ -1669,6 +1705,67 @@ fn PortfolioReport(portfolio: PortfolioView) -> impl IntoView {
                         .collect_view()}
                 </tbody>
             </table>
+
+            <h4>"How this file was read"</h4>
+            <p class="research-hint">
+                "Column names vary by broker, so they are matched by name and the mapping is \
+                 shown here. A wrong guess produces a portfolio that looks entirely plausible; \
+                 this is what makes it visible."
+            </p>
+            <dl class="research-provenance">
+                {portfolio
+                    .import
+                    .columns
+                    .iter()
+                    .map(|(role, column)| {
+                        view! {
+                            <dt>{role.clone()}</dt>
+                            <dd class="research-hash">{column.clone()}</dd>
+                        }
+                    })
+                    .collect_view()}
+                <dt>"Rows imported"</dt>
+                <dd>{portfolio.import.rows_imported}</dd>
+            </dl>
+            {portfolio
+                .import
+                .cost_basis_derived
+                .then(|| {
+                    view! {
+                        <p class="research-stale">
+                            "Cost basis was multiplied up from a per-share column. Check one \
+                             holding against your statement before trusting the totals."
+                        </p>
+                    }
+                })}
+            {(!portfolio.import.ignored.is_empty())
+                .then({
+                    let ignored = portfolio.import.ignored.join(", ");
+                    move || {
+                        view! {
+                            <p class="research-hint">{format!("Columns not used: {ignored}")}</p>
+                        }
+                    }
+                })}
+            {(!portfolio.import.rows_skipped.is_empty())
+                .then({
+                    let skipped = portfolio.import.rows_skipped.clone();
+                    move || {
+                        view! {
+                            <div>
+                                <p class="research-hint">
+                                    "Lines that were not holdings — usually a disclaimer footer:"
+                                </p>
+                                <ul class="research-reasons">
+                                    {skipped
+                                        .iter()
+                                        .map(|line| view! { <li>{line.clone()}</li> })
+                                        .collect_view()}
+                                </ul>
+                            </div>
+                        }
+                    }
+                })}
 
             {(!portfolio.unpriced.is_empty())
                 .then({

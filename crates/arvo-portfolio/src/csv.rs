@@ -1,41 +1,41 @@
-//! Holdings read from a file you export yourself.
+//! Reading a holdings export, whoever produced it.
 //!
-//! # The format
+//! Brokers all export the same handful of facts under different column names:
+//! Fidelity writes `Current Value`, someone else writes `Market Value`, a
+//! 401(k) platform writes `Ending Market Value`. Rather than one hardcoded
+//! schema per broker — each of which has to be guessed at, and silently
+//! breaks when the broker changes a header — this maps columns **by name**
+//! against a list of known aliases and then **reports what it did**.
 //!
-//! One CSV per portfolio, named after it, with the header:
+//! That report is the important part. An importer that guesses wrong produces
+//! a portfolio that looks entirely plausible and is wrong, and no number in it
+//! shows the mistake. This one states which column it used for each role, so a
+//! bad mapping is visible immediately rather than after a decision is made on
+//! it.
 //!
-//! ```text
-//! instrument,quantity,cost_basis,price
-//! AAPL.NASDAQ,25,4210.50,191.24
-//! MSFT.NASDAQ,10,3105.00,
-//! CASH,1832.44,1832.44,
-//! ```
+//! # What it needs
 //!
-//! * `instrument` — the same identifier the data library uses, so a holding
-//!   and its price history are one instrument rather than two things that
-//!   look alike. `CASH` is reserved and worth its face value.
-//! * `cost_basis` — **total** paid, not per share. That is what a brokerage
-//!   statement reports, and dividing down is safer than multiplying up.
-//! * `price` — optional. Blank falls back to the last close in the data
-//!   library, and a holding with neither is reported as unpriced rather than
-//!   quietly valued at zero.
+//! An instrument (a symbol, or failing that a description), a quantity, and
+//! either a price or a value. Everything else is optional:
 //!
-//! # Why an export rather than a broker connection
+//! * **Cost basis** may be total or per-share. Total wins; per-share is
+//!   multiplied by quantity and the report says so. Absent entirely is fine
+//!   and normal for a 401(k) — see [`crate::Holding::cost_basis`].
+//! * **Account** splits one file into several portfolios, which is how
+//!   brokers that export every account at once are handled.
 //!
-//! This is deliberately the boring path, and it is not a placeholder. It
-//! needs no credentials, breaks no terms of service, and cannot get an
-//! account locked. Robinhood in particular retired its public API, so every
-//! library that talks to it drives the private mobile API with full account
-//! credentials — the opposite of the scoped, capability-gated access this
-//! platform is supposed to use.
+//! # What it refuses
 //!
-//! A sanctioned read-only connector slots in beside this reader when there is
-//! one. The domain, the valuation and the view above them do not change.
+//! A file whose header carries no recognisable instrument or quantity column.
+//! Refusing is deliberate: the alternative is importing something whose shape
+//! was misunderstood.
 //!
-//! **This is not any particular broker's export format.** It is Arvo's. A
-//! mapping from a real statement is a separate, small job best done with an
-//! actual file in hand rather than guessed at.
+//! Rows that do not parse are skipped and listed, rather than failing the
+//! file — broker exports routinely end with disclaimer paragraphs, and losing
+//! a whole portfolio to a legal footer would be absurd. A row that looks like
+//! data and fails is still reported.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use chrono::NaiveDate;
@@ -50,15 +50,91 @@ pub enum CsvError {
         #[source]
         source: std::io::Error,
     },
-    #[error("{path} line {line}: {reason}")]
-    Malformed {
-        path: PathBuf,
-        line: usize,
-        reason: String,
-    },
+    #[error("{path}: no header row with a recognisable instrument and quantity column")]
+    Unrecognised { path: PathBuf },
 }
 
-/// A directory of holdings files, one portfolio each.
+/// How a file was read, so a wrong mapping is visible rather than silent.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ImportReport {
+    /// Role → the column heading actually used for it.
+    pub columns: Vec<(String, String)>,
+    /// Headings that were present and not used for anything.
+    pub ignored: Vec<String>,
+    pub rows_imported: usize,
+    /// Rows that looked like data and could not be read, with the reason.
+    /// Disclaimer text at the foot of a file lands here and is harmless.
+    pub rows_skipped: Vec<String>,
+    /// True when cost basis came from a per-share column multiplied by
+    /// quantity rather than from a reported total.
+    pub cost_basis_derived: bool,
+}
+
+/// A portfolio and the story of how it was read.
+#[derive(Debug, Clone)]
+pub struct Imported {
+    pub portfolio: Portfolio,
+    pub report: ImportReport,
+}
+
+/// Column aliases, lowercased. Order matters: earlier is preferred.
+mod roles {
+    pub const INSTRUMENT: &[&str] = &["instrument", "symbol", "ticker", "security id"];
+    pub const DESCRIPTION: &[&str] = &[
+        "description",
+        "security description",
+        "investment",
+        "fund name",
+        "name",
+        "security name",
+    ];
+    pub const QUANTITY: &[&str] = &[
+        "quantity",
+        "shares",
+        "qty",
+        "share quantity",
+        "number of shares",
+        "units",
+    ];
+    pub const PRICE: &[&str] = &[
+        "price",
+        "last price",
+        "current price",
+        "share price",
+        "closing price",
+        "nav",
+        "unit price",
+    ];
+    pub const VALUE: &[&str] = &[
+        "current value",
+        "market value",
+        "value",
+        "ending market value",
+        "total value",
+        "balance",
+    ];
+    pub const COST_TOTAL: &[&str] = &[
+        "cost basis total",
+        "total cost basis",
+        "cost basis",
+        "total cost",
+    ];
+    pub const COST_PER_SHARE: &[&str] = &[
+        "average cost basis",
+        "avg cost basis",
+        "average cost",
+        "cost per share",
+    ];
+    pub const ACCOUNT: &[&str] = &[
+        "account number",
+        "account name",
+        "account",
+        "plan",
+        "plan name",
+    ];
+}
+
+/// A directory of holdings files.
 #[derive(Debug, Clone)]
 pub struct CsvHoldings {
     root: PathBuf,
@@ -70,21 +146,18 @@ impl CsvHoldings {
         Self { root: root.into() }
     }
 
-    /// Every portfolio in the directory, by file name.
+    /// Every portfolio in the directory.
     ///
-    /// `as_of` is supplied rather than read from the file: a holdings export
-    /// is a snapshot and the file does not reliably say when it was taken.
-    /// The caller knows better — the file's modification time, or today.
+    /// `as_of` is supplied rather than read from the file: an export is a
+    /// snapshot and rarely says when it was taken. The caller knows better.
     ///
     /// A missing directory is an empty library, not an error.
     ///
     /// # Errors
     ///
-    /// Returns [`CsvError`] if the directory cannot be listed, or if any file
-    /// in it cannot be read or parsed. One bad file fails the load loudly
-    /// rather than silently returning a short list — a portfolio that is
-    /// quietly missing a position is worse than one that refuses to load.
-    pub fn portfolios(&self, as_of: NaiveDate) -> Result<Vec<Portfolio>, CsvError> {
+    /// Returns [`CsvError`] if the directory cannot be listed, or if a file
+    /// cannot be read or has no recognisable header.
+    pub fn portfolios(&self, as_of: NaiveDate) -> Result<Vec<Imported>, CsvError> {
         let entries = match std::fs::read_dir(&self.root) {
             Ok(entries) => entries,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -106,98 +179,330 @@ impl CsvHoldings {
             .collect();
         paths.sort();
 
-        paths
-            .iter()
-            .map(|path| read_portfolio(path, as_of))
-            .collect()
+        let mut imported = Vec::new();
+        for path in &paths {
+            imported.extend(read_file(path, as_of)?);
+        }
+        Ok(imported)
     }
 }
 
-fn read_portfolio(path: &Path, as_of: NaiveDate) -> Result<Portfolio, CsvError> {
+/// Splits a CSV line, respecting quotes.
+///
+/// Not optional, and not premature. Fund names carry commas —
+/// `"VANGUARD TARGET RETIREMENT 2050 FUND, INVESTOR SHARES"` is one field,
+/// and splitting it naively shifts every later column left by one. The
+/// quantity column then holds text, every row is skipped, and the portfolio
+/// disappears with no error at all. Verified before this was written: a bare
+/// `split(',')` lost the whole file in silence.
+///
+/// Handles the doubled-quote escape (`""`) because that is how a quote inside
+/// a quoted field is written.
+fn split(line: &str) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    let mut chars = line.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        match c {
+            '"' if quoted && chars.peek() == Some(&'"') => {
+                current.push('"');
+                chars.next();
+            }
+            '"' => quoted = !quoted,
+            ',' if !quoted => {
+                fields.push(current.trim().to_owned());
+                current = String::new();
+            }
+            _ => current.push(c),
+        }
+    }
+    fields.push(current.trim().to_owned());
+    fields
+}
+
+/// Normalises a heading for matching: lowercase, and underscores treated as
+/// spaces so `cost_basis` and `Cost Basis` are the same column.
+fn normalise(column: &str) -> String {
+    column
+        .to_ascii_lowercase()
+        .replace(['_', '-'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Finds a column whose heading matches one of `aliases`, ignoring any
+/// column already claimed by another role.
+///
+/// `exclude` is not housekeeping, it is correctness. A fuzzy search for
+/// "cost basis" happily matches "Average Cost Basis", and using a per-share
+/// figure as a total understates cost by the share count while every number
+/// downstream still looks entirely reasonable. Claiming the more specific
+/// role first and excluding it here is what stops that.
+fn find_excluding(header: &[String], aliases: &[&str], exclude: &[usize]) -> Option<usize> {
+    let normalised: Vec<String> = header.iter().map(|column| normalise(column)).collect();
+    let free = |index: &usize| !exclude.contains(index);
+
+    // Exact first, across all aliases, so a precise heading is never lost to
+    // a loose match on a different column.
+    for alias in aliases {
+        if let Some(index) = normalised
+            .iter()
+            .position(|column| column == alias)
+            .filter(free)
+        {
+            return Some(index);
+        }
+    }
+    for alias in aliases {
+        if let Some(index) = normalised
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| free(index))
+            .find(|(_, column)| column.contains(alias))
+            .map(|(index, _)| index)
+        {
+            return Some(index);
+        }
+    }
+    None
+}
+
+fn find(header: &[String], aliases: &[&str]) -> Option<usize> {
+    find_excluding(header, aliases, &[])
+}
+
+struct Mapping {
+    instrument: Option<usize>,
+    description: Option<usize>,
+    quantity: usize,
+    price: Option<usize>,
+    value: Option<usize>,
+    cost_total: Option<usize>,
+    cost_per_share: Option<usize>,
+    account: Option<usize>,
+}
+
+fn map_header(header: &[String]) -> Option<Mapping> {
+    let instrument = find(header, roles::INSTRUMENT);
+    let description = find(header, roles::DESCRIPTION);
+    let quantity = find(header, roles::QUANTITY)?;
+    let price = find(header, roles::PRICE);
+    let value = find(header, roles::VALUE);
+
+    // Something to name the holding, and something to size it by.
+    if instrument.is_none() && description.is_none() {
+        return None;
+    }
+    if price.is_none() && value.is_none() {
+        return None;
+    }
+
+    // Per-share is resolved first and then excluded from the total search:
+    // it is the more specific heading, and letting the looser pattern claim
+    // it is the silent-wrongness case described on `find_excluding`.
+    let cost_per_share = find(header, roles::COST_PER_SHARE);
+    let claimed: Vec<usize> = cost_per_share.into_iter().collect();
+
+    Some(Mapping {
+        instrument,
+        description,
+        quantity,
+        price,
+        value,
+        cost_total: find_excluding(header, roles::COST_TOTAL, &claimed),
+        cost_per_share,
+        account: find(header, roles::ACCOUNT),
+    })
+}
+
+/// Parses a money-ish field: `$1,234.56`, `(12.00)` for negative, `--` and
+/// `n/a` for absent. Brokers write all of these.
+fn number(raw: &str) -> Option<f64> {
+    let cleaned = raw.trim();
+    if cleaned.is_empty()
+        || cleaned.eq_ignore_ascii_case("n/a")
+        || cleaned.eq_ignore_ascii_case("na")
+        || cleaned == "--"
+        || cleaned == "-"
+    {
+        return None;
+    }
+
+    let negative = cleaned.starts_with('(') && cleaned.ends_with(')');
+    let stripped: String = cleaned
+        .trim_matches(|c| c == '(' || c == ')')
+        .chars()
+        .filter(|c| c.is_ascii_digit() || *c == '.' || *c == '-' || *c == '+')
+        .collect();
+
+    let value: f64 = stripped.parse().ok()?;
+    if !value.is_finite() {
+        return None;
+    }
+    Some(if negative { -value.abs() } else { value })
+}
+
+fn read_file(path: &Path, as_of: NaiveDate) -> Result<Vec<Imported>, CsvError> {
     let text = std::fs::read_to_string(path).map_err(|source| CsvError::Io {
         path: path.to_path_buf(),
         source,
     })?;
 
-    let name = path
+    // The header is not always the first line: exports often open with a
+    // title or a blank. Take the first line that maps.
+    let lines: Vec<&str> = text.lines().collect();
+    let (header_at, header, mapping) = lines
+        .iter()
+        .enumerate()
+        .find_map(|(index, line)| {
+            let columns = split(line);
+            map_header(&columns).map(|mapping| (index, columns, mapping))
+        })
+        .ok_or_else(|| CsvError::Unrecognised {
+            path: path.to_path_buf(),
+        })?;
+
+    let mut report = ImportReport::default();
+    let mut used = Vec::new();
+    let mut note = |role: &str, index: Option<usize>, report: &mut ImportReport| {
+        if let Some(index) = index {
+            if let Some(name) = header.get(index) {
+                report.columns.push((role.to_owned(), name.clone()));
+                used.push(index);
+            }
+        }
+    };
+    note("instrument", mapping.instrument, &mut report);
+    note("description", mapping.description, &mut report);
+    note("quantity", Some(mapping.quantity), &mut report);
+    note("price", mapping.price, &mut report);
+    note("value", mapping.value, &mut report);
+    note("cost basis (total)", mapping.cost_total, &mut report);
+    if mapping.cost_total.is_none() {
+        note(
+            "cost basis (per share)",
+            mapping.cost_per_share,
+            &mut report,
+        );
+        report.cost_basis_derived = mapping.cost_per_share.is_some();
+    }
+    note("account", mapping.account, &mut report);
+
+    report.ignored = header
+        .iter()
+        .enumerate()
+        .filter(|(index, name)| !used.contains(index) && !name.is_empty())
+        .map(|(_, name)| name.clone())
+        .collect();
+
+    // Grouped by account when the file names one, so a single export
+    // containing several accounts becomes several portfolios.
+    let stem = path
         .file_stem()
         .and_then(|stem| stem.to_str())
         .unwrap_or("portfolio")
         .to_owned();
+    let mut grouped: BTreeMap<String, Vec<Holding>> = BTreeMap::new();
 
-    let mut holdings = Vec::new();
-    for (index, line) in text.lines().enumerate() {
+    for (offset, line) in lines.iter().enumerate().skip(header_at + 1) {
         let line = line.trim();
-        if line.is_empty() || (index == 0 && line.to_ascii_lowercase().starts_with("instrument")) {
+        if line.is_empty() {
             continue;
         }
-        holdings.push(parse_row(path, index + 1, line)?);
+        let fields = split(line);
+
+        match holding_from(&fields, &mapping) {
+            Some(holding) => {
+                let account = mapping
+                    .account
+                    .and_then(|index| fields.get(index))
+                    .filter(|value| !value.is_empty())
+                    .map_or_else(|| stem.clone(), |value| format!("{stem} · {value}"));
+                grouped.entry(account).or_default().push(holding);
+                report.rows_imported += 1;
+            }
+            None => report
+                .rows_skipped
+                .push(format!("line {}: {line}", offset + 1)),
+        }
     }
 
-    Ok(Portfolio {
-        name,
-        as_of,
-        holdings,
-    })
+    if grouped.is_empty() {
+        // The header was understood but nothing in the file survived parsing.
+        // Returning an empty list here would make the file disappear without
+        // a word; an empty portfolio carrying the report at least says that
+        // it was read and that every row was rejected, and why.
+        return Ok(vec![Imported {
+            portfolio: Portfolio {
+                name: stem,
+                as_of,
+                holdings: Vec::new(),
+            },
+            report,
+        }]);
+    }
+
+    Ok(grouped
+        .into_iter()
+        .map(|(name, holdings)| Imported {
+            portfolio: Portfolio {
+                name,
+                as_of,
+                holdings,
+            },
+            report: report.clone(),
+        })
+        .collect())
 }
 
-/// ponytail: split on commas, no quoting. A holdings export is symbols and
-/// numbers; swap in the `csv` crate the day a broker ships a quoted field.
-fn parse_row(path: &Path, line_no: usize, line: &str) -> Result<Holding, CsvError> {
-    let malformed = |reason: String| CsvError::Malformed {
-        path: path.to_path_buf(),
-        line: line_no,
-        reason,
+fn holding_from(fields: &[String], mapping: &Mapping) -> Option<Holding> {
+    let text = |index: Option<usize>| {
+        index
+            .and_then(|index| fields.get(index))
+            .map(String::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
     };
 
-    let mut fields = line.split(',').map(str::trim);
-    let instrument = fields
-        .next()
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| malformed("missing instrument".to_owned()))?
+    let instrument = text(mapping.instrument)
+        .or_else(|| text(mapping.description))?
         .to_owned();
 
-    let mut number = |name: &str, required: bool| -> Result<Option<f64>, CsvError> {
-        let raw = fields.next().unwrap_or("");
-        if raw.is_empty() {
-            return if required {
-                Err(malformed(format!("missing {name}")))
-            } else {
-                Ok(None)
-            };
-        }
-        // Statements like to write 1,234.56 and $1,234.56. The comma is
-        // already gone by the time we get here (it was the delimiter), so a
-        // thousands separator would have silently split the field — hence
-        // rejecting anything that does not parse rather than salvaging it.
-        let cleaned = raw.trim_start_matches('$');
-        let value: f64 = cleaned
-            .parse()
-            .map_err(|err| malformed(format!("{name} {raw:?}: {err}")))?;
-        if !value.is_finite() {
-            return Err(malformed(format!("{name} {raw:?} is not finite")));
-        }
-        Ok(Some(value))
-    };
-
-    let quantity = number("quantity", true)?.unwrap_or_default();
-    let cost_basis = number("cost_basis", true)?.unwrap_or_default();
-    let price = number("price", false)?;
-
+    let quantity = number(fields.get(mapping.quantity)?)?;
     if quantity < 0.0 {
-        return Err(malformed(format!(
-            "quantity {quantity} is negative; short positions are not modelled"
-        )));
-    }
-    if price.is_some_and(|price| price < 0.0) {
-        return Err(malformed("price is negative".to_owned()));
+        return None;
     }
 
-    Ok(Holding {
+    let price = mapping.price.and_then(|index| number(fields.get(index)?));
+    let value = mapping.value.and_then(|index| number(fields.get(index)?));
+
+    // Whichever is present; if both, price wins and value is a cross-check we
+    // do not currently make. A value with no price is divided out, which is
+    // how a fund position with only a balance is handled.
+    let price = match (price, value) {
+        (Some(price), _) => Some(price),
+        (None, Some(value)) if quantity != 0.0 => Some(value / quantity),
+        _ => None,
+    }?;
+
+    let cost_basis = mapping
+        .cost_total
+        .and_then(|index| number(fields.get(index)?))
+        .or_else(|| {
+            mapping
+                .cost_per_share
+                .and_then(|index| number(fields.get(index)?))
+                .map(|per_share| per_share * quantity)
+        });
+
+    Some(Holding {
         instrument,
         quantity,
         cost_basis,
-        price,
+        price: Some(price),
     })
 }
 
@@ -209,94 +514,195 @@ mod tests {
         NaiveDate::from_ymd_opt(2026, 9, 4).expect("valid")
     }
 
-    fn write(dir: &Path, name: &str, body: &str) {
-        std::fs::write(dir.join(name), body).expect("fixture should write");
+    fn load(body: &str) -> Vec<Imported> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("export.csv"), body).expect("fixture writes");
+        CsvHoldings::new(dir.path())
+            .portfolios(as_of())
+            .expect("should read")
     }
 
     #[test]
-    fn a_holdings_file_reads_into_a_named_portfolio() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        write(
-            dir.path(),
-            "brokerage.csv",
+    fn the_native_format_still_reads() {
+        let imported = load(
             "instrument,quantity,cost_basis,price\n\
-             AAPL.NASDAQ,25,4210.50,191.24\n\
-             MSFT.NASDAQ,10,3105.00,\n\
-             CASH,1832.44,1832.44,\n",
+             AAPL.NASDAQ,25,4210.50,191.24\n",
         );
-
-        let portfolios = CsvHoldings::new(dir.path())
-            .portfolios(as_of())
-            .expect("should read");
-
-        assert_eq!(portfolios.len(), 1);
-        assert_eq!(portfolios[0].name, "brokerage", "named after the file");
-        assert_eq!(portfolios[0].holdings.len(), 3);
-        assert_eq!(portfolios[0].holdings[0].price, Some(191.24));
-        assert_eq!(
-            portfolios[0].holdings[1].price, None,
-            "a blank price falls back to the data library later"
-        );
+        let holding = &imported[0].portfolio.holdings[0];
+        assert_eq!(holding.instrument, "AAPL.NASDAQ");
+        assert_eq!(holding.cost_basis, Some(4210.50));
+        assert_eq!(holding.price, Some(191.24));
     }
 
     #[test]
-    fn a_dollar_sign_is_tolerated_because_statements_write_them() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        write(
-            dir.path(),
-            "p.csv",
-            "instrument,quantity,cost_basis,price\nA.X,2,$100.00,$60.00\n",
+    fn a_brokerage_style_export_maps_by_column_name() {
+        let imported = load(
+            "Account Number,Symbol,Description,Quantity,Last Price,Current Value,Cost Basis Total\n\
+             X123,AAPL,APPLE INC,25,$191.24,\"$4,781.00\",$4210.50\n",
         );
+        let report = &imported[0].report;
 
-        let portfolios = CsvHoldings::new(dir.path())
-            .portfolios(as_of())
-            .expect("should read");
-        assert_eq!(portfolios[0].holdings[0].price, Some(60.0));
-    }
-
-    #[test]
-    fn a_bad_row_fails_the_load_and_names_the_line() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        write(
-            dir.path(),
-            "p.csv",
-            "instrument,quantity,cost_basis,price\n\
-             A.X,2,100.00,60.00\n\
-             B.X,notanumber,50,\n",
-        );
-
-        let err = CsvHoldings::new(dir.path())
-            .portfolios(as_of())
-            .expect_err("should refuse");
-        match err {
-            CsvError::Malformed { line, .. } => assert_eq!(line, 3),
-            other => panic!("expected a malformed row, got {other}"),
-        }
-    }
-
-    #[test]
-    fn a_short_position_is_refused_rather_than_mis_valued() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        write(
-            dir.path(),
-            "p.csv",
-            "instrument,quantity,cost_basis,price\nA.X,-5,100,20\n",
-        );
-
-        let err = CsvHoldings::new(dir.path())
-            .portfolios(as_of())
-            .expect_err("should refuse");
         assert!(
-            matches!(err, CsvError::Malformed { ref reason, .. } if reason.contains("negative")),
-            "{err}"
+            report
+                .columns
+                .contains(&("instrument".to_owned(), "Symbol".to_owned())),
+            "{:?}",
+            report.columns
+        );
+        assert!(report
+            .columns
+            .contains(&("price".to_owned(), "Last Price".to_owned())));
+        assert!(!report.cost_basis_derived, "a total was reported directly");
+        assert_eq!(imported[0].portfolio.holdings[0].price, Some(191.24));
+    }
+
+    #[test]
+    fn a_per_share_cost_is_multiplied_up_and_the_report_says_so() {
+        // The mistake that would otherwise be invisible: average cost read as
+        // if it were the total understates cost by the share count, and every
+        // number downstream still looks reasonable.
+        let imported = load(
+            "Symbol,Quantity,Last Price,Average Cost Basis\n\
+             AAPL,10,200.00,150.00\n",
+        );
+        assert_eq!(
+            imported[0].portfolio.holdings[0].cost_basis,
+            Some(1500.0),
+            "10 shares at 150 average is 1500 total, not 150"
+        );
+        assert!(imported[0].report.cost_basis_derived);
+    }
+
+    #[test]
+    fn a_total_cost_column_beats_a_per_share_one_when_both_exist() {
+        let imported = load(
+            "Symbol,Quantity,Last Price,Cost Basis Total,Average Cost Basis\n\
+             AAPL,10,200.00,1234.00,150.00\n",
+        );
+        assert_eq!(imported[0].portfolio.holdings[0].cost_basis, Some(1234.0));
+        assert!(!imported[0].report.cost_basis_derived);
+    }
+
+    #[test]
+    fn a_retirement_export_with_no_cost_basis_imports_without_inventing_one() {
+        let imported = load(
+            "Investment,Shares,Share Price,Ending Market Value\n\
+             FIDELITY 500 INDEX,120.5,180.22,21716.51\n",
+        );
+        let holding = &imported[0].portfolio.holdings[0];
+        assert_eq!(holding.instrument, "FIDELITY 500 INDEX");
+        assert_eq!(holding.cost_basis, None, "absent is absent, not zero");
+        assert_eq!(holding.price, Some(180.22));
+    }
+
+    #[test]
+    fn a_value_column_with_no_price_is_divided_out() {
+        let imported = load("Investment,Units,Balance\nTARGET 2050,100,25000\n");
+        assert_eq!(imported[0].portfolio.holdings[0].price, Some(250.0));
+    }
+
+    #[test]
+    fn several_accounts_in_one_file_become_several_portfolios() {
+        let imported = load(
+            "Account Number,Symbol,Quantity,Last Price\n\
+             X1,AAPL,10,100\n\
+             X2,MSFT,5,200\n\
+             X1,TSLA,2,300\n",
+        );
+        assert_eq!(imported.len(), 2, "two accounts, two portfolios");
+        assert_eq!(imported[0].portfolio.holdings.len(), 2, "X1 holds two");
+        assert!(imported[0].portfolio.name.contains("X1"));
+    }
+
+    #[test]
+    fn a_disclaimer_footer_does_not_cost_the_whole_file() {
+        let imported = load(
+            "Symbol,Quantity,Last Price\n\
+             AAPL,10,100\n\
+             \n\
+             \"Brokerage services provided by Example LLC. Past performance is no guarantee.\"\n",
+        );
+        assert_eq!(imported[0].portfolio.holdings.len(), 1);
+        assert_eq!(
+            imported[0].report.rows_skipped.len(),
+            1,
+            "and the skipped line is still reported, not hidden"
         );
     }
 
     #[test]
-    fn an_absent_directory_is_an_empty_library_not_a_failure() {
-        assert!(CsvHoldings::new("/no/such/place")
+    fn a_quoted_field_may_contain_commas() {
+        // Fund names do this constantly. A naive split shifts every later
+        // column left by one, the quantity becomes text, every row is
+        // skipped, and the whole portfolio silently disappears.
+        let imported = load(
+            "Investment,Shares,Share Price,Ending Market Value
+             \"VANGUARD TARGET RETIREMENT 2050 FUND, INVESTOR SHARES\",100,25.00,2500.00
+",
+        );
+        let holding = &imported[0].portfolio.holdings[0];
+        assert_eq!(
+            holding.instrument,
+            "VANGUARD TARGET RETIREMENT 2050 FUND, INVESTOR SHARES"
+        );
+        assert_eq!(holding.quantity, 100.0);
+        assert_eq!(holding.price, Some(25.0));
+    }
+
+    #[test]
+    fn a_doubled_quote_is_an_escaped_quote() {
+        let fields = split("a,\"say \"\"hi\"\" now\",c");
+        assert_eq!(fields, vec!["a", "say \"hi\" now", "c"]);
+    }
+
+    #[test]
+    fn a_file_where_every_row_fails_still_reports_itself() {
+        // Otherwise the file vanishes from the list with no explanation, which
+        // is indistinguishable from never having added it.
+        let imported = load(
+            "Symbol,Quantity,Last Price
+AAPL,not-a-number,oops
+",
+        );
+        assert_eq!(imported.len(), 1);
+        assert!(imported[0].portfolio.holdings.is_empty());
+        assert_eq!(imported[0].report.rows_imported, 0);
+        assert_eq!(imported[0].report.rows_skipped.len(), 1);
+    }
+
+    #[test]
+    fn a_header_it_cannot_understand_is_refused_rather_than_guessed_at() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("x.csv"), "alpha,beta,gamma\n1,2,3\n").expect("writes");
+        let err = CsvHoldings::new(dir.path())
             .portfolios(as_of())
-            .expect("absence is not failure")
-            .is_empty());
+            .expect_err("nothing recognisable");
+        assert!(matches!(err, CsvError::Unrecognised { .. }), "{err}");
+    }
+
+    #[test]
+    fn parentheses_mean_negative_and_placeholders_mean_absent() {
+        assert_eq!(number("$1,234.56"), Some(1234.56));
+        assert_eq!(number("(12.00)"), Some(-12.0));
+        assert_eq!(number("n/a"), None);
+        assert_eq!(number("--"), None);
+        assert_eq!(number(""), None);
+    }
+
+    #[test]
+    fn unused_columns_are_listed_so_a_missed_mapping_is_visible() {
+        let imported = load(
+            "Symbol,Quantity,Last Price,Today's Gain/Loss Dollar\n\
+             AAPL,10,100,5.00\n",
+        );
+        assert!(
+            imported[0]
+                .report
+                .ignored
+                .iter()
+                .any(|name| name.contains("Gain/Loss")),
+            "{:?}",
+            imported[0].report.ignored
+        );
     }
 }

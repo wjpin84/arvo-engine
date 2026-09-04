@@ -34,13 +34,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let today = chrono::Utc::now().date_naive();
-    for portfolio in CsvHoldings::new(&portfolio_dir).portfolios(today)? {
-        let valued = portfolio.value(&closes);
+    for imported in CsvHoldings::new(&portfolio_dir).portfolios(today)? {
+        let valued = imported.portfolio.value(&closes);
         println!("\n=== {} ===", valued.name);
         println!(
-            "  value {:.2}   cost {:.2}   unrealised {:+.2}   cash {:.2}",
-            valued.total_value, valued.total_cost, valued.unrealized, valued.cash
+            "  value {:.2}   cost {}   unrealised {}   cash {:.2}",
+            valued.total_value,
+            valued
+                .total_cost
+                .map_or_else(|| "not reported".to_owned(), |cost| format!("{cost:.2}")),
+            valued
+                .unrealized
+                .map_or_else(|| "n/a".to_owned(), |gain| format!("{gain:+.2}")),
+            valued.cash
         );
+        // How the file was read, printed every time: a mis-mapped column is
+        // the failure this importer is most likely to have, and it is
+        // invisible in the numbers themselves.
+        println!("  read as:");
+        for (role, column) in &imported.report.columns {
+            println!("    {role:<22} <- {column}");
+        }
+        if imported.report.cost_basis_derived {
+            println!("    (cost basis multiplied up from a per-share column)");
+        }
+        if !imported.report.ignored.is_empty() {
+            println!("    ignored: {}", imported.report.ignored.join(", "));
+        }
+        for skipped in &imported.report.rows_skipped {
+            println!("    skipped {skipped}");
+        }
         for holding in &valued.holdings {
             println!(
                 "    {:<14} qty {:>10.2}  px {:>9.2}  value {:>11.2}  {:>5.1}%  [{}]",

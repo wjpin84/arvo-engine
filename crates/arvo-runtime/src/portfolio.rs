@@ -10,7 +10,10 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use arvo_data::{BarProvider, CsvBars};
-use arvo_portfolio::{csv::CsvHoldings, PriceSource, ValuedPortfolio};
+use arvo_portfolio::{
+    csv::{CsvHoldings, ImportReport},
+    PriceSource, ValuedPortfolio,
+};
 use serde::Serialize;
 
 use crate::commands::CommandError;
@@ -41,8 +44,8 @@ pub struct HoldingView {
     pub quantity: f64,
     pub price: f64,
     pub market_value: f64,
-    pub cost_basis: f64,
-    pub unrealized: f64,
+    pub cost_basis: Option<f64>,
+    pub unrealized: Option<f64>,
     pub unrealized_pct: Option<f64>,
     pub weight: f64,
     /// "statement", "last_close" or "face" — so a price nobody verified is
@@ -55,12 +58,29 @@ pub struct PortfolioView {
     pub name: String,
     pub as_of: String,
     pub total_value: f64,
-    pub total_cost: f64,
-    pub unrealized: f64,
+    pub total_cost: Option<f64>,
+    pub unrealized: Option<f64>,
     pub unrealized_pct: Option<f64>,
+    /// How many holdings reported no cost basis. Normal for a 401(k).
+    pub without_cost_basis: usize,
     pub cash: f64,
     pub holdings: Vec<HoldingView>,
     pub unpriced: Vec<String>,
+    /// How the file was read. Shown, not hidden: an importer that guessed a
+    /// column wrong produces a portfolio that looks entirely plausible, and
+    /// this is the only thing that would reveal it.
+    pub import: ImportView,
+}
+
+#[derive(Serialize, Clone)]
+pub struct ImportView {
+    /// Role → the column heading used for it.
+    pub columns: Vec<(String, String)>,
+    pub ignored: Vec<String>,
+    pub rows_imported: usize,
+    pub rows_skipped: Vec<String>,
+    /// Cost basis came from a per-share column multiplied by quantity.
+    pub cost_basis_derived: bool,
 }
 
 #[derive(Serialize)]
@@ -96,7 +116,7 @@ pub async fn list_portfolios(
         directory,
         portfolios: portfolios
             .iter()
-            .map(|portfolio| view_of(&portfolio.value(&closes)))
+            .map(|imported| view_of(&imported.portfolio.value(&closes), &imported.report))
             .collect(),
     })
 }
@@ -123,7 +143,7 @@ fn last_closes(bars: &CsvBars) -> BTreeMap<String, f64> {
     closes
 }
 
-fn view_of(valued: &ValuedPortfolio) -> PortfolioView {
+fn view_of(valued: &ValuedPortfolio, report: &ImportReport) -> PortfolioView {
     PortfolioView {
         name: valued.name.clone(),
         as_of: valued.as_of.to_string(),
@@ -131,6 +151,7 @@ fn view_of(valued: &ValuedPortfolio) -> PortfolioView {
         total_cost: valued.total_cost,
         unrealized: valued.unrealized,
         unrealized_pct: valued.unrealized_pct,
+        without_cost_basis: valued.without_cost_basis,
         cash: valued.cash,
         holdings: valued
             .holdings
@@ -153,5 +174,12 @@ fn view_of(valued: &ValuedPortfolio) -> PortfolioView {
             })
             .collect(),
         unpriced: valued.unpriced.clone(),
+        import: ImportView {
+            columns: report.columns.clone(),
+            ignored: report.ignored.clone(),
+            rows_imported: report.rows_imported,
+            rows_skipped: report.rows_skipped.clone(),
+            cost_basis_derived: report.cost_basis_derived,
+        },
     }
 }
