@@ -235,10 +235,14 @@ pub async fn run_study(
 /// The study the workbench runs: a moving-average grid over the instrument's
 /// whole history.
 ///
+/// Public so the `study` example can run exactly what the view runs. A second
+/// definition of "the study" that drifted from this one would make headless
+/// verification worthless.
+///
 /// The grid is fixed at nine configurations. That number is itself part of the
 /// claim — [`arvo_research::run_family`] deflates the result by it — so it is
 /// written here in the open rather than tuned per run.
-fn study_for(instrument: &str, window: DateRange) -> ExperimentFamily {
+pub fn study_for(instrument: &str, window: DateRange) -> ExperimentFamily {
     let template = Experiment {
         id: ExperimentId(format!("study-{instrument}")),
         hypothesis: HypothesisId(format!("trend-following predicts returns in {instrument}")),
@@ -268,9 +272,19 @@ fn study_for(instrument: &str, window: DateRange) -> ExperimentFamily {
 
     ExperimentFamily::new(
         template,
+        // Sized so the study can actually reach a conclusion. The first
+        // version of this grid ran out to a 200-day average, which crosses
+        // roughly ten times in twenty years of held-back data — against a
+        // 30-trade minimum, that made every possible verdict Inconclusive
+        // before the return and drawdown checks were even reached. A bar that
+        // nothing can clear is not conservative, it is inert.
+        //
+        // The honest reading of that: slow trend following cannot be
+        // validated on one instrument's history at all. It needs breadth
+        // across many instruments, which the machinery does not do yet.
         ParameterGrid::new()
             .axis("fast", vec![5.0, 10.0, 20.0])
-            .axis("slow", vec![50.0, 100.0, 200.0]),
+            .axis("slow", vec![30.0, 60.0, 120.0]),
     )
 }
 
