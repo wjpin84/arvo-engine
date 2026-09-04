@@ -33,6 +33,12 @@ extern "C" {
     #[wasm_bindgen(js_namespace = window, js_name = setSidebarVisible)]
     fn set_sidebar_visible(visible: bool);
 
+    // Opens (or focuses) a tab for one study, beside Welcome in the main
+    // group. Creating the panel synchronously drives `on_panel_created`, so
+    // the study must already be in the map before this is called.
+    #[wasm_bindgen(js_namespace = window, js_name = openStudyPanel)]
+    fn open_study_panel(id: &str, title: &str);
+
     // app-shell ticket 12 — Output moved into the View menu; same
     // add/remove-panel toggle as the sidebar's.
     #[wasm_bindgen(js_namespace = window, js_name = setOutputVisible)]
@@ -396,8 +402,7 @@ fn ExtensionsView(
 /// whole reason this platform exists is that backtests are easy to believe.
 #[component]
 fn ResearchView(
-    study: ReadSignal<Option<StudyView>>,
-    set_study: WriteSignal<Option<StudyView>>,
+    set_studies: WriteSignal<std::collections::HashMap<String, StudyView>>,
 ) -> impl IntoView {
     let (library, set_library) = signal(None::<DataLibraryView>);
     let (running, set_running) = signal(false);
@@ -413,14 +418,23 @@ fn ResearchView(
     let run = move |instrument: String| {
         set_running.set(true);
         set_error.set(None);
-        set_study.set(None);
+        // No clearing of previous results: open tabs stay open, which is the
+        // point of having them.
         spawn_local(async move {
             let args = serde_wasm_bindgen::to_value(&serde_json::json!({
                 "instrument": instrument,
             }))
             .unwrap_or(JsValue::UNDEFINED);
             match call_typed::<StudyView>("run_study", args).await {
-                Ok(result) => set_study.set(Some(result)),
+                Ok(result) => {
+                    let instrument = result.instrument.clone();
+                    // Into the map first: opening the panel mounts its
+                    // content synchronously, and that mount reads this key.
+                    set_studies.update(|studies| {
+                        studies.insert(instrument.clone(), result);
+                    });
+                    open_study_panel(&format!("{STUDY_PANEL_PREFIX}{instrument}"), &instrument);
+                }
                 // Show the backend's own words. The previous version could not
                 // even reach this branch: the rejected promise killed the
                 // future above, leaving the spinner up and nothing logged.
@@ -499,10 +513,31 @@ fn ResearchView(
 
             {move || error.get().map(|message| view! { <p class="research-error">{message}</p> })}
 
+        </div>
+    }
+}
+
+/// Dockview panel ids for study tabs are this plus the instrument.
+const STUDY_PANEL_PREFIX: &str = "study:";
+
+/// One study tab's content.
+///
+/// Reads its study back out of the shared map by key rather than capturing a
+/// value, so re-running an instrument refreshes the tab that is already open
+/// instead of leaving a stale report behind it.
+#[component]
+fn StudyTab(
+    instrument: String,
+    studies: ReadSignal<std::collections::HashMap<String, StudyView>>,
+) -> impl IntoView {
+    view! {
+        <div class="study-panel">
             {move || {
-                study
+                studies
                     .get()
-                    .map(|study| view! { <p class="research-hint">{format!("Showing {} in the main panel.", study.instrument)}</p> })
+                    .get(&instrument)
+                    .cloned()
+                    .map(|study| view! { <StudyReport study=study /> })
             }}
         </div>
     }
@@ -664,8 +699,7 @@ fn SidebarPanel(
     set_plugins: WriteSignal<Vec<PluginView>>,
     theme: ReadSignal<Theme>,
     set_theme: WriteSignal<Theme>,
-    study: ReadSignal<Option<StudyView>>,
-    set_study: WriteSignal<Option<StudyView>>,
+    set_studies: WriteSignal<std::collections::HashMap<String, StudyView>>,
 ) -> impl IntoView {
     view! {
         // Needs a real height: .sidebar-view inside it is `height: 100%`,
@@ -675,7 +709,7 @@ fn SidebarPanel(
         <div class="sidebar-panel-root">
             {move || match active_view.get() {
                 Some(ActivityView::Research) => {
-                    view! { <ResearchView study=study set_study=set_study /> }.into_any()
+                    view! { <ResearchView set_studies=set_studies /> }.into_any()
                 }
                 Some(ActivityView::Extensions) => {
                     view! { <ExtensionsView plugins=plugins set_plugins=set_plugins /> }
@@ -1138,14 +1172,9 @@ fn StatusBar(plugins: ReadSignal<Vec<PluginView>>) -> impl IntoView {
 /// is a simplified line-art take on the same logo (peak + underlying
 /// sweep), not a pixel copy of its 3D-rendered artwork.
 #[component]
-fn MainPanel(study: ReadSignal<Option<StudyView>>) -> impl IntoView {
+fn MainPanel() -> impl IntoView {
     view! {
-        {move || {
-            study
-                .get()
-                .map(|study| view! { <div class="study-panel"><StudyReport study=study /></div> })
-        }}
-        <div class="welcome" class:hidden=move || study.get().is_some()>
+        <div class="welcome">
             <svg class="welcome-mark" viewBox="0 0 100 100" aria-hidden="true">
                 <path d="M28 82 L50 16 L72 82" />
                 <path class="welcome-mark-sweep" d="M30 54 Q50 76 70 66" />
@@ -1184,10 +1213,11 @@ pub fn App() -> impl IntoView {
     // Output moved out of the default layout into the View menu.
     let (output_visible, set_output_visible) = signal(false);
     let (palette_open, set_palette_open) = signal(false);
-    // Hoisted out of ResearchView: the sidebar starts the study, the main
-    // panel shows the report. The sidebar is a picker, the way an explorer is
-    // — results belong in the space built for reading.
-    let (study, set_study) = signal(None::<StudyView>);
+    // Hoisted out of ResearchView: the sidebar starts studies, and each one
+    // gets its own tab beside Welcome. Keyed by instrument so a tab that is
+    // already open refreshes rather than duplicating, and so a panel can find
+    // its own study when dockview mounts it.
+    let (studies, set_studies) = signal(std::collections::HashMap::<String, StudyView>::new());
 
     Effect::new(move |_| {
         spawn_local(async move {
@@ -1219,6 +1249,9 @@ pub fn App() -> impl IntoView {
     // makes it toggle on and off too, instead of being a permanent panel.
     let sidebar_mount = Rc::new(RefCell::new(None));
     let bottom_mount = Rc::new(RefCell::new(None));
+    // Study tabs are closable, so their mounts need the same tracking the
+    // sidebar and output already have — keyed, since there can be several.
+    let study_mounts = Rc::new(RefCell::new(std::collections::HashMap::<String, _>::new()));
 
     // Runs once on mount; dispatches each dockview panel to its Leptos
     // component as dockview creates it. See ticket 01's Answer for why
@@ -1228,6 +1261,8 @@ pub fn App() -> impl IntoView {
         let sidebar_mount_removed = sidebar_mount.clone();
         let bottom_mount_created = bottom_mount.clone();
         let bottom_mount_removed = bottom_mount.clone();
+        let study_mounts_created = study_mounts.clone();
+        let study_mounts_removed = study_mounts.clone();
 
         let on_panel_created = Closure::<dyn FnMut(String, web_sys::HtmlElement)>::new(
             move |name: String, el: web_sys::HtmlElement| match name.as_str() {
@@ -1240,19 +1275,27 @@ pub fn App() -> impl IntoView {
                                 set_plugins=set_plugins
                                 theme=theme
                                 set_theme=set_theme
-                                study=study
-                                set_study=set_study
+                                set_studies=set_studies
                             />
                         }
                     });
                     *sidebar_mount_created.borrow_mut() = Some(handle);
                 }
                 "main" => {
-                    mount_to(el, move || view! { <MainPanel study=study /> }).forget();
+                    mount_to(el, || view! { <MainPanel /> }).forget();
                 }
                 "bottom" => {
                     let handle = mount_to(el, || view! { <BottomPanel /> });
                     *bottom_mount_created.borrow_mut() = Some(handle);
+                }
+                id if id.starts_with(STUDY_PANEL_PREFIX) => {
+                    let instrument = id[STUDY_PANEL_PREFIX.len()..].to_owned();
+                    let handle = mount_to(el, move || {
+                        view! { <StudyTab instrument=instrument studies=studies /> }
+                    });
+                    study_mounts_created
+                        .borrow_mut()
+                        .insert(id.to_owned(), handle);
                 }
                 _ => {}
             },
@@ -1266,6 +1309,12 @@ pub fn App() -> impl IntoView {
                 }
                 "bottom" => {
                     bottom_mount_removed.borrow_mut().take();
+                }
+                // Closing a study tab unmounts it but keeps the result in the
+                // map, so reopening the same instrument is instant and does
+                // not re-run eleven backtests.
+                id if id.starts_with(STUDY_PANEL_PREFIX) => {
+                    study_mounts_removed.borrow_mut().remove(id);
                 }
                 _ => {}
             }
