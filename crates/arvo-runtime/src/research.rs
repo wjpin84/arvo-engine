@@ -88,7 +88,17 @@ pub struct MetricsView {
     pub max_drawdown: f64,
     pub volatility: f64,
     pub sharpe: Option<f64>,
+    pub sortino: Option<f64>,
+    pub calmar: Option<f64>,
     pub trades: u32,
+}
+
+/// One month of the strategy's return, for the heatmap.
+#[derive(Serialize)]
+pub struct MonthlyReturnView {
+    pub year: i32,
+    pub month: u32,
+    pub value: f64,
 }
 
 impl From<&Metrics> for MetricsView {
@@ -99,6 +109,8 @@ impl From<&Metrics> for MetricsView {
             max_drawdown: metrics.max_drawdown,
             volatility: metrics.volatility,
             sharpe: metrics.sharpe,
+            sortino: metrics.sortino,
+            calmar: metrics.calmar,
             trades: metrics.trades,
         }
     }
@@ -160,6 +172,9 @@ pub struct StudyView {
     /// it all in one month, and those are different findings.
     pub strategy_curve: Vec<CurvePoint>,
     pub benchmark_curve: Vec<CurvePoint>,
+    /// Month-by-month, so a total return can be read as steady or as one
+    /// lucky quarter. Derived from the same curve, not a second measurement.
+    pub monthly: Vec<MonthlyReturnView>,
 
     // Stated assumptions, because a verdict without them is decoration.
     /// The dataset this result was produced from, as a content hash. Compared
@@ -522,6 +537,14 @@ fn study_view(found: &arvo_research::FamilyEvidence, engine: &str) -> StudyView 
         excess_return: evaluation.excess_return,
         strategy_curve: curve_points(&evaluation.strategy_curve),
         benchmark_curve: curve_points(&evaluation.benchmark_curve),
+        monthly: arvo_research::evaluation::monthly_returns(&evaluation.strategy_curve)
+            .into_iter()
+            .map(|month| MonthlyReturnView {
+                year: month.year,
+                month: month.month,
+                value: month.value,
+            })
+            .collect(),
         dataset_version: found.selected.dataset.version.clone(),
         strategy_name: found.selected.strategy.name.clone(),
         starting_cash: found.selected.starting_cash,

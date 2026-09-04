@@ -53,6 +53,18 @@ pub struct Metrics {
     /// division by zero, and reporting it as `0.0` would read like a real
     /// measurement of a flat strategy.
     pub sharpe: Option<f64>,
+    /// Like [`Self::sharpe`], but dividing by *downside* deviation only.
+    ///
+    /// Upside volatility is not risk, and a strategy punished for its good
+    /// months is being measured by the wrong instrument. `None` when nothing
+    /// ever went down — there is no downside to divide by, and 0.0 would read
+    /// as a measurement rather than an absence.
+    pub sortino: Option<f64>,
+    /// Annual return per unit of worst drawdown: how much was earned for the
+    /// worst moment it had to be held through.
+    ///
+    /// `None` when the curve never fell.
+    pub calmar: Option<f64>,
     pub trades: u32,
 }
 
@@ -107,12 +119,24 @@ impl Metrics {
             None
         };
 
+        // Downside deviation: only the periods that lost money contribute,
+        // measured against a zero target. Dividing by the count of *all*
+        // periods rather than only the losing ones is deliberate and is the
+        // standard definition — a strategy that rarely loses should score
+        // better, not have its few losses amplified.
+        let downside =
+            (returns.iter().map(|r| r.min(0.0).powi(2)).sum::<f64>() / returns.len() as f64).sqrt()
+                * periods_per_year.sqrt();
+
+        let max_drawdown = max_drawdown(curve);
         Some(Self {
             total_return,
             cagr,
-            max_drawdown: max_drawdown(curve),
+            max_drawdown,
             volatility,
             sharpe,
+            sortino: (downside > 0.0).then(|| mean * periods_per_year / downside),
+            calmar: (max_drawdown > 0.0).then(|| cagr / max_drawdown),
             trades,
         })
     }
@@ -130,6 +154,73 @@ fn max_drawdown(curve: &[EquityPoint]) -> f64 {
         }
     }
     worst
+}
+
+/// One calendar month's return.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct MonthlyReturn {
+    pub year: i32,
+    /// 1-12.
+    pub month: u32,
+    /// Fraction, not percent.
+    pub value: f64,
+}
+
+/// Breaks an equity curve into calendar-month returns.
+///
+/// A single total return hides everything about *how* it was earned. Twelve
+/// small gains and one enormous loss average out to the same number as steady
+/// mediocrity, and only one of those is a strategy anyone would hold.
+///
+/// Each month is measured from the previous month's closing equity, so the
+/// months chain: compounding them reproduces the total. The first month is
+/// measured from the curve's opening balance.
+#[must_use]
+pub fn monthly_returns(curve: &[EquityPoint]) -> Vec<MonthlyReturn> {
+    use chrono::Datelike;
+
+    let Some(first) = curve.first() else {
+        return Vec::new();
+    };
+
+    let mut months: Vec<MonthlyReturn> = Vec::new();
+    let mut previous_close = first.equity;
+    let mut current: Option<(i32, u32, f64)> = None;
+
+    for point in curve {
+        let (year, month) = (point.date.year(), point.date.month());
+        match current {
+            // Same month: this is the latest close we have seen for it.
+            Some((y, m, _)) if y == year && m == month => {
+                current = Some((year, month, point.equity));
+            }
+            // A month ended. Close it out before opening the next.
+            Some((y, m, close)) => {
+                if previous_close != 0.0 {
+                    months.push(MonthlyReturn {
+                        year: y,
+                        month: m,
+                        value: (close - previous_close) / previous_close,
+                    });
+                }
+                previous_close = close;
+                current = Some((year, month, point.equity));
+            }
+            None => current = Some((year, month, point.equity)),
+        }
+    }
+
+    if let Some((year, month, close)) = current {
+        if previous_close != 0.0 {
+            months.push(MonthlyReturn {
+                year,
+                month,
+                value: (close - previous_close) / previous_close,
+            });
+        }
+    }
+
+    months
 }
 
 /// The bar a result must clear, stated before the result is known.
@@ -354,6 +445,8 @@ mod tests {
             max_drawdown,
             volatility: 0.1,
             sharpe: Some(1.0),
+            sortino: Some(1.2),
+            calmar: Some(0.9),
             trades,
         }
     }
@@ -408,6 +501,67 @@ mod tests {
             recovered.total_return > 0.0,
             "and the run was still profitable overall"
         );
+    }
+
+    #[test]
+    fn sortino_ignores_upside_volatility_that_sharpe_punishes() {
+        // Same total gain, but one path is all upward jumps and the other
+        // gives some back. Sortino should separate them more sharply than
+        // Sharpe does, because only one of them ever actually lost money.
+        let steady = Metrics::from_curve(&curve(&[100.0, 110.0, 120.0, 130.0]), 3, 252.0)
+            .expect("four points");
+        let choppy = Metrics::from_curve(&curve(&[100.0, 130.0, 105.0, 130.0]), 3, 252.0)
+            .expect("four points");
+
+        assert_eq!(
+            steady.sortino, None,
+            "a curve that never falls has no downside to divide by"
+        );
+        assert!(
+            choppy.sortino.is_some(),
+            "one that does should have a finite Sortino"
+        );
+    }
+
+    #[test]
+    fn calmar_is_return_per_unit_of_worst_drawdown() {
+        let flat = Metrics::from_curve(&curve(&[100.0, 110.0, 120.0]), 1, 252.0).expect("three");
+        assert_eq!(flat.calmar, None, "no drawdown, no ratio");
+
+        let dipped =
+            Metrics::from_curve(&curve(&[100.0, 150.0, 75.0, 120.0]), 1, 252.0).expect("four");
+        let calmar = dipped.calmar.expect("there was a drawdown");
+        assert!(
+            (calmar - dipped.cagr / dipped.max_drawdown).abs() < 1e-12,
+            "{calmar}"
+        );
+    }
+
+    #[test]
+    fn monthly_returns_chain_so_compounding_them_gives_the_total() {
+        let start = chrono::NaiveDate::from_ymd_opt(2024, 1, 1).expect("valid");
+        let points: Vec<EquityPoint> = [(0, 100.0), (20, 110.0), (40, 121.0), (75, 108.9)]
+            .into_iter()
+            .map(|(offset, equity)| EquityPoint {
+                date: start + chrono::Duration::days(offset),
+                equity,
+            })
+            .collect();
+
+        let months = monthly_returns(&points);
+        assert_eq!(months.len(), 3, "January, February, March");
+        assert_eq!((months[0].year, months[0].month), (2024, 1));
+
+        let compounded = months.iter().fold(1.0, |acc, m| acc * (1.0 + m.value));
+        assert!(
+            (compounded - 108.9 / 100.0).abs() < 1e-9,
+            "months must chain, not each measure from the start: {compounded}"
+        );
+    }
+
+    #[test]
+    fn an_empty_curve_has_no_months() {
+        assert!(monthly_returns(&[]).is_empty());
     }
 
     #[test]

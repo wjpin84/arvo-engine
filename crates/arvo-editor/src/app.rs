@@ -135,7 +135,16 @@ struct MetricsView {
     max_drawdown: f64,
     volatility: f64,
     sharpe: Option<f64>,
+    sortino: Option<f64>,
+    calmar: Option<f64>,
     trades: u32,
+}
+
+#[derive(Clone, Deserialize)]
+struct MonthlyReturnView {
+    year: i32,
+    month: u32,
+    value: f64,
 }
 
 #[derive(Clone, Deserialize)]
@@ -172,6 +181,7 @@ struct StudyView {
     excess_return: f64,
     strategy_curve: Vec<CurvePoint>,
     benchmark_curve: Vec<CurvePoint>,
+    monthly: Vec<MonthlyReturnView>,
     dataset_version: String,
     strategy_name: String,
     starting_cash: f64,
@@ -1127,6 +1137,92 @@ fn EquityChart(strategy: Vec<CurvePoint>, benchmark: Vec<CurvePoint>) -> impl In
     }
 }
 
+/// Month-by-month returns as a grid of years against months.
+///
+/// A total return says what was earned; this says whether it arrived steadily
+/// or in one quarter that will not repeat. Cells are shaded by magnitude
+/// relative to the largest move in the table, so a quiet strategy is not
+/// rendered as a wall of colour and a violent one is not washed out.
+#[component]
+fn MonthlyReturns(months: Vec<MonthlyReturnView>) -> impl IntoView {
+    const NAMES: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+
+    let mut years: Vec<i32> = months.iter().map(|m| m.year).collect();
+    years.sort_unstable();
+    years.dedup();
+
+    // Scale to the biggest absolute move present, with a floor so a table of
+    // near-zero months does not get amplified into apparent drama.
+    let peak = months
+        .iter()
+        .map(|m| m.value.abs())
+        .fold(0.0_f64, f64::max)
+        .max(0.01);
+
+    view! {
+        <div class="monthly-scroll">
+            <table class="monthly">
+                <thead>
+                    <tr>
+                        <th></th>
+                        {NAMES.iter().map(|name| view! { <th>{*name}</th> }).collect_view()}
+                    </tr>
+                </thead>
+                <tbody>
+                    {years
+                        .into_iter()
+                        .map(|year| {
+                            let cells = (1..=12u32)
+                                .map(|month| {
+                                    let found = months
+                                        .iter()
+                                        .find(|m| m.year == year && m.month == month);
+                                    match found {
+                                        None => view! { <td class="monthly-empty"></td> }.into_any(),
+                                        Some(entry) => {
+                                            // Opacity carries magnitude, hue carries sign. Two
+                                            // channels for two facts, rather than a colour ramp
+                                            // that has to be looked up in a legend.
+                                            let weight = (entry.value.abs() / peak).clamp(0.12, 1.0);
+                                            let class = if entry.value >= 0.0 {
+                                                "monthly-cell up"
+                                            } else {
+                                                "monthly-cell down"
+                                            };
+                                            view! {
+                                                <td
+                                                    class=class
+                                                    style=format!("--weight:{weight:.3}")
+                                                    title=format!(
+                                                        "{} {year}: {}",
+                                                        NAMES[(month - 1) as usize],
+                                                        percent(entry.value),
+                                                    )
+                                                >
+                                                    {format!("{:.1}", entry.value * 100.0)}
+                                                </td>
+                                            }
+                                                .into_any()
+                                        }
+                                    }
+                                })
+                                .collect_view();
+                            view! {
+                                <tr>
+                                    <th class="monthly-year">{year}</th>
+                                    {cells}
+                                </tr>
+                            }
+                        })
+                        .collect_view()}
+                </tbody>
+            </table>
+        </div>
+    }
+}
+
 /// One study, rendered with its caveats attached rather than beside it.
 #[component]
 fn StudyReport(study: StudyView) -> impl IntoView {
@@ -1235,6 +1331,16 @@ fn StudyReport(study: StudyView) -> impl IntoView {
                         <td>{ratio(study.benchmark.sharpe)}</td>
                     </tr>
                     <tr>
+                        <td>"Sortino"</td>
+                        <td>{ratio(study.strategy.sortino)}</td>
+                        <td>{ratio(study.benchmark.sortino)}</td>
+                    </tr>
+                    <tr>
+                        <td>"Calmar"</td>
+                        <td>{ratio(study.strategy.calmar)}</td>
+                        <td>{ratio(study.benchmark.calmar)}</td>
+                    </tr>
+                    <tr>
                         <td>"Trades"</td>
                         <td>{study.strategy.trades}</td>
                         <td>{study.benchmark.trades}</td>
@@ -1245,6 +1351,17 @@ fn StudyReport(study: StudyView) -> impl IntoView {
                     </tr>
                 </tbody>
             </table>
+
+            {(!study.monthly.is_empty())
+                .then({
+                    let months = study.monthly.clone();
+                    move || {
+                        view! {
+                            <h4>"Monthly returns"</h4>
+                            <MonthlyReturns months=months />
+                        }
+                    }
+                })}
 
             <h4>"How this was arrived at"</h4>
             <dl class="research-provenance">

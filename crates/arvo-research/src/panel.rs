@@ -407,6 +407,8 @@ mod tests {
             max_drawdown: drawdown,
             volatility: 0.1,
             sharpe: Some(1.0),
+            sortino: Some(1.2),
+            calmar: Some(0.9),
             trades,
         };
         InstrumentOutcome {
