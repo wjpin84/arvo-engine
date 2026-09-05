@@ -5,6 +5,7 @@ members = [
     "crates/arvo-data",
     "crates/arvo-research",
     "crates/arvo-plugin-host",
+    "crates/arvo-mcp",
     "crates/arvo-nautilus",
     "crates/arvo-portfolio",
     "crates/arvo-editor",
@@ -23,6 +24,7 @@ license = "Apache-2.0"
 [workspace.dependencies]
 arvo-core = { path = "crates/arvo-core" }
 arvo-data = { path = "crates/arvo-data" }
+arvo-mcp = { path = "crates/arvo-mcp" }
 arvo-nautilus = { path = "crates/arvo-nautilus" }
 arvo-portfolio = { path = "crates/arvo-portfolio" }
 arvo-research = { path = "crates/arvo-research" }
