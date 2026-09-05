@@ -661,6 +661,7 @@ mod tests {
                 commission_bps: 1.5,
                 slippage_bps: 0.0,
             },
+            risk: crate::RiskModel::default(),
             starting_cash: 100_000.0,
             seed: 7,
         };

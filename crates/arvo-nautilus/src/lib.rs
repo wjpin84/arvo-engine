@@ -102,6 +102,10 @@ impl<P: BarProvider> SimulationProvider for NautilusSimulation<P> {
 
     fn run(&self, experiment: &Experiment) -> Result<SimulationResult, SimulationError> {
         let plan = Plan::from_spec(&experiment.strategy)?;
+        experiment
+            .risk
+            .check()
+            .map_err(|reason| SimulationError::Rejected(format!("risk model: {reason}")))?;
 
         // Slippage is pinned in the experiment but not yet wired into a fill
         // model. Failing here is the point: quietly running with an assumption
@@ -326,6 +330,23 @@ fn run_backtest(
     let trade_size = Quantity::new_checked(plan.trade_size(), SIZE_PRECISION)
         .map_err(|err| rejected("trade size", &err))?;
 
+    // Risk is expressed as a fraction of capital in the record and as an
+    // amount of money here: the strategy needs a distance-to-loss in the same
+    // units as the price it is stopping against.
+    //
+    // Measured against *starting* capital rather than current equity, so
+    // sizing is fixed-fractional rather than compounding. That is a real and
+    // common choice, but it is a choice — a compounding version risks more
+    // after a win and less after a loss, and would produce a different curve.
+    let risk = strategy::Risk {
+        stop_atr_multiple: experiment.risk.stop_atr_multiple,
+        atr_period: experiment.risk.atr_period,
+        risk_amount: experiment
+            .risk
+            .risk_per_trade
+            .map(|fraction| fraction * experiment.starting_cash),
+    };
+
     match *plan {
         Plan::SmaCross {
             fast_period,
@@ -337,6 +358,7 @@ fn run_backtest(
             trade_size,
             fast_period,
             slow_period,
+            risk,
         )),
         Plan::BuyAndHold { .. } => {
             engine.add_strategy(strategy::BuyAndHold::new(core, bar_type, trade_size))
@@ -540,6 +562,7 @@ mod tests {
                 commission_bps: 1.0,
                 slippage_bps: 0.0,
             },
+            risk: arvo_research::RiskModel::default(),
             starting_cash: 100_000.0,
             seed: 42,
         }

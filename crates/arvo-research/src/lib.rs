@@ -108,6 +108,87 @@ pub struct CostModel {
     pub slippage_bps: f64,
 }
 
+/// How a strategy protects itself.
+///
+/// Pinned into the experiment beside the cost model, and for the same reason:
+/// it changes the result more than most strategy parameters do. For most
+/// systematic strategies the stop is not a detail bolted on afterwards — it
+/// *is* part of the rule, and "momentum breakout with a 2× ATR stop" and
+/// "momentum breakout" are two different strategies with different return
+/// distributions.
+///
+/// Running without one is allowed and is the honest default for a control,
+/// but it should be a stated choice rather than an omission: an unstopped
+/// strategy has a fatter left tail than the stopped version of itself, so a
+/// backtest that quietly leaves the stop out flatters the idea.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct RiskModel {
+    /// Stop distance as a multiple of ATR. `None` runs with no stop at all.
+    ///
+    /// A multiple rather than a fixed price: a stop has to scale with how
+    /// much the instrument actually moves, or it is arbitrarily tight on a
+    /// volatile name and arbitrarily loose on a quiet one.
+    pub stop_atr_multiple: Option<f64>,
+    /// Bars of history the ATR is averaged over.
+    pub atr_period: usize,
+    /// Fraction of starting capital risked on one trade, sizing the position
+    /// so that a stop-out costs about that much.
+    ///
+    /// `None` trades a fixed quantity instead. Requires a stop: risking 1%
+    /// means nothing without a distance to the exit, and there is no
+    /// defensible default to invent for it.
+    pub risk_per_trade: Option<f64>,
+}
+
+impl Default for RiskModel {
+    /// No stop and fixed sizing — what a backtest does when nobody has said
+    /// otherwise. Named rather than implied, so the absence is visible in the
+    /// record.
+    fn default() -> Self {
+        Self {
+            stop_atr_multiple: None,
+            atr_period: 14,
+            risk_per_trade: None,
+        }
+    }
+}
+
+impl RiskModel {
+    /// Rejects combinations that cannot mean anything.
+    ///
+    /// # Errors
+    ///
+    /// Returns a reason if the model is self-contradictory — most importantly
+    /// sizing by risk with no stop to measure the risk against, which would
+    /// otherwise silently fall back to some invented quantity.
+    pub fn check(&self) -> Result<(), String> {
+        if self.atr_period == 0 {
+            return Err("atr_period must be at least 1 bar".to_owned());
+        }
+        if let Some(multiple) = self.stop_atr_multiple {
+            if !multiple.is_finite() || multiple <= 0.0 {
+                return Err(format!(
+                    "stop_atr_multiple must be positive, got {multiple}"
+                ));
+            }
+        }
+        if let Some(risk) = self.risk_per_trade {
+            if !risk.is_finite() || risk <= 0.0 || risk >= 1.0 {
+                return Err(format!(
+                    "risk_per_trade is a fraction of capital between 0 and 1, got {risk}"
+                ));
+            }
+            if self.stop_atr_multiple.is_none() {
+                return Err(
+                    "risk_per_trade needs a stop: position size is capital-at-risk divided by                      the distance to the exit, and without a stop there is no distance"
+                        .to_owned(),
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Which strategy to run, and with what parameters.
 ///
 /// `BTreeMap` rather than `HashMap`: the ordering is part of the record, so
@@ -205,6 +286,10 @@ pub struct Experiment {
     pub dataset: DatasetRef,
     pub strategy: StrategySpec,
     pub costs: CostModel,
+    /// How the strategy protects itself. Pinned for the same reason the cost
+    /// model is: it changes the answer.
+    #[serde(default)]
+    pub risk: RiskModel,
     /// Opening account balance. Pinned because position sizing and therefore
     /// the whole equity curve depend on it — a return is not interpretable
     /// without the capital it was earned on.
@@ -315,6 +400,69 @@ mod tests {
 
     fn date(y: i32, m: u32, d: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(y, m, d).expect("test date is valid")
+    }
+
+    #[test]
+    fn sizing_by_risk_without_a_stop_is_refused() {
+        // The important one. Position size is capital-at-risk divided by the
+        // distance to the exit; with no stop there is no distance, and the
+        // only alternatives are to invent a quantity or to silently ignore
+        // the risk setting. Both are worse than refusing.
+        let model = RiskModel {
+            stop_atr_multiple: None,
+            atr_period: 14,
+            risk_per_trade: Some(0.01),
+        };
+        let err = model.check().expect_err("should refuse");
+        assert!(err.contains("needs a stop"), "{err}");
+    }
+
+    #[test]
+    fn a_stop_and_a_risk_fraction_together_are_valid() {
+        let model = RiskModel {
+            stop_atr_multiple: Some(2.0),
+            atr_period: 14,
+            risk_per_trade: Some(0.01),
+        };
+        assert!(model.check().is_ok());
+    }
+
+    #[test]
+    fn nonsensical_risk_settings_are_refused() {
+        for (model, why) in [
+            (
+                RiskModel {
+                    stop_atr_multiple: Some(-1.0),
+                    ..RiskModel::default()
+                },
+                "a negative stop distance",
+            ),
+            (
+                RiskModel {
+                    atr_period: 0,
+                    ..RiskModel::default()
+                },
+                "an ATR over zero bars",
+            ),
+            (
+                RiskModel {
+                    stop_atr_multiple: Some(2.0),
+                    risk_per_trade: Some(1.5),
+                    ..RiskModel::default()
+                },
+                "risking more than all the capital",
+            ),
+        ] {
+            assert!(model.check().is_err(), "{why} should be refused");
+        }
+    }
+
+    #[test]
+    fn the_default_risk_model_is_no_stop_and_says_so() {
+        let model = RiskModel::default();
+        assert_eq!(model.stop_atr_multiple, None);
+        assert_eq!(model.risk_per_trade, None);
+        assert!(model.check().is_ok(), "absence is valid, just visible");
     }
 
     #[test]

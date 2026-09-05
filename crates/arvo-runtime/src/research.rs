@@ -40,6 +40,17 @@ const COMMISSION_BPS: f64 = 1.0;
 const TRADE_SIZE: f64 = 100.0;
 const STRATEGY: &str = "sma_cross";
 
+/// Risk settings for a workbench study, from the middle of the range the
+/// systematic-trading literature actually uses: a 2x ATR stop and 1% of
+/// capital at risk per trade.
+///
+/// Stated here rather than left absent. Running with no stop is a different
+/// strategy with a fatter left tail, and a study that quietly omitted one
+/// would be answering an easier question than the one asked.
+const STOP_ATR_MULTIPLE: f64 = 2.0;
+const ATR_PERIOD: usize = 14;
+const RISK_PER_TRADE: f64 = 0.01;
+
 /// Holds the wiring a research run needs, built once at startup.
 pub struct ResearchService {
     simulation: Arc<NautilusSimulation<CsvBars>>,
@@ -660,6 +671,11 @@ fn template_for(subject: &str, window: DateRange, dataset_version: &str) -> Expe
         costs: CostModel {
             commission_bps: COMMISSION_BPS,
             slippage_bps: 0.0,
+        },
+        risk: arvo_research::RiskModel {
+            stop_atr_multiple: Some(STOP_ATR_MULTIPLE),
+            atr_period: ATR_PERIOD,
+            risk_per_trade: Some(RISK_PER_TRADE),
         },
         starting_cash: STARTING_CASH,
         seed: 1,
