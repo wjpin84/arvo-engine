@@ -163,7 +163,12 @@ pub fn run() {
                     "could not create the portfolios directory"
                 );
             }
-            app.manage(portfolio::PortfolioService::new(portfolio_dir, data_dir));
+            let snapshot_dir = app.path().app_data_dir()?.join(portfolio::SNAPSHOT_SUBDIR);
+            app.manage(portfolio::PortfolioService::new(
+                portfolio_dir,
+                data_dir,
+                snapshot_dir,
+            ));
 
             app.manage(plugins_config);
             app.manage(plugin_registry);

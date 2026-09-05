@@ -20,6 +20,7 @@
 //! decision — see the architecture map.
 
 pub mod csv;
+pub mod history;
 
 use std::collections::BTreeMap;
 

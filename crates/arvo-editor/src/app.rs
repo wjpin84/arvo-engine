@@ -256,6 +256,20 @@ struct ImportView {
 }
 
 #[derive(Clone, Deserialize)]
+struct ValuePoint {
+    time: String,
+    value: f64,
+}
+
+#[derive(Clone, Deserialize)]
+struct ChangeView {
+    from: String,
+    to: String,
+    absolute: f64,
+    percent: Option<f64>,
+}
+
+#[derive(Clone, Deserialize)]
 struct PortfolioView {
     name: String,
     as_of: String,
@@ -267,6 +281,8 @@ struct PortfolioView {
     cash: f64,
     holdings: Vec<HoldingView>,
     unpriced: Vec<String>,
+    value_history: Vec<ValuePoint>,
+    change: Option<ChangeView>,
     import: ImportView,
 }
 
@@ -1309,6 +1325,36 @@ fn MonthlyReturns(months: Vec<MonthlyReturnView>) -> impl IntoView {
     }
 }
 
+/// Portfolio value over time.
+///
+/// Reuses the equity-chart glue with an empty second series rather than adding
+/// a second charting path: one series is the degenerate case of two, and a
+/// parallel implementation would be a second place for the theme handling and
+/// resize behaviour to drift.
+#[component]
+fn ValueChart(points: Vec<CurvePoint>) -> impl IntoView {
+    let holder = NodeRef::<leptos::html::Div>::new();
+
+    Effect::new(move |_| {
+        let Some(el) = holder.get() else {
+            return;
+        };
+        let series = serde_wasm_bindgen::to_value(&points).unwrap_or(JsValue::NULL);
+        let empty =
+            serde_wasm_bindgen::to_value(&Vec::<CurvePoint>::new()).unwrap_or(JsValue::NULL);
+        render_equity_chart(&el, series, empty);
+    });
+
+    view! {
+        <div class="equity-chart">
+            <div class="equity-chart-legend">
+                <span class="equity-chart-key strategy">"Portfolio value"</span>
+            </div>
+            <div class="equity-chart-canvas" node_ref=holder></div>
+        </div>
+    }
+}
+
 /// One study, rendered with its caveats attached rather than beside it.
 #[component]
 fn StudyReport(study: StudyView) -> impl IntoView {
@@ -1606,6 +1652,39 @@ fn PortfolioReport(portfolio: PortfolioView) -> impl IntoView {
             percent(portfolio.cash / portfolio.total_value)
         )
     };
+
+    // A single observation has nothing to have changed from, and an em dash
+    // says that where a "+0.00" would claim a flat day nobody measured.
+    let (change_value, change_note, change_tone) = match &portfolio.change {
+        None => (
+            "—".to_owned(),
+            "needs a second day to compare".to_owned(),
+            0.0,
+        ),
+        // Both dates, not just "since X". Snapshots are taken when the
+        // portfolio is looked at, so two consecutive ones can be weeks apart —
+        // calling that "today's change" would be wrong.
+        Some(change) => (
+            money(change.absolute),
+            format!(
+                "{} · {} → {}",
+                change.percent.map_or_else(|| "no base".to_owned(), percent),
+                change.from.clone(),
+                change.to.clone(),
+            ),
+            change.absolute,
+        ),
+    };
+    let chart_points: Vec<CurvePoint> = portfolio
+        .value_history
+        .iter()
+        .map(|point| CurvePoint {
+            time: point.time.clone(),
+            value: point.value,
+        })
+        .collect();
+    // One point draws a chart with nothing to see; the card already says so.
+    let show_chart = chart_points.len() > 1;
     view! {
         <div class="research-report">
             <p class="research-subject">{portfolio.name.clone()}</p>
@@ -1627,12 +1706,29 @@ fn PortfolioReport(portfolio: PortfolioView) -> impl IntoView {
                     value=money(portfolio.cash)
                     note=cash_note
                 />
+                <MetricCard
+                    label="Change"
+                    value=change_value
+                    tone=change_tone
+                    note=change_note
+                />
                 <MetricCard label="Invested" value=money(invested) />
                 <MetricCard
                     label="Positions"
                     value=portfolio.holdings.len().to_string()
                 />
             </div>
+
+            {show_chart
+                .then({
+                    let chart_points = chart_points.clone();
+                    move || {
+                        view! {
+                            <h4>"Value over time"</h4>
+                            <ValueChart points=chart_points />
+                        }
+                    }
+                })}
 
             <h4>"Allocation"</h4>
             <div class="allocation">

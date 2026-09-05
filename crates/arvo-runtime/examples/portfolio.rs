@@ -1,6 +1,10 @@
 //! Values your holdings from the command line, without launching the window.
 //!
-//!     cargo run -p arvo-runtime --example portfolio -- <portfolio-dir> [data-dir]
+//!     cargo run -p arvo-runtime --example portfolio -- <portfolio-dir> [data-dir] [snapshot-dir]
+//!
+//! With a snapshot directory it also *records* the valuation, exactly as the
+//! app does — which makes this a way to take a snapshot without opening the
+//! window, and the only way to check that path outside the GUI.
 //!
 //! Runs the same reader and the same valuation the Portfolio view uses, for
 //! the same reason the `study` example exists: the GUI and the domain fail in
@@ -17,6 +21,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .next()
         .ok_or("usage: portfolio <portfolio-dir> [data-dir]")?;
     let data_dir = args.next();
+    let snapshot_dir = args.next();
 
     // Last closes are best effort: an instrument with no bars simply is not
     // in the map, and the valuation reports it as unpriced rather than
@@ -88,6 +93,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "    excluded, no price available: {}",
                 valued.unpriced.join(", ")
             );
+        }
+
+        if let Some(snapshot_dir) = &snapshot_dir {
+            let store = arvo_portfolio::history::SnapshotStore::new(snapshot_dir);
+            store.record(&valued, today)?;
+            let history = store.history(&valued.name)?;
+            println!("  history: {} snapshot(s)", history.snapshots.len());
+            for snapshot in &history.snapshots {
+                println!(
+                    "    {}  {:.2}",
+                    snapshot.taken_on, snapshot.portfolio.total_value
+                );
+            }
+            match arvo_portfolio::history::latest_change(&history.snapshots) {
+                Some(change) => println!(
+                    "    change {:+.2} ({} -> {})",
+                    change.absolute, change.from, change.to
+                ),
+                None => println!("    change: needs a second day to compare"),
+            }
         }
     }
 

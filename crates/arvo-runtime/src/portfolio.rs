@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use arvo_data::{BarProvider, CsvBars};
 use arvo_portfolio::{
     csv::{CsvHoldings, ImportReport},
+    history::{latest_change, SnapshotStore},
     PriceSource, ValuedPortfolio,
 };
 use serde::Serialize;
@@ -21,19 +22,24 @@ use crate::commands::CommandError;
 /// Where holdings files live: `<app data>/portfolios`, one CSV per portfolio.
 pub const PORTFOLIO_SUBDIR: &str = "portfolios";
 
+/// Where daily valuations are kept.
+pub const SNAPSHOT_SUBDIR: &str = "snapshots";
+
 pub struct PortfolioService {
     holdings: CsvHoldings,
     bars: CsvBars,
     directory: PathBuf,
+    snapshots: SnapshotStore,
 }
 
 impl PortfolioService {
     #[must_use]
-    pub fn new(portfolio_dir: PathBuf, data_dir: PathBuf) -> Self {
+    pub fn new(portfolio_dir: PathBuf, data_dir: PathBuf, snapshot_dir: PathBuf) -> Self {
         Self {
             holdings: CsvHoldings::new(portfolio_dir.clone()),
             bars: CsvBars::new(data_dir),
             directory: portfolio_dir,
+            snapshots: SnapshotStore::new(snapshot_dir),
         }
     }
 }
@@ -68,6 +74,12 @@ pub struct PortfolioView {
     pub cash: f64,
     pub holdings: Vec<HoldingView>,
     pub unpriced: Vec<String>,
+    /// Value on every day this portfolio has been looked at. A holdings file
+    /// says what you hold now; almost everything interesting is a change, and
+    /// a single export cannot express one.
+    pub value_history: Vec<ValuePoint>,
+    /// `None` until a portfolio has been valued on two different days.
+    pub change: Option<ChangeView>,
     /// How the file was read. Shown, not hidden: an importer that guessed a
     /// column wrong produces a portfolio that looks entirely plausible, and
     /// this is the only thing that would reveal it.
@@ -83,6 +95,22 @@ pub struct ImportView {
     pub rows_skipped: Vec<String>,
     /// Cost basis came from a per-share column multiplied by quantity.
     pub cost_basis_derived: bool,
+}
+
+/// One day on the value line.
+#[derive(Serialize)]
+pub struct ValuePoint {
+    pub time: String,
+    pub value: f64,
+}
+
+/// The move between the two most recent valuations.
+#[derive(Serialize)]
+pub struct ChangeView {
+    pub from: String,
+    pub to: String,
+    pub absolute: f64,
+    pub percent: Option<f64>,
 }
 
 #[derive(Serialize)]
@@ -114,12 +142,29 @@ pub async fn list_portfolios(
         .map_err(|err| CommandError::Failed(err.to_string()))?;
 
     let closes = last_closes(&service.bars);
+    let mut views = Vec::with_capacity(portfolios.len());
+
+    for imported in &portfolios {
+        let valued = imported.portfolio.value(&closes);
+
+        // Record before reading, so today's look is part of today's line.
+        // A failed write must not fail the view: the valuation on screen is
+        // real whether or not it could be filed.
+        if let Err(err) = service.snapshots.record(&valued, as_of) {
+            tracing::error!(error = %err, portfolio = %valued.name, "could not record a snapshot");
+        }
+
+        let history = service.snapshots.history(&valued.name).unwrap_or_default();
+        for problem in &history.problems {
+            tracing::warn!(problem, "could not read a stored snapshot");
+        }
+
+        views.push(view_of(&valued, &imported.report, &history.snapshots));
+    }
+
     Ok(PortfolioLibraryView {
         directory,
-        portfolios: portfolios
-            .iter()
-            .map(|imported| view_of(&imported.portfolio.value(&closes), &imported.report))
-            .collect(),
+        portfolios: views,
     })
 }
 
@@ -145,7 +190,11 @@ fn last_closes(bars: &CsvBars) -> BTreeMap<String, f64> {
     closes
 }
 
-fn view_of(valued: &ValuedPortfolio, report: &ImportReport) -> PortfolioView {
+fn view_of(
+    valued: &ValuedPortfolio,
+    report: &ImportReport,
+    snapshots: &[arvo_portfolio::history::Snapshot],
+) -> PortfolioView {
     PortfolioView {
         name: valued.name.clone(),
         as_of: valued.as_of.to_string(),
@@ -176,6 +225,19 @@ fn view_of(valued: &ValuedPortfolio, report: &ImportReport) -> PortfolioView {
             })
             .collect(),
         unpriced: valued.unpriced.clone(),
+        value_history: snapshots
+            .iter()
+            .map(|snapshot| ValuePoint {
+                time: snapshot.taken_on.to_string(),
+                value: snapshot.portfolio.total_value,
+            })
+            .collect(),
+        change: latest_change(snapshots).map(|change| ChangeView {
+            from: change.from.to_string(),
+            to: change.to.to_string(),
+            absolute: change.absolute,
+            percent: change.percent,
+        }),
         import: ImportView {
             columns: report.columns.clone(),
             ignored: report.ignored.clone(),
