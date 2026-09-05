@@ -287,6 +287,19 @@ pub struct Evaluation {
     pub strategy_curve: Vec<EquityPoint>,
     #[serde(default)]
     pub benchmark_curve: Vec<EquityPoint>,
+    /// What the strategy's round trips looked like: win rate, profit factor,
+    /// holding period, and what the venue charged for them.
+    ///
+    /// Kept beside the curve because they answer different questions. The
+    /// curve says whether a rule made money; these say whether it made it the
+    /// same way it would have to keep making it — a 20% return from thirty
+    /// trades and the same 20% from one are not the same finding, and the
+    /// curve alone cannot tell them apart.
+    ///
+    /// `default` for the same reason the curves are: a finding recorded before
+    /// the ledger existed still loads, as one with no trade detail.
+    #[serde(default)]
+    pub strategy_trades: crate::TradeStats,
     /// Strategy return minus benchmark return. The number that matters:
     /// absolute return mostly measures whether the market went up.
     pub excess_return: f64,
@@ -296,6 +309,17 @@ pub struct Evaluation {
 }
 
 impl Evaluation {
+    /// Attaches the strategy run's trade ledger statistics.
+    ///
+    /// Separate from [`Self::new`] so scoring stays a function of the two
+    /// curves and the criteria — the verdict must not start depending on
+    /// something a stored finding may not have.
+    #[must_use]
+    pub fn with_trades(mut self, trades: crate::TradeStats) -> Self {
+        self.strategy_trades = trades;
+        self
+    }
+
     /// Scores a strategy against its benchmark under stated criteria.
     #[must_use]
     pub fn new(
@@ -340,6 +364,7 @@ impl Evaluation {
             benchmark,
             strategy_curve,
             benchmark_curve,
+            strategy_trades: crate::TradeStats::default(),
             excess_return,
             verdict,
             reasons,
@@ -409,7 +434,8 @@ pub fn evaluate_against_benchmark(
         strategy_result.equity_curve,
         benchmark_result.equity_curve,
         criteria,
-    );
+    )
+    .with_trades(crate::TradeStats::from_ledger(&strategy_result.ledger));
 
     Ok(Evidence {
         hypothesis: experiment.hypothesis.clone(),
@@ -665,10 +691,7 @@ mod tests {
                 name: "sma_cross".to_owned(),
                 params: BTreeMap::from([("trade_size".to_owned(), 100.0)]),
             },
-            costs: CostModel {
-                commission_bps: 1.5,
-                slippage_bps: 0.0,
-            },
+            costs: CostModel::proportional(1.5, 0.0),
             risk: crate::RiskModel::default(),
             starting_cash: 100_000.0,
             seed: 7,

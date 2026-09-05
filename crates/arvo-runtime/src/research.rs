@@ -163,6 +163,60 @@ fn curve_points(curve: &[arvo_research::EquityPoint]) -> Vec<CurvePoint> {
     points
 }
 
+/// What the round trips looked like, flattened for display.
+///
+/// Beside the metrics rather than inside them: metrics come from the equity
+/// curve and these come from the ledger, and keeping the two apart is what
+/// makes it obvious which is which when they say different things.
+#[derive(Serialize)]
+pub struct TradesView {
+    pub closed: u32,
+    pub still_open: u32,
+    pub win_rate: Option<f64>,
+    pub profit_factor: Option<f64>,
+    pub expectancy: Option<f64>,
+    pub average_win: Option<f64>,
+    pub average_loss: Option<f64>,
+    /// Mean holding period in days, which is the unit a reader thinks in and
+    /// the one that decides short- versus long-term tax treatment.
+    pub average_holding_days: Option<f64>,
+    /// Every fee and commission the venue charged, in account currency.
+    ///
+    /// Fees only — slippage is charged inside the fill prices and is already
+    /// reflected in the return, not here. Naming this `fees` rather than
+    /// `cost` is the whole point: a reader who took it for the total cost of
+    /// trading would be short by the spread assumption on every round trip.
+    pub fees_paid: f64,
+    /// Fees as a fraction of starting capital, so they can be read against
+    /// the return directly.
+    pub fees_fraction: f64,
+    pub signal_exits: u32,
+    pub stop_exits: u32,
+}
+
+impl TradesView {
+    fn build(stats: &arvo_research::TradeStats, starting_cash: f64) -> Self {
+        Self {
+            closed: stats.closed,
+            still_open: stats.still_open,
+            win_rate: stats.win_rate,
+            profit_factor: stats.profit_factor,
+            expectancy: stats.expectancy(),
+            average_win: stats.average_win,
+            average_loss: stats.average_loss,
+            average_holding_days: stats.average_holding_secs.map(|secs| secs / 86_400.0),
+            fees_paid: stats.total_commission,
+            fees_fraction: if starting_cash > 0.0 {
+                stats.total_commission / starting_cash
+            } else {
+                0.0
+            },
+            signal_exits: stats.signal_exits,
+            stop_exits: stats.stop_exits,
+        }
+    }
+}
+
 /// The full result of a study, flattened for display.
 #[derive(Serialize)]
 pub struct StudyView {
@@ -194,6 +248,8 @@ pub struct StudyView {
     /// Month-by-month, so a total return can be read as steady or as one
     /// lucky quarter. Derived from the same curve, not a second measurement.
     pub monthly: Vec<MonthlyReturnView>,
+    /// The round trips behind the return, and what they cost.
+    pub trades_detail: TradesView,
 
     // Stated assumptions, because a verdict without them is decoration.
     /// The dataset this result was produced from, as a content hash. Compared
@@ -577,6 +633,10 @@ fn study_view(found: &arvo_research::FamilyEvidence, engine: &str) -> StudyView 
                 value: month.value,
             })
             .collect(),
+        trades_detail: TradesView::build(
+            &evaluation.strategy_trades,
+            found.selected.starting_cash,
+        ),
         dataset_version: found.selected.dataset.version.clone(),
         strategy_name: found.selected.strategy.name.clone(),
         starting_cash: found.selected.starting_cash,
@@ -695,10 +755,7 @@ fn template_for(subject: &str, window: DateRange, dataset_version: &str) -> Expe
                 .into_iter()
                 .collect(),
         },
-        costs: CostModel {
-            commission_bps: COMMISSION_BPS,
-            slippage_bps: SLIPPAGE_BPS,
-        },
+        costs: CostModel::proportional(COMMISSION_BPS, SLIPPAGE_BPS),
         risk: arvo_research::RiskModel {
             stop_atr_multiple: Some(STOP_ATR_MULTIPLE),
             atr_period: ATR_PERIOD,

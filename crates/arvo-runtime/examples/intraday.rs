@@ -70,10 +70,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .into_iter()
             .collect(),
         },
-        costs: CostModel {
-            commission_bps: 1.0,
-            slippage_bps,
-        },
+        costs: CostModel::proportional(1.0, slippage_bps),
         risk: RiskModel {
             stop_atr_multiple: Some(2.0),
             atr_period: 14,

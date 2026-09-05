@@ -37,7 +37,9 @@
 //! obligation attaches to the distributed binary — but keeping the dependency
 //! to this one crate keeps the fact obvious rather than diffuse.
 
+mod fee;
 mod fill;
+mod ledger;
 mod strategy;
 
 use std::str::FromStr;
@@ -53,7 +55,7 @@ use nautilus_backtest::{
     engine::BacktestEngine,
 };
 use nautilus_common::logging::logging_set_bypass;
-use nautilus_execution::models::fill::FillModelHandle;
+use nautilus_execution::models::{fee::FeeModelHandle, fill::FillModelHandle};
 use nautilus_core::UnixNanos;
 use nautilus_model::{
     data::{Bar, BarSpecification, BarType, Data},
@@ -108,6 +110,10 @@ impl<P: BarProvider> SimulationProvider for NautilusSimulation<P> {
             .risk
             .check()
             .map_err(|reason| SimulationError::Rejected(format!("risk model: {reason}")))?;
+        experiment
+            .costs
+            .check()
+            .map_err(|reason| SimulationError::Rejected(format!("cost model: {reason}")))?;
 
         let instrument_id = InstrumentId::from_str(&experiment.instrument).map_err(|err| {
             SimulationError::Rejected(format!("instrument {:?}: {err}", experiment.instrument))
@@ -281,6 +287,15 @@ fn run_backtest(
                 .book_type(BookType::L1_MBP)
                 .starting_balances(vec![starting_balance])
                 .bar_execution(true)
+                // Only when there is something to charge that a rate cannot
+                // say. With nothing extra, Nautilus's own model computes the
+                // same number, and leaving it in place keeps every result
+                // produced before venue fees existed reproducible.
+                .fee_model(if experiment.costs.has_venue_fees() {
+                    FeeModelHandle::new(fee::VenueFees::new(&experiment.costs))
+                } else {
+                    FeeModelHandle::default()
+                })
                 .build()
                 .map_err(|err| rejected("venue config", &err))?,
         )
@@ -380,6 +395,9 @@ fn run_backtest(
         .map_err(|err| SimulationError::Engine(Box::new(BacktestFailed(err.to_string()))))?;
 
     let result = engine.get_result();
+    // Before `dispose`: the positions live in the kernel's cache, and
+    // disposal is what tears it down.
+    let ledger = ledger::from_cache(&engine.kernel_mut().cache.borrow());
     let equity_curve = compound(
         experiment.starting_cash,
         experiment.window.from.and_time(NaiveTime::MIN),
@@ -390,8 +408,9 @@ fn run_backtest(
     Ok(SimulationResult {
         experiment: experiment.id.clone(),
         engine: ENGINE.to_owned(),
-        trades: u32::try_from(result.total_positions).unwrap_or(u32::MAX),
+        trades: u32::try_from(ledger.len()).unwrap_or(u32::MAX),
         equity_curve,
+        ledger,
     })
 }
 
@@ -595,10 +614,7 @@ mod tests {
                 name: SMA_CROSS.to_owned(),
                 params,
             },
-            costs: CostModel {
-                commission_bps: 1.0,
-                slippage_bps: 0.0,
-            },
+            costs: CostModel::proportional(1.0, 0.0),
             risk: arvo_research::RiskModel::default(),
             starting_cash: 100_000.0,
             seed: 42,
@@ -699,6 +715,154 @@ mod tests {
             final_equity(&with),
             final_equity(&without)
         );
+    }
+
+    #[test]
+    fn the_ledger_describes_the_same_run_the_curve_does() {
+        let bars = sawtooth(200);
+        let experiment = experiment(params(10.0, 30.0), &bars);
+        let result = provider(bars).run(&experiment).expect("runs");
+
+        assert_eq!(
+            result.trades as usize,
+            result.ledger.len(),
+            "the count is derived from the ledger, so they cannot disagree"
+        );
+        assert!(!result.ledger.is_empty(), "the fixture is built to trade");
+
+        let stats = arvo_research::TradeStats::from_ledger(&result.ledger);
+        assert_eq!(stats.closed + stats.still_open, result.trades);
+
+        // Every closed trade must be a real round trip with both prices and
+        // an ordered pair of timestamps. A ledger that reports a fill at zero
+        // or an exit before its entry is worse than no ledger.
+        for trade in result.ledger.iter().filter(|t| t.closed.is_some()) {
+            assert!(trade.entry > 0.0 && trade.quantity > 0.0, "{trade:?}");
+            assert!(trade.exit.expect("closed") > 0.0, "{trade:?}");
+            assert!(trade.closed.expect("closed") >= trade.opened, "{trade:?}");
+        }
+
+        // The ledger is the only place commission is visible at all, and it
+        // has to be non-zero at 1 bps or the cost model is not reaching fills.
+        assert!(
+            stats.total_commission > 0.0,
+            "1 bps of commission should have been charged somewhere"
+        );
+
+        // Realised P&L must account for the curve. Not exactly — a position
+        // still open at the end is marked to market by the curve and not yet
+        // realised by the ledger — so the check is that they agree in sign
+        // and magnitude once the open one is set aside.
+        if stats.still_open == 0 {
+            let realised: f64 = result.ledger.iter().map(|trade| trade.pnl).sum();
+            let curve = result.equity_curve.last().expect("non-empty").equity
+                - experiment.starting_cash;
+            assert!(
+                (realised - curve).abs() < 1.0,
+                "ledger realised {realised} vs curve {curve}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stop_exit_is_distinguishable_from_a_signal_exit() {
+        // The strategy enforces its own stops with plain market orders, so
+        // nothing about the order *type* says why it was sent. Without the
+        // tag this reports zero stops on every run, which reads as a fact
+        // about the strategy rather than a hole in the instrumentation.
+        let bars = sawtooth(200);
+        let mut experiment = experiment(params(10.0, 30.0), &bars);
+        experiment.risk = arvo_research::RiskModel {
+            stop_atr_multiple: Some(1.0),
+            atr_period: 14,
+            ..arvo_research::RiskModel::default()
+        };
+
+        let result = provider(bars).run(&experiment).expect("runs");
+        let stats = arvo_research::TradeStats::from_ledger(&result.ledger);
+
+        assert_eq!(
+            stats.signal_exits + stats.stop_exits,
+            stats.closed,
+            "every closed trade left for exactly one reason"
+        );
+        assert!(
+            stats.stop_exits > 0,
+            "a one-ATR stop on an oscillating fixture must be hit at least once;              got {} signal exits and no stops",
+            stats.signal_exits
+        );
+    }
+
+    #[test]
+    fn venue_fees_cost_money_that_a_rate_alone_would_not_charge() {
+        // The point of the extra shapes: a flat per-fill charge is invisible
+        // to a bps model, and on a small position it is the dominant cost.
+        let bars = sawtooth(200);
+        let free = experiment(params(10.0, 30.0), &bars);
+        let mut charged = free.clone();
+        charged.costs.per_fill = 5.0;
+
+        let without = provider(bars.clone()).run(&free).expect("runs");
+        let with = provider(bars).run(&charged).expect("runs");
+
+        let commission = |result: &SimulationResult| {
+            arvo_research::TradeStats::from_ledger(&result.ledger).total_commission
+        };
+        assert_eq!(
+            without.trades, with.trades,
+            "a fee should cost money, not change which signals fired"
+        );
+        // Two fills a round trip at $5 each.
+        let expected = 10.0 * f64::from(with.trades);
+        let extra = commission(&with) - commission(&without);
+        assert!(
+            (extra - expected).abs() < 1.0,
+            "expected about {expected} of extra fees, got {extra}"
+        );
+    }
+
+    #[test]
+    fn a_sell_side_fee_is_not_charged_on_the_buy() {
+        // SEC- and FINRA-shaped charges fall on sales. Charging them both
+        // ways would double a round trip's regulatory cost, and nothing in
+        // the output would show it.
+        let bars = sawtooth(200);
+        let mut experiment = experiment(params(10.0, 30.0), &bars);
+        // A round number against a ~$100 fixture: 100 bps of sale proceeds.
+        experiment.costs.sell_notional_bps = 100.0;
+
+        let result = provider(bars).run(&experiment).expect("runs");
+        let stats = arvo_research::TradeStats::from_ledger(&result.ledger);
+
+        // Sell proceeds only, so roughly 1% of one side of each round trip
+        // rather than of both. Compared against the two-sided figure, which
+        // is what a side-blind implementation would produce.
+        let sold: f64 = result
+            .ledger
+            .iter()
+            .filter_map(|trade| Some(trade.exit? * trade.quantity))
+            .sum();
+        let one_sided = sold * 0.01;
+        assert!(
+            stats.total_commission < one_sided * 1.5,
+            "commission {} looks two-sided against {one_sided} of sale proceeds",
+            stats.total_commission
+        );
+        assert!(
+            stats.total_commission > one_sided * 0.5,
+            "commission {} is too small to include the sell-side charge",
+            stats.total_commission
+        );
+    }
+
+    #[test]
+    fn a_negative_fee_is_refused_rather_than_paying_us_to_trade() {
+        let bars = sawtooth(50);
+        let mut experiment = experiment(params(5.0, 10.0), &bars);
+        experiment.costs.per_fill = -1.0;
+
+        let err = provider(bars).run(&experiment).expect_err("a fee is not a rebate");
+        assert!(matches!(err, SimulationError::Rejected(_)), "{err}");
     }
 
     #[test]

@@ -294,10 +294,7 @@ mod tests {
                 name: "sma_cross".to_owned(),
                 params: BTreeMap::new(),
             },
-            costs: CostModel {
-                commission_bps: 1.0,
-                slippage_bps: 0.0,
-            },
+            costs: CostModel::proportional(1.0, 0.0),
             risk: crate::RiskModel::default(),
             starting_cash: 100_000.0,
             seed: 1,

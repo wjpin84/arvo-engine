@@ -28,6 +28,7 @@ pub mod evaluation;
 pub mod family;
 pub mod memory;
 pub mod panel;
+pub mod trade;
 
 pub use evaluation::{
     evaluate_against_benchmark, Evaluation, EvaluationCriteria, Evidence, Metrics, Verdict,
@@ -35,6 +36,7 @@ pub use evaluation::{
 pub use family::{run_family, ExperimentFamily, FamilyEvidence, ParameterGrid, Selection};
 pub use memory::{EvidenceStore, Loaded, MemoryError, Record, StoredRecord};
 pub use panel::{run_panel, InstrumentOutcome, PanelEvidence, PanelStudy, PooledOutcome};
+pub use trade::{Direction, ExitReason, Trade, TradeStats};
 
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
@@ -102,10 +104,94 @@ pub struct DatasetRef {
 /// Pinned into the experiment because it changes results more than most
 /// strategy parameters do, and because an unstated cost assumption is the
 /// most common way a backtest flatters itself.
+///
+/// Two proportional rates were the whole model at first, which quietly
+/// assumed every cost scales with notional. Real US equity schedules do not:
+/// a flat ticket charge falls hardest on small positions, per-share fees
+/// scale with size rather than value, and the regulatory charges fall on
+/// *sells* only. Each field below is a different shape for that reason, and
+/// every one of them defaults to zero, so a schedule that does not have a
+/// charge simply does not state it.
+///
+/// Taxes are deliberately absent — see [`crate::trade`] for why they are not
+/// a per-fill cost.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct CostModel {
+    /// Proportional commission, charged on every fill, both sides.
     pub commission_bps: f64,
+    /// How much worse than the quoted price a fill is assumed to land.
     pub slippage_bps: f64,
+    /// Flat charge per fill, in account currency.
+    ///
+    /// The one cost that does not scale at all, so it is the one that decides
+    /// whether a strategy trading small size often is viable. Zero at a
+    /// commission-free US equity broker.
+    #[serde(default)]
+    pub per_fill: f64,
+    /// Charged per unit sold — the shape of FINRA's Trading Activity Fee.
+    ///
+    /// Sell side only, and per *share* rather than per dollar, so it bites
+    /// hardest on cheap instruments where a share is worth little.
+    #[serde(default)]
+    pub per_unit_sold: f64,
+    /// Basis points of sale proceeds — the shape of the SEC Section 31 fee.
+    ///
+    /// Sell side only. The rate is reset by the SEC periodically and is not a
+    /// constant worth hardcoding anywhere; it belongs in whatever states the
+    /// broker schedule, checked against a current one.
+    #[serde(default)]
+    pub sell_notional_bps: f64,
+}
+
+impl CostModel {
+    /// Only the two proportional costs — what the model was before venue and
+    /// regulatory fees existed.
+    ///
+    /// Kept because most callers genuinely have nothing else to say, and
+    /// spelling three zeroes at every construction site invites one of them
+    /// being wrong.
+    #[must_use]
+    pub const fn proportional(commission_bps: f64, slippage_bps: f64) -> Self {
+        Self {
+            commission_bps,
+            slippage_bps,
+            per_fill: 0.0,
+            per_unit_sold: 0.0,
+            sell_notional_bps: 0.0,
+        }
+    }
+
+    /// Whether anything beyond the proportional rates is charged.
+    ///
+    /// Used to decide whether the engine needs Arvo's own fee model at all:
+    /// with nothing extra to charge, the venue default already computes the
+    /// same number.
+    #[must_use]
+    pub fn has_venue_fees(&self) -> bool {
+        self.per_fill != 0.0 || self.per_unit_sold != 0.0 || self.sell_notional_bps != 0.0
+    }
+
+    /// Rejects a schedule that cannot mean anything.
+    ///
+    /// # Errors
+    ///
+    /// Returns a reason if any rate is negative or not finite. A negative fee
+    /// is a rebate, and a backtest that pays the trader to trade is the single
+    /// most flattering bug available.
+    pub fn check(&self) -> Result<(), String> {
+        for (name, value) in [
+            ("commission_bps", self.commission_bps),
+            ("slippage_bps", self.slippage_bps),
+            ("per_fill", self.per_fill),
+            ("per_unit_sold", self.per_unit_sold),
+            ("sell_notional_bps", self.sell_notional_bps),
+        ] {
+            if !value.is_finite() || value < 0.0 {
+                return Err(format!("{name} must be zero or positive, got {value}"));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// How a strategy protects itself.
@@ -351,9 +437,18 @@ pub struct SimulationResult {
     /// Part of the reproducibility record: a result is only comparable to
     /// another from the same engine version.
     pub engine: String,
+    /// Round trips completed. Derived from [`Self::ledger`] rather than
+    /// counted separately, so the two cannot drift apart.
     pub trades: u32,
     /// Account equity, one point per bar, opening at the starting balance.
     pub equity_curve: Vec<EquityPoint>,
+    /// Every position the run opened, in the order it opened them.
+    ///
+    /// `default` so evidence stored before the ledger existed still loads —
+    /// it reads back as an empty ledger beside a non-zero `trades`, which is
+    /// the honest description of a result recorded before this was captured.
+    #[serde(default)]
+    pub ledger: Vec<Trade>,
 }
 
 impl SimulationResult {
@@ -547,6 +642,7 @@ mod tests {
             experiment: ExperimentId::from("e-1"),
             engine: "test 0".to_owned(),
             trades: 0,
+            ledger: Vec::new(),
             equity_curve: vec![EquityPoint {
                 at: NaiveDate::from_ymd_opt(2024, 1, 1)
                     .expect("valid")

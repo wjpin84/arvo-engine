@@ -89,6 +89,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     evaluation.strategy.max_drawdown * 100.0,
                     evaluation.benchmark.max_drawdown * 100.0
                 );
+                // The ledger, not the curve. A return says a rule made money;
+                // these say whether it did so in a way that could repeat.
+                let trades = &evaluation.strategy_trades;
+                let show = |value: Option<f64>| {
+                    value.map_or_else(|| "n/a".to_owned(), |v| format!("{v:.2}"))
+                };
+                println!(
+                    "  ledger: {} closed ({} still open), {} won, {} lost on stops",
+                    trades.closed, trades.still_open, trades.wins, trades.stop_exits
+                );
+                println!(
+                    "  win rate {}, profit factor {}, expectancy {} per trade",
+                    trades
+                        .win_rate
+                        .map_or_else(|| "n/a".to_owned(), |v| format!("{:.0}%", v * 100.0)),
+                    show(trades.profit_factor),
+                    show(trades.expectancy())
+                );
+                println!(
+                    "  held {} on average; fees {:.2} ({:.2}% of capital, slippage not incl.)",
+                    trades.average_holding_secs.map_or_else(
+                        || "n/a".to_owned(),
+                        |secs| format!("{:.1} days", secs / 86_400.0)
+                    ),
+                    trades.total_commission,
+                    trades.total_commission / found.selected.starting_cash * 100.0
+                );
                 for reason in &found.reasons {
                     println!("  - {reason}");
                 }

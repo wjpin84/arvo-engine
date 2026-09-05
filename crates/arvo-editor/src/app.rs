@@ -183,12 +183,30 @@ struct StudyView {
     strategy_curve: Vec<CurvePoint>,
     benchmark_curve: Vec<CurvePoint>,
     monthly: Vec<MonthlyReturnView>,
+    trades_detail: TradesView,
     dataset_version: String,
     strategy_name: String,
     starting_cash: f64,
     commission_bps: f64,
     slippage_bps: f64,
     engine: String,
+}
+
+/// The round trips behind a return, and what they cost.
+#[derive(Clone, Deserialize)]
+struct TradesView {
+    closed: u32,
+    still_open: u32,
+    win_rate: Option<f64>,
+    profit_factor: Option<f64>,
+    expectancy: Option<f64>,
+    average_win: Option<f64>,
+    average_loss: Option<f64>,
+    average_holding_days: Option<f64>,
+    fees_paid: f64,
+    fees_fraction: f64,
+    signal_exits: u32,
+    stop_exits: u32,
 }
 
 #[derive(Clone, Deserialize, serde::Serialize)]
@@ -308,8 +326,10 @@ struct HistoryEntryView {
 #[derive(Clone, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum RecordView {
-    Study(StudyView),
-    Panel(PanelView),
+    // Both boxed: each carries curves and tables, so an unboxed enum would
+    // size every record to whichever view is currently the larger.
+    Study(Box<StudyView>),
+    Panel(Box<PanelView>),
 }
 
 /// Grouped to thousands. A portfolio total is read as a quantity of money,
@@ -893,7 +913,7 @@ fn ResearchView(
                                                         let instrument = study.instrument.clone();
                                                         set_studies
                                                             .update(|studies| {
-                                                                studies.insert(instrument.clone(), study);
+                                                                studies.insert(instrument.clone(), *study);
                                                             });
                                                         open_study_panel(
                                                             &format!("{STUDY_PANEL_PREFIX}{instrument}"),
@@ -901,7 +921,7 @@ fn ResearchView(
                                                         );
                                                     }
                                                     Ok(RecordView::Panel(panel)) => {
-                                                        set_panel.set(Some(panel));
+                                                        set_panel.set(Some(*panel));
                                                         open_study_panel(PANEL_PANEL_ID, "Panel");
                                                     }
                                                     Err(reason) => set_error.set(Some(reason)),
@@ -1245,6 +1265,61 @@ fn EquityChart(strategy: Vec<CurvePoint>, benchmark: Vec<CurvePoint>) -> impl In
 
 /// Month-by-month returns as a grid of years against months.
 ///
+/// What the round trips looked like, and what they cost.
+///
+/// A return says a rule made money. This says whether it did so the way it
+/// would have to keep doing so: a high win rate with negative expectancy is
+/// the most common shape of a strategy that looks good and loses, and no
+/// summary statistic drawn from the equity curve can show it.
+///
+/// Fees are shown as money *and* as a fraction of capital, because that is
+/// the comparison that matters — 2% of fees against a 3% return is the
+/// finding, and neither number says it alone. They are fees and not the total
+/// cost of trading: slippage is charged inside the fill prices, so it is
+/// already subtracted from the return and never appears as a line item.
+#[component]
+fn TradeDetail(trades: TradesView) -> impl IntoView {
+    // "—" rather than a zero throughout: a statistic that has no value
+    // because nothing closed is not the same as one that measured zero, and
+    // the whole point of these being `Option` upstream is to keep them apart.
+    let pct = |value: Option<f64>| value.map_or_else(|| "—".to_owned(), |v| format!("{:.0}%", v * 100.0));
+    let ratio = |value: Option<f64>| value.map_or_else(|| "—".to_owned(), |v| format!("{v:.2}"));
+    let money = |value: Option<f64>| value.map_or_else(|| "—".to_owned(), |v| format!("{v:+.0}"));
+    let days = trades
+        .average_holding_days
+        .map_or_else(|| "—".to_owned(), |d| format!("{d:.1} days"));
+    let open_note = (trades.still_open > 0)
+        .then(|| format!(" ({} still open)", trades.still_open));
+    let expectancy_class = match trades.expectancy {
+        Some(value) if value > 0.0 => "research-good",
+        Some(_) => "research-bad",
+        None => "",
+    };
+
+    view! {
+        <dl class="research-provenance">
+            <dt>"Closed round trips"</dt>
+            <dd>{format!("{}{}", trades.closed, open_note.unwrap_or_default())}</dd>
+            <dt>"Win rate"</dt>
+            <dd>{pct(trades.win_rate)}</dd>
+            <dt>"Expectancy per trade"</dt>
+            <dd class=expectancy_class>{money(trades.expectancy)}</dd>
+            <dt>"Profit factor"</dt>
+            <dd>{ratio(trades.profit_factor)}</dd>
+            <dt>"Average win / loss"</dt>
+            <dd>{format!("{} / {}", money(trades.average_win), money(trades.average_loss.map(|l| -l)))}</dd>
+            <dt>"Average hold"</dt>
+            <dd>{days}</dd>
+            <dt>"Exits"</dt>
+            <dd>{format!("{} on signal, {} on stop", trades.signal_exits, trades.stop_exits)}</dd>
+            <dt>"Fees and commission"</dt>
+            <dd title="Slippage is charged in the fill prices and is already in the return">
+                {format!("{:.0} ({:.2}% of capital)", trades.fees_paid, trades.fees_fraction * 100.0)}
+            </dd>
+        </dl>
+    }
+}
+
 /// A total return says what was earned; this says whether it arrived steadily
 /// or in one quarter that will not repeat. Cells are shaded by magnitude
 /// relative to the largest move in the table, so a quiet strategy is not
@@ -1498,6 +1573,9 @@ fn StudyReport(study: StudyView) -> impl IntoView {
                         }
                     }
                 })}
+
+            <h4>"The trades behind it"</h4>
+            <TradeDetail trades=study.trades_detail.clone() />
 
             <h4>"How this was arrived at"</h4>
             <dl class="research-provenance">

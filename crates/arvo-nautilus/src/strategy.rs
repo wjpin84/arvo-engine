@@ -14,6 +14,14 @@
 //! never sees the type.
 
 use std::collections::VecDeque;
+
+/// Tags stamped on a closing order to say why it was sent.
+///
+/// Read back by [`crate::ledger`], which is the other half of this contract:
+/// change a spelling here and the ledger silently reclassifies every exit.
+pub(crate) const EXIT_STOP: &str = "arvo:exit=stop";
+pub(crate) const EXIT_SIGNAL: &str = "arvo:exit=signal";
+
 use std::fmt::Debug;
 
 use nautilus_common::actor::DataActor;
@@ -207,13 +215,20 @@ impl SmaCross {
 
     /// Closes whatever is held. Does nothing when flat.
     ///
+    /// The `reason` is stamped on the closing order as a tag, and that is the
+    /// only place it survives. A stop here is a market order the strategy
+    /// sends when it sees the level breached, not a resting stop order the
+    /// venue holds, so nothing about the order itself says why it was sent —
+    /// which means a ledger reading order *types* would report every exit as
+    /// a signal and never as a stop. It would have been wrong silently.
+    ///
     /// Asks the engine what the position actually is rather than trusting the
     /// quantity this strategy asked for. The two diverge whenever an order is
     /// rejected or partially filled — insufficient funds, for one — and a
     /// strategy that sold its *intended* size would then either leave a
     /// remainder that outlives its stop or flip short without ever deciding
     /// to. Its own record is the fallback, for a venue that reports nothing.
-    fn exit(&mut self) -> anyhow::Result<()> {
+    fn exit(&mut self, reason: &'static str) -> anyhow::Result<()> {
         self.stop = None;
         let intended = self.held.take();
 
@@ -227,10 +242,15 @@ impl SmaCross {
         let Some(size) = size else {
             return Ok(());
         };
-        self.enter_sized(OrderSide::Sell, size)
+        self.enter_sized(OrderSide::Sell, size, Some(reason))
     }
 
-    fn enter_sized(&mut self, side: OrderSide, trade_size: Quantity) -> anyhow::Result<()> {
+    fn enter_sized(
+        &mut self,
+        side: OrderSide,
+        trade_size: Quantity,
+        reason: Option<&'static str>,
+    ) -> anyhow::Result<()> {
         let instrument_id = self.instrument_id;
         let order = self.order().market(
             instrument_id,
@@ -241,7 +261,7 @@ impl SmaCross {
             None, // quote_quantity
             None, // exec_algorithm_id
             None, // exec_algorithm_params
-            None, // tags
+            reason.map(|reason| vec![ustr::Ustr::from(reason)]),
             None, // client_order_id
         );
         self.submit_order(order, None, None, None)
@@ -293,7 +313,7 @@ impl DataActor for SmaCross {
                 // should need a fresh signal, not the stale one that is still
                 // technically in force.
                 self.previous_fast_above = None;
-                return self.exit();
+                return self.exit(EXIT_STOP);
             }
         }
 
@@ -318,7 +338,7 @@ impl DataActor for SmaCross {
                         Ok(())
                     } else {
                         self.held = Some(self.trade_size);
-                        self.enter_sized(OrderSide::Buy, self.trade_size)
+                        self.enter_sized(OrderSide::Buy, self.trade_size, None)
                     };
                 };
 
@@ -335,9 +355,9 @@ impl DataActor for SmaCross {
 
                 self.stop = Some(close - distance);
                 self.held = Some(size);
-                self.enter_sized(OrderSide::Buy, size)
+                self.enter_sized(OrderSide::Buy, size, None)
             }
-            Some(true) if !fast_above => self.exit(),
+            Some(true) if !fast_above => self.exit(EXIT_SIGNAL),
             _ => Ok(()),
         }
     }
