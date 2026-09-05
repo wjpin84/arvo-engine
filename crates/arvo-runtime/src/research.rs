@@ -37,6 +37,11 @@ pub const EVIDENCE_SUBDIR: &str = "evidence";
 /// These become editable when there is a reason to edit them.
 const STARTING_CASH: f64 = 100_000.0;
 const COMMISSION_BPS: f64 = 1.0;
+/// A half-spread on a liquid US large cap, taken with a market order. Not
+/// zero, because zero is the assumption that makes a backtest look best and
+/// is true of no market — and it is now honoured by the engine rather than
+/// merely recorded. See `arvo_nautilus`'s fill model for how it is charged.
+const SLIPPAGE_BPS: f64 = 1.0;
 const TRADE_SIZE: f64 = 100.0;
 const STRATEGY: &str = "sma_cross";
 
@@ -197,6 +202,7 @@ pub struct StudyView {
     pub strategy_name: String,
     pub starting_cash: f64,
     pub commission_bps: f64,
+    pub slippage_bps: f64,
     pub engine: String,
 }
 
@@ -494,6 +500,7 @@ pub struct PanelView {
     pub strategy_name: String,
     pub starting_cash: f64,
     pub commission_bps: f64,
+    pub slippage_bps: f64,
     pub engine: String,
 }
 
@@ -574,6 +581,7 @@ fn study_view(found: &arvo_research::FamilyEvidence, engine: &str) -> StudyView 
         strategy_name: found.selected.strategy.name.clone(),
         starting_cash: found.selected.starting_cash,
         commission_bps: found.selected.costs.commission_bps,
+        slippage_bps: found.selected.costs.slippage_bps,
         engine: engine.to_owned(),
     }
 }
@@ -617,6 +625,7 @@ fn panel_view(found: &arvo_research::PanelEvidence, engine: &str) -> PanelView {
         strategy_name: STRATEGY.to_owned(),
         starting_cash: STARTING_CASH,
         commission_bps: COMMISSION_BPS,
+        slippage_bps: SLIPPAGE_BPS,
         engine: engine.to_owned(),
     }
 }
@@ -688,7 +697,7 @@ fn template_for(subject: &str, window: DateRange, dataset_version: &str) -> Expe
         },
         costs: CostModel {
             commission_bps: COMMISSION_BPS,
-            slippage_bps: 0.0,
+            slippage_bps: SLIPPAGE_BPS,
         },
         risk: arvo_research::RiskModel {
             stop_atr_multiple: Some(STOP_ATR_MULTIPLE),
@@ -740,8 +749,8 @@ mod tests {
             "the dataset identity must reach the record, or nothing can be found stale"
         );
         assert!(
-            (family.template.costs.slippage_bps - 0.0).abs() < f64::EPSILON,
-            "non-zero slippage is not honoured by the engine yet and would fail the run"
+            family.template.costs.slippage_bps > 0.0,
+            "a study that assumes free fills is the optimistic one, and the engine              honours slippage now"
         );
     }
 }

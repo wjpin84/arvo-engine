@@ -17,6 +17,7 @@ thiserror.workspace = true
 nautilus-backtest = "=0.63.0"
 nautilus-common = "=0.63.0"
 nautilus-core = "=0.63.0"
+nautilus-execution = "=0.63.0"
 nautilus-model = "=0.63.0"
 nautilus-trading = "=0.63.0"
 rust_decimal = "1.43.0"

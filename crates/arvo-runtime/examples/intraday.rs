@@ -1,7 +1,7 @@
 //! Runs one experiment at an explicit resolution, to prove the interval is
 //! honoured end to end.
 //!
-//!     cargo run -p arvo-runtime --example intraday -- <data-dir> <instrument> <interval>
+//!     cargo run -p arvo-runtime --example intraday -- //!         <data-dir> <instrument> <interval> [risk-per-trade] [slippage-bps]
 //!
 //! Exists because the interval touches four crates — the data tier, the
 //! record, the engine boundary and annualisation — and a mistake in any of
@@ -19,12 +19,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let root = args
         .next()
-        .ok_or("usage: intraday <data-dir> <instrument> <interval>")?;
+        .ok_or("usage: intraday <data-dir> <instrument> <interval> [risk] [slippage-bps]")?;
     let instrument = args.next().ok_or("missing instrument")?;
     let interval: BarInterval = args.next().ok_or("missing interval")?.parse()?;
     // Optional 4th argument: "none" for fixed sizing, so risk-based sizing
     // can be isolated as a cause rather than assumed.
     let risk_arg = args.next().unwrap_or_else(|| "0.01".to_owned());
+    // Optional 5th argument. Slippage often exceeds the edge at intraday
+    // resolution, so being able to vary it here is how that gets checked
+    // rather than assumed.
+    let slippage_bps: f64 = args.next().unwrap_or_else(|| "0".to_owned()).parse()?;
 
     let bars = CsvBars::new(&root);
     let series = bars.bars(
@@ -38,7 +42,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     };
 
-    println!("{instrument} at {interval}");
+    println!("{instrument} at {interval}, slippage {slippage_bps} bps");
     println!("  {} bars, {} .. {}", series.len(), first.at, last.at);
     println!(
         "  {:.1} periods a year (a daily bar is {:.0})",
@@ -68,7 +72,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         costs: CostModel {
             commission_bps: 1.0,
-            slippage_bps: 0.0,
+            slippage_bps,
         },
         risk: RiskModel {
             stop_atr_multiple: Some(2.0),

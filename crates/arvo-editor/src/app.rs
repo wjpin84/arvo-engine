@@ -187,6 +187,7 @@ struct StudyView {
     strategy_name: String,
     starting_cash: f64,
     commission_bps: f64,
+    slippage_bps: f64,
     engine: String,
 }
 
@@ -230,6 +231,7 @@ struct PanelView {
     strategy_name: String,
     starting_cash: f64,
     commission_bps: f64,
+    slippage_bps: f64,
     engine: String,
 }
 
@@ -1160,7 +1162,9 @@ fn PanelReport(panel: PanelView) -> impl IntoView {
                 <dt>"Starting cash"</dt>
                 <dd>{format!("{:.0} per instrument", panel.starting_cash)}</dd>
                 <dt>"Commission"</dt>
-                <dd>{format!("{} bps, slippage not modelled", panel.commission_bps)}</dd>
+                <dd>{format!("{} bps", panel.commission_bps)}</dd>
+                <dt>"Slippage"</dt>
+                <dd>{format!("{} bps a side", panel.slippage_bps)}</dd>
                 <dt>"Engine"</dt>
                 <dd>{panel.engine.clone()}</dd>
             </dl>
@@ -1514,7 +1518,9 @@ fn StudyReport(study: StudyView) -> impl IntoView {
                 <dt>"Starting cash"</dt>
                 <dd>{format!("{:.0}", study.starting_cash)}</dd>
                 <dt>"Commission"</dt>
-                <dd>{format!("{} bps, slippage not modelled", study.commission_bps)}</dd>
+                <dd>{format!("{} bps", study.commission_bps)}</dd>
+                <dt>"Slippage"</dt>
+                <dd>{format!("{} bps a side", study.slippage_bps)}</dd>
                 <dt>"Engine"</dt>
                 <dd>{study.engine.clone()}</dd>
             </dl>

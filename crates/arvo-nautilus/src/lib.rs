@@ -37,6 +37,7 @@
 //! obligation attaches to the distributed binary — but keeping the dependency
 //! to this one crate keeps the fact obvious rather than diffuse.
 
+mod fill;
 mod strategy;
 
 use std::str::FromStr;
@@ -52,6 +53,7 @@ use nautilus_backtest::{
     engine::BacktestEngine,
 };
 use nautilus_common::logging::logging_set_bypass;
+use nautilus_execution::models::fill::FillModelHandle;
 use nautilus_core::UnixNanos;
 use nautilus_model::{
     data::{Bar, BarSpecification, BarType, Data},
@@ -106,17 +108,6 @@ impl<P: BarProvider> SimulationProvider for NautilusSimulation<P> {
             .risk
             .check()
             .map_err(|reason| SimulationError::Rejected(format!("risk model: {reason}")))?;
-
-        // Slippage is pinned in the experiment but not yet wired into a fill
-        // model. Failing here is the point: quietly running with an assumption
-        // the record claims was applied would make the evidence a lie.
-        if experiment.costs.slippage_bps != 0.0 {
-            return Err(SimulationError::Unsupported(format!(
-                "slippage_bps is recorded but not yet applied to fills; \
-                 got {}, only 0 can be honoured",
-                experiment.costs.slippage_bps
-            )));
-        }
 
         let instrument_id = InstrumentId::from_str(&experiment.instrument).map_err(|err| {
             SimulationError::Rejected(format!("instrument {:?}: {err}", experiment.instrument))
@@ -294,6 +285,15 @@ fn run_backtest(
                 .map_err(|err| rejected("venue config", &err))?,
         )
         .map_err(|err| rejected("adding the venue", &err))?;
+
+    // Only when there is slippage to apply. A zero-slippage run keeps
+    // Nautilus's own matching untouched, so every result produced before this
+    // existed is still reproducible byte for byte.
+    if experiment.costs.slippage_bps != 0.0 {
+        let model = fill::BpsSlippage::new(experiment.costs.slippage_bps)
+            .map_err(SimulationError::Rejected)?;
+        engine.change_fill_model(instrument_id.venue, FillModelHandle::new(model));
+    }
 
     let instrument = equity(instrument_id, currency, experiment.costs.commission_bps)
         .map_err(|err| rejected("building the instrument", &err))?;
@@ -675,15 +675,42 @@ mod tests {
     }
 
     #[test]
-    fn an_unwired_cost_assumption_fails_rather_than_being_ignored() {
+    fn slippage_makes_the_same_strategy_worse() {
+        // The reason the feature exists: a backtest run without it is
+        // optimistic, and the optimism has to show up as a number.
+        let bars = sawtooth(200);
+        let clean = experiment(params(5.0, 10.0), &bars);
+        let mut slipped = clean.clone();
+        slipped.costs.slippage_bps = 25.0;
+
+        let without = provider(bars.clone()).run(&clean).expect("runs");
+        let with = provider(bars).run(&slipped).expect("runs");
+
+        assert_eq!(
+            without.trades, with.trades,
+            "slippage should cost money, not change which signals fired"
+        );
+        let final_equity = |result: &SimulationResult| {
+            result.equity_curve.last().expect("non-empty").equity
+        };
+        assert!(
+            final_equity(&with) < final_equity(&without),
+            "slipped {} should end below unslipped {}",
+            final_equity(&with),
+            final_equity(&without)
+        );
+    }
+
+    #[test]
+    fn nonsense_slippage_is_refused_rather_than_run() {
         let bars = sawtooth(50);
         let mut experiment = experiment(params(5.0, 10.0), &bars);
-        experiment.costs.slippage_bps = 2.0;
+        experiment.costs.slippage_bps = -2.0;
 
         let err = provider(bars)
             .run(&experiment)
-            .expect_err("slippage is recorded but not applied");
-        assert!(matches!(err, SimulationError::Unsupported(_)), "{err}");
+            .expect_err("negative slippage would pay us to trade");
+        assert!(matches!(err, SimulationError::Rejected(_)), "{err}");
     }
 
     #[test]
