@@ -184,12 +184,22 @@ struct StudyView {
     benchmark_curve: Vec<CurvePoint>,
     monthly: Vec<MonthlyReturnView>,
     trades_detail: TradesView,
+    recommendations: Vec<RecommendationView>,
     dataset_version: String,
     strategy_name: String,
     starting_cash: f64,
     commission_bps: f64,
     slippage_bps: f64,
     engine: String,
+}
+
+/// One thing to do about a finding.
+#[derive(Clone, Deserialize)]
+struct RecommendationView {
+    severity: String,
+    finding: String,
+    action: String,
+    evidence: String,
 }
 
 /// The round trips behind a return, and what they cost.
@@ -1265,6 +1275,40 @@ fn EquityChart(strategy: Vec<CurvePoint>, benchmark: Vec<CurvePoint>) -> impl In
 
 /// Month-by-month returns as a grid of years against months.
 ///
+/// What to do about a finding.
+///
+/// Directly under the verdict, above the charts, because a blocking item
+/// means the charts below it should not be read yet — and a reader who has
+/// already looked at a rising equity curve has formed the view the blocking
+/// item exists to prevent.
+///
+/// Every item carries the figures it came from. That is not decoration: these
+/// are mechanical consequences of stated thresholds, not judgements, and a
+/// reader has to be able to disagree with one.
+#[component]
+fn Recommendations(items: Vec<RecommendationView>) -> impl IntoView {
+    (!items.is_empty()).then(|| {
+        view! {
+            <ul class="research-advice">
+                {items
+                    .into_iter()
+                    .map(|item| {
+                        let class = format!("research-advice-item {}", item.severity);
+                        view! {
+                            <li class=class>
+                                <span class="research-advice-severity">{item.severity.clone()}</span>
+                                <strong>{item.finding.clone()}</strong>
+                                <p>{item.action.clone()}</p>
+                                <p class="research-advice-evidence">{item.evidence.clone()}</p>
+                            </li>
+                        }
+                    })
+                    .collect_view()}
+            </ul>
+        }
+    })
+}
+
 /// What the round trips looked like, and what they cost.
 ///
 /// A return says a rule made money. This says whether it did so the way it
@@ -1469,6 +1513,8 @@ fn StudyReport(study: StudyView) -> impl IntoView {
             <ul class="research-reasons">
                 {study.reasons.iter().map(|r| view! { <li>{r.clone()}</li> }).collect_view()}
             </ul>
+
+            <Recommendations items=study.recommendations.clone() />
 
             <div class="metric-cards">
                 <MetricCard

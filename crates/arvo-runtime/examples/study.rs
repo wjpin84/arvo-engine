@@ -116,6 +116,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     trades.total_commission,
                     trades.total_commission / found.selected.starting_cash * 100.0
                 );
+                for item in arvo_research::recommend(&found) {
+                    println!("  [{}] {}", item.severity.label(), item.finding);
+                    println!("      {}", item.action);
+                    println!("      ({})", item.evidence);
+                }
                 for reason in &found.reasons {
                     println!("  - {reason}");
                 }

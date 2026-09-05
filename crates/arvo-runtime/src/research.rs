@@ -163,6 +163,15 @@ fn curve_points(curve: &[arvo_research::EquityPoint]) -> Vec<CurvePoint> {
     points
 }
 
+/// One thing to do about a finding, flattened for display.
+#[derive(Serialize)]
+pub struct RecommendationView {
+    pub severity: String,
+    pub finding: String,
+    pub action: String,
+    pub evidence: String,
+}
+
 /// What the round trips looked like, flattened for display.
 ///
 /// Beside the metrics rather than inside them: metrics come from the equity
@@ -250,6 +259,12 @@ pub struct StudyView {
     pub monthly: Vec<MonthlyReturnView>,
     /// The round trips behind the return, and what they cost.
     pub trades_detail: TradesView,
+    /// What to do about this finding, most stopping first.
+    ///
+    /// Derived on read rather than stored, so a finding pulled out of memory
+    /// is read against today's rules rather than the ones in force when it
+    /// was recorded.
+    pub recommendations: Vec<RecommendationView>,
 
     // Stated assumptions, because a verdict without them is decoration.
     /// The dataset this result was produced from, as a content hash. Compared
@@ -637,6 +652,15 @@ fn study_view(found: &arvo_research::FamilyEvidence, engine: &str) -> StudyView 
             &evaluation.strategy_trades,
             found.selected.starting_cash,
         ),
+        recommendations: arvo_research::recommend(found)
+            .into_iter()
+            .map(|item| RecommendationView {
+                severity: item.severity.label().to_owned(),
+                finding: item.finding,
+                action: item.action,
+                evidence: item.evidence,
+            })
+            .collect(),
         dataset_version: found.selected.dataset.version.clone(),
         strategy_name: found.selected.strategy.name.clone(),
         starting_cash: found.selected.starting_cash,

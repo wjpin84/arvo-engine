@@ -24,12 +24,14 @@
 //! An abstraction earns its place by removing a dependency or a panic, not by
 //! anticipating an implementation nobody has asked for.
 
+pub mod advice;
 pub mod evaluation;
 pub mod family;
 pub mod memory;
 pub mod panel;
 pub mod trade;
 
+pub use advice::{recommend, Recommendation, Severity};
 pub use evaluation::{
     evaluate_against_benchmark, Evaluation, EvaluationCriteria, Evidence, Metrics, Verdict,
 };
