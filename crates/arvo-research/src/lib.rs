@@ -138,6 +138,20 @@ pub struct RiskModel {
     /// means nothing without a distance to the exit, and there is no
     /// defensible default to invent for it.
     pub risk_per_trade: Option<f64>,
+    /// The largest fraction of starting capital one position may occupy.
+    ///
+    /// Not a refinement — without it, risk sizing is unbounded. Position size
+    /// is capital-at-risk divided by the stop distance, and a *tight* stop
+    /// therefore buys a *bigger* position. At a daily resolution ATR is wide
+    /// enough that this never binds; on five-minute bars a one-dollar stop on
+    /// a five-hundred-dollar share asks for a position several times the
+    /// account, every order is rejected, and the backtest reports zero trades
+    /// with no error anywhere. Found exactly that way.
+    ///
+    /// Defaults to one whole account: you cannot spend money you do not have,
+    /// which is arithmetic rather than a strategy choice. Above 1.0 is
+    /// leverage and has to be asked for.
+    pub max_position_fraction: Option<f64>,
 }
 
 impl Default for RiskModel {
@@ -149,6 +163,7 @@ impl Default for RiskModel {
             stop_atr_multiple: None,
             atr_period: 14,
             risk_per_trade: None,
+            max_position_fraction: Some(1.0),
         }
     }
 }
@@ -170,6 +185,11 @@ impl RiskModel {
                 return Err(format!(
                     "stop_atr_multiple must be positive, got {multiple}"
                 ));
+            }
+        }
+        if let Some(cap) = self.max_position_fraction {
+            if !cap.is_finite() || cap <= 0.0 {
+                return Err(format!("max_position_fraction must be positive, got {cap}"));
             }
         }
         if let Some(risk) = self.risk_per_trade {
@@ -283,6 +303,13 @@ pub struct Experiment {
     /// than here — this crate has no opinion on venue naming.
     pub instrument: String,
     pub window: DateRange,
+    /// The resolution the rule was evaluated at.
+    ///
+    /// Pinned, because the same rule at five minutes and at one day is not
+    /// the same experiment: it sees different prices, trades at different
+    /// times, and its statistics annualise by a different factor.
+    #[serde(default)]
+    pub interval: arvo_data::BarInterval,
     pub dataset: DatasetRef,
     pub strategy: StrategySpec,
     pub costs: CostModel,
@@ -303,7 +330,7 @@ pub struct Experiment {
 /// The equity curve is the primitive on purpose: Sharpe, drawdown, hit rate
 /// and the rest all derive from it, so evaluation can grow without the engine
 /// boundary changing shape every time a new metric is wanted.
-/// Account equity on one day.
+/// Account equity at one instant.
 ///
 /// Dated, not just ordered. A bare `Vec<f64>` was enough to compute a return
 /// and is not enough to draw one, to align two runs against each other, or to
@@ -311,7 +338,9 @@ pub struct Experiment {
 /// discarding them was throwing away something free.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct EquityPoint {
-    pub date: NaiveDate,
+    /// When, to the resolution the experiment ran at. A date was enough
+    /// while everything was daily and is not once two points can share one.
+    pub at: chrono::NaiveDateTime,
     pub equity: f64,
 }
 
@@ -410,8 +439,8 @@ mod tests {
         // the risk setting. Both are worse than refusing.
         let model = RiskModel {
             stop_atr_multiple: None,
-            atr_period: 14,
             risk_per_trade: Some(0.01),
+            ..RiskModel::default()
         };
         let err = model.check().expect_err("should refuse");
         assert!(err.contains("needs a stop"), "{err}");
@@ -421,10 +450,34 @@ mod tests {
     fn a_stop_and_a_risk_fraction_together_are_valid() {
         let model = RiskModel {
             stop_atr_multiple: Some(2.0),
-            atr_period: 14,
             risk_per_trade: Some(0.01),
+            ..RiskModel::default()
         };
         assert!(model.check().is_ok());
+    }
+
+    #[test]
+    fn a_position_cap_bounds_what_risk_sizing_can_ask_for() {
+        // The intraday failure this exists to prevent: position size is
+        // capital-at-risk over stop distance, so a one-dollar stop on a
+        // five-hundred-dollar share asks for several accounts' worth. Every
+        // order is then rejected and the backtest reports no trades at all,
+        // with nothing anywhere saying why.
+        let uncapped = RiskModel {
+            stop_atr_multiple: Some(2.0),
+            risk_per_trade: Some(0.01),
+            max_position_fraction: None,
+            ..RiskModel::default()
+        };
+        assert!(
+            uncapped.check().is_ok(),
+            "uncapped is legal, just unbounded"
+        );
+        assert_eq!(
+            RiskModel::default().max_position_fraction,
+            Some(1.0),
+            "and the default is one whole account"
+        );
     }
 
     #[test]
@@ -462,6 +515,11 @@ mod tests {
         let model = RiskModel::default();
         assert_eq!(model.stop_atr_multiple, None);
         assert_eq!(model.risk_per_trade, None);
+        assert_eq!(
+            model.max_position_fraction,
+            Some(1.0),
+            "spending more than the account holds is not a strategy choice"
+        );
         assert!(model.check().is_ok(), "absence is valid, just visible");
     }
 
@@ -490,14 +548,18 @@ mod tests {
             engine: "test 0".to_owned(),
             trades: 0,
             equity_curve: vec![EquityPoint {
-                date: NaiveDate::from_ymd_opt(2024, 1, 1).expect("valid"),
+                at: NaiveDate::from_ymd_opt(2024, 1, 1)
+                    .expect("valid")
+                    .and_time(chrono::NaiveTime::MIN),
                 equity: 100_000.0,
             }],
         };
         assert_eq!(result.total_return(), None, "one point is not a return");
 
         result.equity_curve.push(EquityPoint {
-            date: NaiveDate::from_ymd_opt(2024, 1, 2).expect("valid"),
+            at: NaiveDate::from_ymd_opt(2024, 1, 2)
+                .expect("valid")
+                .and_time(chrono::NaiveTime::MIN),
             equity: 110_000.0,
         });
         let total = result.total_return().expect("two points is a return");

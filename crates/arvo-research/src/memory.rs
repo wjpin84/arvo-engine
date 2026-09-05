@@ -285,6 +285,7 @@ mod tests {
             hypothesis: HypothesisId::from("h-1"),
             instrument: instrument.to_owned(),
             window: DateRange::new(day(1), day(31)).expect("ordered"),
+            interval: arvo_data::BarInterval::DAILY,
             dataset: DatasetRef {
                 id: instrument.to_owned(),
                 version: dataset_version.to_owned(),

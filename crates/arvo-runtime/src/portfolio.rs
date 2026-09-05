@@ -178,7 +178,7 @@ fn last_closes(bars: &CsvBars) -> BTreeMap<String, f64> {
         return closes;
     };
     for instrument in instruments {
-        let Ok(Some((_, last))) = bars.coverage(&instrument) else {
+        let Ok(Some((_, last))) = bars.coverage(&instrument, arvo_data::BarInterval::DAILY) else {
             continue;
         };
         if let Ok(bars_in_window) = bars.daily_bars(&instrument, last, last) {

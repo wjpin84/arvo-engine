@@ -121,6 +121,8 @@ pub(crate) struct Risk {
     pub(crate) atr_period: usize,
     /// Capital-at-risk per trade, already in currency rather than a fraction.
     pub(crate) risk_amount: Option<f64>,
+    /// The most one position may be worth, in currency.
+    pub(crate) max_position_value: Option<f64>,
 }
 
 /// Buys when the fast average crosses above the slow one, sells when it
@@ -182,12 +184,21 @@ impl SmaCross {
     /// Rounded down to whole shares, and `None` when that rounds to zero —
     /// buying a share anyway would silently risk more than the model allows,
     /// which is the failure this sizing exists to prevent.
-    fn sized(&self, stop_distance: f64) -> Option<Quantity> {
+    fn sized(&self, stop_distance: f64, price: f64) -> Option<Quantity> {
         let risk_amount = self.risk.risk_amount?;
-        if stop_distance <= 0.0 {
+        if stop_distance <= 0.0 || price <= 0.0 {
             return None;
         }
-        let shares = (risk_amount / stop_distance).floor();
+        let mut shares = (risk_amount / stop_distance).floor();
+
+        // A tighter stop asks for a bigger position, so this is where an
+        // intraday stop of a dollar tries to buy several accounts' worth.
+        // Capping is what turns that into a smaller trade rather than a
+        // rejected order and a silently empty backtest.
+        if let Some(cap) = self.risk.max_position_value {
+            shares = shares.min((cap / price).floor());
+        }
+
         if shares < 1.0 {
             return None;
         }
@@ -316,7 +327,7 @@ impl DataActor for SmaCross {
                     // No size that keeps the loss within budget means no
                     // trade. Taking it anyway would break the one rule the
                     // risk model exists to enforce.
-                    Some(_) => self.sized(distance),
+                    Some(_) => self.sized(distance, close),
                 };
                 let Some(size) = size else {
                     return Ok(());

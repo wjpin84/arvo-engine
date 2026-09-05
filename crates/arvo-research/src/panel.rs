@@ -34,7 +34,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-use crate::evaluation::{benchmark_for, EvaluationCriteria, TRADING_DAYS_PER_YEAR};
+use crate::evaluation::{benchmark_for, EvaluationCriteria};
 use crate::family::{expected_best_under_null, ParameterGrid, Selection};
 use crate::{
     DateRange, Experiment, ExperimentId, HypothesisId, Metrics, SimulationError,
@@ -170,7 +170,7 @@ pub fn run_panel(
                     if let Some(sharpe) = Metrics::from_curve(
                         &result.equity_curve,
                         result.trades,
-                        TRADING_DAYS_PER_YEAR,
+                        study.template.interval.periods_per_year(),
                     )
                     .and_then(|metrics| metrics.sharpe)
                     {
@@ -230,8 +230,9 @@ pub fn run_panel(
 
         let outcome = provider.run(&experiment).and_then(|strategy_result| {
             let benchmark_result = provider.run(&benchmark)?;
+            let periods = study.template.interval.periods_per_year();
             let metrics = |result: &crate::SimulationResult| {
-                Metrics::from_curve(&result.equity_curve, result.trades, TRADING_DAYS_PER_YEAR)
+                Metrics::from_curve(&result.equity_curve, result.trades, periods)
             };
             match (metrics(&strategy_result), metrics(&benchmark_result)) {
                 (Some(strategy), Some(benchmark)) => Ok(InstrumentOutcome {

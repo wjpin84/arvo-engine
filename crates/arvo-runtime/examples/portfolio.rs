@@ -30,7 +30,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(data_dir) = &data_dir {
         let bars = CsvBars::new(data_dir);
         for instrument in bars.instruments()? {
-            if let Some((_, last)) = bars.coverage(&instrument)? {
+            if let Some((_, last)) = bars.coverage(&instrument, arvo_data::BarInterval::DAILY)? {
                 if let Some(bar) = bars.daily_bars(&instrument, last, last)?.last() {
                     closes.insert(instrument, bar.close);
                 }

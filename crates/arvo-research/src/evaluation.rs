@@ -22,10 +22,12 @@ use crate::{
     SimulationResult, StrategySpec,
 };
 
-/// Trading days in a year, for annualising daily-bar results.
+/// Trading days in a year.
 ///
-/// The slice runs on daily bars. When a second bar interval appears this
-/// becomes a property of the dataset rather than a constant.
+/// Kept for the daily case and for existing callers, but no longer the thing
+/// to reach for: annualisation now comes from the experiment's own interval
+/// via [`arvo_data::BarInterval::periods_per_year`]. Using this constant on a
+/// five-minute result understates its Sharpe by about nine times, silently.
 pub const TRADING_DAYS_PER_YEAR: f64 = 252.0;
 
 /// The benchmark every experiment is scored against: buy on the first bar,
@@ -188,7 +190,7 @@ pub fn monthly_returns(curve: &[EquityPoint]) -> Vec<MonthlyReturn> {
     let mut current: Option<(i32, u32, f64)> = None;
 
     for point in curve {
-        let (year, month) = (point.date.year(), point.date.month());
+        let (year, month) = (point.at.year(), point.at.month());
         match current {
             // Same month: this is the latest close we have seen for it.
             Some((y, m, _)) if y == year && m == month => {
@@ -388,15 +390,16 @@ pub fn evaluate_against_benchmark(
     let strategy_result = provider.run(experiment)?;
     let benchmark_result = provider.run(&benchmark_experiment)?;
 
+    // From the experiment's own resolution, not a constant: this is the
+    // number every annualised statistic is scaled by.
+    let periods = experiment.interval.periods_per_year();
     let metrics = |result: &SimulationResult, what: &str| {
-        Metrics::from_curve(&result.equity_curve, result.trades, TRADING_DAYS_PER_YEAR).ok_or_else(
-            || {
-                SimulationError::Rejected(format!(
-                    "the {what} run produced {} equity points, too few to evaluate",
-                    result.equity_curve.len()
-                ))
-            },
-        )
+        Metrics::from_curve(&result.equity_curve, result.trades, periods).ok_or_else(|| {
+            SimulationError::Rejected(format!(
+                "the {what} run produced {} equity points, too few to evaluate",
+                result.equity_curve.len()
+            ))
+        })
     };
 
     let engine = strategy_result.engine.clone();
@@ -454,12 +457,14 @@ mod tests {
     /// Dates are irrelevant to every statistic here, so the fixtures walk one
     /// day at a time and the tests stay about the numbers.
     fn curve(values: &[f64]) -> Vec<EquityPoint> {
-        let start = chrono::NaiveDate::from_ymd_opt(2024, 1, 1).expect("valid");
+        let start = chrono::NaiveDate::from_ymd_opt(2024, 1, 1)
+            .expect("valid")
+            .and_time(chrono::NaiveTime::MIN);
         values
             .iter()
             .enumerate()
             .map(|(index, equity)| EquityPoint {
-                date: start + chrono::Duration::days(index as i64),
+                at: start + chrono::Duration::days(index as i64),
                 equity: *equity,
             })
             .collect()
@@ -539,11 +544,13 @@ mod tests {
 
     #[test]
     fn monthly_returns_chain_so_compounding_them_gives_the_total() {
-        let start = chrono::NaiveDate::from_ymd_opt(2024, 1, 1).expect("valid");
+        let start = chrono::NaiveDate::from_ymd_opt(2024, 1, 1)
+            .expect("valid")
+            .and_time(chrono::NaiveTime::MIN);
         let points: Vec<EquityPoint> = [(0, 100.0), (20, 110.0), (40, 121.0), (75, 108.9)]
             .into_iter()
             .map(|(offset, equity)| EquityPoint {
-                date: start + chrono::Duration::days(offset),
+                at: start + chrono::Duration::days(offset),
                 equity,
             })
             .collect();
@@ -649,6 +656,7 @@ mod tests {
             hypothesis: HypothesisId::from("h-1"),
             instrument: "AAPL.NASDAQ".to_owned(),
             window: DateRange::new(day(1), day(31)).expect("ordered"),
+            interval: arvo_data::BarInterval::DAILY,
             dataset: DatasetRef {
                 id: "d".to_owned(),
                 version: "1".to_owned(),

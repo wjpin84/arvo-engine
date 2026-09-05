@@ -7,25 +7,36 @@
 //!
 //! # Scope
 //!
-//! Daily bars only, and deliberately. The first vertical slice runs on daily
-//! bars, which sidesteps the intraday tier and the paid-feed question
-//! entirely. Intraday, quotes, order books and live subscriptions are not
-//! modelled here because nothing consumes them yet, and guessing their shape
-//! now would mean guessing wrong.
+//! Bars at any resolution, from seconds to weeks — see [`interval`]. Quotes,
+//! order books and live subscriptions are still not modelled, because nothing
+//! consumes them yet and guessing their shape would mean guessing wrong.
+//!
+//! A bar carries a *timestamp*, not a date. That was a date while everything
+//! was daily, and the assumption had spread into three crates by the time it
+//! had to come out.
 //!
 //! This is *research* data — it is not Nautilus's `DataClient` and does not
 //! mirror it. Venue adapters, execution feeds and live streaming remain
 //! Nautilus's, reached through `arvo-nautilus`.
 
-use chrono::{Datelike, NaiveDate};
+pub mod interval;
+
+use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
+
+pub use crate::interval::{BarInterval, IntervalUnit};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-/// One day of trading for one instrument.
+/// One bar of trading for one instrument.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Bar {
-    pub date: NaiveDate,
+    /// When the bar *opens*. A daily bar opens at midnight of its date.
+    ///
+    /// The instant it closes is this plus the interval's duration, and that
+    /// is what the engine timestamps it with — a close is not knowable until
+    /// the period ends, and pretending otherwise is look-ahead bias.
+    pub at: NaiveDateTime,
     pub open: f64,
     pub high: f64,
     pub low: f64,
@@ -78,12 +89,27 @@ pub trait BarProvider: Send + Sync {
     ///
     /// Returns [`DataError`] if the instrument is unknown or its data cannot
     /// be read or parsed.
+    fn bars(
+        &self,
+        instrument: &str,
+        interval: BarInterval,
+        from: NaiveDate,
+        to: NaiveDate,
+    ) -> Result<Vec<Bar>, DataError>;
+
+    /// Daily bars, which is what most callers still want.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::bars`].
     fn daily_bars(
         &self,
         instrument: &str,
         from: NaiveDate,
         to: NaiveDate,
-    ) -> Result<Vec<Bar>, DataError>;
+    ) -> Result<Vec<Bar>, DataError> {
+        self.bars(instrument, BarInterval::DAILY, from, to)
+    }
 
     /// The first and last day this source holds for `instrument`.
     ///
@@ -96,10 +122,14 @@ pub trait BarProvider: Send + Sync {
     /// # Errors
     ///
     /// Returns [`DataError`] on the same conditions as [`Self::daily_bars`].
-    fn coverage(&self, instrument: &str) -> Result<Option<(NaiveDate, NaiveDate)>, DataError> {
-        let bars = self.daily_bars(instrument, NaiveDate::MIN, NaiveDate::MAX)?;
+    fn coverage(
+        &self,
+        instrument: &str,
+        interval: BarInterval,
+    ) -> Result<Option<(NaiveDate, NaiveDate)>, DataError> {
+        let bars = self.bars(instrument, interval, NaiveDate::MIN, NaiveDate::MAX)?;
         Ok(match (bars.first(), bars.last()) {
-            (Some(first), Some(last)) => Some((first.date, last.date)),
+            (Some(first), Some(last)) => Some((first.at.date(), last.at.date())),
             _ => None,
         })
     }
@@ -116,18 +146,27 @@ pub trait BarProvider: Send + Sync {
     /// does not invalidate a result, because none of that changes what the
     /// experiment saw. Changing a single price does.
     ///
-    /// Covers the instrument's whole history rather than any one window. A
-    /// dataset is the data; which slice of it an experiment used is recorded
-    /// separately, and conflating the two would make every window look like a
-    /// different dataset.
+    /// Covers the instrument's whole history at that resolution, rather than
+    /// any one window. A dataset is the data; which slice of it an experiment
+    /// used is recorded separately, and conflating the two would make every
+    /// window look like a different dataset.
+    ///
+    /// Per-resolution, because they *are* different datasets: the same
+    /// instrument at five minutes and at one day is two different series, and
+    /// one hash covering both would say a result was stale when the other
+    /// changed.
     ///
     /// `None` for a known instrument holding no bars.
     ///
     /// # Errors
     ///
     /// Returns [`DataError`] on the same conditions as [`Self::daily_bars`].
-    fn fingerprint(&self, instrument: &str) -> Result<Option<String>, DataError> {
-        let bars = self.daily_bars(instrument, NaiveDate::MIN, NaiveDate::MAX)?;
+    fn fingerprint(
+        &self,
+        instrument: &str,
+        interval: BarInterval,
+    ) -> Result<Option<String>, DataError> {
+        let bars = self.bars(instrument, interval, NaiveDate::MIN, NaiveDate::MAX)?;
         if bars.is_empty() {
             return Ok(None);
         }
@@ -139,7 +178,7 @@ pub trait BarProvider: Send + Sync {
             // would have been easier and is explicitly not stable across Rust
             // releases, which would make a fingerprint meaningless the moment
             // the compiler moved.
-            hasher.update(&bar.date.num_days_from_ce().to_le_bytes());
+            hasher.update(&bar.at.and_utc().timestamp().to_le_bytes());
             for value in [bar.open, bar.high, bar.low, bar.close, bar.volume] {
                 hasher.update(&value.to_bits().to_le_bytes());
             }
@@ -155,7 +194,11 @@ pub trait BarProvider: Send + Sync {
 /// loop end to end and for regression fixtures pinned into evidence.
 #[derive(Debug, Default, Clone)]
 pub struct InMemoryBars {
-    bars: BTreeMap<String, Vec<Bar>>,
+    /// Keyed by instrument *and* resolution: the same instrument at five
+    /// minutes and at one day is two different series, and returning one when
+    /// the other was asked for would be a silent resolution mismatch.
+    bars: BTreeMap<(String, String), Vec<Bar>>,
+    instruments: std::collections::BTreeSet<String>,
 }
 
 impl InMemoryBars {
@@ -164,12 +207,25 @@ impl InMemoryBars {
         Self::default()
     }
 
-    /// Adds an instrument's history, sorted on the way in so callers need not
-    /// care about the order they supply.
+    /// Adds an instrument's daily history.
     #[must_use]
-    pub fn with_instrument(mut self, instrument: &str, mut bars: Vec<Bar>) -> Self {
-        bars.sort_by_key(|bar| bar.date);
-        self.bars.insert(instrument.to_owned(), bars);
+    pub fn with_instrument(self, instrument: &str, bars: Vec<Bar>) -> Self {
+        self.with_interval(instrument, BarInterval::DAILY, bars)
+    }
+
+    /// Adds an instrument's history at one resolution, sorted on the way in so
+    /// callers need not care about the order they supply.
+    #[must_use]
+    pub fn with_interval(
+        mut self,
+        instrument: &str,
+        interval: BarInterval,
+        mut bars: Vec<Bar>,
+    ) -> Self {
+        bars.sort_by_key(|bar| bar.at);
+        self.instruments.insert(instrument.to_owned());
+        self.bars
+            .insert((instrument.to_owned(), interval.to_string()), bars);
         self
     }
 }
@@ -179,20 +235,28 @@ impl BarProvider for InMemoryBars {
         "in-memory"
     }
 
-    fn daily_bars(
+    fn bars(
         &self,
         instrument: &str,
+        interval: BarInterval,
         from: NaiveDate,
         to: NaiveDate,
     ) -> Result<Vec<Bar>, DataError> {
-        let bars = self
+        if !self.instruments.contains(instrument) {
+            return Err(DataError::UnknownInstrument(instrument.to_owned()));
+        }
+        // Known instrument, nothing at this resolution: empty rather than
+        // unknown, matching the distinction the trait already draws.
+        let Some(bars) = self
             .bars
-            .get(instrument)
-            .ok_or_else(|| DataError::UnknownInstrument(instrument.to_owned()))?;
+            .get(&(instrument.to_owned(), interval.to_string()))
+        else {
+            return Ok(Vec::new());
+        };
 
         Ok(bars
             .iter()
-            .filter(|bar| bar.date >= from && bar.date <= to)
+            .filter(|bar| bar.at.date() >= from && bar.at.date() <= to)
             .copied()
             .collect())
     }
@@ -217,13 +281,28 @@ impl CsvBars {
         }
     }
 
+    /// Where a resolution's files live.
+    ///
+    /// Daily bars sit in the root, so an existing library keeps working and
+    /// [`Self::instruments`] still lists instruments rather than filenames.
+    /// Anything finer goes in a subdirectory named for the interval —
+    /// `5minute/AAPL.NASDAQ.csv` — because putting the interval in the
+    /// filename would make `AAPL.NASDAQ.5minute` look like an instrument.
+    fn directory(&self, interval: BarInterval) -> PathBuf {
+        if interval == BarInterval::DAILY {
+            self.root.clone()
+        } else {
+            self.root.join(interval.to_string())
+        }
+    }
+
     /// Resolves an instrument to its file, refusing anything that could
     /// escape the root.
     ///
     /// Instrument names arrive from config files and UI fields, so this is a
     /// trust boundary: `../../etc/passwd` is rejected here rather than handed
     /// to the filesystem.
-    fn path_for(&self, instrument: &str) -> Result<PathBuf, DataError> {
+    fn path_for(&self, instrument: &str, interval: BarInterval) -> Result<PathBuf, DataError> {
         let safe = !instrument.is_empty()
             && instrument
                 .chars()
@@ -232,7 +311,7 @@ impl CsvBars {
         if !safe {
             return Err(DataError::UnsafeInstrument(instrument.to_owned()));
         }
-        Ok(self.root.join(format!("{instrument}.csv")))
+        Ok(self.directory(interval).join(format!("{instrument}.csv")))
     }
 }
 
@@ -276,6 +355,20 @@ impl CsvBars {
     }
 }
 
+/// A date or a timestamp, as the instant a bar opens.
+fn parse_stamp(text: &str) -> Option<NaiveDateTime> {
+    let cleaned = text.trim().trim_end_matches('Z').replace(' ', "T");
+    for format in ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%dT%H:%M"] {
+        if let Ok(at) = NaiveDateTime::parse_from_str(&cleaned, format) {
+            return Some(at);
+        }
+    }
+    // A bare date is midnight: a daily bar opens at the start of its day.
+    NaiveDate::parse_from_str(&cleaned, "%Y-%m-%d")
+        .ok()
+        .map(|date| date.and_time(NaiveTime::MIN))
+}
+
 /// Parses one data row.
 ///
 /// ponytail: split on commas, no quoting or escapes. OHLCV exports are bare
@@ -296,9 +389,12 @@ fn parse_row(path: &Path, line_no: usize, line: &str) -> Result<Bar, DataError> 
             .ok_or_else(|| malformed(format!("missing {name}")))
     };
 
-    let date = next("date")?;
-    let date = NaiveDate::parse_from_str(&date, "%Y-%m-%d")
-        .map_err(|err| malformed(format!("date {date:?}: {err}")))?;
+    let stamp = next("date")?;
+    // A date or a timestamp. Daily exports write `2024-01-02`; an intraday
+    // one writes `2024-01-02T13:30:00` or the same with a space, and some
+    // carry a trailing Z. All mean the instant the bar opens.
+    let at = parse_stamp(&stamp)
+        .ok_or_else(|| malformed(format!("date {stamp:?} is not a date or timestamp")))?;
 
     let mut number = |name: &str| -> Result<f64, DataError> {
         let raw = next(name)?;
@@ -312,7 +408,7 @@ fn parse_row(path: &Path, line_no: usize, line: &str) -> Result<Bar, DataError> 
     };
 
     let bar = Bar {
-        date,
+        at,
         open: number("open")?,
         high: number("high")?,
         low: number("low")?,
@@ -348,13 +444,14 @@ impl BarProvider for CsvBars {
         "csv"
     }
 
-    fn daily_bars(
+    fn bars(
         &self,
         instrument: &str,
+        interval: BarInterval,
         from: NaiveDate,
         to: NaiveDate,
     ) -> Result<Vec<Bar>, DataError> {
-        let path = self.path_for(instrument)?;
+        let path = self.path_for(instrument, interval)?;
         let text = match std::fs::read_to_string(&path) {
             Ok(text) => text,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -371,14 +468,14 @@ impl BarProvider for CsvBars {
                 continue;
             }
             let bar = parse_row(&path, index + 1, line)?;
-            if bar.date >= from && bar.date <= to {
+            if bar.at.date() >= from && bar.at.date() <= to {
                 bars.push(bar);
             }
         }
 
         // Sources are not reliably ordered, and every consumer assumes they
         // are. Sorting once here is cheaper than every caller remembering.
-        bars.sort_by_key(|bar| bar.date);
+        bars.sort_by_key(|bar| bar.at);
         Ok(bars)
     }
 }
@@ -393,7 +490,7 @@ mod tests {
 
     fn bar(day: u32, close: f64) -> Bar {
         Bar {
-            date: date(2024, 1, day),
+            at: date(2024, 1, day).and_time(chrono::NaiveTime::MIN),
             open: close,
             high: close,
             low: close,
@@ -451,7 +548,7 @@ mod tests {
             .expect("fixture parses");
 
         assert_eq!(bars.len(), 2);
-        assert_eq!(bars[0].date, date(2024, 1, 3));
+        assert_eq!(bars[0].at.date(), date(2024, 1, 3));
         assert!((bars[1].close - 187.5).abs() < f64::EPSILON);
     }
 
@@ -487,14 +584,19 @@ mod tests {
             .with_instrument("AAPL.NASDAQ", vec![bar(3, 3.0), bar(1, 1.0), bar(2, 2.0)]);
 
         let (first, last) = source
-            .coverage("AAPL.NASDAQ")
+            .coverage("AAPL.NASDAQ", BarInterval::DAILY)
             .expect("known instrument")
             .expect("it holds bars");
         assert_eq!(first, date(2024, 1, 1));
         assert_eq!(last, date(2024, 1, 3));
 
         let empty = InMemoryBars::new().with_instrument("EMPTY.X", vec![]);
-        assert_eq!(empty.coverage("EMPTY.X").expect("known"), None);
+        assert_eq!(
+            empty
+                .coverage("EMPTY.X", BarInterval::DAILY)
+                .expect("known"),
+            None
+        );
     }
 
     #[test]
@@ -508,7 +610,7 @@ mod tests {
 
         let of = |source: &InMemoryBars| {
             source
-                .fingerprint("AAPL.NASDAQ")
+                .fingerprint("AAPL.NASDAQ", BarInterval::DAILY)
                 .expect("known instrument")
                 .expect("holds bars")
         };
@@ -528,10 +630,15 @@ mod tests {
     #[test]
     fn an_empty_instrument_has_no_fingerprint_to_report() {
         let empty = InMemoryBars::new().with_instrument("EMPTY.X", vec![]);
-        assert_eq!(empty.fingerprint("EMPTY.X").expect("known"), None);
+        assert_eq!(
+            empty
+                .fingerprint("EMPTY.X", BarInterval::DAILY)
+                .expect("known"),
+            None
+        );
 
         let err = empty
-            .fingerprint("NEVER.HEARD")
+            .fingerprint("NEVER.HEARD", BarInterval::DAILY)
             .expect_err("unknown instrument");
         assert!(matches!(err, DataError::UnknownInstrument(_)), "{err}");
     }

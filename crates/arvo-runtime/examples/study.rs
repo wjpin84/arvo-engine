@@ -38,7 +38,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for instrument in instruments {
         println!("\n=== {instrument} ===");
-        let Some((from, to)) = bars.coverage(&instrument)? else {
+        let Some((from, to)) = bars.coverage(&instrument, arvo_data::BarInterval::DAILY)? else {
             println!("  no bars");
             continue;
         };
@@ -46,7 +46,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  {} .. {} ({} days)", from, to, window.days());
 
         let fingerprint = bars
-            .fingerprint(&instrument)?
+            .fingerprint(&instrument, arvo_data::BarInterval::DAILY)?
             .ok_or("instrument holds no bars")?;
         println!("  dataset {}", &fingerprint[..16]);
         let family = arvo_runtime_lib::research::study_for(&instrument, window, &fingerprint);
@@ -122,12 +122,12 @@ fn run_panel_over(
     let mut usable = Vec::new();
 
     for instrument in instruments {
-        let Some((first, last)) = bars.coverage(instrument)? else {
+        let Some((first, last)) = bars.coverage(instrument, arvo_data::BarInterval::DAILY)? else {
             continue;
         };
         from = from.max(first);
         to = to.min(last);
-        if let Some(fingerprint) = bars.fingerprint(instrument)? {
+        if let Some(fingerprint) = bars.fingerprint(instrument, arvo_data::BarInterval::DAILY)? {
             hasher.update(fingerprint.as_bytes());
         }
         usable.push(instrument.clone());

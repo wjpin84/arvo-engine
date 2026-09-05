@@ -143,7 +143,10 @@ pub struct CurvePoint {
 fn curve_points(curve: &[arvo_research::EquityPoint]) -> Vec<CurvePoint> {
     let mut points: Vec<CurvePoint> = Vec::with_capacity(curve.len());
     for point in curve {
-        let time = point.date.to_string();
+        // Date only: the chart draws a daily series, and the library keys
+        // points by day. An intraday curve needs a time-aware axis, which is
+        // a chart change rather than a data one.
+        let time = point.at.date().to_string();
         match points.last_mut() {
             Some(last) if last.time == time => last.value = point.equity,
             _ => points.push(CurvePoint {
@@ -288,7 +291,10 @@ fn live_dataset_version(service: &ResearchService, record: &Record) -> Option<St
     match record {
         Record::Study(evidence) => service
             .bars
-            .fingerprint(&evidence.selected.instrument)
+            // At the resolution the finding was produced at, not a default:
+            // the same instrument at two resolutions is two datasets, and
+            // hashing the wrong one would call a current result stale.
+            .fingerprint(&evidence.selected.instrument, evidence.selected.interval)
             .ok()
             .flatten(),
         Record::Panel(_) => panel_dataset_version(&service.bars).map(|(version, _, _, _)| version),
@@ -312,7 +318,11 @@ pub async fn list_instruments(
             // A file that fails to parse should not blank the whole library;
             // it shows as an instrument with no coverage, which is visible
             // and recoverable rather than silently missing.
-            let coverage = service.bars.coverage(&id).ok().flatten();
+            let coverage = service
+                .bars
+                .coverage(&id, arvo_data::BarInterval::DAILY)
+                .ok()
+                .flatten();
             let bars = coverage
                 .map(|(from, to)| {
                     service
@@ -321,7 +331,11 @@ pub async fn list_instruments(
                         .map_or(0, |bars| bars.len())
                 })
                 .unwrap_or_default();
-            let fingerprint = service.bars.fingerprint(&id).ok().flatten();
+            let fingerprint = service
+                .bars
+                .fingerprint(&id, arvo_data::BarInterval::DAILY)
+                .ok()
+                .flatten();
             InstrumentView {
                 id,
                 from: coverage.map(|(from, _)| from.to_string()),
@@ -351,14 +365,14 @@ pub async fn run_study(
     let simulation = service.simulation.clone();
     let coverage = service
         .bars
-        .coverage(&instrument)
+        .coverage(&instrument, arvo_data::BarInterval::DAILY)
         .map_err(|err| CommandError::Failed(format!("reading {instrument}: {err}")))?
         .ok_or_else(|| CommandError::Failed(format!("{instrument} holds no bars")))?;
 
     let engine = simulation.engine().to_owned();
     let fingerprint = service
         .bars
-        .fingerprint(&instrument)
+        .fingerprint(&instrument, arvo_data::BarInterval::DAILY)
         .map_err(|err| CommandError::Failed(format!("hashing {instrument}: {err}")))?
         .ok_or_else(|| CommandError::Failed(format!("{instrument} holds no bars")))?;
 
@@ -419,10 +433,10 @@ fn panel_dataset_version(
     let mut instruments = Vec::new();
 
     for id in bars.instruments().ok()? {
-        let Ok(Some((first, last))) = bars.coverage(&id) else {
+        let Ok(Some((first, last))) = bars.coverage(&id, arvo_data::BarInterval::DAILY) else {
             continue;
         };
-        if let Ok(Some(fingerprint)) = bars.fingerprint(&id) {
+        if let Ok(Some(fingerprint)) = bars.fingerprint(&id, arvo_data::BarInterval::DAILY) {
             hasher.update(fingerprint.as_bytes());
         }
         from = from.max(first);
@@ -654,6 +668,10 @@ fn template_for(subject: &str, window: DateRange, dataset_version: &str) -> Expe
         hypothesis: HypothesisId(format!("trend-following predicts returns in {subject}")),
         instrument: subject.to_owned(),
         window,
+        // Daily for the workbench study. Intraday is now expressible
+        // end-to-end; what it still needs is intraday bars in the data
+        // library, which is a fetching problem rather than a modelling one.
+        interval: arvo_data::BarInterval::DAILY,
         dataset: DatasetRef {
             id: subject.to_owned(),
             // A content hash of the bars, so a stored result knows exactly
@@ -676,6 +694,7 @@ fn template_for(subject: &str, window: DateRange, dataset_version: &str) -> Expe
             stop_atr_multiple: Some(STOP_ATR_MULTIPLE),
             atr_period: ATR_PERIOD,
             risk_per_trade: Some(RISK_PER_TRADE),
+            ..arvo_research::RiskModel::default()
         },
         starting_cash: STARTING_CASH,
         seed: 1,

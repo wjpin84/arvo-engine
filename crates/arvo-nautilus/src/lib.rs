@@ -46,7 +46,7 @@ use arvo_data::BarProvider;
 use arvo_research::{
     EquityPoint, Experiment, SimulationError, SimulationProvider, SimulationResult, StrategySpec,
 };
-use chrono::{NaiveDate, NaiveTime};
+use chrono::NaiveTime;
 use nautilus_backtest::{
     config::{BacktestEngineConfig, SimulatedVenueConfig},
     engine::BacktestEngine,
@@ -124,8 +124,9 @@ impl<P: BarProvider> SimulationProvider for NautilusSimulation<P> {
 
         let bars = self
             .bars
-            .daily_bars(
+            .bars(
                 &experiment.instrument,
+                experiment.interval,
                 experiment.window.from,
                 experiment.window.to,
             )
@@ -300,7 +301,8 @@ fn run_backtest(
         .add_instrument(&instrument)
         .map_err(|err| rejected("adding the instrument", &err))?;
 
-    let spec = BarSpecification::new_checked(1, BarAggregation::Day, PriceType::Last)
+    let (step, aggregation) = aggregation_of(experiment.interval)?;
+    let spec = BarSpecification::new_checked(step, aggregation, PriceType::Last)
         .map_err(|err| rejected("bar specification", &err))?;
     // `External` says these bars arrived already aggregated rather than being
     // built by the engine from ticks, which is what a daily export is.
@@ -308,7 +310,7 @@ fn run_backtest(
 
     let data = bars
         .iter()
-        .map(|bar| to_nautilus_bar(bar_type, bar).map(Data::Bar))
+        .map(|bar| to_nautilus_bar(bar_type, bar, experiment.interval).map(Data::Bar))
         .collect::<Result<Vec<_>, _>>()?;
 
     engine
@@ -345,6 +347,10 @@ fn run_backtest(
             .risk
             .risk_per_trade
             .map(|fraction| fraction * experiment.starting_cash),
+        max_position_value: experiment
+            .risk
+            .max_position_fraction
+            .map(|fraction| fraction * experiment.starting_cash),
     };
 
     match *plan {
@@ -376,7 +382,7 @@ fn run_backtest(
     let result = engine.get_result();
     let equity_curve = compound(
         experiment.starting_cash,
-        experiment.window.from,
+        experiment.window.from.and_time(NaiveTime::MIN),
         result.returns_series.iter(),
     );
     engine.dispose();
@@ -419,22 +425,28 @@ fn equity(
     Ok(InstrumentAny::Equity(equity))
 }
 
-fn to_nautilus_bar(bar_type: BarType, bar: &arvo_data::Bar) -> Result<Bar, SimulationError> {
+fn to_nautilus_bar(
+    bar_type: BarType,
+    bar: &arvo_data::Bar,
+    interval: arvo_data::BarInterval,
+) -> Result<Bar, SimulationError> {
     let rejected = |what: &str, err: &dyn std::fmt::Display| {
-        SimulationError::Rejected(format!("bar {}: {what}: {err}", bar.date))
+        SimulationError::Rejected(format!("bar {}: {what}: {err}", bar.at))
     };
 
     let price = |name: &str, value: f64| {
         Price::new_checked(value, PRICE_PRECISION).map_err(|err| rejected(name, &err))
     };
 
-    // A daily bar is only knowable once its day has closed. Timestamping it at
-    // the *end* of the day is what stops a strategy acting on a close it could
-    // not have seen yet — the look-ahead bias this platform exists to catch.
-    let ts = close_of_day(bar.date).ok_or_else(|| {
+    // A bar is only knowable once its period has closed. Timestamping it at
+    // the *end* of that period is what stops a strategy acting on a close it
+    // could not have seen yet — the look-ahead bias this platform exists to
+    // catch. That was close-of-day while everything was daily; it is
+    // close-of-bar now, and the daily case is unchanged by it.
+    let ts = close_of_bar(bar.at, interval).ok_or_else(|| {
         SimulationError::Rejected(format!(
-            "bar date {} is outside the representable range",
-            bar.date
+            "bar timestamp {} is outside the representable range",
+            bar.at
         ))
     })?;
 
@@ -452,11 +464,35 @@ fn to_nautilus_bar(bar_type: BarType, bar: &arvo_data::Bar) -> Result<Bar, Simul
     .map_err(|err| rejected("failed Nautilus's OHLC checks", &err))
 }
 
-/// The instant a trading day ends, as UNIX nanoseconds.
-fn close_of_day(date: NaiveDate) -> Option<UnixNanos> {
-    let end = date.succ_opt()?.and_time(NaiveTime::MIN).and_utc();
+/// The instant a bar's period ends, as UNIX nanoseconds.
+fn close_of_bar(at: chrono::NaiveDateTime, interval: arvo_data::BarInterval) -> Option<UnixNanos> {
+    let end = at.checked_add_signed(interval.duration())?.and_utc();
     let nanos = end.timestamp_nanos_opt()?;
     u64::try_from(nanos).ok().map(UnixNanos::from)
+}
+
+/// Maps an Arvo interval onto Nautilus's own aggregation vocabulary.
+///
+/// # Errors
+///
+/// Returns [`SimulationError::Unsupported`] for a resolution Nautilus has no
+/// aggregation for, rather than silently substituting a neighbouring one — a
+/// backtest quietly run at the wrong resolution is worse than one refused.
+fn aggregation_of(
+    interval: arvo_data::BarInterval,
+) -> Result<(usize, BarAggregation), SimulationError> {
+    use arvo_data::IntervalUnit;
+    let step = usize::try_from(interval.step).map_err(|_| {
+        SimulationError::Unsupported(format!("interval step {} is too large", interval.step))
+    })?;
+    let aggregation = match interval.unit {
+        IntervalUnit::Second => BarAggregation::Second,
+        IntervalUnit::Minute => BarAggregation::Minute,
+        IntervalUnit::Hour => BarAggregation::Hour,
+        IntervalUnit::Day => BarAggregation::Day,
+        IntervalUnit::Week => BarAggregation::Week,
+    };
+    Ok((step, aggregation))
 }
 
 /// Turns Nautilus's dated period returns into a dated equity curve.
@@ -472,30 +508,29 @@ fn close_of_day(date: NaiveDate) -> Option<UnixNanos> {
 /// them costs a conversion.
 fn compound<'a>(
     starting_cash: f64,
-    opened: NaiveDate,
+    opened: chrono::NaiveDateTime,
     returns: impl Iterator<Item = (&'a UnixNanos, &'a f64)>,
 ) -> Vec<EquityPoint> {
     let mut equity = starting_cash;
-    let mut curve = vec![EquityPoint {
-        date: opened,
-        equity,
-    }];
+    let mut curve = vec![EquityPoint { at: opened, equity }];
     for (at, value) in returns {
         equity *= 1.0 + value;
         curve.push(EquityPoint {
-            date: date_of(*at).unwrap_or(opened),
+            at: instant_of(*at).unwrap_or(opened),
             equity,
         });
     }
     curve
 }
 
-/// The UTC calendar day a Nautilus timestamp falls on.
-fn date_of(at: UnixNanos) -> Option<NaiveDate> {
+/// The UTC instant a Nautilus timestamp names.
+///
+/// The whole instant, not just its date: at an intraday resolution many
+/// points share a day, and collapsing them would flatten the curve into one
+/// value per day with no warning.
+fn instant_of(at: UnixNanos) -> Option<chrono::NaiveDateTime> {
     let nanos = i64::try_from(at.as_u64()).ok()?;
-    chrono::DateTime::from_timestamp_nanos(nanos)
-        .date_naive()
-        .into()
+    Some(chrono::DateTime::from_timestamp_nanos(nanos).naive_utc())
 }
 
 /// Wraps a Nautilus engine failure so it can cross the boundary as a plain
@@ -511,6 +546,7 @@ mod tests {
     use arvo_research::{
         CostModel, DatasetRef, DateRange, ExperimentId, HypothesisId, StrategySpec,
     };
+    use chrono::NaiveDate;
     use std::collections::BTreeMap;
 
     fn date(y: i32, m: u32, d: u32) -> NaiveDate {
@@ -528,7 +564,7 @@ mod tests {
             let cycle = if phase < 20.0 { phase } else { 40.0 - phase };
             let close = 100.0 + index as f64 * 0.05 + cycle * 0.5;
             bars.push(arvo_data::Bar {
-                date: start,
+                at: start.and_time(NaiveTime::MIN),
                 open: close,
                 high: close + 0.5,
                 low: close - 0.5,
@@ -546,10 +582,11 @@ mod tests {
             hypothesis: HypothesisId::from("h-1"),
             instrument: "AAPL.NASDAQ".to_owned(),
             window: DateRange::new(
-                bars.first().expect("fixture is not empty").date,
-                bars.last().expect("fixture is not empty").date,
+                bars.first().expect("fixture is not empty").at.date(),
+                bars.last().expect("fixture is not empty").at.date(),
             )
             .expect("fixture window is ordered"),
+            interval: arvo_data::BarInterval::DAILY,
             dataset: DatasetRef {
                 id: "fixture".to_owned(),
                 version: "1".to_owned(),
@@ -688,7 +725,11 @@ mod tests {
 
     #[test]
     fn a_daily_bar_is_timestamped_at_the_close_of_its_day() {
-        let ts = close_of_day(date(2024, 1, 2)).expect("date is representable");
+        let ts = close_of_bar(
+            date(2024, 1, 2).and_time(NaiveTime::MIN),
+            arvo_data::BarInterval::DAILY,
+        )
+        .expect("date is representable");
         let expected = date(2024, 1, 3)
             .and_time(NaiveTime::MIN)
             .and_utc()
@@ -702,12 +743,40 @@ mod tests {
     }
 
     #[test]
+    fn an_intraday_bar_closes_at_the_end_of_its_own_period() {
+        // The look-ahead guard has to scale with the bar, not stay at a day:
+        // a five-minute close is knowable five minutes after it opens, and
+        // holding it back a whole day would hide a day of information.
+        let opens = date(2024, 1, 2).and_hms_opt(14, 30, 0).expect("valid time");
+        let ts = close_of_bar(
+            opens,
+            arvo_data::BarInterval::new(5, arvo_data::IntervalUnit::Minute),
+        )
+        .expect("representable");
+
+        let expected = opens
+            .and_utc()
+            .timestamp_nanos_opt()
+            .expect("representable")
+            + 5 * 60 * 1_000_000_000;
+        assert_eq!(
+            ts.as_u64(),
+            u64::try_from(expected).expect("positive"),
+            "a five-minute bar closes five minutes after it opens"
+        );
+    }
+
+    #[test]
     fn an_empty_return_series_still_yields_the_opening_balance() {
         let empty: std::collections::BTreeMap<UnixNanos, f64> = std::collections::BTreeMap::new();
-        let curve = compound(100_000.0, date(2024, 1, 1), empty.iter());
+        let curve = compound(
+            100_000.0,
+            date(2024, 1, 1).and_time(NaiveTime::MIN),
+            empty.iter(),
+        );
         assert_eq!(curve.len(), 1, "the opening balance is always a point");
         assert!((curve[0].equity - 100_000.0).abs() < f64::EPSILON);
-        assert_eq!(curve[0].date, date(2024, 1, 1));
+        assert_eq!(curve[0].at.date(), date(2024, 1, 1));
     }
 
     /// A steadily rising market, so buy-and-hold must show a gain. If the
@@ -719,7 +788,7 @@ mod tests {
         for index in 0..days {
             let close = 100.0 + index as f64 * 0.25;
             bars.push(arvo_data::Bar {
-                date: start,
+                at: start.and_time(NaiveTime::MIN),
                 open: close,
                 high: close + 0.5,
                 low: close - 0.5,
@@ -835,17 +904,24 @@ mod tests {
 
     #[test]
     fn returns_compound_rather_than_summing() {
-        let returns: std::collections::BTreeMap<UnixNanos, f64> = [
-            (close_of_day(date(2024, 1, 1)).expect("representable"), 0.1),
-            (close_of_day(date(2024, 1, 2)).expect("representable"), 0.1),
-        ]
-        .into_iter()
-        .collect();
+        let day = |d: u32| {
+            close_of_bar(
+                date(2024, 1, d).and_time(NaiveTime::MIN),
+                arvo_data::BarInterval::DAILY,
+            )
+            .expect("representable")
+        };
+        let returns: std::collections::BTreeMap<UnixNanos, f64> =
+            [(day(1), 0.1), (day(2), 0.1)].into_iter().collect();
 
-        let curve = compound(100.0, date(2024, 1, 1), returns.iter());
+        let curve = compound(
+            100.0,
+            date(2024, 1, 1).and_time(NaiveTime::MIN),
+            returns.iter(),
+        );
         assert!((curve[2].equity - 121.0).abs() < 1e-9, "{curve:?}");
         assert_eq!(
-            curve[2].date,
+            curve[2].at.date(),
             date(2024, 1, 3),
             "a bar timestamped at its close lands on the following calendar day"
         );

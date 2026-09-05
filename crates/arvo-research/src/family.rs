@@ -24,7 +24,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-use crate::evaluation::{EvaluationCriteria, TRADING_DAYS_PER_YEAR};
+use crate::evaluation::EvaluationCriteria;
 use crate::{
     evaluate_against_benchmark, DateRange, Evidence, Experiment, ExperimentId, HypothesisId,
     Metrics, SimulationError, SimulationProvider, StrategySpec, Verdict,
@@ -233,9 +233,15 @@ pub fn run_family(
         let trial = variant(&family.template, &combination, in_sample, "is");
         match provider.run(&trial) {
             Ok(result) => {
-                let sharpe =
-                    Metrics::from_curve(&result.equity_curve, result.trades, TRADING_DAYS_PER_YEAR)
-                        .and_then(|metrics| metrics.sharpe);
+                // Annualised at the experiment's own resolution, not a
+                // constant: a five-minute Sharpe scaled by 252 is understated
+                // by about nine times, and nothing in the output would show it.
+                let sharpe = Metrics::from_curve(
+                    &result.equity_curve,
+                    result.trades,
+                    family.template.interval.periods_per_year(),
+                )
+                .and_then(|metrics| metrics.sharpe);
                 match sharpe {
                     Some(sharpe) => scored.push((sharpe, combination)),
                     // A flat curve is a configuration that never traded. It
