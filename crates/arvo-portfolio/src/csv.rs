@@ -525,7 +525,13 @@ fn holding_from(fields: &[String], mapping: &Mapping) -> Option<Holding> {
     let value = mapping.value.and_then(|index| number(fields.get(index)?));
 
     // Money, one way or another, or this is not a position we can report.
-    if value.is_none() && !(quantity.is_some() && price.is_some()) {
+    //
+    // Cash is the exception and needs stating: it carries a quantity of
+    // dollars and no price, because its price is one. The valuation layer has
+    // always known that; this check did not, so a cash line was silently
+    // dropped from a file that parsed perfectly otherwise.
+    let is_cash = instrument.eq_ignore_ascii_case(crate::CASH);
+    if !is_cash && value.is_none() && !(quantity.is_some() && price.is_some()) {
         return None;
     }
 
@@ -716,6 +722,31 @@ AAPL,not-a-number,oops
         assert!(imported[0].portfolio.holdings.is_empty());
         assert_eq!(imported[0].report.rows_imported, 0);
         assert_eq!(imported[0].report.rows_skipped.len(), 1);
+    }
+
+    #[test]
+    fn a_cash_line_survives_the_import() {
+        // Regression: the "must have money" check rejected cash, because cash
+        // has a quantity of dollars and no price. It parsed, then vanished,
+        // and the only visible symptom was a total that was quietly short.
+        let imported = load(
+            "instrument,quantity,cost_basis,price
+             AAPL,10,1000,150
+             CASH,11.85,11.85,
+",
+        );
+        assert_eq!(imported[0].portfolio.holdings.len(), 2);
+        assert!(
+            imported[0].report.rows_skipped.is_empty(),
+            "{:?}",
+            imported[0].report.rows_skipped
+        );
+
+        let valued = imported[0]
+            .portfolio
+            .value(&std::collections::BTreeMap::new());
+        assert!((valued.cash - 11.85).abs() < 1e-9);
+        assert!((valued.total_value - 1511.85).abs() < 1e-9);
     }
 
     #[test]
