@@ -20,6 +20,7 @@
 //! Nautilus's, reached through `arvo-nautilus`.
 
 pub mod interval;
+pub mod quality;
 
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 

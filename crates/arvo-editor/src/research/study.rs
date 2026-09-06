@@ -8,7 +8,8 @@
 use leptos::prelude::*;
 
 use crate::chart::{
-    EquityChart, MetricCard, MonthlyReturns, ParameterSurface, PriceChart, UnderwaterChart,
+    DataQuality, EquityChart, MetricCard, MonthlyReturns, ParameterSurface, PriceChart,
+    UnderwaterChart,
 };
 use crate::format::{percent, ratio, short_hash, verdict_class};
 use crate::trades::TradesTable;
@@ -142,6 +143,7 @@ pub(crate) fn StudyReport(study: StudyView) -> impl IntoView {
             </ul>
 
             <Recommendations items=study.recommendations.clone() />
+            <DataQuality findings=study.data_findings.clone() />
 
             <div class="metric-cards">
                 <MetricCard

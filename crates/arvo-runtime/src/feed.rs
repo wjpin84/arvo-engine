@@ -103,6 +103,8 @@ pub struct FetchReport {
     pub from: Option<chrono::NaiveDateTime>,
     pub to: Option<chrono::NaiveDateTime>,
     pub path: PathBuf,
+    /// What is wrong with what arrived.
+    pub quality: arvo_data::quality::Report,
 }
 
 /// Fetches one instrument's history and writes it into the library.
@@ -150,6 +152,10 @@ pub async fn fetch(
         });
     }
 
+    // Inspected before it is written, so a series that arrives wrong is said
+    // so at the moment it arrives rather than the first time a verdict rests
+    // on it.
+    let quality = arvo_data::quality::inspect(&bars, interval);
     let path = CsvBars::new(root).write(instrument, interval, &bars)?;
     Ok(FetchReport {
         instrument: instrument.to_owned(),
@@ -159,6 +165,7 @@ pub async fn fetch(
         from: bars.first().map(|bar| bar.at),
         to: bars.last().map(|bar| bar.at),
         path,
+        quality,
     })
 }
 

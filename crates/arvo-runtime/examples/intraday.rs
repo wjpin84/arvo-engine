@@ -47,6 +47,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     println!("{instrument} at {interval}: {strategy}, slippage {slippage_bps} bps");
+
+    // What is wrong with the bars, before anything is concluded from them.
+    let quality = arvo_data::quality::inspect(&series, interval);
+    if quality.is_clean() {
+        println!("  data: nothing to report across {} bars", quality.bars);
+    } else {
+        println!("  data: {} findings across {} bars", quality.findings.len(), quality.bars);
+        for finding in &quality.findings {
+            println!(
+                "    [{}] {} {}: {}",
+                match finding.severity {
+                    arvo_data::quality::Severity::Fault => "fault",
+                    arvo_data::quality::Severity::Suspect => "suspect",
+                },
+                finding.kind,
+                finding.at.map(|at| at.to_string()).unwrap_or_default(),
+                finding.detail,
+            );
+        }
+    }
     println!("  {} bars, {} .. {}", series.len(), first.at, last.at);
     println!(
         "  {:.1} periods a year (a daily bar is {:.0})",

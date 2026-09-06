@@ -8,7 +8,7 @@
 
 use leptos::prelude::*;
 
-use crate::chart::{EquityChart, MetricCard, PriceChart, UnderwaterChart};
+use crate::chart::{DataQuality, EquityChart, MetricCard, PriceChart, UnderwaterChart};
 use crate::format::{percent, ratio, short_hash, verdict_class};
 use crate::research::study::TradeDetail;
 use crate::trades::TradesTable;
@@ -41,6 +41,8 @@ pub(crate) fn WalkForwardReport(walk: WalkForwardView) -> impl IntoView {
             <ul class="research-reasons">
                 {walk.reasons.iter().map(|r| view! { <li>{r.clone()}</li> }).collect_view()}
             </ul>
+
+            <DataQuality findings=walk.data_findings.clone() />
 
             <div class="metric-cards">
                 <MetricCard

@@ -196,6 +196,8 @@ pub struct StudyView {
     pub markers: Vec<TradeMarkerView>,
     /// Depth below the running peak, as a percentage.
     pub underwater: Vec<CurvePoint>,
+    /// What is wrong with the bars this was produced from.
+    pub data_findings: Vec<DataFindingView>,
     /// Every round trip, so nobody has to take the summary on trust.
     pub trades: Vec<TradeRowView>,
     /// Month-by-month, so a total return can be read as steady or as one
@@ -269,6 +271,8 @@ pub struct WalkForwardView {
     pub price: Vec<CandlePoint>,
     pub markers: Vec<TradeMarkerView>,
     pub underwater: Vec<CurvePoint>,
+    /// What is wrong with the bars this was produced from.
+    pub data_findings: Vec<DataFindingView>,
     pub trades: Vec<TradeRowView>,
     pub trades_detail: TradesView,
 
@@ -356,6 +360,22 @@ pub struct SurfaceView {
 }
 
 /// A stored finding, summarised for the history list.
+/// Something wrong with the price series a result was produced from.
+///
+/// Shown beside the verdict rather than in a data screen nobody opens. A
+/// verdict is only as good as the bars under it, and a backtest cannot tell an
+/// unadjusted split from a crash — it will trade both and report a number
+/// either way.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DataFindingView {
+    /// `fault` for something that cannot legitimately be true of a price
+    /// series, `suspect` for something merely unusual.
+    pub severity: String,
+    pub kind: String,
+    pub at: Option<String>,
+    pub detail: String,
+}
+
 /// A finding that could not be read, and why.
 ///
 /// Shown rather than logged. Four findings were once lost to a field rename
@@ -457,6 +477,7 @@ pub struct FetchView {
     pub interpolated: usize,
     pub from: Option<String>,
     pub to: Option<String>,
+    pub data_findings: Vec<DataFindingView>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

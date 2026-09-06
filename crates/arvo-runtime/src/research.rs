@@ -21,7 +21,7 @@ use arvo_research::{
 };
 // The view shapes live in `arvo-views` so the window cannot drift from
 // them. See that crate for what two hand-mirrored copies cost.
-pub use arvo_views::{CandlePoint, HistoryView, UnreadableView, CurvePoint, DataLibraryView, FetchView, FoldView, HistoryEntryView, InstrumentView, MetricsView, MonthlyReturnView, OutcomeView, PanelView, RecommendationView, RecordView, StabilityView, StrategyView, StudyView, SurfaceCell, SurfaceView, TradeMarkerView, TradeRowView, TradesView, WalkForwardView};
+pub use arvo_views::{CandlePoint, DataFindingView, HistoryView, UnreadableView, CurvePoint, DataLibraryView, FetchView, FoldView, HistoryEntryView, InstrumentView, MetricsView, MonthlyReturnView, OutcomeView, PanelView, RecommendationView, RecordView, StabilityView, StrategyView, StudyView, SurfaceCell, SurfaceView, TradeMarkerView, TradeRowView, TradesView, WalkForwardView};
 
 use crate::commands::CommandError;
 
@@ -242,6 +242,38 @@ fn curve_points(curve: &[arvo_research::EquityPoint]) -> Vec<CurvePoint> {
         .map(|point| CurvePoint {
             time: point.at.and_utc().timestamp(),
             value: point.equity,
+        })
+        .collect()
+}
+
+/// What is wrong with the bars a result was produced from.
+///
+/// Run at report time rather than at fetch time, and attached to the *result*.
+/// A verdict is only as good as the series under it, and the place a person
+/// will actually read "these bars have a hole in them" is next to the number
+/// it undermines — not in a data screen they would have to think to open.
+fn data_findings(
+    bars: &dyn arvo_data::BarProvider,
+    instrument: &str,
+    interval: arvo_data::BarInterval,
+    window: &DateRange,
+) -> Vec<DataFindingView> {
+    let series = bars
+        .bars(instrument, interval, window.from, window.to)
+        .unwrap_or_default();
+
+    arvo_data::quality::inspect(&series, interval)
+        .findings
+        .into_iter()
+        .map(|finding| DataFindingView {
+            severity: match finding.severity {
+                arvo_data::quality::Severity::Fault => "fault",
+                arvo_data::quality::Severity::Suspect => "suspect",
+            }
+            .to_owned(),
+            kind: finding.kind.to_owned(),
+            at: finding.at.map(|at| at.format("%Y-%m-%d %H:%M").to_string()),
+            detail: finding.detail,
         })
         .collect()
 }
@@ -786,6 +818,21 @@ pub async fn fetch_bars(
         interpolated: report.interpolated,
         from: report.from.map(|at| at.to_string()),
         to: report.to.map(|at| at.to_string()),
+        data_findings: report
+            .quality
+            .findings
+            .into_iter()
+            .map(|finding| DataFindingView {
+                severity: match finding.severity {
+                    arvo_data::quality::Severity::Fault => "fault",
+                    arvo_data::quality::Severity::Suspect => "suspect",
+                }
+                .to_owned(),
+                kind: finding.kind.to_owned(),
+                at: finding.at.map(|at| at.format("%Y-%m-%d %H:%M").to_string()),
+                detail: finding.detail,
+            })
+            .collect(),
     })
 }
 
@@ -1180,6 +1227,12 @@ pub fn study_view(
         ),
         markers: markers(&evaluation.strategy_ledger, found.selected.interval),
         trades: trade_rows(&evaluation.strategy_ledger),
+        data_findings: data_findings(
+            bars,
+            &found.selected.instrument,
+            found.selected.interval,
+            &found.out_of_sample,
+        ),
         underwater: underwater(&evaluation.strategy_curve),
         monthly: arvo_research::evaluation::monthly_returns(&evaluation.strategy_curve)
             .into_iter()
@@ -1303,6 +1356,17 @@ pub fn walk_forward_view(
             template.interval,
         ),
         underwater: underwater(&found.combined_curve),
+        data_findings: found
+            .folds
+            .first()
+            .zip(found.folds.last())
+            .and_then(|(first, last)| {
+                DateRange::new(first.out_of_sample.from, last.out_of_sample.to).ok()
+            })
+            .map(|window| {
+                data_findings(bars, &template.instrument, template.interval, &window)
+            })
+            .unwrap_or_default(),
         trades: trade_rows(
             &found
                 .folds

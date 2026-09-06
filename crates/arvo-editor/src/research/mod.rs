@@ -22,6 +22,7 @@ use crate::bridge::{
     call_typed, open_study_panel, PANEL_PANEL_ID, STUDY_PANEL_PREFIX, WALK_PANEL_PREFIX,
 };
 use crate::format::verdict_dot;
+use crate::chart::DataQuality;
 use crate::views::*;
 
 /// The research view: pick an instrument, run a parameter study, read what
@@ -414,6 +415,7 @@ pub(crate) fn ResearchView(
                                         .zip(report.to.as_ref())
                                         .map(|(from, to)| format!(" ({from} → {to})"))}
                                 </p>
+                                <DataQuality findings=report.data_findings.clone() />
                             }
                         })
                 }}

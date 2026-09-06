@@ -401,3 +401,61 @@ pub(crate) fn ParameterSurface(surface: SurfaceView) -> impl IntoView {
         </div>
     }
 }
+
+/// What is wrong with the bars a result was produced from.
+///
+/// Directly under the verdict, because that is what it qualifies. A backtest
+/// cannot tell an unadjusted split from a crash, or a stalled feed from a
+/// quiet market — it trades both and reports a number either way, and the
+/// number looks exactly as convincing as any other.
+///
+/// A `fault` is something that cannot legitimately be true of a price series,
+/// so it is coloured as a failure. A `suspect` is unusual and might be real,
+/// which is why nothing here refuses to show the result: whether a 43% fall is
+/// a bad print or March 2020 is a judgement about the world that the check
+/// cannot make and the reader can.
+#[component]
+pub(crate) fn DataQuality(findings: Vec<DataFindingView>) -> impl IntoView {
+    (!findings.is_empty()).then(|| {
+        let faults = findings.iter().filter(|f| f.severity == "fault").count();
+        // Hoisted: the `view!` macro will not parse a bare `if` inside an
+        // attribute position.
+        let headline = if faults > 0 { "research-flag" } else { "research-hint" };
+        view! {
+            <div class="data-quality">
+                <p class=headline>
+                    {format!(
+                        "{} thing{} to know about the data behind this{}",
+                        findings.len(),
+                        if findings.len() == 1 { "" } else { "s" },
+                        if faults > 0 {
+                            format!(" — {faults} cannot be true of a price series")
+                        } else {
+                            String::new()
+                        },
+                    )}
+                </p>
+                <ul class="research-reasons">
+                    {findings
+                        .into_iter()
+                        .map(|finding| {
+                            let tone = if finding.severity == "fault" {
+                                "research-bad"
+                            } else {
+                                ""
+                            };
+                            view! {
+                                <li class=tone>
+                                    <strong>{finding.kind.clone()}</strong>
+                                    {finding.at.map(|at| format!(" {at}")).unwrap_or_default()}
+                                    ": "
+                                    {finding.detail}
+                                </li>
+                            }
+                        })
+                        .collect_view()}
+                </ul>
+            </div>
+        }
+    })
+}
