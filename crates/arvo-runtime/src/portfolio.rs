@@ -15,7 +15,9 @@ use arvo_portfolio::{
     history::{latest_change, SnapshotStore},
     PriceSource, ValuedPortfolio,
 };
-use serde::Serialize;
+// The view shapes live in `arvo-views` so the window cannot drift from
+// them. See that crate for what two hand-mirrored copies cost.
+pub use arvo_views::{ChangeView, HoldingView, ImportView, PortfolioLibraryView, PortfolioView, ValuePoint};
 
 use crate::commands::CommandError;
 
@@ -42,87 +44,6 @@ impl PortfolioService {
             snapshots: SnapshotStore::new(snapshot_dir),
         }
     }
-}
-
-#[derive(Serialize)]
-pub struct HoldingView {
-    pub instrument: String,
-    /// `None` when the source reported money without units — a collective
-    /// trust in a 401(k) does exactly that.
-    pub quantity: Option<f64>,
-    pub price: Option<f64>,
-    pub market_value: f64,
-    pub cost_basis: Option<f64>,
-    pub unrealized: Option<f64>,
-    pub unrealized_pct: Option<f64>,
-    pub weight: f64,
-    /// "statement", "last_close" or "face" — so a price nobody verified is
-    /// visibly different from one that came off a statement.
-    pub priced_by: String,
-}
-
-#[derive(Serialize)]
-pub struct PortfolioView {
-    pub name: String,
-    pub as_of: String,
-    pub total_value: f64,
-    pub total_cost: Option<f64>,
-    pub unrealized: Option<f64>,
-    pub unrealized_pct: Option<f64>,
-    /// How many holdings reported no cost basis. Normal for a 401(k).
-    pub without_cost_basis: usize,
-    pub cash: f64,
-    pub holdings: Vec<HoldingView>,
-    pub unpriced: Vec<String>,
-    /// Value on every day this portfolio has been looked at. A holdings file
-    /// says what you hold now; almost everything interesting is a change, and
-    /// a single export cannot express one.
-    pub value_history: Vec<ValuePoint>,
-    /// `None` until a portfolio has been valued on two different days.
-    pub change: Option<ChangeView>,
-    /// How the file was read. Shown, not hidden: an importer that guessed a
-    /// column wrong produces a portfolio that looks entirely plausible, and
-    /// this is the only thing that would reveal it.
-    pub import: ImportView,
-}
-
-#[derive(Serialize, Clone)]
-pub struct ImportView {
-    /// Role → the column heading used for it.
-    pub columns: Vec<(String, String)>,
-    pub ignored: Vec<String>,
-    pub rows_imported: usize,
-    pub rows_skipped: Vec<String>,
-    /// Cost basis came from a per-share column multiplied by quantity.
-    pub cost_basis_derived: bool,
-}
-
-/// One day on the value line.
-#[derive(Serialize)]
-pub struct ValuePoint {
-    /// Seconds since the epoch, the same convention every other chart series
-    /// uses. One convention rather than two: the portfolio chart reuses the
-    /// research chart component, and a date string here against epoch seconds
-    /// there is a mismatch the compiler cannot see and the reader meets as a
-    /// deserialisation error at runtime.
-    pub time: i64,
-    pub value: f64,
-}
-
-/// The move between the two most recent valuations.
-#[derive(Serialize)]
-pub struct ChangeView {
-    pub from: String,
-    pub to: String,
-    pub absolute: f64,
-    pub percent: Option<f64>,
-}
-
-#[derive(Serialize)]
-pub struct PortfolioLibraryView {
-    /// Shown so somebody with no holdings file knows where to put one.
-    pub directory: String,
-    pub portfolios: Vec<PortfolioView>,
 }
 
 /// Every portfolio, valued.

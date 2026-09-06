@@ -7,6 +7,7 @@ members = [
     "crates/arvo-plugin-host",
     "crates/arvo-mcp",
     "crates/arvo-oauth",
+    "crates/arvo-views",
     "crates/arvo-nautilus",
     "crates/arvo-portfolio",
     "crates/arvo-editor",
@@ -27,6 +28,7 @@ arvo-core = { path = "crates/arvo-core" }
 arvo-data = { path = "crates/arvo-data" }
 arvo-mcp = { path = "crates/arvo-mcp" }
 arvo-oauth = { path = "crates/arvo-oauth" }
+arvo-views = { path = "crates/arvo-views" }
 arvo-nautilus = { path = "crates/arvo-nautilus" }
 arvo-portfolio = { path = "crates/arvo-portfolio" }
 arvo-research = { path = "crates/arvo-research" }

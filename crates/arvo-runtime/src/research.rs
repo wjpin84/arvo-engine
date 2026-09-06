@@ -19,7 +19,9 @@ use arvo_research::{
     CostModel, DatasetRef, DateRange, Experiment, ExperimentFamily, ExperimentId, HypothesisId,
     Metrics, ParameterGrid, SimulationProvider, StrategySpec, Verdict,
 };
-use serde::Serialize;
+// The view shapes live in `arvo-views` so the window cannot drift from
+// them. See that crate for what two hand-mirrored copies cost.
+pub use arvo_views::{CandlePoint, CurvePoint, DataLibraryView, FetchView, FoldView, HistoryEntryView, InstrumentView, MetricsView, MonthlyReturnView, OutcomeView, PanelView, RecommendationView, RecordView, StabilityView, StrategyView, StudyView, SurfaceCell, SurfaceView, TradeMarkerView, TradeRowView, TradesView, WalkForwardView};
 
 use crate::commands::CommandError;
 
@@ -206,75 +208,23 @@ impl ResearchService {
     }
 }
 
-/// What the workbench shows before anything has been run.
-#[derive(Serialize)]
-pub struct DataLibraryView {
-    /// Shown so a user with no data knows where to put some.
-    pub directory: String,
-    pub instruments: Vec<InstrumentView>,
-}
+/// A metrics summary, as the window sees it.
+///
+/// A free function rather than a `From` impl: [`MetricsView`] lives in
+/// `arvo-views` and `Metrics` in `arvo-research`, so neither is local here and
+/// the orphan rule forbids the impl.
+pub fn metrics_view(metrics: &Metrics) -> MetricsView {
 
-#[derive(Serialize)]
-pub struct InstrumentView {
-    pub id: String,
-    /// `None` when the file exists but holds no usable bars.
-    pub from: Option<String>,
-    pub to: Option<String>,
-    pub bars: usize,
-    /// Content hash of the data as it stands right now. The workbench compares
-    /// this against the hash recorded in a held result to tell whether that
-    /// result still describes the data on disk.
-    pub fingerprint: Option<String>,
-}
-
-#[derive(Serialize)]
-pub struct MetricsView {
-    pub total_return: f64,
-    pub cagr: f64,
-    pub max_drawdown: f64,
-    pub volatility: f64,
-    pub sharpe: Option<f64>,
-    pub sortino: Option<f64>,
-    pub calmar: Option<f64>,
-    pub trades: u32,
-}
-
-/// One month of the strategy's return, for the heatmap.
-#[derive(Serialize)]
-pub struct MonthlyReturnView {
-    pub year: i32,
-    pub month: u32,
-    pub value: f64,
-}
-
-impl From<&Metrics> for MetricsView {
-    fn from(metrics: &Metrics) -> Self {
-        Self {
-            total_return: metrics.total_return,
-            cagr: metrics.cagr,
-            max_drawdown: metrics.max_drawdown,
-            volatility: metrics.volatility,
-            sharpe: metrics.sharpe,
-            sortino: metrics.sortino,
-            calmar: metrics.calmar,
-            trades: metrics.trades,
-        }
+MetricsView {
+        total_return: metrics.total_return,
+        cagr: metrics.cagr,
+        max_drawdown: metrics.max_drawdown,
+        volatility: metrics.volatility,
+        sharpe: metrics.sharpe,
+        sortino: metrics.sortino,
+        calmar: metrics.calmar,
+        trades: metrics.trades,
     }
-}
-
-/// One point on a curve, in the shape a chart library wants: an ISO date and
-/// a value.
-#[derive(Serialize)]
-pub struct CurvePoint {
-    /// Seconds since the epoch, not a date string.
-    ///
-    /// A date was enough while every curve was daily and is not once two
-    /// points can share a day: the chart keys points by time, so an intraday
-    /// series collapsed to dates loses every point but the last of each day.
-    /// The previous version did exactly that, deliberately and with a comment
-    /// saying so — this is what removing the limitation instead looks like.
-    pub time: i64,
-    pub value: f64,
 }
 
 /// Flattens an equity curve for charting, collapsing any repeated day.
@@ -294,28 +244,6 @@ fn curve_points(curve: &[arvo_research::EquityPoint]) -> Vec<CurvePoint> {
             value: point.equity,
         })
         .collect()
-}
-
-/// One bar, as the chart wants it.
-#[derive(Serialize)]
-pub struct CandlePoint {
-    pub time: i64,
-    pub open: f64,
-    pub high: f64,
-    pub low: f64,
-    pub close: f64,
-}
-
-/// Where a trade happened, to be drawn on the price.
-#[derive(Serialize)]
-pub struct TradeMarkerView {
-    pub time: i64,
-    /// `entry` or `exit`; the chart decides shape and side from it.
-    pub kind: String,
-    /// `stop` or `signal` for an exit, so a stop-out is visually distinct
-    /// from a rule that chose to leave. Empty for an entry.
-    pub reason: String,
-    pub label: String,
 }
 
 /// The instrument's own bars over a window.
@@ -422,49 +350,12 @@ fn underwater(curve: &[arvo_research::EquityPoint]) -> Vec<CurvePoint> {
         .collect()
 }
 
-/// One thing to do about a finding, flattened for display.
-#[derive(Serialize)]
-pub struct RecommendationView {
-    pub severity: String,
-    pub finding: String,
-    pub action: String,
-    pub evidence: String,
-}
-
-/// What the round trips looked like, flattened for display.
+/// What the round trips looked like, as the window sees it.
 ///
-/// Beside the metrics rather than inside them: metrics come from the equity
-/// curve and these come from the ledger, and keeping the two apart is what
-/// makes it obvious which is which when they say different things.
-#[derive(Serialize)]
-pub struct TradesView {
-    pub closed: u32,
-    pub still_open: u32,
-    pub win_rate: Option<f64>,
-    pub profit_factor: Option<f64>,
-    pub expectancy: Option<f64>,
-    pub average_win: Option<f64>,
-    pub average_loss: Option<f64>,
-    /// Mean holding period in days, which is the unit a reader thinks in and
-    /// the one that decides short- versus long-term tax treatment.
-    pub average_holding_days: Option<f64>,
-    /// Every fee and commission the venue charged, in account currency.
-    ///
-    /// Fees only — slippage is charged inside the fill prices and is already
-    /// reflected in the return, not here. Naming this `fees` rather than
-    /// `cost` is the whole point: a reader who took it for the total cost of
-    /// trading would be short by the spread assumption on every round trip.
-    pub fees_paid: f64,
-    /// Fees as a fraction of starting capital, so they can be read against
-    /// the return directly.
-    pub fees_fraction: f64,
-    pub signal_exits: u32,
-    pub stop_exits: u32,
-}
+/// A free function for the same reason as the two above.
+pub fn trades_view(stats: &arvo_research::TradeStats, starting_cash: f64) -> TradesView {
 
-impl TradesView {
-    fn build(stats: &arvo_research::TradeStats, starting_cash: f64) -> Self {
-        Self {
+    TradesView {
             closed: stats.closed,
             still_open: stats.still_open,
             win_rate: stats.win_rate,
@@ -482,228 +373,6 @@ impl TradesView {
             signal_exits: stats.signal_exits,
             stop_exits: stats.stop_exits,
         }
-    }
-}
-
-/// The full result of a study, flattened for display.
-#[derive(Serialize)]
-pub struct StudyView {
-    pub instrument: String,
-    pub verdict: String,
-    pub reasons: Vec<String>,
-
-    // How hard the search was, and what that costs in credibility.
-    pub trials: usize,
-    pub best_sharpe: f64,
-    pub expected_best_under_null: Option<f64>,
-    pub survived_deflation: bool,
-    /// Every configuration the search tried, not only the one it picked.
-    pub surface: Option<SurfaceView>,
-
-    // Which days chose the configuration, and which days judged it.
-    pub in_sample: String,
-    pub out_of_sample: String,
-    pub selected_params: Vec<(String, f64)>,
-
-    // The out-of-sample comparison itself.
-    pub strategy: MetricsView,
-    pub benchmark: MetricsView,
-    pub excess_return: f64,
-
-    /// The two curves behind the numbers. A table says a strategy returned
-    /// less than the market; a chart says whether it did so steadily or lost
-    /// it all in one month, and those are different findings.
-    pub strategy_curve: Vec<CurvePoint>,
-    pub benchmark_curve: Vec<CurvePoint>,
-    /// The instrument's own bars over the judged period, with every entry and
-    /// exit marked on them.
-    ///
-    /// The view that shows what the rule *did* rather than what it added up
-    /// to. A summary cannot say the entries all landed on three days, or that
-    /// every winner came out of one gap; this says it at a glance.
-    pub price: Vec<CandlePoint>,
-    pub markers: Vec<TradeMarkerView>,
-    /// Depth below the running peak, as a percentage.
-    pub underwater: Vec<CurvePoint>,
-    /// Every round trip, so nobody has to take the summary on trust.
-    pub trades: Vec<TradeRowView>,
-    /// Month-by-month, so a total return can be read as steady or as one
-    /// lucky quarter. Derived from the same curve, not a second measurement.
-    pub monthly: Vec<MonthlyReturnView>,
-    /// The round trips behind the return, and what they cost.
-    pub trades_detail: TradesView,
-    /// What to do about this finding, most stopping first.
-    ///
-    /// Derived on read rather than stored, so a finding pulled out of memory
-    /// is read against today's rules rather than the ones in force when it
-    /// was recorded.
-    pub recommendations: Vec<RecommendationView>,
-
-    // Stated assumptions, because a verdict without them is decoration.
-    /// The dataset this result was produced from, as a content hash. Compared
-    /// against the live one to decide whether the result is still current.
-    pub dataset_version: String,
-    pub strategy_name: String,
-    pub starting_cash: f64,
-    pub commission_bps: f64,
-    pub slippage_bps: f64,
-    pub engine: String,
-}
-
-/// One fold of a walk-forward, flattened for display.
-#[derive(Serialize)]
-pub struct FoldView {
-    pub chose_on: String,
-    pub judged_on: String,
-    pub params: Vec<(String, f64)>,
-    pub strategy_return: f64,
-    pub benchmark_return: f64,
-    pub trades: u32,
-    /// Whether this fold's winner beat what a no-skill search of that size
-    /// would produce. Per fold, because a procedure that selects noise in most
-    /// periods has not been shown to select.
-    pub survived_deflation: bool,
-}
-
-/// How much one parameter moved across the folds.
-#[derive(Serialize)]
-pub struct StabilityView {
-    pub axis: String,
-    pub distinct: usize,
-    pub modal: f64,
-    pub modal_share: f64,
-}
-
-/// A walk-forward run, flattened for display.
-#[derive(Serialize)]
-pub struct WalkForwardView {
-    pub instrument: String,
-    pub verdict: String,
-    pub reasons: Vec<String>,
-
-    pub folds: Vec<FoldView>,
-    pub folds_surviving_deflation: usize,
-    /// Folds in which the selected configuration never opened a position — the
-    /// symptom of a step too short for the rule's warm-up.
-    pub folds_without_trades: usize,
-    /// How the selection moved. The thing only a rolling procedure can show.
-    pub stability: Vec<StabilityView>,
-
-    // The stitched out-of-sample record.
-    pub strategy: MetricsView,
-    pub benchmark: MetricsView,
-    pub excess_return: f64,
-    pub strategy_curve: Vec<CurvePoint>,
-    pub benchmark_curve: Vec<CurvePoint>,
-    pub price: Vec<CandlePoint>,
-    pub markers: Vec<TradeMarkerView>,
-    pub underwater: Vec<CurvePoint>,
-    pub trades: Vec<TradeRowView>,
-    pub trades_detail: TradesView,
-
-    pub in_sample_days: i64,
-    pub step_days: i64,
-    pub anchored: bool,
-    pub dataset_version: String,
-    pub strategy_name: String,
-    pub starting_cash: f64,
-    pub commission_bps: f64,
-    pub slippage_bps: f64,
-    pub engine: String,
-}
-
-/// One round trip, as a table row.
-///
-/// Every field the ledger holds, because the point of a table is that nobody
-/// has to decide in advance which column someone will want to sort by. The
-/// aggregate statistics above it answer "how did it do"; this answers "what
-/// did it actually do", and those are different questions with different
-/// failure modes — an expectancy of +£300 built from one +£9,000 trade and
-/// nineteen losses is a fact only the rows show.
-#[derive(Serialize)]
-pub struct TradeRowView {
-    pub opened: String,
-    /// Empty while the position is still open at the end of the run.
-    pub closed: String,
-    pub direction: String,
-    pub quantity: f64,
-    pub entry: f64,
-    /// `None` while still open, so the table shows a gap rather than a price
-    /// nobody traded at.
-    pub exit: Option<f64>,
-    pub pnl: f64,
-    pub commission: f64,
-    /// Days held. Fractional, because an intraday trade held forty minutes is
-    /// not "0 days" — it is 0.03, and rounding it away would make every
-    /// intraday ledger look like a column of zeroes.
-    pub held_days: Option<f64>,
-    /// `signal`, `stop`, or `open`.
-    pub exit_reason: String,
-}
-
-/// One configuration's cell on the search surface.
-#[derive(Serialize)]
-pub struct SurfaceCell {
-    pub x: f64,
-    pub y: f64,
-    pub sharpe: f64,
-    /// Whether this is the configuration that was chosen.
-    pub selected: bool,
-    /// Whether it beat what a no-skill search of this size would produce.
-    ///
-    /// The distinction the whole chart is drawn around. A cell below the bar
-    /// is not a weak result, it is *not a result* — a score a coin-flipping
-    /// search of the same size would have been expected to reach anyway.
-    pub above_null: bool,
-}
-
-/// The in-sample score of every configuration the search tried.
-///
-/// # Why this exists at all
-///
-/// Reporting only the winner shows two completely different situations
-/// identically: a broad region of configurations that all scored well, which
-/// suggests something real and robust to the exact parameters; and one bright
-/// cell surrounded by nothing, which is what fitting noise looks like from
-/// above. The verdict machinery already deflates for the *size* of the search;
-/// this is the part a person has to look at.
-#[derive(Serialize)]
-pub struct SurfaceView {
-    /// The two axes drawn, by name.
-    pub x_axis: String,
-    pub y_axis: String,
-    pub x_values: Vec<f64>,
-    pub y_values: Vec<f64>,
-    pub cells: Vec<SurfaceCell>,
-    /// The bar a cell has to clear to be worth anything. `None` when there
-    /// were too few trials to say.
-    pub null_bar: Option<f64>,
-    pub best: f64,
-    /// Axes not drawn, because a surface has two dimensions and a grid may
-    /// have more. Named so nobody reads the chart as the whole search.
-    pub collapsed: Vec<String>,
-}
-
-/// A stored finding, summarised for the history list.
-#[derive(Serialize)]
-pub struct HistoryEntryView {
-    pub id: String,
-    pub kind: String,
-    pub subject: String,
-    pub verdict: String,
-    pub recorded_at: String,
-    /// True when the data this was produced from no longer matches disk.
-    /// `None` when the data it referenced can no longer be found at all.
-    pub stale: Option<bool>,
-}
-
-/// A stored finding, reopened.
-#[derive(Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum RecordView {
-    Study(Box<StudyView>),
-    Panel(Box<PanelView>),
-    WalkForward(Box<WalkForwardView>),
 }
 
 /// Everything held in research memory, newest first.
@@ -974,63 +643,6 @@ fn panel_dataset_version(
     ))
 }
 
-/// One instrument's out-of-sample outcome under the panel's configuration.
-#[derive(Serialize)]
-pub struct OutcomeView {
-    pub instrument: String,
-    pub strategy_return: f64,
-    pub benchmark_return: f64,
-    pub excess_return: f64,
-    pub max_drawdown: f64,
-    pub trades: u32,
-}
-
-/// A panel study, flattened for display.
-#[derive(Serialize)]
-pub struct PanelView {
-    pub verdict: String,
-    pub reasons: Vec<String>,
-
-    pub instruments: usize,
-    pub total_trades: u32,
-    pub mean_excess_return: f64,
-    pub beat_benchmark: usize,
-    pub mean_max_drawdown: f64,
-    pub worst_max_drawdown: f64,
-
-    pub trials: usize,
-    pub best_sharpe: f64,
-    pub expected_best_under_null: Option<f64>,
-    pub survived_deflation: bool,
-
-    pub in_sample: String,
-    pub out_of_sample: String,
-    pub selected_params: Vec<(String, f64)>,
-    pub per_instrument: Vec<OutcomeView>,
-    pub failures: Vec<String>,
-
-    pub dataset_version: String,
-    pub strategy_name: String,
-    pub starting_cash: f64,
-    pub commission_bps: f64,
-    pub slippage_bps: f64,
-    pub engine: String,
-}
-
-/// A strategy the workbench can run.
-#[derive(Serialize)]
-pub struct StrategyView {
-    pub name: String,
-    pub label: String,
-    pub premise: String,
-    /// Spelled out rather than a boolean, because it is the reason a study
-    /// may refuse an instrument the sidebar just listed.
-    pub interval: String,
-    /// Backtests one study will run. A spinner that says how much work is
-    /// coming is the difference between waiting and suspecting a hang.
-    pub backtests: usize,
-}
-
 /// What can be run, so the UI offers the engine's actual list rather than a
 /// copy of it that drifts.
 ///
@@ -1050,20 +662,6 @@ pub fn list_strategies() -> Result<Vec<StrategyView>, CommandError> {
             backtests: plan.backtests(),
         })
         .collect())
-}
-
-/// What a fetch pulled in.
-#[derive(Serialize)]
-pub struct FetchView {
-    pub instrument: String,
-    pub interval: String,
-    pub bars: usize,
-    /// Gap-fill bars the server synthesised, which were dropped. Surfaced
-    /// rather than hidden: a series that is a quarter invented is one to know
-    /// about before drawing a conclusion from it.
-    pub interpolated: usize,
-    pub from: Option<String>,
-    pub to: Option<String>,
 }
 
 /// Whether a broker connection is stored, so the UI knows what to offer.
@@ -1568,8 +1166,8 @@ pub fn study_view(
             .iter()
             .map(|(name, value)| (name.clone(), *value))
             .collect(),
-        strategy: MetricsView::from(&evaluation.strategy),
-        benchmark: MetricsView::from(&evaluation.benchmark),
+        strategy: metrics_view(&evaluation.strategy),
+        benchmark: metrics_view(&evaluation.benchmark),
         excess_return: evaluation.excess_return,
         strategy_curve: curve_points(&evaluation.strategy_curve),
         benchmark_curve: curve_points(&evaluation.benchmark_curve),
@@ -1590,7 +1188,7 @@ pub fn study_view(
                 value: month.value,
             })
             .collect(),
-        trades_detail: TradesView::build(
+        trades_detail: trades_view(
             &evaluation.strategy_trades,
             found.selected.starting_cash,
         ),
@@ -1665,8 +1263,8 @@ pub fn walk_forward_view(
                 modal_share: axis.modal_share,
             })
             .collect(),
-        strategy: MetricsView::from(&found.combined),
-        benchmark: MetricsView::from(&found.benchmark),
+        strategy: metrics_view(&found.combined),
+        benchmark: metrics_view(&found.benchmark),
         excess_return: found.excess_return,
         strategy_curve: curve_points(&found.combined_curve),
         benchmark_curve: curve_points(&found.benchmark_curve),
@@ -1717,7 +1315,7 @@ pub fn walk_forward_view(
                 })
                 .collect::<Vec<_>>(),
         ),
-        trades_detail: TradesView::build(&found.combined_trades, template.starting_cash),
+        trades_detail: trades_view(&found.combined_trades, template.starting_cash),
         in_sample_days: found.in_sample_days,
         step_days: found.step_days,
         anchored: found.anchored,

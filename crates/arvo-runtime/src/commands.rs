@@ -1,5 +1,8 @@
 use arvo_plugin_host::registry::{PluginEntry, PluginRegistry, PluginStatus};
 use serde::{Serialize, Serializer};
+
+// The view shapes live in `arvo-views` so the window cannot drift from them.
+pub use arvo_views::{PluginStatusView, PluginView};
 use std::sync::Arc;
 
 /// Error surface for Tauri commands.
@@ -24,48 +27,32 @@ impl Serialize for CommandError {
     }
 }
 
-#[derive(Serialize)]
-pub struct PluginView {
-    pub id: String,
-    pub address: Option<String>,
-    pub status: PluginStatusView,
-}
+/// One plugin, as the window sees it.
+///
+/// A free function rather than a `From` impl: [`PluginView`] lives in
+/// `arvo-views` and [`PluginEntry`] in `arvo-plugin-host`, so neither is local
+/// here and the orphan rule forbids the impl. That is the rule doing its job —
+/// the conversion is this crate's business and belongs in this crate.
+pub fn plugin_view(entry: &PluginEntry) -> PluginView {
+    let status = match &entry.status {
+        PluginStatus::Reachable(manifest) => PluginStatusView::Reachable {
+            name: manifest.name.clone(),
+            version: manifest.version.clone(),
+            capabilities: manifest
+                .capabilities
+                .iter()
+                .map(|capability| capability.name.clone())
+                .collect(),
+        },
+        PluginStatus::Unreachable(reason) => PluginStatusView::Unreachable {
+            reason: reason.clone(),
+        },
+    };
 
-#[derive(Serialize)]
-#[serde(tag = "state")]
-pub enum PluginStatusView {
-    Reachable {
-        name: String,
-        version: String,
-        capabilities: Vec<String>,
-    },
-    Unreachable {
-        reason: String,
-    },
-}
-
-impl From<&PluginEntry> for PluginView {
-    fn from(entry: &PluginEntry) -> Self {
-        let status = match &entry.status {
-            PluginStatus::Reachable(manifest) => PluginStatusView::Reachable {
-                name: manifest.name.clone(),
-                version: manifest.version.clone(),
-                capabilities: manifest
-                    .capabilities
-                    .iter()
-                    .map(|capability| capability.name.clone())
-                    .collect(),
-            },
-            PluginStatus::Unreachable(reason) => PluginStatusView::Unreachable {
-                reason: reason.clone(),
-            },
-        };
-
-        Self {
-            id: entry.id.clone(),
-            address: entry.address.clone(),
-            status,
-        }
+    PluginView {
+        id: entry.id.clone(),
+        address: entry.address.clone(),
+        status,
     }
 }
 
@@ -77,7 +64,7 @@ pub async fn list_plugins(
         .snapshot()
         .await
         .iter()
-        .map(PluginView::from)
+        .map(plugin_view)
         .collect())
 }
 
@@ -90,7 +77,7 @@ pub async fn refresh_plugins(
         .snapshot()
         .await
         .iter()
-        .map(PluginView::from)
+        .map(plugin_view)
         .collect())
 }
 
