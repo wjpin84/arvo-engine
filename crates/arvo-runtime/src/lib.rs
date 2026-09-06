@@ -8,6 +8,7 @@
 //! implementation is bound to `tauri::async_runtime` — see [`scheduler`].
 
 pub mod commands;
+pub mod feed;
 pub mod portfolio;
 pub mod research;
 pub mod scheduler;
@@ -180,6 +181,9 @@ pub fn run() {
             research::list_instruments,
             research::run_study,
             research::list_strategies,
+            research::feed_connected,
+            research::set_feed_token,
+            research::fetch_bars,
             research::run_panel,
             research::list_history,
             research::open_record,

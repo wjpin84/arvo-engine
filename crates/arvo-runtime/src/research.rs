@@ -756,6 +756,83 @@ pub fn list_strategies() -> Result<Vec<StrategyView>, CommandError> {
         .collect())
 }
 
+/// What a fetch pulled in.
+#[derive(Serialize)]
+pub struct FetchView {
+    pub instrument: String,
+    pub interval: String,
+    pub bars: usize,
+    /// Gap-fill bars the server synthesised, which were dropped. Surfaced
+    /// rather than hidden: a series that is a quarter invented is one to know
+    /// about before drawing a conclusion from it.
+    pub interpolated: usize,
+    pub from: Option<String>,
+    pub to: Option<String>,
+}
+
+/// Whether a broker token is stored, so the UI knows whether to ask.
+///
+/// # Errors
+///
+/// Returns [`CommandError::Failed`] if the keychain cannot be read.
+#[tauri::command]
+pub fn feed_connected() -> Result<bool, CommandError> {
+    crate::feed::has_token().map_err(|err| CommandError::Failed(err.to_string()))
+}
+
+/// Stores or clears the broker token. Returns whether one is now held.
+///
+/// # Errors
+///
+/// Returns [`CommandError::Failed`] if the keychain rejects the write.
+#[tauri::command]
+pub fn set_feed_token(token: String) -> Result<bool, CommandError> {
+    crate::feed::set_token(&token).map_err(|err| CommandError::Failed(err.to_string()))
+}
+
+/// Pulls one instrument's bars into the data library.
+///
+/// Fetching is a separate act from running, deliberately. An experiment pins
+/// its dataset as a content hash of the bars it ran on, so a provider that
+/// went to the network mid-backtest would give a different answer whenever the
+/// vendor revised a bar and every stored verdict would quietly stop being
+/// checkable. See [`crate::feed`].
+///
+/// # Errors
+///
+/// Returns [`CommandError::Failed`] if there is no token, the resolution is
+/// one the broker does not serve, or nothing comes back.
+#[tauri::command]
+pub async fn fetch_bars(
+    instrument: String,
+    interval: String,
+    days: Option<u32>,
+    service: tauri::State<'_, ResearchService>,
+) -> Result<FetchView, CommandError> {
+    let interval: arvo_data::BarInterval = interval
+        .parse()
+        .map_err(|err| CommandError::Failed(format!("{interval:?}: {err}")))?;
+
+    // A default that is generous for a daily pull and modest for an intraday
+    // one, where the same span is two orders of magnitude more bars.
+    let days = days.unwrap_or(if interval.is_intraday() { 30 } else { 3_650 });
+    let to = chrono::Utc::now().date_naive();
+    let from = to - chrono::Duration::days(i64::from(days));
+
+    let report = crate::feed::fetch(&service.data_dir, &instrument, interval, from, to)
+        .await
+        .map_err(|err| CommandError::Failed(err.to_string()))?;
+
+    Ok(FetchView {
+        instrument: report.instrument,
+        interval: report.interval.to_string(),
+        bars: report.bars,
+        interpolated: report.interpolated,
+        from: report.from.map(|at| at.to_string()),
+        to: report.to.map(|at| at.to_string()),
+    })
+}
+
 /// Runs one configuration across every instrument that has data.
 ///
 /// This is the study that can actually reach a verdict: a single instrument

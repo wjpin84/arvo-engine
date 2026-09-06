@@ -281,6 +281,61 @@ impl CsvBars {
         }
     }
 
+    /// Writes bars into the library, replacing whatever was there.
+    ///
+    /// The counterpart to reading, so a fetched series lands in exactly the
+    /// shape [`CsvBars`] already reads — same directory rule, same header,
+    /// same timestamp spelling. A fetcher that invented its own format would
+    /// be a second parser to keep in step with this one.
+    ///
+    /// Replacing rather than appending is deliberate. Merging two overlapping
+    /// pulls means deciding which revision of a bar wins, and a file that is
+    /// partly one fetch and partly another is not a dataset anyone can name:
+    /// the content hash that identifies it would describe a state no single
+    /// request ever returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataError::Io`] if the directory cannot be created or the
+    /// file cannot be written.
+    pub fn write(
+        &self,
+        instrument: &str,
+        interval: BarInterval,
+        bars: &[Bar],
+    ) -> Result<PathBuf, DataError> {
+        let path = self.path_for(instrument, interval)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|source| DataError::Io {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+
+        let mut out = String::with_capacity(bars.len() * 64 + 32);
+        out.push_str("date,open,high,low,close,volume\n");
+        for bar in bars {
+            // A daily bar keeps its bare date so an exported file still looks
+            // like the free daily exports this format came from; anything
+            // finer needs the time or the resolution is lost.
+            let at = if interval == BarInterval::DAILY {
+                bar.at.date().to_string()
+            } else {
+                bar.at.format("%Y-%m-%dT%H:%M:%S").to_string()
+            };
+            out.push_str(&format!(
+                "{at},{},{},{},{},{}\n",
+                bar.open, bar.high, bar.low, bar.close, bar.volume
+            ));
+        }
+
+        std::fs::write(&path, out).map_err(|source| DataError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        Ok(path)
+    }
+
     /// Where a resolution's files live.
     ///
     /// Daily bars sit in the root, so an existing library keeps working and
@@ -482,6 +537,129 @@ impl BarProvider for CsvBars {
 
 #[cfg(test)]
 mod tests {
+    /// What a fetcher writes must be what the library reads. This is the seam
+    /// where a format mismatch costs nothing at write time and shows up later
+    /// as an instrument that exists on disk and holds no bars.
+    mod round_trip {
+        use super::super::*;
+
+        fn bars(interval: BarInterval) -> Vec<Bar> {
+            (0..4)
+                .map(|index| {
+                    let at = NaiveDate::from_ymd_opt(2026, 9, 3)
+                        .expect("valid")
+                        .and_hms_opt(13, 30, 0)
+                        .expect("valid")
+                        + interval.duration() * index;
+                    let close = 500.0 + f64::from(index) * 0.25;
+                    Bar {
+                        at,
+                        open: close - 0.1,
+                        high: close + 0.5,
+                        low: close - 0.5,
+                        close,
+                        volume: 1_000.0 + f64::from(index),
+                    }
+                })
+                .collect()
+        }
+
+        #[test]
+        fn intraday_bars_survive_a_write_and_a_read() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let library = CsvBars::new(dir.path());
+            let interval = BarInterval::new(5, IntervalUnit::Minute);
+            let written = bars(interval);
+
+            library
+                .write("MSFT.NASDAQ", interval, &written)
+                .expect("writes");
+            let read = library
+                .bars(
+                    "MSFT.NASDAQ",
+                    interval,
+                    NaiveDate::MIN,
+                    NaiveDate::MAX,
+                )
+                .expect("reads");
+
+            assert_eq!(read.len(), written.len());
+            for (read, written) in read.iter().zip(&written) {
+                assert_eq!(read.at, written.at, "the timestamp is the whole instant");
+                assert!((read.close - written.close).abs() < 1e-9);
+                assert!((read.volume - written.volume).abs() < 1e-9);
+            }
+        }
+
+        #[test]
+        fn a_daily_file_keeps_the_bare_date_the_free_exports_use() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let library = CsvBars::new(dir.path());
+            let daily: Vec<Bar> = bars(BarInterval::DAILY)
+                .into_iter()
+                .map(|bar| Bar {
+                    at: bar.at.date().and_time(NaiveTime::MIN),
+                    ..bar
+                })
+                .collect();
+
+            let path = library
+                .write("MSFT.NASDAQ", BarInterval::DAILY, &daily)
+                .expect("writes");
+            let text = std::fs::read_to_string(&path).expect("readable");
+            assert!(
+                text.contains("\n2026-09-03,"),
+                "a daily row is a bare date: {text}"
+            );
+
+            let read = library
+                .daily_bars("MSFT.NASDAQ", NaiveDate::MIN, NaiveDate::MAX)
+                .expect("reads");
+            assert_eq!(read, daily);
+        }
+
+        #[test]
+        fn an_intraday_write_does_not_appear_as_a_new_instrument() {
+            // Intraday files live in a subdirectory precisely so a five-minute
+            // pull does not make `MSFT.NASDAQ.5minute` look like something you
+            // could trade.
+            let dir = tempfile::tempdir().expect("tempdir");
+            let library = CsvBars::new(dir.path());
+            let interval = BarInterval::new(5, IntervalUnit::Minute);
+
+            library
+                .write("MSFT.NASDAQ", interval, &bars(interval))
+                .expect("writes");
+            assert_eq!(
+                library.instruments().expect("lists"),
+                Vec::<String>::new(),
+                "only daily files name instruments"
+            );
+        }
+
+        #[test]
+        fn writing_replaces_rather_than_appends() {
+            // A file that is partly one fetch and partly another is not a
+            // dataset anyone can name: its content hash would describe a state
+            // no single request ever returned.
+            let dir = tempfile::tempdir().expect("tempdir");
+            let library = CsvBars::new(dir.path());
+            let interval = BarInterval::new(5, IntervalUnit::Minute);
+
+            library
+                .write("MSFT.NASDAQ", interval, &bars(interval))
+                .expect("writes");
+            library
+                .write("MSFT.NASDAQ", interval, &bars(interval)[..2])
+                .expect("writes again");
+
+            let read = library
+                .bars("MSFT.NASDAQ", interval, NaiveDate::MIN, NaiveDate::MAX)
+                .expect("reads");
+            assert_eq!(read.len(), 2);
+        }
+    }
+
     use super::*;
 
     fn date(y: i32, m: u32, d: u32) -> NaiveDate {

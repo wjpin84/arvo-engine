@@ -193,6 +193,17 @@ struct StudyView {
     engine: String,
 }
 
+/// What a fetch pulled in.
+#[derive(Clone, Deserialize)]
+struct FetchView {
+    instrument: String,
+    interval: String,
+    bars: usize,
+    interpolated: usize,
+    from: Option<String>,
+    to: Option<String>,
+}
+
 /// A strategy the workbench can run.
 #[derive(Clone, Deserialize)]
 struct StrategyView {
@@ -647,6 +658,12 @@ fn ResearchView(
     // that drifts from the engine offers rules it will then refuse.
     let (strategies, set_strategies) = signal(Vec::<StrategyView>::new());
     let (chosen, set_chosen) = signal(String::new());
+    // Whether a broker token is held, never the token itself. A getter for the
+    // credential would put it on the wire to the web view for no reason the UI
+    // actually has.
+    let (connected, set_connected) = signal(false);
+    let (symbol, set_symbol) = signal(String::new());
+    let (fetched, set_fetched) = signal(None::<FetchView>);
 
     // Refetched after every run, so a finding appears in the history the
     // moment it is recorded rather than only after a restart.
@@ -677,6 +694,67 @@ fn ResearchView(
         }
     });
     refresh_history();
+
+    let refresh_library = move || {
+        spawn_local(async move {
+            if let Ok(value) =
+                call_typed::<DataLibraryView>("list_instruments", JsValue::UNDEFINED).await
+            {
+                set_library.set(Some(value));
+            }
+        });
+    };
+    spawn_local(async move {
+        if let Ok(held) = call_typed::<bool>("feed_connected", JsValue::UNDEFINED).await {
+            set_connected.set(held);
+        }
+    });
+
+    let save_token = move |token: String| {
+        spawn_local(async move {
+            let args = serde_wasm_bindgen::to_value(&serde_json::json!({ "token": token }))
+                .unwrap_or(JsValue::UNDEFINED);
+            match call_typed::<bool>("set_feed_token", args).await {
+                Ok(held) => set_connected.set(held),
+                Err(reason) => set_error.set(Some(reason)),
+            }
+        });
+    };
+
+    let fetch = move |_| {
+        let instrument = symbol.get_untracked().trim().to_uppercase();
+        if instrument.is_empty() {
+            set_error.set(Some("Name an instrument to fetch".to_owned()));
+            return;
+        }
+        // The resolution the selected rule is defined at, so a session-anchored
+        // strategy pulls the bars it can actually run on rather than daily ones
+        // it will refuse.
+        let interval = strategies.with_untracked(|found| {
+            found
+                .iter()
+                .find(|plan| plan.name == chosen.get_untracked())
+                .map_or_else(|| "1day".to_owned(), |plan| plan.interval.clone())
+        });
+        set_running.set(Some(format!("Fetching {instrument} at {interval}")));
+        set_error.set(None);
+        set_fetched.set(None);
+        spawn_local(async move {
+            let args = serde_wasm_bindgen::to_value(&serde_json::json!({
+                "instrument": instrument,
+                "interval": interval,
+            }))
+            .unwrap_or(JsValue::UNDEFINED);
+            match call_typed::<FetchView>("fetch_bars", args).await {
+                Ok(report) => {
+                    set_fetched.set(Some(report));
+                    refresh_library();
+                }
+                Err(reason) => set_error.set(Some(reason)),
+            }
+            set_running.set(None);
+        });
+    };
 
     let run = move |instrument: String| {
         let strategy = chosen.get_untracked();
@@ -796,6 +874,79 @@ fn ResearchView(
                         }
                     })
             }}
+
+            // Fetching is a separate act from running, and the separation is
+            // the point: an experiment pins its dataset as a content hash of
+            // the bars it ran on, so a study that went to the network mid-run
+            // would give a different answer whenever the vendor revised a bar.
+            <div class="research-fetch">
+                {move || {
+                    if connected.get() {
+                        view! {
+                            <div class="research-fetch-row">
+                                <input
+                                    type="text"
+                                    placeholder="MSFT.NASDAQ"
+                                    prop:value=move || symbol.get()
+                                    on:input:target=move |ev| set_symbol.set(ev.target().value())
+                                />
+                                <button disabled=move || running.get().is_some() on:click=fetch>
+                                    "Fetch"
+                                </button>
+                            </div>
+                        }
+                            .into_any()
+                    } else {
+                        view! {
+                            <div>
+                                <p class="research-hint">
+                                    "Paste a Robinhood bearer token to pull bars. It is kept in \
+                                     the OS keychain, never in a file beside your data, and only \
+                                     ever used to read history."
+                                </p>
+                                <input
+                                    class="research-token"
+                                    type="password"
+                                    placeholder="Bearer token"
+                                    on:change:target=move |ev| save_token(ev.target().value())
+                                />
+                            </div>
+                        }
+                            .into_any()
+                    }
+                }}
+                {move || {
+                    fetched
+                        .get()
+                        .map(|report| {
+                            // Interpolated bars are gap-fill the server
+                            // synthesised. Saying how many were dropped is the
+                            // difference between a series you can trust and one
+                            // that is quietly part invention.
+                            let invented = if report.interpolated > 0 {
+                                format!(", {} invented bars dropped", report.interpolated)
+                            } else {
+                                String::new()
+                            };
+                            view! {
+                                <p class="research-hint">
+                                    {format!(
+                                        "{}: {} {} bars{}",
+                                        report.instrument,
+                                        report.bars,
+                                        report.interval,
+                                        invented,
+                                    )}
+                                    {report
+                                        .from
+                                        .as_ref()
+                                        .zip(report.to.as_ref())
+                                        .map(|(from, to)| format!(" ({from} → {to})"))}
+                                </p>
+                            }
+                        })
+                }}
+            </div>
 
             // The panel is the run that can actually conclude something: one
             // instrument yields a dozen round trips against a thirty-trade
