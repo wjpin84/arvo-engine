@@ -18,12 +18,29 @@
 //! So: fetch is an explicit act that writes files, and everything downstream
 //! keeps reading [`arvo_data::CsvBars`].
 //!
+//! # Signing in
+//!
+//! OAuth 2.1 with PKCE and dynamic client registration, via [`arvo_oauth`]. No
+//! pasted token, and nothing about Robinhood is embedded beyond the endpoint —
+//! every URL comes from the server's own discovery document.
+//!
+//! What is stored is a client id and a token pair, in the OS keychain. The
+//! access token is refreshed on use when it has run out, and the refreshed
+//! pair is written back, so an unattended sync survives an expiry.
+//!
 //! # What is deliberately not here
 //!
 //! Only `get_equity_historicals` is called, and only that. The same server
 //! offers `place_equity_order`; live execution with real capital is a
 //! separate, later, explicit decision and not a matter of which tool name a
 //! function happens to pass.
+//!
+//! The scope asked for is whatever the server advertises. That is not a way of
+//! asking for more than is needed — it is one scope, `internal`, and the same
+//! one the endpoint requires for any call at all — but it is worth knowing
+//! that the token this holds could place an order if something asked it to.
+//! Nothing does, and that is a property of the code above rather than of the
+//! token.
 
 use std::path::PathBuf;
 
@@ -39,10 +56,26 @@ const ENDPOINT: &str = "https://agent.robinhood.com/mcp/trading";
 /// The only tool this module calls.
 const HISTORICALS: &str = "get_equity_historicals";
 
+/// What is kept in the keychain once someone has signed in.
+///
+/// The client id travels with the tokens rather than being registered afresh
+/// each time: dynamic registration works on every sign-in, but it leaves one
+/// abandoned client on the server per attempt, and reusing the id is what
+/// makes a re-authorisation look like the same app coming back.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct Connection {
+    client_id: String,
+    tokens: arvo_oauth::Tokens,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum FeedError {
-    #[error("no {FEED_ID} token stored; add one before fetching")]
+    #[error("not connected to {FEED_ID}; sign in before fetching")]
     NoToken,
+    #[error("signing in to {FEED_ID}: {0}")]
+    OAuth(#[from] arvo_oauth::OAuthError),
+    #[error("the stored {FEED_ID} connection could not be read: {0}")]
+    Stored(String),
     #[error("reading the stored token: {0}")]
     Secrets(#[from] arvo_core::secrets::SecretsError),
     #[error("talking to {FEED_ID}: {0}")]
@@ -85,7 +118,7 @@ pub async fn fetch(
     from: chrono::NaiveDate,
     to: chrono::NaiveDate,
 ) -> Result<FetchReport, FeedError> {
-    let token = arvo_core::secrets::get_token(FEED_ID)?.ok_or(FeedError::NoToken)?;
+    let token = access_token().await?;
     let symbol = symbol_of(instrument);
     let client = arvo_mcp::McpClient::new(ENDPOINT, token);
     client.connect().await?;
@@ -252,36 +285,137 @@ fn one_bar(bar: &Value) -> Result<Bar, FeedError> {
     })
 }
 
-/// Whether a token is stored, without revealing it.
+/// Whether a connection is stored, without revealing anything about it.
 ///
 /// A getter for the token itself would put a bearer credential on the wire to
 /// the web view for no reason a UI actually has — the only thing a UI needs to
-/// know is whether to show the field.
+/// know is whether to offer sign-in or sign-out.
 ///
 /// # Errors
 ///
 /// Returns [`FeedError::Secrets`] if the keychain cannot be read.
-pub fn has_token() -> Result<bool, FeedError> {
-    Ok(arvo_core::secrets::get_token(FEED_ID)?.is_some())
+pub fn is_connected() -> Result<bool, FeedError> {
+    Ok(stored()?.is_some())
 }
 
-/// Stores the bearer token, or clears it when given nothing.
+/// Forgets the stored connection.
 ///
-/// Into the OS keychain via [`arvo_core::secrets`], not a config file. A
-/// broker credential in plain text next to the data is the kind of thing that
-/// ends up in a backup or a screen share.
+/// Local only. Whether the tokens are also revoked at the server is the
+/// server's business and there is no revocation endpoint in its metadata, so
+/// this does not claim to have done more than it did.
 ///
 /// # Errors
 ///
-/// Returns [`FeedError::Secrets`] if the keychain rejects the write.
-pub fn set_token(token: &str) -> Result<bool, FeedError> {
-    let token = token.trim();
-    if token.is_empty() {
-        arvo_core::secrets::delete_token(FEED_ID)?;
-        return Ok(false);
+/// Returns [`FeedError::Secrets`] if the keychain rejects the delete.
+pub fn disconnect() -> Result<(), FeedError> {
+    arvo_core::secrets::delete_token(FEED_ID)?;
+    Ok(())
+}
+
+/// Starts a sign-in: discovers the server, registers, and returns the URL to
+/// open along with the pending flow.
+///
+/// Returning the URL rather than opening it keeps `arvo-oauth` free of a
+/// browser dependency, and keeps *this* function testable up to the point a
+/// person is actually required.
+///
+/// # Errors
+///
+/// Returns [`FeedError::OAuth`] if discovery or registration fails.
+pub async fn begin_sign_in() -> Result<arvo_oauth::Pending, FeedError> {
+    // Reuse the client id from a previous sign-in when there is one, even if
+    // its tokens have since expired or been revoked — the registration is
+    // still good, and re-registering would strand it.
+    let client_id = stored().ok().flatten().map(|held| held.client_id);
+    Ok(arvo_oauth::begin(&arvo_oauth::AuthConfig {
+        resource: ENDPOINT.to_owned(),
+        client_name: "Arvo".to_owned(),
+        // Empty: take whatever the server advertises rather than asserting a
+        // scope name that may not exist. Asking for one it does not know is a
+        // refusal, and asking for more than it offers is worse.
+        scopes: Vec::new(),
+        client_id,
+    })
+    .await?)
+}
+
+/// Waits for the browser redirect and stores what comes back.
+///
+/// # Errors
+///
+/// Returns [`FeedError::OAuth`] if consent is refused or nobody finishes.
+pub async fn complete_sign_in(pending: arvo_oauth::Pending) -> Result<(), FeedError> {
+    let client_id = pending.client_id.clone();
+    let tokens = pending.finish(arvo_oauth::DEFAULT_TIMEOUT).await?;
+    store(&Connection { client_id, tokens })
+}
+
+/// A usable access token, refreshed if the stored one has run out.
+///
+/// The refreshed pair is written back before it is used. Refreshing without
+/// storing works exactly once and then asks for a browser again, which is the
+/// sort of bug that only shows up an hour after someone stops watching.
+///
+/// # Errors
+///
+/// Returns [`FeedError::NoToken`] if nobody has signed in, or
+/// [`FeedError::OAuth`] if the refresh token has been revoked — in which case
+/// a person has to sign in again.
+pub async fn access_token() -> Result<String, FeedError> {
+    let held = stored()?.ok_or(FeedError::NoToken)?;
+    if !held.tokens.is_expired(std::time::SystemTime::now()) {
+        return Ok(held.tokens.access_token);
     }
-    arvo_core::secrets::store_token(FEED_ID, token)?;
-    Ok(true)
+
+    let refresh_token = held
+        .tokens
+        .refresh_token
+        .as_deref()
+        .ok_or(FeedError::NoToken)?;
+
+    // The token endpoint again from discovery rather than remembered: an
+    // endpoint cached at sign-in and moved since would fail every refresh
+    // with no way to recover but a reinstall.
+    let document: serde_json::Value = reqwest::Client::new()
+        .get(arvo_oauth::metadata_url(ENDPOINT).map_err(FeedError::OAuth)?)
+        .send()
+        .await
+        .map_err(|err| FeedError::OAuth(arvo_oauth::OAuthError::Http(err)))?
+        .json()
+        .await
+        .map_err(|err| FeedError::OAuth(arvo_oauth::OAuthError::Http(err)))?;
+    let metadata = arvo_oauth::ServerMetadata::parse(&document)?;
+
+    let tokens = arvo_oauth::refresh(
+        &metadata.token_endpoint,
+        &held.client_id,
+        refresh_token,
+        ENDPOINT,
+    )
+    .await?;
+
+    let access = tokens.access_token.clone();
+    store(&Connection {
+        client_id: held.client_id,
+        tokens,
+    })?;
+    Ok(access)
+}
+
+fn stored() -> Result<Option<Connection>, FeedError> {
+    let Some(text) = arvo_core::secrets::get_token(FEED_ID)? else {
+        return Ok(None);
+    };
+    serde_json::from_str(&text)
+        .map(Some)
+        .map_err(|err| FeedError::Stored(err.to_string()))
+}
+
+fn store(connection: &Connection) -> Result<(), FeedError> {
+    let text = serde_json::to_string(connection)
+        .map_err(|err| FeedError::Stored(err.to_string()))?;
+    arvo_core::secrets::store_token(FEED_ID, &text)?;
+    Ok(())
 }
 
 #[cfg(test)]

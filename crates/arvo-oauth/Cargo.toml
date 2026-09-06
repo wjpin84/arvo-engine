@@ -1,0 +1,25 @@
+[package]
+name = "arvo-oauth"
+description = "OAuth 2.1 authorization-code flow with PKCE for a native desktop client."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json = "1"
+thiserror.workspace = true
+# Already in the graph via Tauri; rustls rather than native-tls so the build
+# does not depend on a platform OpenSSL.
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+tokio = { workspace = true, features = ["net", "time", "io-util"] }
+# PKCE is a SHA-256 of a random string, base64url-encoded. All three already
+# in the graph.
+sha2 = "0.10"
+base64 = "0.21"
+rand = "0.8"
+url = "2"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+serde_json = "1"

@@ -23,9 +23,12 @@ blake3 = "1.8.7"
 chrono.workspace = true
 arvo-core.workspace = true
 arvo-mcp.workspace = true
+arvo-oauth.workspace = true
 arvo-plugin-host.workspace = true
 serde.workspace = true
 serde_json = "1"
+# For the one discovery GET the refresh path needs; already in the graph.
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 tokio.workspace = true
 tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"

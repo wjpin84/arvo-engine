@@ -710,11 +710,24 @@ fn ResearchView(
         }
     });
 
-    let save_token = move |token: String| {
+    let connect = move |_| {
+        // A slow command by design: it returns when the sign-in finishes in
+        // the browser, or after five minutes. Saying so beats a spinner that
+        // is indistinguishable from a hang for that long.
+        set_running.set(Some("Waiting for the sign-in in your browser…".to_owned()));
+        set_error.set(None);
         spawn_local(async move {
-            let args = serde_wasm_bindgen::to_value(&serde_json::json!({ "token": token }))
-                .unwrap_or(JsValue::UNDEFINED);
-            match call_typed::<bool>("set_feed_token", args).await {
+            match call_typed::<bool>("connect_feed", JsValue::UNDEFINED).await {
+                Ok(held) => set_connected.set(held),
+                Err(reason) => set_error.set(Some(reason)),
+            }
+            set_running.set(None);
+        });
+    };
+
+    let disconnect = move |_| {
+        spawn_local(async move {
+            match call_typed::<bool>("disconnect_feed", JsValue::UNDEFINED).await {
                 Ok(held) => set_connected.set(held),
                 Err(reason) => set_error.set(Some(reason)),
             }
@@ -883,15 +896,20 @@ fn ResearchView(
                 {move || {
                     if connected.get() {
                         view! {
-                            <div class="research-fetch-row">
-                                <input
-                                    type="text"
-                                    placeholder="MSFT.NASDAQ"
-                                    prop:value=move || symbol.get()
-                                    on:input:target=move |ev| set_symbol.set(ev.target().value())
-                                />
-                                <button disabled=move || running.get().is_some() on:click=fetch>
-                                    "Fetch"
+                            <div>
+                                <div class="research-fetch-row">
+                                    <input
+                                        type="text"
+                                        placeholder="MSFT.NASDAQ"
+                                        prop:value=move || symbol.get()
+                                        on:input:target=move |ev| set_symbol.set(ev.target().value())
+                                    />
+                                    <button disabled=move || running.get().is_some() on:click=fetch>
+                                        "Fetch"
+                                    </button>
+                                </div>
+                                <button class="research-linkish" on:click=disconnect>
+                                    "Disconnect Robinhood"
                                 </button>
                             </div>
                         }
@@ -900,16 +918,19 @@ fn ResearchView(
                         view! {
                             <div>
                                 <p class="research-hint">
-                                    "Paste a Robinhood bearer token to pull bars. It is kept in \
-                                     the OS keychain, never in a file beside your data, and only \
-                                     ever used to read history."
+                                    "Sign in to Robinhood to pull bars. This opens your own \
+                                     browser — never a window inside Arvo, so you can see whose \
+                                     page you are typing a password into. Arvo keeps only the \
+                                     resulting token, in the OS keychain, and uses it to read \
+                                     price history."
                                 </p>
-                                <input
-                                    class="research-token"
-                                    type="password"
-                                    placeholder="Bearer token"
-                                    on:change:target=move |ev| save_token(ev.target().value())
-                                />
+                                <button
+                                    class="research-panel-run"
+                                    disabled=move || running.get().is_some()
+                                    on:click=connect
+                                >
+                                    "Sign in to Robinhood"
+                                </button>
                             </div>
                         }
                             .into_any()

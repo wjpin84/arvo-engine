@@ -770,24 +770,67 @@ pub struct FetchView {
     pub to: Option<String>,
 }
 
-/// Whether a broker token is stored, so the UI knows whether to ask.
+/// Whether a broker connection is stored, so the UI knows what to offer.
 ///
 /// # Errors
 ///
 /// Returns [`CommandError::Failed`] if the keychain cannot be read.
 #[tauri::command]
 pub fn feed_connected() -> Result<bool, CommandError> {
-    crate::feed::has_token().map_err(|err| CommandError::Failed(err.to_string()))
+    crate::feed::is_connected().map_err(|err| CommandError::Failed(err.to_string()))
 }
 
-/// Stores or clears the broker token. Returns whether one is now held.
+/// Signs in to the broker: opens the browser and waits for the redirect.
+///
+/// One command rather than two — begin, then finish — because the flow holds a
+/// bound socket and a PKCE verifier between those halves, and parking that in
+/// shared state so a second command could find it would mean a half-finished
+/// sign-in outliving the window that started it. Here the whole flow lives on
+/// one stack and ends when it ends.
+///
+/// It is therefore a slow command: it returns when someone finishes in their
+/// browser, or after [`arvo_oauth::DEFAULT_TIMEOUT`].
 ///
 /// # Errors
 ///
-/// Returns [`CommandError::Failed`] if the keychain rejects the write.
+/// Returns [`CommandError::Failed`] if the browser cannot be opened, consent
+/// is refused, or nobody completes the sign-in.
 #[tauri::command]
-pub fn set_feed_token(token: String) -> Result<bool, CommandError> {
-    crate::feed::set_token(&token).map_err(|err| CommandError::Failed(err.to_string()))
+pub async fn connect_feed(app: tauri::AppHandle) -> Result<bool, CommandError> {
+    use tauri_plugin_opener::OpenerExt as _;
+
+    let pending = crate::feed::begin_sign_in()
+        .await
+        .map_err(|err| CommandError::Failed(err.to_string()))?;
+
+    // The system browser, not a window in this app. A sign-in page rendered
+    // inside the app cannot be told apart from one the app drew itself, so a
+    // user has no way to check what they are typing a password into — which
+    // is the whole reason RFC 8252 says to use the external agent.
+    app.opener()
+        .open_url(pending.url.clone(), None::<&str>)
+        .map_err(|err| {
+            CommandError::Failed(format!(
+                "could not open a browser for the sign-in ({err}); the address is {}",
+                pending.url
+            ))
+        })?;
+
+    crate::feed::complete_sign_in(pending)
+        .await
+        .map_err(|err| CommandError::Failed(err.to_string()))?;
+    Ok(true)
+}
+
+/// Forgets the stored broker connection.
+///
+/// # Errors
+///
+/// Returns [`CommandError::Failed`] if the keychain rejects the delete.
+#[tauri::command]
+pub fn disconnect_feed() -> Result<bool, CommandError> {
+    crate::feed::disconnect().map_err(|err| CommandError::Failed(err.to_string()))?;
+    Ok(false)
 }
 
 /// Pulls one instrument's bars into the data library.
