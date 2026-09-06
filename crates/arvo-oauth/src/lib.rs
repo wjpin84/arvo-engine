@@ -434,7 +434,15 @@ impl Pending {
                         respond(&mut stream, "That request did not come from this app.").await;
                         return Err(OAuthError::StateMismatch);
                     }
-                    respond(&mut stream, "Connected. You can close this tab.").await;
+                    // Deliberately not "Connected". The token exchange has not
+                    // happened yet and can still fail, and a browser tab
+                    // claiming success while the app reports failure is worse
+                    // than either message alone.
+                    respond(
+                        &mut stream,
+                        "Signed in. Returning to Arvo — you can close this tab.",
+                    )
+                    .await;
                     return Ok(code);
                 }
             }
@@ -477,6 +485,12 @@ pub async fn refresh(
 
 /// Posts a form-encoded body and reads JSON back.
 ///
+/// The response body is read whatever the status says: OAuth returns its
+/// failures as JSON with a 400, and that body is the only thing that
+/// distinguishes an expired grant from a rejected redirect from a parameter
+/// the server does not accept. Throwing it away for the status code would
+/// leave "400 Bad Request" as the whole diagnosis.
+///
 /// Hand-rolled rather than reqwest's `form`, which is behind a feature this
 /// crate would otherwise not need; the encoder is already here for building
 /// the authorization URL.
@@ -498,14 +512,27 @@ async fn post_form(endpoint: &str, fields: &[(&str, &str)]) -> Result<Value, OAu
         encoder.finish()
     };
 
-    Ok(reqwest::Client::new()
+    let response = reqwest::Client::new()
         .post(endpoint)
         .header("content-type", "application/x-www-form-urlencoded")
         .body(body)
         .send()
-        .await?
-        .json()
-        .await?)
+        .await?;
+
+    let status = response.status();
+    let text = response.text().await?;
+    serde_json::from_str(&text).map_or_else(
+        // Not JSON at all — an HTML error page, a proxy, a gateway. Carrying
+        // the first of it through is the difference between a diagnosis and a
+        // shrug.
+        |_| {
+            Err(OAuthError::Denied {
+                error: format!("HTTP {status}"),
+                description: Some(text.chars().take(300).collect()),
+            })
+        },
+        Ok,
+    )
 }
 
 async fn register(

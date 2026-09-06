@@ -600,7 +600,6 @@ pub struct WalkForwardView {
     pub underwater: Vec<CurvePoint>,
     pub trades: Vec<TradeRowView>,
     pub trades_detail: TradesView,
-    pub recommendations: Vec<RecommendationView>,
 
     pub in_sample_days: i64,
     pub step_days: i64,
@@ -1096,9 +1095,21 @@ pub fn feed_connected() -> Result<bool, CommandError> {
 pub async fn connect_feed(app: tauri::AppHandle) -> Result<bool, CommandError> {
     use tauri_plugin_opener::OpenerExt as _;
 
-    let pending = crate::feed::begin_sign_in()
-        .await
-        .map_err(|err| CommandError::Failed(err.to_string()))?;
+    // Logged at every step. The first attempt at this failed and left no
+    // trace anywhere: the error went to the UI and only to the UI, and the UI
+    // was showing something else at the time. An authorization flow has five
+    // places to fail across two processes and a browser, and "it failed" is
+    // not a diagnosis.
+    tracing::info!("starting the {} sign-in", crate::feed::FEED_ID);
+    let pending = crate::feed::begin_sign_in().await.map_err(|err| {
+        tracing::error!(error = %err, "could not start the sign-in");
+        CommandError::Failed(err.to_string())
+    })?;
+    tracing::info!(
+        client_id = %pending.client_id,
+        url = %pending.url,
+        "registered; waiting for the browser redirect"
+    );
 
     // The system browser, not a window in this app. A sign-in page rendered
     // inside the app cannot be told apart from one the app drew itself, so a
@@ -1107,15 +1118,21 @@ pub async fn connect_feed(app: tauri::AppHandle) -> Result<bool, CommandError> {
     app.opener()
         .open_url(pending.url.clone(), None::<&str>)
         .map_err(|err| {
+            tracing::error!(error = %err, "could not open a browser");
             CommandError::Failed(format!(
                 "could not open a browser for the sign-in ({err}); the address is {}",
                 pending.url
             ))
         })?;
 
-    crate::feed::complete_sign_in(pending)
-        .await
-        .map_err(|err| CommandError::Failed(err.to_string()))?;
+    crate::feed::complete_sign_in(pending).await.map_err(|err| {
+        // The server's own words, not a summary of them. An expired grant, a
+        // rejected redirect and an unknown parameter are three different
+        // problems with three different fixes.
+        tracing::error!(error = %err, "the sign-in did not complete");
+        CommandError::Failed(err.to_string())
+    })?;
+    tracing::info!("{} sign-in complete", crate::feed::FEED_ID);
     Ok(true)
 }
 
@@ -1701,12 +1718,6 @@ pub fn walk_forward_view(
                 .collect::<Vec<_>>(),
         ),
         trades_detail: TradesView::build(&found.combined_trades, template.starting_cash),
-        // Recommendations are keyed to a single study's evidence shape. A
-        // walk-forward's own diagnostics live in `reasons` above — the
-        // stability line and the empty-fold count say the things advice would
-        // say here — and inventing a second, differently-derived list would
-        // give two answers to the same question.
-        recommendations: Vec::new(),
         in_sample_days: found.in_sample_days,
         step_days: found.step_days,
         anchored: found.anchored,

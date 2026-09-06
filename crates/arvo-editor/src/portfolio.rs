@@ -168,7 +168,7 @@ pub(crate) fn PortfolioReport(portfolio: PortfolioView) -> impl IntoView {
         .value_history
         .iter()
         .map(|point| CurvePoint {
-            time: point.time.clone(),
+            time: point.time,
             value: point.value,
         })
         .collect();

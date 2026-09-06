@@ -100,7 +100,12 @@ pub struct ImportView {
 /// One day on the value line.
 #[derive(Serialize)]
 pub struct ValuePoint {
-    pub time: String,
+    /// Seconds since the epoch, the same convention every other chart series
+    /// uses. One convention rather than two: the portfolio chart reuses the
+    /// research chart component, and a date string here against epoch seconds
+    /// there is a mismatch the compiler cannot see and the reader meets as a
+    /// deserialisation error at runtime.
+    pub time: i64,
     pub value: f64,
 }
 
@@ -228,7 +233,11 @@ fn view_of(
         value_history: snapshots
             .iter()
             .map(|snapshot| ValuePoint {
-                time: snapshot.taken_on.to_string(),
+                time: snapshot
+                    .taken_on
+                    .and_time(chrono::NaiveTime::MIN)
+                    .and_utc()
+                    .timestamp(),
                 value: snapshot.portfolio.total_value,
             })
             .collect(),

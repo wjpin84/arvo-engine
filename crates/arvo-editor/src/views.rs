@@ -278,7 +278,9 @@ pub(crate) struct TradeMarkerView {
 
 #[derive(Clone, Deserialize, serde::Serialize)]
 pub(crate) struct CurvePoint {
-    pub(crate) time: String,
+    /// Seconds since the epoch, not a date string. See
+    /// `arvo_runtime::research::CurvePoint`.
+    pub(crate) time: i64,
     pub(crate) value: f64,
 }
 
@@ -344,7 +346,7 @@ pub(crate) struct ImportView {
 
 #[derive(Clone, Deserialize)]
 pub(crate) struct ValuePoint {
-    pub(crate) time: String,
+    pub(crate) time: i64,
     pub(crate) value: f64,
 }
 
