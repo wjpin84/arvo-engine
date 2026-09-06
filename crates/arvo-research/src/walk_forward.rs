@@ -163,6 +163,17 @@ pub struct AxisStability {
 pub struct WalkForwardEvidence {
     pub hypothesis: HypothesisId,
     pub template: Experiment,
+    /// The cadence that produced this, pinned into the record.
+    ///
+    /// Not a display detail. The same rule re-selected yearly and re-selected
+    /// every three years is not the same experiment — it sees different
+    /// selection windows, restarts a different number of times, and pays the
+    /// cold-start cost a different number of times. A stored finding that did
+    /// not say which one it was would not be reproducible, and could not even
+    /// be redrawn.
+    pub in_sample_days: i64,
+    pub step_days: i64,
+    pub anchored: bool,
     /// Every fold, each a complete study in its own right.
     pub folds: Vec<FamilyEvidence>,
     /// The folds' out-of-sample runs, end to end.
@@ -303,6 +314,9 @@ pub fn run_walk_forward(
     Ok(WalkForwardEvidence {
         hypothesis: plan.hypothesis.clone(),
         template: plan.template.clone(),
+        in_sample_days: plan.in_sample_days,
+        step_days: plan.step_days,
+        anchored: plan.anchored,
         folds,
         combined,
         benchmark,

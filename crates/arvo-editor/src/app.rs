@@ -193,6 +193,54 @@ struct StudyView {
     engine: String,
 }
 
+/// One fold of a walk-forward.
+#[derive(Clone, Deserialize)]
+struct FoldView {
+    chose_on: String,
+    judged_on: String,
+    params: Vec<(String, f64)>,
+    strategy_return: f64,
+    benchmark_return: f64,
+    trades: u32,
+    survived_deflation: bool,
+}
+
+/// How much one parameter moved across the folds.
+#[derive(Clone, Deserialize)]
+struct StabilityView {
+    axis: String,
+    distinct: usize,
+    modal: f64,
+    modal_share: f64,
+}
+
+/// A rolling re-selection run.
+#[derive(Clone, Deserialize)]
+struct WalkForwardView {
+    instrument: String,
+    verdict: String,
+    reasons: Vec<String>,
+    folds: Vec<FoldView>,
+    folds_surviving_deflation: usize,
+    folds_without_trades: usize,
+    stability: Vec<StabilityView>,
+    strategy: MetricsView,
+    benchmark: MetricsView,
+    excess_return: f64,
+    strategy_curve: Vec<CurvePoint>,
+    benchmark_curve: Vec<CurvePoint>,
+    trades_detail: TradesView,
+    in_sample_days: i64,
+    step_days: i64,
+    anchored: bool,
+    dataset_version: String,
+    strategy_name: String,
+    starting_cash: f64,
+    commission_bps: f64,
+    slippage_bps: f64,
+    engine: String,
+}
+
 /// What a fetch pulled in.
 #[derive(Clone, Deserialize)]
 struct FetchView {
@@ -361,6 +409,7 @@ enum RecordView {
     // size every record to whichever view is currently the larger.
     Study(Box<StudyView>),
     Panel(Box<PanelView>),
+    WalkForward(Box<WalkForwardView>),
 }
 
 /// Grouped to thousands. A portfolio total is read as a quantity of money,
@@ -643,6 +692,8 @@ fn ExtensionsView(
 fn ResearchView(
     studies: ReadSignal<std::collections::HashMap<String, StudyView>>,
     set_studies: WriteSignal<std::collections::HashMap<String, StudyView>>,
+    walks: ReadSignal<std::collections::HashMap<String, WalkForwardView>>,
+    set_walks: WriteSignal<std::collections::HashMap<String, WalkForwardView>>,
     panel: ReadSignal<Option<PanelView>>,
     set_panel: WriteSignal<Option<PanelView>>,
 ) -> impl IntoView {
@@ -808,6 +859,48 @@ fn ResearchView(
                 // Show the backend's own words. The previous version could not
                 // even reach this branch: the rejected promise killed the
                 // future above, leaving the spinner up and nothing logged.
+                Err(reason) => set_error.set(Some(reason)),
+            }
+            set_running.set(None);
+            refresh_history();
+        });
+    };
+
+    let run_walk = move |instrument: String| {
+        let strategy = chosen.get_untracked();
+        let (label, backtests) = strategies.with_untracked(|found| {
+            found
+                .iter()
+                .find(|plan| plan.name == strategy)
+                .map_or_else(
+                    || (strategy.clone(), 11),
+                    |plan| (plan.label.clone(), plan.backtests),
+                )
+        });
+        // A fold is a whole study. Saying so up front matters more here than
+        // anywhere else in this view: a walk-forward is the slowest thing the
+        // workbench runs, by roughly the number of folds.
+        set_running.set(Some(format!(
+            "Rolling {label} across {instrument}: {backtests} backtests per fold"
+        )));
+        set_error.set(None);
+        spawn_local(async move {
+            let args = serde_wasm_bindgen::to_value(&serde_json::json!({
+                "instrument": instrument,
+                "strategy": strategy,
+            }))
+            .unwrap_or(JsValue::UNDEFINED);
+            match call_typed::<WalkForwardView>("run_walk_forward", args).await {
+                Ok(result) => {
+                    let instrument = result.instrument.clone();
+                    set_walks.update(|walks| {
+                        walks.insert(instrument.clone(), result);
+                    });
+                    open_study_panel(
+                        &format!("{WALK_PANEL_PREFIX}{instrument}"),
+                        &format!("{instrument} rolling"),
+                    );
+                }
                 Err(reason) => set_error.set(Some(reason)),
             }
             set_running.set(None);
@@ -1023,6 +1116,11 @@ fn ResearchView(
                                     };
                                     let runnable = instrument.bars > 0;
                                     let id_again = instrument.id.clone();
+                                    let id_rolling = instrument.id.clone();
+                                    let held_walk = {
+                                        let id = instrument.id.clone();
+                                        move || walks.with(|walks| walks.contains_key(&id))
+                                    };
                                     let live_hash = instrument.fingerprint.clone();
                                     // Two closures rather than one shared: each
                                     // owns a String, so the predicate is not
@@ -1133,6 +1231,45 @@ fn ResearchView(
                                                         }
                                                     })
                                             }}
+                                            // The rolling run, beside the single split rather
+                                            // than replacing it. They answer different
+                                            // questions — did this configuration hold, versus
+                                            // does choosing this way work — and a reader wants
+                                            // both about the same rule.
+                                            <button
+                                                class="research-rerun"
+                                                title=move || {
+                                                    if held_walk() {
+                                                        "Open the rolling result already held"
+                                                    } else {
+                                                        "Re-select on a rolling schedule"
+                                                    }
+                                                }
+                                                disabled=move || running.get().is_some() || !runnable
+                                                on:click={
+                                                    let id = id_rolling.clone();
+                                                    move |_| {
+                                                        // Same reopen-rather-than-recompute rule
+                                                        // as a study, and it matters far more
+                                                        // here: a walk-forward is a study per
+                                                        // fold.
+                                                        if walks
+                                                            .with_untracked(|walks| {
+                                                                walks.contains_key(&id)
+                                                            })
+                                                        {
+                                                            open_study_panel(
+                                                                &format!("{WALK_PANEL_PREFIX}{id}"),
+                                                                &format!("{id} rolling"),
+                                                            );
+                                                        } else {
+                                                            run_walk(id.clone());
+                                                        }
+                                                    }
+                                                }
+                                            >
+                                                "\u{21c9}"
+                                            </button>
                                         </li>
                                     }
                                 })
@@ -1183,6 +1320,17 @@ fn ResearchView(
                                                         open_study_panel(
                                                             &format!("{STUDY_PANEL_PREFIX}{instrument}"),
                                                             &instrument,
+                                                        );
+                                                    }
+                                                    Ok(RecordView::WalkForward(walk)) => {
+                                                        let instrument = walk.instrument.clone();
+                                                        set_walks
+                                                            .update(|walks| {
+                                                                walks.insert(instrument.clone(), *walk);
+                                                            });
+                                                        open_study_panel(
+                                                            &format!("{WALK_PANEL_PREFIX}{instrument}"),
+                                                            &format!("{instrument} rolling"),
                                                         );
                                                     }
                                                     Ok(RecordView::Panel(panel)) => {
@@ -1266,6 +1414,11 @@ const PORTFOLIO_PANEL_ID: &str = "portfolio";
 /// Dockview panel ids for study tabs are this plus the instrument.
 const STUDY_PANEL_PREFIX: &str = "study:";
 
+/// And for walk-forward tabs. A separate prefix so an instrument can have both
+/// open at once — they answer different questions about the same rule, and
+/// reading them side by side is the point.
+const WALK_PANEL_PREFIX: &str = "walk:";
+
 /// One study tab's content.
 ///
 /// Reads its study back out of the shared map by key rather than capturing a
@@ -1285,6 +1438,204 @@ fn StudyTab(
                     .cloned()
                     .map(|study| view! { <StudyReport study=study /> })
             }}
+        </div>
+    }
+}
+
+/// One walk-forward tab's content.
+#[component]
+fn WalkTab(
+    instrument: String,
+    walks: ReadSignal<std::collections::HashMap<String, WalkForwardView>>,
+) -> impl IntoView {
+    view! {
+        <div class="study-panel">
+            {move || {
+                walks
+                    .get()
+                    .get(&instrument)
+                    .cloned()
+                    .map(|walk| view! { <WalkForwardReport walk=walk /> })
+            }}
+        </div>
+    }
+}
+
+/// A rolling re-selection: what the procedure did, fold by fold.
+///
+/// The fold table is the centre of this report rather than a detail. A single
+/// study shows one winner and asks you to believe the search found it; this
+/// shows every winner the search found, in order, and lets the reader see for
+/// themselves whether the selection settled or wandered.
+#[component]
+fn WalkForwardReport(walk: WalkForwardView) -> impl IntoView {
+    let verdict_class = verdict_class(&walk.verdict);
+    let folds = walk.folds.len();
+    let cadence = format!(
+        "{} on {} days, judged {} at a time",
+        if walk.anchored { "expanding" } else { "sliding" },
+        walk.in_sample_days,
+        walk.step_days,
+    );
+
+    view! {
+        <div class="research-report">
+            <div class=verdict_class>{walk.verdict.clone()}</div>
+            <p class="research-subject">
+                {format!("{} — walk-forward", walk.instrument)}
+            </p>
+
+            <ul class="research-reasons">
+                {walk.reasons.iter().map(|r| view! { <li>{r.clone()}</li> }).collect_view()}
+            </ul>
+
+            <div class="metric-cards">
+                <MetricCard
+                    label="Excess return"
+                    value=percent(walk.excess_return)
+                    tone=walk.excess_return
+                    note="stitched, vs buy and hold".to_owned()
+                />
+                <MetricCard
+                    label="Strategy"
+                    value=percent(walk.strategy.total_return)
+                    tone=walk.strategy.total_return
+                />
+                <MetricCard
+                    label="Buy and hold"
+                    value=percent(walk.benchmark.total_return)
+                    tone=walk.benchmark.total_return
+                />
+                <MetricCard label="Sharpe" value=ratio(walk.strategy.sharpe) />
+                <MetricCard
+                    label="Max drawdown"
+                    value=percent(walk.strategy.max_drawdown)
+                />
+                // The number a single split cannot produce: how often the
+                // search found something better than luck. Zero here is the
+                // finding, whatever the return says.
+                <MetricCard
+                    label="Folds beating chance"
+                    value=format!("{} / {folds}", walk.folds_surviving_deflation)
+                    note="per-fold deflation".to_owned()
+                />
+            </div>
+
+            <h4>"Out-of-sample record, stitched"</h4>
+            <EquityChart
+                strategy=walk.strategy_curve.clone()
+                benchmark=walk.benchmark_curve.clone()
+            />
+
+            <h4>"How the selection moved"</h4>
+            {(walk.stability.is_empty())
+                .then(|| {
+                    view! {
+                        <p class="research-hint">
+                            "The grid varies nothing, so there was no selection to watch."
+                        </p>
+                    }
+                })}
+            <dl class="research-provenance">
+                {walk
+                    .stability
+                    .iter()
+                    .map(|axis| {
+                        // Under half means the search landed somewhere
+                        // different more often than not — which is what
+                        // fitting noise looks like from the outside.
+                        let unstable = axis.modal_share < 0.5;
+                        view! {
+                            <dt>{axis.axis.clone()}</dt>
+                            <dd class=if unstable { "research-bad" } else { "" }>
+                                {format!(
+                                    "{} in {:.0}% of folds, {} values tried",
+                                    axis.modal,
+                                    axis.modal_share * 100.0,
+                                    axis.distinct,
+                                )}
+                            </dd>
+                        }
+                    })
+                    .collect_view()}
+            </dl>
+
+            <h4>"Every fold"</h4>
+            <div class="research-scroll">
+                <table class="research-metrics">
+                    <thead>
+                        <tr>
+                            <th>"Chose on"</th>
+                            <th>"Judged on"</th>
+                            <th>"Winner"</th>
+                            <th>"Strategy"</th>
+                            <th>"Buy and hold"</th>
+                            <th>"Trades"</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {walk
+                            .folds
+                            .iter()
+                            .map(|fold| {
+                                let params = fold
+                                    .params
+                                    .iter()
+                                    .map(|(name, value)| format!("{name}={value}"))
+                                    .collect::<Vec<_>>()
+                                    .join(" ");
+                                // A fold whose winner was noise is marked, not
+                                // dropped: the run still happened and its
+                                // return still counts toward the stitch.
+                                let noise = (!fold.survived_deflation)
+                                    .then_some("research-flag");
+                                view! {
+                                    <tr>
+                                        <td class="research-left">{fold.chose_on.clone()}</td>
+                                        <td class="research-left">{fold.judged_on.clone()}</td>
+                                        <td class=noise>{params}</td>
+                                        <td>{percent(fold.strategy_return)}</td>
+                                        <td>{percent(fold.benchmark_return)}</td>
+                                        <td>{fold.trades}</td>
+                                    </tr>
+                                }
+                            })
+                            .collect_view()}
+                    </tbody>
+                </table>
+            </div>
+
+            <h4>"The trades behind it"</h4>
+            <TradeDetail trades=walk.trades_detail.clone() />
+
+            <h4>"How this was arrived at"</h4>
+            <dl class="research-provenance">
+                <dt>"Cadence"</dt>
+                <dd>{cadence}</dd>
+                <dt>"Folds"</dt>
+                <dd>
+                    {format!(
+                        "{folds}{}",
+                        if walk.folds_without_trades > 0 {
+                            format!(", {} of which never opened a position", walk.folds_without_trades)
+                        } else {
+                            String::new()
+                        },
+                    )}
+                </dd>
+                <dt>"Dataset"</dt>
+                <dd class="research-hash">{short_hash(&walk.dataset_version)}</dd>
+                <dt>"Strategy"</dt>
+                <dd>{walk.strategy_name.clone()}</dd>
+                <dt>"Starting cash"</dt>
+                <dd>{format!("{:.0}", walk.starting_cash)}</dd>
+                <dt>"Commission"</dt>
+                <dd>{format!("{} bps", walk.commission_bps)}</dd>
+                <dt>"Slippage"</dt>
+                <dd>{format!("{} bps a side", walk.slippage_bps)}</dd>
+                <dt>"Engine"</dt>
+                <dd>{walk.engine.clone()}</dd>
+            </dl>
         </div>
     }
 }
@@ -2329,6 +2680,8 @@ fn SidebarPanel(
     set_theme: WriteSignal<Theme>,
     studies: ReadSignal<std::collections::HashMap<String, StudyView>>,
     set_studies: WriteSignal<std::collections::HashMap<String, StudyView>>,
+    walks: ReadSignal<std::collections::HashMap<String, WalkForwardView>>,
+    set_walks: WriteSignal<std::collections::HashMap<String, WalkForwardView>>,
     panel: ReadSignal<Option<PanelView>>,
     set_panel: WriteSignal<Option<PanelView>>,
     portfolios: ReadSignal<Option<PortfolioLibraryView>>,
@@ -2355,6 +2708,8 @@ fn SidebarPanel(
                         <ResearchView
                             studies=studies
                             set_studies=set_studies
+                            walks=walks
+                            set_walks=set_walks
                             panel=panel
                             set_panel=set_panel
                         />
@@ -2868,6 +3223,7 @@ pub fn App() -> impl IntoView {
     // already open refreshes rather than duplicating, and so a panel can find
     // its own study when dockview mounts it.
     let (studies, set_studies) = signal(std::collections::HashMap::<String, StudyView>::new());
+    let (walks, set_walks) = signal(std::collections::HashMap::<String, WalkForwardView>::new());
     // One panel at a time: there is only one panel, and re-running it should
     // replace what the tab shows rather than accumulate tabs.
     let (panel, set_panel) = signal(None::<PanelView>);
@@ -2941,6 +3297,8 @@ pub fn App() -> impl IntoView {
                                 set_theme=set_theme
                                 studies=studies
                                 set_studies=set_studies
+                                walks=walks
+                                set_walks=set_walks
                                 panel=panel
                                 set_panel=set_panel
                                 portfolios=portfolios
@@ -2983,6 +3341,15 @@ pub fn App() -> impl IntoView {
                         .borrow_mut()
                         .insert(id.to_owned(), handle);
                 }
+                id if id.starts_with(WALK_PANEL_PREFIX) => {
+                    let instrument = id[WALK_PANEL_PREFIX.len()..].to_owned();
+                    let handle = mount_to(el, move || {
+                        view! { <WalkTab instrument=instrument walks=walks /> }.into_any()
+                    });
+                    study_mounts_created
+                        .borrow_mut()
+                        .insert(id.to_owned(), handle);
+                }
                 _ => {}
             },
         );
@@ -3001,7 +3368,8 @@ pub fn App() -> impl IntoView {
                 // not re-run eleven backtests.
                 id if id == PANEL_PANEL_ID
                     || id == PORTFOLIO_PANEL_ID
-                    || id.starts_with(STUDY_PANEL_PREFIX) =>
+                    || id.starts_with(STUDY_PANEL_PREFIX)
+                    || id.starts_with(WALK_PANEL_PREFIX) =>
                 {
                     study_mounts_removed.borrow_mut().remove(id);
                 }

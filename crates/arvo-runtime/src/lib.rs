@@ -180,6 +180,7 @@ pub fn run() {
             commands::refresh_plugins,
             research::list_instruments,
             research::run_study,
+            research::run_walk_forward,
             research::list_strategies,
             research::feed_connected,
             research::connect_feed,

@@ -32,7 +32,10 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{family::FamilyEvidence, panel::PanelEvidence, HypothesisId, Verdict};
+use crate::{
+    family::FamilyEvidence, panel::PanelEvidence, walk_forward::WalkForwardEvidence,
+    HypothesisId, Verdict,
+};
 
 /// One finding, of whichever kind.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -40,6 +43,7 @@ use crate::{family::FamilyEvidence, panel::PanelEvidence, HypothesisId, Verdict}
 pub enum Record {
     Study(Box<FamilyEvidence>),
     Panel(Box<PanelEvidence>),
+    WalkForward(Box<WalkForwardEvidence>),
 }
 
 impl Record {
@@ -51,6 +55,9 @@ impl Record {
             Self::Panel(evidence) => {
                 format!("Panel of {} instruments", evidence.pooled.instruments)
             }
+            Self::WalkForward(evidence) => {
+                format!("{} walk-forward", evidence.template.instrument)
+            }
         }
     }
 
@@ -61,6 +68,7 @@ impl Record {
         match self {
             Self::Study(evidence) => &evidence.selected.dataset.version,
             Self::Panel(evidence) => &evidence.dataset.version,
+            Self::WalkForward(evidence) => &evidence.template.dataset.version,
         }
     }
 
@@ -69,6 +77,7 @@ impl Record {
         match self {
             Self::Study(evidence) => evidence.verdict,
             Self::Panel(evidence) => evidence.verdict,
+            Self::WalkForward(evidence) => evidence.verdict,
         }
     }
 
@@ -77,6 +86,7 @@ impl Record {
         match self {
             Self::Study(evidence) => &evidence.hypothesis,
             Self::Panel(evidence) => &evidence.hypothesis,
+            Self::WalkForward(evidence) => &evidence.hypothesis,
         }
     }
 }

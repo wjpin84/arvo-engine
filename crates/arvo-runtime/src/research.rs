@@ -407,6 +407,65 @@ pub struct StudyView {
     pub engine: String,
 }
 
+/// One fold of a walk-forward, flattened for display.
+#[derive(Serialize)]
+pub struct FoldView {
+    pub chose_on: String,
+    pub judged_on: String,
+    pub params: Vec<(String, f64)>,
+    pub strategy_return: f64,
+    pub benchmark_return: f64,
+    pub trades: u32,
+    /// Whether this fold's winner beat what a no-skill search of that size
+    /// would produce. Per fold, because a procedure that selects noise in most
+    /// periods has not been shown to select.
+    pub survived_deflation: bool,
+}
+
+/// How much one parameter moved across the folds.
+#[derive(Serialize)]
+pub struct StabilityView {
+    pub axis: String,
+    pub distinct: usize,
+    pub modal: f64,
+    pub modal_share: f64,
+}
+
+/// A walk-forward run, flattened for display.
+#[derive(Serialize)]
+pub struct WalkForwardView {
+    pub instrument: String,
+    pub verdict: String,
+    pub reasons: Vec<String>,
+
+    pub folds: Vec<FoldView>,
+    pub folds_surviving_deflation: usize,
+    /// Folds in which the selected configuration never opened a position — the
+    /// symptom of a step too short for the rule's warm-up.
+    pub folds_without_trades: usize,
+    /// How the selection moved. The thing only a rolling procedure can show.
+    pub stability: Vec<StabilityView>,
+
+    // The stitched out-of-sample record.
+    pub strategy: MetricsView,
+    pub benchmark: MetricsView,
+    pub excess_return: f64,
+    pub strategy_curve: Vec<CurvePoint>,
+    pub benchmark_curve: Vec<CurvePoint>,
+    pub trades_detail: TradesView,
+    pub recommendations: Vec<RecommendationView>,
+
+    pub in_sample_days: i64,
+    pub step_days: i64,
+    pub anchored: bool,
+    pub dataset_version: String,
+    pub strategy_name: String,
+    pub starting_cash: f64,
+    pub commission_bps: f64,
+    pub slippage_bps: f64,
+    pub engine: String,
+}
+
 /// A stored finding, summarised for the history list.
 #[derive(Serialize)]
 pub struct HistoryEntryView {
@@ -426,6 +485,7 @@ pub struct HistoryEntryView {
 pub enum RecordView {
     Study(Box<StudyView>),
     Panel(Box<PanelView>),
+    WalkForward(Box<WalkForwardView>),
 }
 
 /// Everything held in research memory, newest first.
@@ -454,6 +514,7 @@ pub async fn list_history(
                 kind: match stored.record {
                     Record::Study(_) => "study",
                     Record::Panel(_) => "panel",
+                    Record::WalkForward(_) => "walk-forward",
                 }
                 .to_owned(),
                 subject: stored.record.subject(),
@@ -485,6 +546,9 @@ pub async fn open_record(
     Ok(match stored.record {
         Record::Study(evidence) => RecordView::Study(Box::new(study_view(&evidence, engine))),
         Record::Panel(evidence) => RecordView::Panel(Box::new(panel_view(&evidence, engine))),
+        Record::WalkForward(evidence) => {
+            RecordView::WalkForward(Box::new(walk_forward_view(&evidence, engine)))
+        }
     })
 }
 
@@ -505,6 +569,11 @@ fn live_dataset_version(service: &ResearchService, record: &Record) -> Option<St
             .ok()
             .flatten(),
         Record::Panel(_) => panel_dataset_version(&service.bars).map(|(version, _, _, _)| version),
+        Record::WalkForward(evidence) => service
+            .bars
+            .fingerprint(&evidence.template.instrument, evidence.template.interval)
+            .ok()
+            .flatten(),
     }
 }
 
@@ -876,6 +945,66 @@ pub async fn fetch_bars(
     })
 }
 
+/// Runs a rolling re-selection over an instrument's whole history.
+///
+/// Slower than a study by roughly the number of folds — every fold is a full
+/// grid search plus an out-of-sample run — which is why the caller is told the
+/// backtest count before it starts.
+///
+/// # Errors
+///
+/// Returns [`CommandError::Failed`] if the instrument has no bars at the
+/// strategy's resolution, or the span is too short to roll.
+#[tauri::command]
+pub async fn run_walk_forward(
+    instrument: String,
+    strategy: Option<String>,
+    service: tauri::State<'_, ResearchService>,
+) -> Result<WalkForwardView, CommandError> {
+    let name = strategy.unwrap_or_else(|| STRATEGY.to_owned());
+    let plan = StrategyPlan::find(&name)
+        .ok_or_else(|| CommandError::Failed(format!("no strategy called {name:?}")))?;
+    let interval = plan.interval();
+
+    let simulation = service.simulation.clone();
+    let missing = || {
+        CommandError::Failed(format!(
+            "{instrument} holds no {interval} bars; {} is defined at that resolution",
+            plan.label
+        ))
+    };
+    let coverage = service
+        .bars
+        .coverage(&instrument, interval)
+        .map_err(|err| CommandError::Failed(format!("reading {instrument}: {err}")))?
+        .ok_or_else(missing)?;
+    let fingerprint = service
+        .bars
+        .fingerprint(&instrument, interval)
+        .map_err(|err| CommandError::Failed(format!("hashing {instrument}: {err}")))?
+        .ok_or_else(missing)?;
+    let engine = simulation.engine().to_owned();
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let window = DateRange::new(coverage.0, coverage.1)
+            .map_err(|err| CommandError::Failed(err.to_string()))?;
+        let procedure = walk_forward_for(&instrument, plan, window, &fingerprint);
+
+        let found = arvo_research::run_walk_forward(
+            simulation.as_ref(),
+            &procedure,
+            &arvo_research::EvaluationCriteria::default(),
+        )
+        .map_err(|err| CommandError::Failed(err.to_string()))?;
+
+        let view = walk_forward_view(&found, &engine);
+        Ok((view, Record::WalkForward(Box::new(found))))
+    })
+    .await
+    .map_err(|err| CommandError::Failed(format!("the walk-forward did not finish: {err}")))
+    .and_then(|outcome| outcome.and_then(|outcome| remember(&service, outcome)))
+}
+
 /// Runs one configuration across every instrument that has data.
 ///
 /// This is the study that can actually reach a verdict: a single instrument
@@ -967,6 +1096,82 @@ fn study_view(found: &arvo_research::FamilyEvidence, engine: &str) -> StudyView 
         starting_cash: found.selected.starting_cash,
         commission_bps: found.selected.costs.commission_bps,
         slippage_bps: found.selected.costs.slippage_bps,
+        engine: engine.to_owned(),
+    }
+}
+
+/// Flattens a walk-forward run for display. Same reasoning as [`study_view`]:
+/// one projection, so a finding read back from memory renders exactly as the
+/// run that produced it.
+fn walk_forward_view(
+    found: &arvo_research::WalkForwardEvidence,
+    engine: &str,
+) -> WalkForwardView {
+    let template = &found.template;
+    WalkForwardView {
+        instrument: template.instrument.clone(),
+        verdict: verdict_label(found.verdict).to_owned(),
+        reasons: found.reasons.clone(),
+        folds: found
+            .folds
+            .iter()
+            .map(|fold| {
+                let evaluation = &fold.out_of_sample_evidence.evaluation;
+                FoldView {
+                    chose_on: format!("{} → {}", fold.in_sample.from, fold.in_sample.to),
+                    judged_on: format!("{} → {}", fold.out_of_sample.from, fold.out_of_sample.to),
+                    // Only what the grid varied. Carrying the fixed parameters
+                    // into every row would bury the one thing this table is
+                    // for, which is watching the selection move.
+                    params: fold
+                        .selected
+                        .strategy
+                        .params
+                        .iter()
+                        .filter(|(name, _)| {
+                            found.stability.iter().any(|axis| &axis.axis == *name)
+                        })
+                        .map(|(name, value)| (name.clone(), *value))
+                        .collect(),
+                    strategy_return: evaluation.strategy.total_return,
+                    benchmark_return: evaluation.benchmark.total_return,
+                    trades: evaluation.strategy.trades,
+                    survived_deflation: fold.selection.survived_deflation,
+                }
+            })
+            .collect(),
+        folds_surviving_deflation: found.folds_surviving_deflation,
+        folds_without_trades: found.folds_without_trades,
+        stability: found
+            .stability
+            .iter()
+            .map(|axis| StabilityView {
+                axis: axis.axis.clone(),
+                distinct: axis.distinct,
+                modal: axis.modal,
+                modal_share: axis.modal_share,
+            })
+            .collect(),
+        strategy: MetricsView::from(&found.combined),
+        benchmark: MetricsView::from(&found.benchmark),
+        excess_return: found.excess_return,
+        strategy_curve: curve_points(&found.combined_curve),
+        benchmark_curve: curve_points(&found.benchmark_curve),
+        trades_detail: TradesView::build(&found.combined_trades, template.starting_cash),
+        // Recommendations are keyed to a single study's evidence shape. A
+        // walk-forward's own diagnostics live in `reasons` above — the
+        // stability line and the empty-fold count say the things advice would
+        // say here — and inventing a second, differently-derived list would
+        // give two answers to the same question.
+        recommendations: Vec::new(),
+        in_sample_days: found.in_sample_days,
+        step_days: found.step_days,
+        anchored: found.anchored,
+        dataset_version: template.dataset.version.clone(),
+        strategy_name: template.strategy.name.clone(),
+        starting_cash: template.starting_cash,
+        commission_bps: template.costs.commission_bps,
+        slippage_bps: template.costs.slippage_bps,
         engine: engine.to_owned(),
     }
 }
