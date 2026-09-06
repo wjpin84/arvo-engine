@@ -47,10 +47,23 @@ pub enum SessionError {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Session {
-    /// dockview's own serialisation. Opaque here on purpose — this crate has
-    /// no business knowing how a layout is encoded, and treating it as data
-    /// means a dockview upgrade cannot break the Rust side.
-    pub layout: Option<serde_json::Value>,
+    /// dockview's own serialisation, as text.
+    ///
+    /// Opaque on purpose — this crate has no business knowing how a layout is
+    /// encoded, and treating it as data means a dockview upgrade cannot become
+    /// a Rust change.
+    ///
+    /// **Text, not a `serde_json::Value`**, and that is a bug fix rather than a
+    /// preference. A `Value` crossing into the webview goes through
+    /// `serde_wasm_bindgen`, which encodes maps as JavaScript `Map`s rather
+    /// than plain objects by default; `dockview.fromJSON` throws on a `Map`,
+    /// the restore failed, and the recovery path wiped the window. A string
+    /// has no such trap.
+    ///
+    /// A session written before this change stores an object here, fails to
+    /// parse, and is discarded as any unreadable session is — which is the
+    /// right outcome, because it is the one that caused the problem.
+    pub layout: Option<String>,
     /// Which activity-bar view was showing, or `None` for a collapsed sidebar.
     pub active_view: Option<String>,
     pub output_visible: bool,
@@ -138,7 +151,7 @@ mod tests {
     fn a_workspace_survives_a_round_trip() {
         let dir = tempfile::tempdir().expect("tempdir");
         let session = Session {
-            layout: Some(serde_json::json!({ "grid": { "root": "branch" } })),
+            layout: Some(r#"{"grid":{"root":"branch"}}"#.to_owned()),
             active_view: Some("research".to_owned()),
             output_visible: true,
             theme: Some("catppuccin-mocha".to_owned()),
@@ -179,15 +192,27 @@ mod tests {
     }
 
     #[test]
+    fn a_session_from_before_the_layout_was_text_is_discarded() {
+        // It stored the layout as an object, and an object round-tripped
+        // through `serde_wasm_bindgen` reached dockview as a `Map` it throws
+        // on — which wiped the window. Discarding such a session is the
+        // correct outcome: it is the one that caused the problem.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join(FILE),
+            r#"{"layout":{"grid":{}},"theme":"dark"}"#,
+        )
+        .expect("write");
+        assert_eq!(load(dir.path()), Session::default());
+    }
+
+    #[test]
     fn the_layout_is_carried_without_being_understood() {
         // dockview owns its own encoding. Treating it as opaque data is what
         // stops a dockview upgrade from breaking the Rust side.
         let dir = tempfile::tempdir().expect("tempdir");
-        let odd = serde_json::json!({
-            "activeGroup": "1",
-            "grid": { "height": 900, "width": 1600, "orientation": "HORIZONTAL" },
-            "panels": { "study:MSFT.NASDAQ": { "id": "study:MSFT.NASDAQ" } },
-        });
+        let odd = r#"{"activeGroup":"1","grid":{"height":900,"width":1600},"panels":{}}"#
+            .to_owned();
         save(
             dir.path(),
             &Session {

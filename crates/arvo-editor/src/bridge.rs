@@ -36,12 +36,12 @@ extern "C" {
     // treating it as data is what stops a dockview upgrade from becoming a
     // Rust change.
     #[wasm_bindgen(js_namespace = window, js_name = captureLayout)]
-    pub(crate) fn capture_layout() -> JsValue;
+    pub(crate) fn capture_layout() -> Option<String>;
     // Returns whether it worked. A layout naming a panel this build no longer
     // has throws, and the caller has to fall back to the default arrangement
     // rather than open to a blank window.
     #[wasm_bindgen(js_namespace = window, js_name = restoreLayout)]
-    pub(crate) fn restore_layout(layout: JsValue) -> bool;
+    pub(crate) fn restore_layout(layout: &str) -> bool;
     // Debounced in JS, where the events are: a file write per animation frame
     // is the obvious way to make dragging a panel stutter.
     #[wasm_bindgen(js_namespace = window, js_name = onLayoutSettled)]

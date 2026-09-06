@@ -206,7 +206,9 @@ pub(crate) struct TradesView {
 /// that knows less rather than as a failure that costs the layout.
 #[derive(Clone, Default, Deserialize, serde::Serialize)]
 pub(crate) struct SessionView {
-    pub(crate) layout: Option<serde_json::Value>,
+    /// dockview's own serialisation, as text. See `arvo_runtime::session`
+    /// for why it is not a structured value.
+    pub(crate) layout: Option<String>,
     pub(crate) active_view: Option<String>,
     pub(crate) output_visible: bool,
     pub(crate) theme: Option<String>,

@@ -1055,19 +1055,19 @@ pub fn App() -> impl IntoView {
             set_output_visible.set(session.output_visible);
 
             if let Some(layout) = session.layout {
-                let value = serde_wasm_bindgen::to_value(&layout).unwrap_or(JsValue::NULL);
                 // A layout that will not restore is discarded rather than
-                // fought with. The default arrangement is already on screen;
-                // opening to a blank window is the one failure a workspace
-                // file must never cause.
-                restore_layout(value);
+                // fought with, and the JS side puts the default arrangement
+                // back rather than leaving whatever half-applied state the
+                // failure produced. Opening to a window with no main panel is
+                // the failure a workspace file must never cause — and did.
+                restore_layout(&layout);
             }
 
             // Only now: restoring is itself a layout change, and saving
             // during it would race the thing that produced it.
             let record = Closure::<dyn FnMut()>::new(move || {
                 let session = SessionView {
-                    layout: serde_wasm_bindgen::from_value(capture_layout()).ok(),
+                    layout: capture_layout(),
                     active_view: active_view
                         .get_untracked()
                         .map(|view| view.slug().to_owned()),
