@@ -226,6 +226,51 @@ pub fn run_family(
             ))
         })?;
 
+    run_split(
+        provider,
+        &family.hypothesis,
+        &family.template,
+        &family.grid,
+        in_sample,
+        out_of_sample,
+        criteria,
+    )
+}
+
+/// The same procedure against windows chosen by the caller.
+///
+/// Split out so walk-forward can drive it fold by fold without restating any
+/// of it. Selection, deflation and evaluation are the part that has to be
+/// identical between a single split and a rolling one — a walk-forward that
+/// scored its folds even slightly differently from a plain study would not be
+/// comparable to one, and comparing them is the entire point.
+///
+/// # Errors
+///
+/// Returns [`SimulationError`] if the grid is empty, every trial failed, or
+/// the winner's out-of-sample run failed.
+pub fn run_split(
+    provider: &dyn SimulationProvider,
+    hypothesis: &HypothesisId,
+    template: &Experiment,
+    grid: &ParameterGrid,
+    in_sample: DateRange,
+    out_of_sample: DateRange,
+    criteria: &EvaluationCriteria,
+) -> Result<FamilyEvidence, SimulationError> {
+    let combinations = grid.combinations();
+    if combinations.is_empty() {
+        return Err(SimulationError::Rejected(
+            "the parameter grid is empty, so the family tests nothing".to_owned(),
+        ));
+    }
+    let family = &ExperimentFamily {
+        hypothesis: hypothesis.clone(),
+        template: template.clone(),
+        grid: grid.clone(),
+        in_sample_fraction: 0.0,
+    };
+
     let mut scored: Vec<(f64, BTreeMap<String, f64>)> = Vec::with_capacity(combinations.len());
     let mut failures = Vec::new();
 

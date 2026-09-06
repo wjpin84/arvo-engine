@@ -30,6 +30,7 @@ pub mod family;
 pub mod memory;
 pub mod panel;
 pub mod trade;
+pub mod walk_forward;
 
 pub use advice::{recommend, Recommendation, Severity};
 pub use evaluation::{
@@ -39,6 +40,7 @@ pub use family::{run_family, ExperimentFamily, FamilyEvidence, ParameterGrid, Se
 pub use memory::{EvidenceStore, Loaded, MemoryError, Record, StoredRecord};
 pub use panel::{run_panel, InstrumentOutcome, PanelEvidence, PanelStudy, PooledOutcome};
 pub use trade::{Direction, ExitReason, Trade, TradeStats};
+pub use walk_forward::{run_walk_forward, AxisStability, WalkForward, WalkForwardEvidence};
 
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};

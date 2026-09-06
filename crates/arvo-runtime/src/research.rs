@@ -1094,6 +1094,46 @@ fn template_for(
 /// The grid is fixed at nine configurations. That number is itself part of the
 /// claim — [`arvo_research::run_family`] deflates the result by it — so it is
 /// written here in the open rather than tuned per run.
+/// How long each selection window looks back, and how often it re-selects.
+///
+/// Three years to choose on, two to be judged on. The step is two rather than
+/// one for a measured reason: every fold's out-of-sample period is an
+/// independent backtest that starts cold, so a rule with a 120-bar slow
+/// average cannot trade in the first 120 bars of it. At a one-year step that
+/// is half the fold, and this grid's slowest configuration then produced no
+/// trades at all in nine folds out of sixteen. Two years halves the waste.
+///
+/// These are a claim, not a setting: a walk-forward run at a different cadence
+/// is a different experiment, and the pair is part of what the record pins.
+const IN_SAMPLE_DAYS: i64 = 365 * 3;
+const STEP_DAYS: i64 = 365 * 2;
+
+/// Builds the rolling procedure for one instrument.
+///
+/// Same template and grid as [`study_for`], deliberately: the point of a
+/// walk-forward is to be comparable with the single split it replaces, and a
+/// different grid would make the two incomparable while looking like a
+/// stronger result.
+#[must_use]
+pub fn walk_forward_for(
+    instrument: &str,
+    plan: &StrategyPlan,
+    window: DateRange,
+    dataset_version: &str,
+) -> arvo_research::WalkForward {
+    arvo_research::WalkForward {
+        hypothesis: HypothesisId(format!("trend-following predicts returns in {instrument}")),
+        template: template_for(instrument, plan, window, dataset_version),
+        grid: plan.grid(),
+        in_sample_days: IN_SAMPLE_DAYS,
+        step_days: STEP_DAYS,
+        // Anchored: every selection sees all history. The alternative assumes
+        // old data stops applying, which is a claim about the market nobody
+        // here has evidence for.
+        anchored: true,
+    }
+}
+
 pub fn study_for(
     instrument: &str,
     plan: &StrategyPlan,

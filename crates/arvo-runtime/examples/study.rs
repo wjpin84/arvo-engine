@@ -1,6 +1,7 @@
 //! Runs a study from the command line, without launching the window.
 //!
-//!     cargo run -p arvo-runtime --example study -- <data-dir> [--strategy NAME] [instrument...]
+//!     cargo run -p arvo-runtime --example study -- \
+//!         <data-dir> [--strategy NAME] [--walk-forward] [instrument...]
 //!
 //! Exists because the research path and the GUI fail in completely different
 //! ways, and only one of them can be checked in a terminal. This runs exactly
@@ -31,6 +32,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         requested.drain(flag..=flag + 1);
     }
     let strategy = strategy.as_str();
+    // `--walk-forward` re-selects on a rolling schedule instead of splitting
+    // the window once. The two answer different questions, so this is a mode
+    // rather than a flag on the same output.
+    let rolling = requested.iter().any(|arg| arg == "--walk-forward");
+    requested.retain(|arg| arg != "--walk-forward");
     let instruments = if requested.is_empty() {
         bars.instruments()?
     } else {
@@ -62,6 +68,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  dataset {}", &fingerprint[..16]);
         let plan = arvo_runtime_lib::research::StrategyPlan::find(strategy)
             .ok_or_else(|| format!("no strategy called {strategy:?}"))?;
+
+        if rolling {
+            let procedure = arvo_runtime_lib::research::walk_forward_for(
+                &instrument,
+                plan,
+                window,
+                &fingerprint,
+            );
+            match arvo_research::run_walk_forward(&simulation, &procedure, &criteria) {
+                Err(reason) => println!("  could not run: {reason}"),
+                Ok(found) => report_walk_forward(&found),
+            }
+            continue;
+        }
+
         let family =
             arvo_runtime_lib::research::study_for(&instrument, plan, window, &fingerprint);
         match arvo_research::run_family(&simulation, &family, &criteria) {
@@ -154,6 +175,58 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// The panel: one configuration chosen across every instrument, judged on all
 /// of them. This is the run that can actually reach a verdict, so it goes
 /// first.
+fn report_walk_forward(found: &arvo_research::WalkForwardEvidence) {
+    println!("  verdict: {:?}", found.verdict);
+    println!(
+        "  {} folds, {} of which selected better than chance",
+        found.folds.len(),
+        found.folds_surviving_deflation
+    );
+    if found.folds_without_trades > 0 {
+        println!(
+            "  {} folds never opened a position at all",
+            found.folds_without_trades
+        );
+    }
+    for fold in &found.folds {
+        println!(
+            "    chose on {}..{} → judged {}..{}: {:?} {:+.2}%",
+            fold.in_sample.from,
+            fold.in_sample.to,
+            fold.out_of_sample.from,
+            fold.out_of_sample.to,
+            fold.selected.strategy.params,
+            fold.out_of_sample_evidence.evaluation.strategy.total_return * 100.0,
+        );
+    }
+    // The stitched record is the point: one continuous out-of-sample track
+    // rather than a slice, which is what makes the trade minimum reachable.
+    println!(
+        "  stitched: {:+.2}% vs buy-and-hold {:+.2}% (excess {:+.2}%), {} round trips",
+        found.combined.total_return * 100.0,
+        found.benchmark.total_return * 100.0,
+        found.excess_return * 100.0,
+        found.combined_trades.closed,
+    );
+    println!(
+        "  drawdown {:.2}%, sharpe {:?}",
+        found.combined.max_drawdown * 100.0,
+        found.combined.sharpe.map(|value| format!("{value:.2}"))
+    );
+    for axis in &found.stability {
+        println!(
+            "  {} settled on {} in {:.0}% of folds ({} distinct values tried)",
+            axis.axis,
+            axis.modal,
+            axis.modal_share * 100.0,
+            axis.distinct
+        );
+    }
+    for reason in &found.reasons {
+        println!("  - {reason}");
+    }
+}
+
 fn run_panel_over(
     bars: &CsvBars,
     simulation: &NautilusSimulation<CsvBars>,
