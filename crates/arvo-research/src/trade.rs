@@ -39,6 +39,14 @@ pub enum ExitReason {
     Signal,
     /// A protective stop was hit.
     Stop,
+    /// The account's drawdown limit was reached, so the rule was stopped and
+    /// whatever it held was closed.
+    ///
+    /// Not a stop and not a signal: the position did not fail on its own
+    /// terms, the *account* did. Counting it as either would misdescribe both
+    /// the trade and the run — and a run that ended early is a different claim
+    /// from one that ran its window out.
+    Halted,
     /// The run ended with the position still open.
     ///
     /// Not an exit at all, and kept distinct from one: a run that ends while
@@ -134,6 +142,14 @@ pub struct TradeStats {
     /// How the closed trades ended.
     pub signal_exits: u32,
     pub stop_exits: u32,
+    /// Whether the run stopped early because the account's drawdown limit was
+    /// reached.
+    ///
+    /// A material fact about what every other number means: a halted run
+    /// reports the return it had when it stopped, over a window it did not
+    /// finish.
+    #[serde(default)]
+    pub halted: bool,
 }
 
 impl TradeStats {
@@ -156,6 +172,7 @@ impl TradeStats {
             total_commission: ledger.iter().map(|trade| trade.commission).sum(),
             signal_exits: 0,
             stop_exits: 0,
+            halted: false,
         };
 
         let mut gross_win = 0.0;
@@ -171,6 +188,10 @@ impl TradeStats {
             match trade.exit_reason {
                 ExitReason::Signal => stats.signal_exits += 1,
                 ExitReason::Stop => stats.stop_exits += 1,
+                ExitReason::Halted => {
+                    stats.stop_exits += 1;
+                    stats.halted = true;
+                }
                 // Unreachable while `is_win` gates on `closed`, but a match
                 // that stays exhaustive is cheaper than one that stops being
                 // when a fourth reason appears.

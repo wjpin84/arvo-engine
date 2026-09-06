@@ -339,11 +339,17 @@ fn markers(
             out.push(TradeMarkerView {
                 time: on_bar(closed),
                 kind: "exit".to_owned(),
-                // A stop-out and a signal exit look identical in a summary and
-                // could not be more different in what they say about the rule.
+                // A stop-out, a halt and a signal exit look identical in a
+                // summary and could not be more different in what they say
+                // about the rule: the first says the trade failed, the second
+                // says the *account* did, and the third says the rule chose to
+                // leave. Matched exhaustively so a fourth reason cannot
+                // silently join the third.
                 reason: match trade.exit_reason {
                     arvo_research::ExitReason::Stop => "stop",
-                    _ => "signal",
+                    arvo_research::ExitReason::Halted => "halt",
+                    arvo_research::ExitReason::Signal
+                    | arvo_research::ExitReason::StillOpen => "signal",
                 }
                 .to_owned(),
                 label: format!("{exit:.2} ({:+.0})", trade.pnl),
@@ -1082,6 +1088,7 @@ fn trade_rows(ledger: &[arvo_research::Trade]) -> Vec<TradeRowView> {
             exit_reason: match trade.exit_reason {
                 arvo_research::ExitReason::Signal => "signal",
                 arvo_research::ExitReason::Stop => "stop",
+                arvo_research::ExitReason::Halted => "halted",
                 arvo_research::ExitReason::StillOpen => "open",
             }
             .to_owned(),

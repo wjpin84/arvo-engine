@@ -155,6 +155,18 @@ pub fn recommend(found: &FamilyEvidence) -> Vec<Recommendation> {
 
     out.extend(shape_warnings(trades));
 
+    if trades.halted {
+        out.push(Recommendation::new(
+            Severity::Blocking,
+            "The run stopped early: the account hit its drawdown limit.",
+            "Read every number here as covering a window that was not              finished. The return is what it was at the halt, not what the              rule would have made — and the rule was stopped precisely where              it was going worst, so what came after is unmeasured.",
+            format!(
+                "{} round trips before the limit was reached",
+                trades.closed
+            ),
+        ));
+    }
+
     if trades.still_open > 0 {
         out.push(Recommendation::new(
             Severity::Warning,

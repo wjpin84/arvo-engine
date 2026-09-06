@@ -246,6 +246,24 @@ pub struct RiskModel {
     /// which is arithmetic rather than a strategy choice. Above 1.0 is
     /// leverage and has to be asked for.
     pub max_position_fraction: Option<f64>,
+    /// How far the account may fall below its own peak before the rule stops
+    /// trading, as a fraction. `None` runs without a halt.
+    ///
+    /// A per-*trade* stop and this are different instruments. A stop bounds
+    /// one loss; this bounds the sum of them, which is the number that
+    /// actually ends accounts — twenty consecutive stop-outs each costing one
+    /// percent is a well-behaved rule and a twenty percent hole.
+    ///
+    /// The halt is **permanent for the run**. Nothing else is coherent: a rule
+    /// that stops trading cannot recover the equity that would let it resume,
+    /// so "halt until recovered" would either never resume or would have to
+    /// keep trading to find out — which is not a halt.
+    ///
+    /// It changes what a result *means*, not just its size. A halted run
+    /// reports the return it had when it stopped, over a window it did not
+    /// finish, and the ledger's last trade says so.
+    #[serde(default)]
+    pub max_drawdown: Option<f64>,
 }
 
 impl Default for RiskModel {
@@ -258,6 +276,10 @@ impl Default for RiskModel {
             atr_period: 14,
             risk_per_trade: None,
             max_position_fraction: Some(1.0),
+            // No halt by default. A drawdown limit is a real choice about how
+            // much of an idea you are willing to fund before concluding it is
+            // wrong, and inventing one would silently change every result.
+            max_drawdown: None,
         }
     }
 }
@@ -273,6 +295,15 @@ impl RiskModel {
     pub fn check(&self) -> Result<(), String> {
         if self.atr_period == 0 {
             return Err("atr_period must be at least 1 bar".to_owned());
+        }
+        if let Some(limit) = self.max_drawdown {
+            // Zero halts before the first trade; one or more can never be
+            // reached. Both describe a run nobody meant to ask for.
+            if !limit.is_finite() || limit <= 0.0 || limit >= 1.0 {
+                return Err(format!(
+                    "max_drawdown must be a fraction between 0 and 1, got {limit}"
+                ));
+            }
         }
         if let Some(multiple) = self.stop_atr_multiple {
             if !multiple.is_finite() || multiple <= 0.0 {

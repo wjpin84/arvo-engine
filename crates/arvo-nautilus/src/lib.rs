@@ -496,6 +496,7 @@ fn run_backtest(
             .risk
             .max_position_fraction
             .map(|fraction| fraction * experiment.starting_cash),
+        max_drawdown: experiment.risk.max_drawdown,
     };
 
     match *plan {
@@ -1142,6 +1143,165 @@ mod tests {
         }
     }
 
+    /// Rises until a crossover rule is holding, then collapses.
+    ///
+    /// Engineered rather than realistic, and for a specific reason: it has to
+    /// put the account under water *while a position is open*. A rule that
+    /// merely loses slowly cannot test this — the per-trade stop closes each
+    /// loss long before the account falls far, and a full-size position on a
+    /// cash account cannot re-enter until settlement, so the losses never
+    /// accumulate. Both of those are real behaviours, and both were found by
+    /// writing the obvious fixture first and getting one trade out of it.
+    fn collapse(days: usize) -> Vec<arvo_data::Bar> {
+        let mut start = date(2024, 1, 1);
+        let mut bars = Vec::with_capacity(days);
+        for index in 0..days {
+            // Three acts, and the first is not decoration. On a monotonic rise
+            // the fast average is already above the slow one from the first
+            // bar it exists, so a crossover rule never sees a crossing and
+            // never enters — which the previous version of this fixture proved
+            // by producing a drawdown of exactly zero. So: fall first, so the
+            // averages are the right way round to cross.
+            let quarter = days / 4;
+            let close = if index < quarter {
+                150.0 - index as f64 * 0.5
+            } else if index < days / 2 {
+                150.0 - quarter as f64 * 0.5 + (index - quarter) as f64 * 1.0
+            } else {
+                // Steeply. The account has to fall past the limit *before*
+                // the crossover notices and exits — which is the whole point:
+                // this bounds the loss a signal-based exit is too slow to.
+                let peak = 150.0 - quarter as f64 * 0.5 + quarter as f64;
+                let fallen = (index - days / 2) as f64;
+                (peak - fallen * 8.0).max(5.0)
+            };
+            bars.push(arvo_data::Bar {
+                at: start.and_time(NaiveTime::MIN),
+                open: close,
+                high: close + 0.4,
+                low: close - 0.4,
+                close,
+                volume: 10_000.0,
+            });
+            start = start.succ_opt().expect("date stays in range");
+        }
+        bars
+    }
+
+    #[test]
+    fn a_drawdown_limit_stops_the_run_and_the_ledger_says_so() {
+        // A per-trade stop bounds one loss; this bounds their sum, which is
+        // the number that actually ends accounts. Twenty consecutive stop-outs
+        // at one percent each is a well-behaved rule and a twenty percent hole.
+        let bars = collapse(200);
+        let mut experiment = experiment(params(5.0, 40.0), &bars);
+        // Half the account in one position, so the collapse actually shows up
+        // in the *account* rather than only in the instrument. A hundred
+        // shares of a hundred-dollar stock is a tenth of the capital, and a
+        // limit measured on the account cannot see a fall that small.
+        experiment
+            .strategy
+            .params
+            .insert("trade_size".to_owned(), 400.0);
+        // No per-trade stop, which is the point: this is the loss a stop does
+        // not bound. The position rides the collapse and the *account* is what
+        // ends the run.
+        experiment.risk = arvo_research::RiskModel {
+            stop_atr_multiple: None,
+            atr_period: 14,
+            risk_per_trade: None,
+            max_position_fraction: Some(1.0),
+            max_drawdown: Some(0.05),
+        };
+
+        let result = provider(bars.clone()).run(&experiment).expect("runs");
+        let stats = arvo_research::TradeStats::from_ledger(&result.ledger);
+        assert!(stats.halted, "a rule that only loses must reach the limit");
+
+        // Exactly one halt, and it is the last thing that happened: the halt
+        // is permanent, so nothing may trade after it.
+        let halts = result
+            .ledger
+            .iter()
+            .filter(|trade| trade.exit_reason == arvo_research::ExitReason::Halted)
+            .count();
+        assert_eq!(halts, 1, "the halt fires once and stays fired");
+        assert_eq!(
+            result.ledger.last().map(|trade| trade.exit_reason),
+            Some(arvo_research::ExitReason::Halted),
+            "nothing may trade after the account has stopped"
+        );
+
+        // And the halt did its job: the drawdown is bounded near the limit
+        // rather than running on to whatever the market was going to do.
+        let drawdown = arvo_research::Metrics::from_curve(
+            &result.equity_curve,
+            result.trades,
+            arvo_data::BarInterval::DAILY.periods_per_year(),
+        )
+        .expect("a curve to measure")
+        .max_drawdown;
+        assert!(
+            drawdown < 0.12,
+            "a 5% limit should not let a 12% hole open: {drawdown}"
+        );
+    }
+
+    #[test]
+    fn without_a_limit_the_same_run_keeps_trading() {
+        // The control for the test above. If the losing fixture stopped early
+        // on its own, the halt test would pass while proving nothing.
+        let bars = collapse(200);
+        let mut experiment = experiment(params(5.0, 40.0), &bars);
+        experiment
+            .strategy
+            .params
+            .insert("trade_size".to_owned(), 400.0);
+        experiment.risk = arvo_research::RiskModel {
+            stop_atr_multiple: None,
+            atr_period: 14,
+            risk_per_trade: None,
+            max_position_fraction: Some(1.0),
+            max_drawdown: None,
+        };
+
+        let result = provider(bars).run(&experiment).expect("runs");
+        let stats = arvo_research::TradeStats::from_ledger(&result.ledger);
+        assert!(!stats.halted, "nothing to halt against");
+
+        // The claim that makes the halt meaningful: without it, this run draws
+        // down further than the limit would have allowed. Drawdown rather than
+        // final equity, because the account peaks on the way up and the fall
+        // is measured from that peak — a run can end in profit and still have
+        // been through a hole nobody would have sat in.
+        let drawdown = arvo_research::Metrics::from_curve(
+            &result.equity_curve,
+            result.trades,
+            arvo_data::BarInterval::DAILY.periods_per_year(),
+        )
+        .expect("a curve to measure")
+        .max_drawdown;
+        assert!(
+            drawdown > 0.05,
+            "the control must exceed the limit or the halt proves nothing: {drawdown}"
+        );
+    }
+
+    #[test]
+    fn a_nonsense_drawdown_limit_is_refused_before_the_engine_starts() {
+        // Zero halts before the first trade; one or more can never be reached.
+        // Both describe a run nobody meant to ask for.
+        let bars = sawtooth(50);
+        for limit in [0.0, 1.0, 1.5, f64::NAN] {
+            let mut experiment = experiment(params(5.0, 10.0), &bars);
+            experiment.risk.max_drawdown = Some(limit);
+            let err = provider(bars.clone())
+                .run(&experiment)
+                .expect_err("a limit outside (0, 1) means nothing");
+            assert!(matches!(err, SimulationError::Rejected(_)), "{limit}: {err}");
+        }
+    }
+
     #[test]
     fn a_stop_exit_is_distinguishable_from_a_signal_exit() {
         // The strategy enforces its own stops with plain market orders, so
@@ -1483,6 +1643,7 @@ mod tests {
             atr_period: 14,
             risk_per_trade: Some(0.01),
             max_position_fraction: Some(1.0),
+            max_drawdown: None,
         };
 
         let result = intraday_provider(bars.clone()).run(&experiment).expect("runs");

@@ -530,6 +530,9 @@ impl TradeStats {
             out.total_commission += part.total_commission;
             out.signal_exits += part.signal_exits;
             out.stop_exits += part.stop_exits;
+            // Any fold halting is the whole record halting: the stitched run
+            // has a hole in it wherever that fold stopped early.
+            out.halted |= part.halted;
             gross_win += part.average_win.unwrap_or_default() * f64::from(part.wins);
             gross_loss += part.average_loss.unwrap_or_default() * f64::from(part.losses);
             holding += part.average_holding_secs.unwrap_or_default() * f64::from(part.closed);

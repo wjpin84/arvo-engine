@@ -54,6 +54,7 @@ pub(crate) use rules::{
 /// change a spelling here and the ledger silently reclassifies every exit.
 pub(crate) const EXIT_STOP: &str = "arvo:exit=stop";
 pub(crate) const EXIT_SIGNAL: &str = "arvo:exit=signal";
+pub(crate) const EXIT_HALT: &str = "arvo:exit=halt";
 
 /// What a strategy does to protect a position, resolved from the experiment.
 #[derive(Debug, Clone, Copy)]
@@ -64,6 +65,9 @@ pub(crate) struct Risk {
     pub(crate) risk_amount: Option<f64>,
     /// The most one position may be worth, in currency.
     pub(crate) max_position_value: Option<f64>,
+    /// How far the account may fall below its own peak before the rule stops,
+    /// as a fraction.
+    pub(crate) max_drawdown: Option<f64>,
 }
 
 /// The long position a strategy is managing, and the levels around it.
@@ -91,6 +95,14 @@ pub(crate) struct Position {
     /// position that outlives the signal that opened it and keeps losing after
     /// the stop was supposed to have ended it.
     held: Option<Quantity>,
+    /// The highest account equity seen so far, and whether the drawdown limit
+    /// has since been reached.
+    ///
+    /// Peak-to-trough against a running maximum, which is what a drawdown is:
+    /// measuring against *starting* capital instead would let a rule give back
+    /// every gain it ever made without once registering a fall.
+    peak_equity: Option<f64>,
+    halted: bool,
 }
 
 impl Position {
@@ -101,7 +113,34 @@ impl Position {
             stop: None,
             target: None,
             held: None,
+            peak_equity: None,
+            halted: false,
         }
+    }
+
+    /// Whether the account's drawdown limit has been reached.
+    ///
+    /// Once true it stays true. Nothing else is coherent: a rule that has
+    /// stopped trading cannot recover the equity that would let it resume.
+    pub(crate) const fn is_halted(&self) -> bool {
+        self.halted
+    }
+
+    /// Records the account's equity and says whether the limit has just been
+    /// breached.
+    fn observe(&mut self, equity: f64) -> bool {
+        let limit = match self.risk.max_drawdown {
+            Some(limit) if !self.halted => limit,
+            _ => return false,
+        };
+        let peak = self.peak_equity.map_or(equity, |peak| peak.max(equity));
+        self.peak_equity = Some(peak);
+
+        if peak > 0.0 && (peak - equity) / peak >= limit {
+            self.halted = true;
+            return true;
+        }
+        false
     }
 
     pub(crate) const fn is_open(&self) -> bool {
@@ -270,6 +309,45 @@ pub(crate) trait Managed: Strategy + StrategyNative {
         Ok(None)
     }
 
+    /// Stops the rule if the account has fallen too far from its own peak.
+    ///
+    /// Called every bar by every rule, before any signal is read. A per-trade
+    /// stop bounds one loss; this bounds their sum, which is the number that
+    /// actually ends accounts — twenty consecutive stop-outs at one percent
+    /// each is a well-behaved rule and a twenty percent hole.
+    ///
+    /// The equity comes from the engine's own portfolio, marked to market,
+    /// rather than from anything this strategy tracks itself. A second running
+    /// total of the same quantity is a second thing that can be wrong, and the
+    /// one that disagreed with the account would be this one.
+    ///
+    /// Returns whether the halt fired on this bar.
+    fn halt_if_drawn_down(&mut self) -> anyhow::Result<bool> {
+        if self.position().risk.max_drawdown.is_none() || self.position().is_halted() {
+            return Ok(false);
+        }
+        let venue = self.instrument().venue;
+        let equity = self
+            .portfolio()
+            .equity(&venue, None)
+            .values()
+            .next()
+            .map(nautilus_model::types::Money::as_f64);
+
+        // No account yet — before the first fill there is nothing to measure.
+        let Some(equity) = equity else {
+            return Ok(false);
+        };
+        if !self.position_mut().observe(equity) {
+            return Ok(false);
+        }
+
+        // Flatten. A halt that left a position open would be a risk limit that
+        // stops you adding to the thing already losing money.
+        self.close(EXIT_HALT)?;
+        Ok(true)
+    }
+
     fn send(
         &mut self,
         side: OrderSide,
@@ -344,6 +422,7 @@ mod tests {
         atr_period: 14,
         risk_amount: None,
         max_position_value: None,
+        max_drawdown: None,
     };
 
     #[test]
@@ -397,6 +476,48 @@ mod tests {
             position(risk).plan(500.0, Some(25.0)).is_none(),
             "rounding up to one share would breach the risk budget"
         );
+    }
+
+    const HALTING: Risk = Risk {
+        stop_atr_multiple: None,
+        atr_period: 14,
+        risk_amount: None,
+        max_position_value: None,
+        max_drawdown: Some(0.10),
+    };
+
+    #[test]
+    fn drawdown_is_measured_from_the_peak_not_from_the_start() {
+        // Measuring against starting capital would let a rule give back every
+        // gain it ever made without once registering a fall.
+        let mut position = position(HALTING);
+        assert!(!position.observe(100_000.0));
+        assert!(!position.observe(200_000.0), "a new peak is not a drawdown");
+        // 185k is 7.5% below the 200k peak, and 85% *above* the start.
+        assert!(!position.observe(185_000.0));
+        assert!(position.observe(179_000.0), "10.5% below the peak");
+    }
+
+    #[test]
+    fn the_halt_is_permanent() {
+        // Nothing else is coherent: a rule that has stopped trading cannot
+        // recover the equity that would let it resume.
+        let mut position = position(HALTING);
+        position.observe(100_000.0);
+        assert!(position.observe(89_000.0));
+        assert!(position.is_halted());
+
+        // Even back above the old peak.
+        assert!(!position.observe(150_000.0), "it does not fire twice");
+        assert!(position.is_halted(), "and it does not un-fire");
+    }
+
+    #[test]
+    fn without_a_limit_nothing_ever_halts() {
+        let mut position = position(UNSTOPPED);
+        assert!(!position.observe(100_000.0));
+        assert!(!position.observe(1.0), "a 99.999% fall, and no limit to hit");
+        assert!(!position.is_halted());
     }
 
     #[test]

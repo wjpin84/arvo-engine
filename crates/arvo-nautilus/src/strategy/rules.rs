@@ -86,11 +86,14 @@ impl DataActor for SmaCross {
         let (high, low, close) = (bar.high.as_f64(), bar.low.as_f64(), bar.close.as_f64());
         let atr = self.atr.update(high, low, close);
 
-        if self.exit_on_levels(high, low)?.is_some() {
+        if self.exit_on_levels(high, low)?.is_some() || self.halt_if_drawn_down()? {
             // Reset the crossover memory too: after a stop the next entry
             // should need a fresh signal, not the stale one that is still
             // technically in force.
             self.previous_fast_above = None;
+            return Ok(());
+        }
+        if self.position.is_halted() {
             return Ok(());
         }
 
@@ -130,6 +133,11 @@ impl BuyAndHold {
                     atr_period: 1,
                     risk_amount: None,
                     max_position_value: None,
+                    // And no halt. The benchmark is "what the market did";
+                    // one that stopped trading partway through would be a
+                    // strategy, and every excess return measured against it
+                    // would be measured against the wrong thing.
+                    max_drawdown: None,
                 },
                 trade_size,
             ),
@@ -259,7 +267,12 @@ impl DataActor for OpeningRange {
             self.traded_today = false;
         }
 
-        if self.exit_on_levels(high, low)?.is_some() {
+        // Risk before signal, always: a rule that has spent its drawdown
+        // budget should not be reading its entry condition at all.
+        if self.exit_on_levels(high, low)?.is_some() || self.halt_if_drawn_down()? {
+            return Ok(());
+        }
+        if self.position.is_halted() {
             return Ok(());
         }
 
@@ -353,7 +366,12 @@ impl DataActor for VolatilityBreakout {
         let atr = self.atr.update(high, low, close);
         let reference = self.previous_close.replace(close);
 
-        if self.exit_on_levels(high, low)?.is_some() {
+        // Risk before signal, always: a rule that has spent its drawdown
+        // budget should not be reading its entry condition at all.
+        if self.exit_on_levels(high, low)?.is_some() || self.halt_if_drawn_down()? {
+            return Ok(());
+        }
+        if self.position.is_halted() {
             return Ok(());
         }
 
@@ -455,7 +473,12 @@ impl DataActor for VwapReversion {
             self.vwap.reset();
         }
 
-        if self.exit_on_levels(high, low)?.is_some() {
+        // Risk before signal, always: a rule that has spent its drawdown
+        // budget should not be reading its entry condition at all.
+        if self.exit_on_levels(high, low)?.is_some() || self.halt_if_drawn_down()? {
+            return Ok(());
+        }
+        if self.position.is_halted() {
             return Ok(());
         }
 
@@ -551,7 +574,12 @@ impl DataActor for MomentumBreakout {
         self.entry.push(high, low);
         self.exit.push(high, low);
 
-        if self.exit_on_levels(high, low)?.is_some() {
+        // Risk before signal, always: a rule that has spent its drawdown
+        // budget should not be reading its entry condition at all.
+        if self.exit_on_levels(high, low)?.is_some() || self.halt_if_drawn_down()? {
+            return Ok(());
+        }
+        if self.position.is_halted() {
             return Ok(());
         }
 

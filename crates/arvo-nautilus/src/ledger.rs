@@ -109,7 +109,9 @@ fn exit_reason(cache: &Cache, position: &Position) -> ExitReason {
     // Signal is the fallback, including for an order no longer in the cache:
     // the position did close, and calling that a stop on no evidence would
     // inflate the count this field exists to make honest.
-    if tagged(crate::strategy::EXIT_STOP) {
+    if tagged(crate::strategy::EXIT_HALT) {
+        ExitReason::Halted
+    } else if tagged(crate::strategy::EXIT_STOP) {
         ExitReason::Stop
     } else {
         ExitReason::Signal
