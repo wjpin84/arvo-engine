@@ -52,6 +52,10 @@ pub(crate) fn ResearchView(
     let (running, set_running) = signal(None::<String>);
     let (error, set_error) = signal(None::<String>);
     let (history, set_history) = signal(Vec::<HistoryEntryView>::new());
+    // Findings the store could not read. Shown, not logged: four were once
+    // lost to a field rename and the only trace was a warning nobody had
+    // reason to look at.
+    let (unreadable, set_unreadable) = signal(Vec::<UnreadableView>::new());
     // What the engine can actually run, fetched rather than hardcoded: a menu
     // that drifts from the engine offers rules it will then refuse.
     let (strategies, set_strategies) = signal(Vec::<StrategyView>::new());
@@ -68,9 +72,10 @@ pub(crate) fn ResearchView(
     let refresh_history = move || {
         spawn_local(async move {
             if let Ok(entries) =
-                call_typed::<Vec<HistoryEntryView>>("list_history", JsValue::UNDEFINED).await
+                call_typed::<HistoryView>("list_history", JsValue::UNDEFINED).await
             {
-                set_history.set(entries);
+                set_unreadable.set(entries.unreadable);
+                set_history.set(entries.entries);
             }
         });
     };
@@ -646,6 +651,34 @@ pub(crate) fn ResearchView(
                     .then(|| {
                         view! {
                             <h4 class="research-section">"History"</h4>
+                            // Said out loud. A store that quietly forgets is
+                            // worse than one that admits it has: these are
+                            // findings that exist on disk and cannot be read,
+                            // and knowing that is the difference between
+                            // "I never ran that" and "I ran it and lost it".
+                            {move || {
+                                let lost = unreadable.get();
+                                (!lost.is_empty())
+                                    .then(|| {
+                                        view! {
+                                            <p class="research-flag">
+                                                {format!(
+                                                    "{} finding{} could not be read",
+                                                    lost.len(),
+                                                    if lost.len() == 1 { "" } else { "s" },
+                                                )}
+                                            </p>
+                                            <ul class="research-reasons">
+                                                {lost
+                                                    .into_iter()
+                                                    .map(|item| {
+                                                        view! { <li title=item.reason>{item.id}</li> }
+                                                    })
+                                                    .collect_view()}
+                                            </ul>
+                                        }
+                                    })
+                            }}
                             <ul class="research-history">
                                 {entries
                                     .into_iter()

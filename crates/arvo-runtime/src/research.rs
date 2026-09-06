@@ -21,7 +21,7 @@ use arvo_research::{
 };
 // The view shapes live in `arvo-views` so the window cannot drift from
 // them. See that crate for what two hand-mirrored copies cost.
-pub use arvo_views::{CandlePoint, CurvePoint, DataLibraryView, FetchView, FoldView, HistoryEntryView, InstrumentView, MetricsView, MonthlyReturnView, OutcomeView, PanelView, RecommendationView, RecordView, StabilityView, StrategyView, StudyView, SurfaceCell, SurfaceView, TradeMarkerView, TradeRowView, TradesView, WalkForwardView};
+pub use arvo_views::{CandlePoint, HistoryView, UnreadableView, CurvePoint, DataLibraryView, FetchView, FoldView, HistoryEntryView, InstrumentView, MetricsView, MonthlyReturnView, OutcomeView, PanelView, RecommendationView, RecordView, StabilityView, StrategyView, StudyView, SurfaceCell, SurfaceView, TradeMarkerView, TradeRowView, TradesView, WalkForwardView};
 
 use crate::commands::CommandError;
 
@@ -375,42 +375,67 @@ pub fn trades_view(stats: &arvo_research::TradeStats, starting_cash: f64) -> Tra
         }
 }
 
-/// Everything held in research memory, newest first.
+/// Everything in research memory, newest first.
+///
+/// Reads the store's *summaries* rather than its findings. A stored finding is
+/// around 400 KB — curves, ledgers, per-fold evidence, the search surface —
+/// and this renders a column of names; parsing every byte of every one to do
+/// that cost 1.7 MB for five findings and would cost seconds for five hundred.
+///
+/// Findings that could not be read come back too. They used to be a log line,
+/// which is how four of them were lost to a field rename without anyone being
+/// told.
+///
+/// # Errors
+///
+/// Returns [`CommandError::Failed`] if the directory cannot be listed.
 #[tauri::command]
 pub async fn list_history(
     service: tauri::State<'_, ResearchService>,
-) -> Result<Vec<HistoryEntryView>, CommandError> {
-    let loaded = service
+) -> Result<HistoryView, CommandError> {
+    let (summaries, unreadable) = service
         .memory
-        .load()
+        .summaries()
         .map_err(|err| CommandError::Failed(err.to_string()))?;
 
-    // Reported, not swallowed: a record that cannot be read is a lost finding
-    // and should look like one.
-    for problem in &loaded.problems {
-        tracing::warn!(problem, "could not read a stored finding");
-    }
-
-    Ok(loaded
-        .records
-        .iter()
-        .map(|stored| {
-            let live = live_dataset_version(&service, &stored.record);
-            HistoryEntryView {
-                id: stored.id.clone(),
-                kind: match stored.record {
-                    Record::Study(_) => "study",
-                    Record::Panel(_) => "panel",
-                    Record::WalkForward(_) => "walk-forward",
+    Ok(HistoryView {
+        entries: summaries
+            .iter()
+            .map(|summary| {
+                let live = live_version(&service, summary);
+                HistoryEntryView {
+                    id: summary.id.clone(),
+                    kind: summary.kind.clone(),
+                    subject: summary.subject.clone(),
+                    verdict: verdict_label(summary.verdict).to_owned(),
+                    recorded_at: summary.recorded_at.format("%Y-%m-%d %H:%M").to_string(),
+                    stale: live.map(|live| live != summary.dataset_version),
                 }
-                .to_owned(),
-                subject: stored.record.subject(),
-                verdict: verdict_label(stored.record.verdict()).to_owned(),
-                recorded_at: stored.recorded_at.format("%Y-%m-%d %H:%M").to_string(),
-                stale: live.map(|live| live != stored.record.dataset_version()),
-            }
-        })
-        .collect())
+            })
+            .collect(),
+        unreadable: unreadable
+            .into_iter()
+            .map(|item| UnreadableView {
+                id: item.id,
+                reason: item.reason,
+            })
+            .collect(),
+    })
+}
+
+/// What the data behind a finding hashes to *now*, or `None` if it is gone.
+///
+/// From the summary, so staleness costs no parsing either. A panel's identity
+/// is every member's hash combined and is recomputed the same way it was
+/// produced — over the instruments present today, so one added or removed also
+/// reads as stale, which is correct: the panel would not run the same twice.
+fn live_version(service: &ResearchService, summary: &arvo_research::Summary) -> Option<String> {
+    match (&summary.instrument, summary.interval) {
+        (Some(instrument), Some(interval)) => {
+            service.bars.fingerprint(instrument, interval).ok().flatten()
+        }
+        _ => panel_dataset_version(&service.bars).map(|(version, _, _, _)| version),
+    }
 }
 
 /// Reopens one stored finding.
@@ -445,30 +470,6 @@ pub async fn open_record(
     })
 }
 
-/// What the data behind a finding hashes to *now*, or `None` if it is gone.
-///
-/// A panel's identity is every member's hash combined, so it is recomputed the
-/// same way it was produced — over the instruments present today. An
-/// instrument added or removed since therefore also reads as stale, which is
-/// correct: the panel would not run the same way twice.
-fn live_dataset_version(service: &ResearchService, record: &Record) -> Option<String> {
-    match record {
-        Record::Study(evidence) => service
-            .bars
-            // At the resolution the finding was produced at, not a default:
-            // the same instrument at two resolutions is two datasets, and
-            // hashing the wrong one would call a current result stale.
-            .fingerprint(&evidence.selected.instrument, evidence.selected.interval)
-            .ok()
-            .flatten(),
-        Record::Panel(_) => panel_dataset_version(&service.bars).map(|(version, _, _, _)| version),
-        Record::WalkForward(evidence) => service
-            .bars
-            .fingerprint(&evidence.template.instrument, evidence.template.interval)
-            .ok()
-            .flatten(),
-    }
-}
 
 /// Lists the instruments the workbench can study.
 #[tauri::command]

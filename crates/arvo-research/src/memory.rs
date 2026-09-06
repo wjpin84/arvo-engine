@@ -47,6 +47,16 @@ pub enum Record {
 }
 
 impl Record {
+    /// Which sort of finding this is, as the stored id says it.
+    #[must_use]
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::Study(_) => "study",
+            Self::Panel(_) => "panel",
+            Self::WalkForward(_) => "walk-forward",
+        }
+    }
+
     /// What the finding is about, for a history listing.
     #[must_use]
     pub fn subject(&self) -> String {
@@ -91,12 +101,64 @@ impl Record {
     }
 }
 
+/// The shape this build writes.
+///
+/// Bumped whenever a stored finding stops being readable by the code that
+/// wrote the previous one. It is not a migration system — it is the thing that
+/// lets a failure say *which* version wrote the file, instead of
+/// `missing field \`at\` at line 16903`, which is what four real findings said
+/// after `EquityPoint.date` was renamed and nothing recorded that a rename had
+/// happened.
+pub const SCHEMA: u32 = 1;
+
 /// A record plus when it was taken.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StoredRecord {
     pub id: String,
     pub recorded_at: DateTime<Utc>,
+    /// Which build's format this is. `0` for anything written before the
+    /// version existed — which is exactly the set of findings that cannot be
+    /// read any more, so it is a useful thing to be able to say.
+    #[serde(default)]
+    pub schema: u32,
     pub record: Record,
+}
+
+/// What a finding is, without reading the finding.
+///
+/// Everything the history list and the staleness check need, and nothing
+/// else. It exists because the alternative measured badly: a stored finding is
+/// around 400 KB — curves, ledgers, per-fold evidence and the search surface —
+/// and listing them all parsed every byte of every one to render a column of
+/// names. Five findings cost 1.7 MB of parsing; five hundred would cost
+/// seconds, on every render.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Summary {
+    pub id: String,
+    pub recorded_at: DateTime<Utc>,
+    pub kind: String,
+    pub subject: String,
+    pub verdict: Verdict,
+    pub hypothesis: HypothesisId,
+    pub dataset_version: String,
+    /// The instrument and resolution the finding was produced at, so
+    /// staleness can be checked without loading it. `None` for a panel, whose
+    /// dataset identity is every member's hash combined and has to be
+    /// recomputed the same way it was produced.
+    pub instrument: Option<String>,
+    pub interval: Option<arvo_data::BarInterval>,
+}
+
+/// A finding that could not be read, and why.
+///
+/// Kept as a value rather than a log line. Four findings were lost to a field
+/// rename and the only trace was a warning nobody had reason to look at; a
+/// research store that quietly forgets things is worse than one that says it
+/// has.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Unreadable {
+    pub id: String,
+    pub reason: String,
 }
 
 impl StoredRecord {
@@ -118,7 +180,35 @@ impl StoredRecord {
         Self {
             id,
             recorded_at,
+            schema: SCHEMA,
             record,
+        }
+    }
+
+    /// What the history list needs, without the finding itself.
+    #[must_use]
+    pub fn summary(&self) -> Summary {
+        let (instrument, interval) = match &self.record {
+            Record::Study(evidence) => (
+                Some(evidence.selected.instrument.clone()),
+                Some(evidence.selected.interval),
+            ),
+            Record::WalkForward(evidence) => (
+                Some(evidence.template.instrument.clone()),
+                Some(evidence.template.interval),
+            ),
+            Record::Panel(_) => (None, None),
+        };
+        Summary {
+            id: self.id.clone(),
+            recorded_at: self.recorded_at,
+            kind: self.record.kind().to_owned(),
+            subject: self.record.subject(),
+            verdict: self.record.verdict(),
+            hypothesis: self.record.hypothesis().clone(),
+            dataset_version: self.record.dataset_version().to_owned(),
+            instrument,
+            interval,
         }
     }
 }
@@ -243,6 +333,8 @@ impl EvidenceStore {
             .flatten()
             .map(|entry| entry.path())
             .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+            // The summary cache lives beside the findings and is not one.
+            .filter(|path| path.file_name().is_some_and(|name| name != INDEX))
         {
             match read_record(&path) {
                 Ok(record) => loaded.records.push(record),
@@ -259,14 +351,298 @@ impl EvidenceStore {
     }
 }
 
+/// Where the summaries are cached, inside the store.
+const INDEX: &str = "index.json";
+
+impl EvidenceStore {
+    /// Every finding's headline, newest first, with the ones that could not be
+    /// read.
+    ///
+    /// # The index is a cache, and is treated as one
+    ///
+    /// The directory is the truth. This lists it — which reads no file
+    /// contents — takes summaries from the cache for ids it already knows,
+    /// parses only the ids it does not, and rewrites the cache if anything
+    /// changed. An id in the cache that is no longer on disk is dropped.
+    ///
+    /// That shape has no staleness class to reason about: delete the index,
+    /// hand-edit it, copy findings in from another machine, and the next call
+    /// is correct. The alternative — an index maintained on write and trusted
+    /// on read — is one missed write away from a finding that exists and
+    /// cannot be seen.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MemoryError::Read`] only if the directory cannot be listed.
+    /// A finding that cannot be parsed is reported, not fatal.
+    pub fn summaries(&self) -> Result<(Vec<Summary>, Vec<Unreadable>), MemoryError> {
+        let paths = self.finding_paths()?;
+
+        let cached: std::collections::HashMap<String, Summary> = self
+            .read_index()
+            .into_iter()
+            .map(|summary| (summary.id.clone(), summary))
+            .collect();
+
+        let mut summaries = Vec::with_capacity(paths.len());
+        let mut unreadable = Vec::new();
+        let mut rebuilt = paths.len() != cached.len();
+
+        for path in paths {
+            let id = path
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned())
+                .unwrap_or_default();
+
+            if let Some(summary) = cached.get(&id) {
+                summaries.push(summary.clone());
+                continue;
+            }
+            rebuilt = true;
+            match read_record(&path) {
+                Ok(record) => summaries.push(record.summary()),
+                Err(reason) => unreadable.push(Unreadable { id, reason }),
+            }
+        }
+
+        summaries.sort_by_key(|summary| std::cmp::Reverse(summary.recorded_at));
+        if rebuilt {
+            self.write_index(&summaries);
+        }
+        Ok((summaries, unreadable))
+    }
+
+    /// Reads one finding by id.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MemoryError::Read`] if the file is missing or unreadable.
+    pub fn open(&self, id: &str) -> Result<StoredRecord, MemoryError> {
+        let path = self.root.join(format!("{}.json", slug(id)));
+        read_record(&path).map_err(|reason| MemoryError::Read {
+            path: path.clone(),
+            source: std::io::Error::new(std::io::ErrorKind::InvalidData, reason),
+        })
+    }
+
+    fn finding_paths(&self) -> Result<Vec<PathBuf>, MemoryError> {
+        let entries = match std::fs::read_dir(&self.root) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(source) => {
+                return Err(MemoryError::Read {
+                    path: self.root.clone(),
+                    source,
+                })
+            }
+        };
+        Ok(entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+            // The cache lives in the same directory and is not a finding.
+            .filter(|path| path.file_name().is_some_and(|name| name != INDEX))
+            .collect())
+    }
+
+    fn read_index(&self) -> Vec<Summary> {
+        std::fs::read_to_string(self.root.join(INDEX))
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_default()
+    }
+
+    /// Best effort. A cache that cannot be written costs the next listing some
+    /// parsing and nothing else, and failing a read because a *cache* could
+    /// not be updated would be the wrong trade entirely.
+    fn write_index(&self, summaries: &[Summary]) {
+        if let Ok(text) = serde_json::to_string(summaries) {
+            let _ = std::fs::write(self.root.join(INDEX), text);
+        }
+    }
+}
+
 fn read_record(path: &Path) -> Result<StoredRecord, String> {
     let text = std::fs::read_to_string(path).map_err(|err| format!("{}: {err}", path.display()))?;
-    serde_json::from_str(&text).map_err(|err| format!("{}: {err}", path.display()))
+
+    // Read the version before the record. A finding written by a newer build
+    // fails on whichever field changed first, and "missing field `at`" is a
+    // description of a symptom rather than of the problem.
+    let schema = serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|value| value.get("schema").and_then(serde_json::Value::as_u64))
+        .unwrap_or(0);
+    // The path stays in every message. A reason without one is a reason
+    // nobody can act on when the store holds hundreds of files.
+    let where_ = path.display();
+    if schema > u64::from(SCHEMA) {
+        return Err(format!(
+            "{where_}: written by a newer version of Arvo              (format {schema}, this build reads {SCHEMA})"
+        ));
+    }
+
+    serde_json::from_str(&text).map_err(|err| {
+        if schema < u64::from(SCHEMA) {
+            format!(
+                "{where_}: written by an older version of Arvo (format {schema})                  and cannot be read: {err}"
+            )
+        } else {
+            format!("{where_}: {err}")
+        }
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The index is a cache over the directory, and every test here is about
+    /// that being true rather than nearly true.
+    mod index {
+        use super::*;
+
+        fn store() -> (tempfile::TempDir, EvidenceStore) {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let store = EvidenceStore::new(dir.path());
+            (dir, store)
+        }
+
+        fn record(subject: &str, at: i64) -> StoredRecord {
+            let mut stored = StoredRecord::new(
+                study(subject, "v1"),
+                DateTime::from_timestamp(at, 0).expect("valid"),
+            );
+            stored.id = format!("{at}-{subject}");
+            stored
+        }
+
+        #[test]
+        fn a_summary_says_what_the_list_needs_without_the_finding() {
+            let (_dir, store) = store();
+            store.save(&record("AAPL.NASDAQ", 1_700_000_000)).expect("saves");
+
+            let (summaries, unreadable) = store.summaries().expect("lists");
+            assert!(unreadable.is_empty());
+            assert_eq!(summaries.len(), 1);
+            assert_eq!(summaries[0].kind, "study");
+            assert_eq!(summaries[0].subject, "AAPL.NASDAQ");
+            assert_eq!(summaries[0].instrument.as_deref(), Some("AAPL.NASDAQ"));
+        }
+
+        #[test]
+        fn a_finding_added_behind_the_index_still_appears() {
+            // Copied in from another machine, restored from a backup, written
+            // by a build that did not know about the cache. The directory is
+            // the truth and the cache catches up.
+            let (_dir, store) = store();
+            store.save(&record("AAPL.NASDAQ", 1_700_000_000)).expect("saves");
+            store.summaries().expect("builds the index");
+
+            store.save(&record("MSFT.NASDAQ", 1_700_000_100)).expect("saves");
+            let (summaries, _) = store.summaries().expect("lists");
+            assert_eq!(summaries.len(), 2);
+        }
+
+        #[test]
+        fn a_finding_deleted_behind_the_index_stops_appearing() {
+            let (dir, store) = store();
+            let stored = record("AAPL.NASDAQ", 1_700_000_000);
+            let path = store.save(&stored).expect("saves");
+            store.summaries().expect("builds the index");
+
+            std::fs::remove_file(&path).expect("removes");
+            let (summaries, _) = store.summaries().expect("lists");
+            assert!(summaries.is_empty(), "{:?}", dir.path());
+        }
+
+        #[test]
+        fn a_corrupt_index_costs_parsing_and_nothing_else() {
+            // It is a cache. Losing it must never lose a finding.
+            let (dir, store) = store();
+            store.save(&record("AAPL.NASDAQ", 1_700_000_000)).expect("saves");
+            std::fs::write(dir.path().join(INDEX), "not json").expect("write");
+
+            let (summaries, unreadable) = store.summaries().expect("lists");
+            assert_eq!(summaries.len(), 1);
+            assert!(unreadable.is_empty());
+        }
+
+        #[test]
+        fn the_index_is_not_listed_as_a_finding() {
+            let (_dir, store) = store();
+            store.save(&record("AAPL.NASDAQ", 1_700_000_000)).expect("saves");
+            store.summaries().expect("writes the index");
+            let (summaries, unreadable) = store.summaries().expect("lists again");
+            assert_eq!(summaries.len(), 1);
+            assert!(unreadable.is_empty(), "{unreadable:?}");
+        }
+
+        #[test]
+        fn an_unreadable_finding_is_reported_rather_than_skipped() {
+            // Four real findings were lost to a field rename and the only
+            // trace was a log line. A store that quietly forgets is worse than
+            // one that says it has.
+            let (dir, store) = store();
+            store.save(&record("AAPL.NASDAQ", 1_700_000_000)).expect("saves");
+            std::fs::write(dir.path().join("broken.json"), r#"{"id":"broken"}"#).expect("write");
+
+            let (summaries, unreadable) = store.summaries().expect("lists");
+            assert_eq!(summaries.len(), 1, "the good one still lists");
+            assert_eq!(unreadable.len(), 1);
+            assert_eq!(unreadable[0].id, "broken");
+        }
+
+        #[test]
+        fn a_finding_from_a_newer_build_says_so_rather_than_naming_a_field() {
+            // "missing field `at` at line 16903" is a description of a symptom.
+            let (dir, store) = store();
+            std::fs::create_dir_all(dir.path()).expect("dir");
+            std::fs::write(
+                dir.path().join("future.json"),
+                format!(r#"{{"id":"future","schema":{},"recorded_at":"2026-01-01T00:00:00Z"}}"#, SCHEMA + 9),
+            )
+            .expect("write");
+
+            let (_, unreadable) = store.summaries().expect("lists");
+            assert_eq!(unreadable.len(), 1);
+            assert!(
+                unreadable[0].reason.contains("newer version"),
+                "{}",
+                unreadable[0].reason
+            );
+        }
+
+        #[test]
+        fn a_finding_written_before_the_version_existed_says_which_format_it_is() {
+            let (dir, store) = store();
+            std::fs::create_dir_all(dir.path()).expect("dir");
+            // Schema 0: no version field, and a shape this build cannot read.
+            std::fs::write(dir.path().join("ancient.json"), r#"{"id":"ancient"}"#).expect("write");
+
+            let (_, unreadable) = store.summaries().expect("lists");
+            assert!(
+                unreadable[0].reason.contains("older version"),
+                "{}",
+                unreadable[0].reason
+            );
+        }
+
+        #[test]
+        fn a_saved_record_carries_the_format_that_wrote_it() {
+            assert_eq!(
+                StoredRecord::new(study("AAPL.NASDAQ", "v1"), Utc::now()).schema,
+                SCHEMA
+            );
+        }
+
+        #[test]
+        fn one_finding_can_be_opened_without_reading_the_rest() {
+            let (_dir, store) = store();
+            let stored = record("AAPL.NASDAQ", 1_700_000_000);
+            store.save(&stored).expect("saves");
+            assert_eq!(store.open(&stored.id).expect("opens").id, stored.id);
+        }
+    }
     use crate::evaluation::{Evaluation, EvaluationCriteria, Evidence};
     use crate::family::Selection;
     use crate::{

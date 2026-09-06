@@ -39,7 +39,9 @@ pub use evaluation::{
 pub use family::{
     run_family, ExperimentFamily, FamilyEvidence, ParameterGrid, ScoredTrial, Selection,
 };
-pub use memory::{EvidenceStore, Loaded, MemoryError, Record, StoredRecord};
+pub use memory::{
+    EvidenceStore, Loaded, MemoryError, Record, StoredRecord, Summary, Unreadable, SCHEMA,
+};
 pub use panel::{run_panel, InstrumentOutcome, PanelEvidence, PanelStudy, PooledOutcome};
 pub use trade::{Direction, ExitReason, Trade, TradeStats};
 pub use walk_forward::{run_walk_forward, AxisStability, WalkForward, WalkForwardEvidence};

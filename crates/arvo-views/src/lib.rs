@@ -32,6 +32,13 @@
 use serde::{Deserialize, Serialize};
 
 /// What the workbench shows before anything has been run.
+/// Everything in research memory, and what could not be read of it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HistoryView {
+    pub entries: Vec<HistoryEntryView>,
+    pub unreadable: Vec<UnreadableView>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DataLibraryView {
     /// Shown so a user with no data knows where to put some.
@@ -349,6 +356,17 @@ pub struct SurfaceView {
 }
 
 /// A stored finding, summarised for the history list.
+/// A finding that could not be read, and why.
+///
+/// Shown rather than logged. Four findings were once lost to a field rename
+/// and the only trace was a warning nobody had reason to look at — a research
+/// store that quietly forgets things is worse than one that says it has.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnreadableView {
+    pub id: String,
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HistoryEntryView {
     pub id: String,
