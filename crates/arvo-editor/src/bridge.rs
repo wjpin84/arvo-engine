@@ -49,6 +49,14 @@ extern "C" {
     #[wasm_bindgen(js_namespace = window, js_name = renderEquityChart)]
     pub(crate) fn render_equity_chart(el: &web_sys::HtmlElement, strategy: JsValue, benchmark: JsValue);
 
+    // The instrument's own bars with trades marked on them, and the
+    // underwater plot beneath. Same vendored library as the equity chart,
+    // same reading of the app's CSS variables for its palette.
+    #[wasm_bindgen(js_namespace = window, js_name = renderPriceChart)]
+    pub(crate) fn render_price_chart(el: &web_sys::HtmlElement, candles: JsValue, markers: JsValue);
+    #[wasm_bindgen(js_namespace = window, js_name = renderUnderwaterChart)]
+    pub(crate) fn render_underwater_chart(el: &web_sys::HtmlElement, points: JsValue);
+
     // app-shell ticket 12 — Output moved into the View menu; same
     // add/remove-panel toggle as the sidebar's.
     #[wasm_bindgen(js_namespace = window, js_name = setOutputVisible)]

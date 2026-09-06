@@ -266,7 +266,14 @@ impl From<&Metrics> for MetricsView {
 /// a value.
 #[derive(Serialize)]
 pub struct CurvePoint {
-    pub time: String,
+    /// Seconds since the epoch, not a date string.
+    ///
+    /// A date was enough while every curve was daily and is not once two
+    /// points can share a day: the chart keys points by time, so an intraday
+    /// series collapsed to dates loses every point but the last of each day.
+    /// The previous version did exactly that, deliberately and with a comment
+    /// saying so — this is what removing the limitation instead looks like.
+    pub time: i64,
     pub value: f64,
 }
 
@@ -274,23 +281,145 @@ pub struct CurvePoint {
 ///
 /// Charting libraries reject non-ascending or duplicated times, and typically
 /// by throwing — which in a webview means a blank panel and no explanation.
-/// Cheaper to guarantee the shape here than to debug it there.
+/// An equity curve as the chart wants it.
+///
+/// One point per bar, in epoch seconds. Nothing is collapsed or deduplicated:
+/// the curve is already one point per bar by construction, and thinning it
+/// here would draw a different line from the one the metrics were computed on.
 fn curve_points(curve: &[arvo_research::EquityPoint]) -> Vec<CurvePoint> {
-    let mut points: Vec<CurvePoint> = Vec::with_capacity(curve.len());
-    for point in curve {
-        // Date only: the chart draws a daily series, and the library keys
-        // points by day. An intraday curve needs a time-aware axis, which is
-        // a chart change rather than a data one.
-        let time = point.at.date().to_string();
-        match points.last_mut() {
-            Some(last) if last.time == time => last.value = point.equity,
-            _ => points.push(CurvePoint {
-                time,
-                value: point.equity,
-            }),
+    curve
+        .iter()
+        .map(|point| CurvePoint {
+            time: point.at.and_utc().timestamp(),
+            value: point.equity,
+        })
+        .collect()
+}
+
+/// One bar, as the chart wants it.
+#[derive(Serialize)]
+pub struct CandlePoint {
+    pub time: i64,
+    pub open: f64,
+    pub high: f64,
+    pub low: f64,
+    pub close: f64,
+}
+
+/// Where a trade happened, to be drawn on the price.
+#[derive(Serialize)]
+pub struct TradeMarkerView {
+    pub time: i64,
+    /// `entry` or `exit`; the chart decides shape and side from it.
+    pub kind: String,
+    /// `stop` or `signal` for an exit, so a stop-out is visually distinct
+    /// from a rule that chose to leave. Empty for an entry.
+    pub reason: String,
+    pub label: String,
+}
+
+/// The instrument's own bars over a window.
+///
+/// Read from the library at render time rather than stored in the finding.
+/// The bars are the *input* to an experiment and are already identified by a
+/// content hash; copying them into every stored result would duplicate
+/// megabytes to say something the hash already says. If the file has changed
+/// since, the finding is marked stale by the machinery that exists for it.
+fn candles(
+    bars: &dyn arvo_data::BarProvider,
+    instrument: &str,
+    interval: arvo_data::BarInterval,
+    window: &DateRange,
+) -> Vec<CandlePoint> {
+    bars.bars(instrument, interval, window.from, window.to)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|bar| CandlePoint {
+            time: bar.at.and_utc().timestamp(),
+            open: bar.open,
+            high: bar.high,
+            low: bar.low,
+            close: bar.close,
+        })
+        .collect()
+}
+
+/// Every entry and exit in a ledger, as chart markers on the bars that caused
+/// them.
+///
+/// # The interval is not decoration
+///
+/// A trade's timestamp is the instant it *filled*, and a fill happens at the
+/// close of the bar the signal was read from — that is the whole look-ahead
+/// convention this platform is built on. A candle, meanwhile, is stamped at
+/// the instant it *opens*. So a fill on the bar opening at 09:30 carries the
+/// time 09:35, and drawing it there puts every marker one bar to the right of
+/// the bar that actually produced it.
+///
+/// Shifting back by one interval is what lines them up. It is invisible if you
+/// do not look for it: the chart would render, the markers would sit on
+/// plausible candles, and every entry would appear to have been taken one bar
+/// after the rule fired.
+fn markers(
+    ledger: &[arvo_research::Trade],
+    interval: arvo_data::BarInterval,
+) -> Vec<TradeMarkerView> {
+    let step = interval.duration();
+    let on_bar = |at: chrono::NaiveDateTime| (at - step).and_utc().timestamp();
+
+    let mut out = Vec::with_capacity(ledger.len() * 2);
+    for trade in ledger {
+        out.push(TradeMarkerView {
+            time: on_bar(trade.opened),
+            kind: "entry".to_owned(),
+            reason: String::new(),
+            label: format!("{:.0} @ {:.2}", trade.quantity, trade.entry),
+        });
+        if let (Some(closed), Some(exit)) = (trade.closed, trade.exit) {
+            out.push(TradeMarkerView {
+                time: on_bar(closed),
+                kind: "exit".to_owned(),
+                // A stop-out and a signal exit look identical in a summary and
+                // could not be more different in what they say about the rule.
+                reason: match trade.exit_reason {
+                    arvo_research::ExitReason::Stop => "stop",
+                    _ => "signal",
+                }
+                .to_owned(),
+                label: format!("{exit:.2} ({:+.0})", trade.pnl),
+            });
         }
     }
-    points
+    // The chart requires markers in time order and throws on anything else,
+    // and an exception crossing back into wasm takes the calling future with
+    // it — so this is not a tidiness sort.
+    out.sort_by_key(|marker| marker.time);
+    out
+}
+
+/// The equity curve expressed as depth below its own running peak.
+///
+/// Drawn rather than summarised because a single worst-drawdown number cannot
+/// distinguish one deep hole from a decade spent underwater, and those are
+/// different things to have lived through.
+fn underwater(curve: &[arvo_research::EquityPoint]) -> Vec<CurvePoint> {
+    let mut peak = f64::NEG_INFINITY;
+    curve
+        .iter()
+        .map(|point| {
+            peak = peak.max(point.equity);
+            CurvePoint {
+                time: point.at.and_utc().timestamp(),
+                // Negative, so the series hangs below zero the way every
+                // underwater plot in the literature does.
+                value: if peak > 0.0 {
+                    (point.equity - peak) / peak * 100.0
+                } else {
+                    0.0
+                },
+            }
+        })
+        .collect()
 }
 
 /// One thing to do about a finding, flattened for display.
@@ -384,6 +513,16 @@ pub struct StudyView {
     /// it all in one month, and those are different findings.
     pub strategy_curve: Vec<CurvePoint>,
     pub benchmark_curve: Vec<CurvePoint>,
+    /// The instrument's own bars over the judged period, with every entry and
+    /// exit marked on them.
+    ///
+    /// The view that shows what the rule *did* rather than what it added up
+    /// to. A summary cannot say the entries all landed on three days, or that
+    /// every winner came out of one gap; this says it at a glance.
+    pub price: Vec<CandlePoint>,
+    pub markers: Vec<TradeMarkerView>,
+    /// Depth below the running peak, as a percentage.
+    pub underwater: Vec<CurvePoint>,
     /// Month-by-month, so a total return can be read as steady or as one
     /// lucky quarter. Derived from the same curve, not a second measurement.
     pub monthly: Vec<MonthlyReturnView>,
@@ -452,6 +591,9 @@ pub struct WalkForwardView {
     pub excess_return: f64,
     pub strategy_curve: Vec<CurvePoint>,
     pub benchmark_curve: Vec<CurvePoint>,
+    pub price: Vec<CandlePoint>,
+    pub markers: Vec<TradeMarkerView>,
+    pub underwater: Vec<CurvePoint>,
     pub trades_detail: TradesView,
     pub recommendations: Vec<RecommendationView>,
 
@@ -544,10 +686,16 @@ pub async fn open_record(
 
     let engine = service.simulation.engine();
     Ok(match stored.record {
-        Record::Study(evidence) => RecordView::Study(Box::new(study_view(&evidence, engine))),
+        Record::Study(evidence) => {
+            RecordView::Study(Box::new(study_view(&evidence, &service.bars, engine)))
+        }
         Record::Panel(evidence) => RecordView::Panel(Box::new(panel_view(&evidence, engine))),
         Record::WalkForward(evidence) => {
-            RecordView::WalkForward(Box::new(walk_forward_view(&evidence, engine)))
+            RecordView::WalkForward(Box::new(walk_forward_view(
+                &evidence,
+                &service.bars,
+                engine,
+            )))
         }
     })
 }
@@ -668,6 +816,9 @@ pub async fn run_study(
         .map_err(|err| CommandError::Failed(format!("hashing {instrument}: {err}")))?
         .ok_or_else(missing)?;
 
+    // A copy for the blocking closure: rendering the report reads the bars
+    // back to draw them, and the `State` cannot cross that boundary.
+    let library = service.bars.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let window = DateRange::new(coverage.0, coverage.1)
             .map_err(|err| CommandError::Failed(err.to_string()))?;
@@ -680,7 +831,7 @@ pub async fn run_study(
         )
         .map_err(|err| CommandError::Failed(err.to_string()))?;
 
-        let view = study_view(&found, &engine);
+        let view = study_view(&found, &library, &engine);
         Ok((view, Record::Study(Box::new(found))))
     })
     .await
@@ -985,6 +1136,7 @@ pub async fn run_walk_forward(
         .ok_or_else(missing)?;
     let engine = simulation.engine().to_owned();
 
+    let library = service.bars.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let window = DateRange::new(coverage.0, coverage.1)
             .map_err(|err| CommandError::Failed(err.to_string()))?;
@@ -997,7 +1149,7 @@ pub async fn run_walk_forward(
         )
         .map_err(|err| CommandError::Failed(err.to_string()))?;
 
-        let view = walk_forward_view(&found, &engine);
+        let view = walk_forward_view(&found, &library, &engine);
         Ok((view, Record::WalkForward(Box::new(found))))
     })
     .await
@@ -1046,7 +1198,17 @@ pub async fn run_panel(
 /// identically to one just produced. Two projections would drift, and a
 /// history that showed something subtly different from the live run would be
 /// worse than no history.
-fn study_view(found: &arvo_research::FamilyEvidence, engine: &str) -> StudyView {
+/// Flattens a study for display.
+///
+/// Public because the projection *is* what this crate does, and because the
+/// test that proves trade markers land on real candles has to run in its own
+/// process — a backtest installs Nautilus's logger, and there is a guard test
+/// in this crate asserting nothing has claimed that global.
+pub fn study_view(
+    found: &arvo_research::FamilyEvidence,
+    bars: &dyn arvo_data::BarProvider,
+    engine: &str,
+) -> StudyView {
     let evaluation = &found.out_of_sample_evidence.evaluation;
     StudyView {
         instrument: found.selected.instrument.clone(),
@@ -1070,6 +1232,14 @@ fn study_view(found: &arvo_research::FamilyEvidence, engine: &str) -> StudyView 
         excess_return: evaluation.excess_return,
         strategy_curve: curve_points(&evaluation.strategy_curve),
         benchmark_curve: curve_points(&evaluation.benchmark_curve),
+        price: candles(
+            bars,
+            &found.selected.instrument,
+            found.selected.interval,
+            &found.out_of_sample,
+        ),
+        markers: markers(&evaluation.strategy_ledger, found.selected.interval),
+        underwater: underwater(&evaluation.strategy_curve),
         monthly: arvo_research::evaluation::monthly_returns(&evaluation.strategy_curve)
             .into_iter()
             .map(|month| MonthlyReturnView {
@@ -1103,8 +1273,9 @@ fn study_view(found: &arvo_research::FamilyEvidence, engine: &str) -> StudyView 
 /// Flattens a walk-forward run for display. Same reasoning as [`study_view`]:
 /// one projection, so a finding read back from memory renders exactly as the
 /// run that produced it.
-fn walk_forward_view(
+pub fn walk_forward_view(
     found: &arvo_research::WalkForwardEvidence,
+    bars: &dyn arvo_data::BarProvider,
     engine: &str,
 ) -> WalkForwardView {
     let template = &found.template;
@@ -1157,6 +1328,40 @@ fn walk_forward_view(
         excess_return: found.excess_return,
         strategy_curve: curve_points(&found.combined_curve),
         benchmark_curve: curve_points(&found.benchmark_curve),
+        // Every fold's judged period, end to end — which is the whole span
+        // after the first selection window, so the price chart covers exactly
+        // what the stitched record covers.
+        price: found
+            .folds
+            .first()
+            .zip(found.folds.last())
+            .and_then(|(first, last)| {
+                DateRange::new(first.out_of_sample.from, last.out_of_sample.to).ok()
+            })
+            .map(|window| {
+                candles(
+                    bars,
+                    &template.instrument,
+                    template.interval,
+                    &window,
+                )
+            })
+            .unwrap_or_default(),
+        markers: markers(
+            &found
+                .folds
+                .iter()
+                .flat_map(|fold| {
+                    fold.out_of_sample_evidence
+                        .evaluation
+                        .strategy_ledger
+                        .iter()
+                        .cloned()
+                })
+                .collect::<Vec<_>>(),
+            template.interval,
+        ),
+        underwater: underwater(&found.combined_curve),
         trades_detail: TradesView::build(&found.combined_trades, template.starting_cash),
         // Recommendations are keyed to a single study's evidence shape. A
         // walk-forward's own diagnostics live in `reasons` above — the
@@ -1349,6 +1554,134 @@ pub fn study_for(
         template_for(instrument, plan, window, dataset_version),
         plan.grid(),
     )
+}
+
+#[cfg(test)]
+mod chart_tests {
+    use super::*;
+    use arvo_research::{Direction, ExitReason, Trade};
+
+    fn at(day: u32, hour: u32, minute: u32) -> chrono::NaiveDateTime {
+        chrono::NaiveDate::from_ymd_opt(2024, 1, day)
+            .expect("valid")
+            .and_hms_opt(hour, minute, 0)
+            .expect("valid")
+    }
+
+    fn trade(opened: chrono::NaiveDateTime, closed: Option<chrono::NaiveDateTime>) -> Trade {
+        Trade {
+            opened,
+            closed,
+            direction: Direction::Long,
+            quantity: 10.0,
+            entry: 100.0,
+            exit: closed.map(|_| 110.0),
+            pnl: 100.0,
+            commission: 1.0,
+            exit_reason: closed.map_or(ExitReason::StillOpen, |_| ExitReason::Stop),
+        }
+    }
+
+    #[test]
+    fn a_marker_lands_on_the_bar_that_caused_it_not_the_one_after() {
+        // The off-by-one this shift exists for. A fill is stamped at the close
+        // of the bar the signal was read from; a candle is stamped at its
+        // open. Without the shift every entry appears one bar late, and the
+        // chart renders perfectly while saying something false.
+        let interval = arvo_data::BarInterval::new(5, arvo_data::IntervalUnit::Minute);
+        let bar_opens = at(2, 9, 30);
+        let filled_at_its_close = at(2, 9, 35);
+
+        let out = markers(&[trade(filled_at_its_close, None)], interval);
+        assert_eq!(out[0].time, bar_opens.and_utc().timestamp());
+    }
+
+    #[test]
+    fn a_daily_marker_lands_on_its_own_day() {
+        let out = markers(&[trade(at(3, 0, 0), None)], arvo_data::BarInterval::DAILY);
+        assert_eq!(out[0].time, at(2, 0, 0).and_utc().timestamp());
+    }
+
+    #[test]
+    fn a_closed_trade_yields_two_markers_and_an_open_one_yields_one() {
+        let interval = arvo_data::BarInterval::DAILY;
+        let out = markers(
+            &[
+                trade(at(2, 0, 0), Some(at(4, 0, 0))),
+                trade(at(6, 0, 0), None),
+            ],
+            interval,
+        );
+        assert_eq!(out.len(), 3);
+        assert_eq!(out.iter().filter(|m| m.kind == "entry").count(), 2);
+        assert_eq!(out.iter().filter(|m| m.kind == "exit").count(), 1);
+    }
+
+    #[test]
+    fn markers_come_out_in_time_order() {
+        // Not tidiness: the chart library throws on unsorted markers, and an
+        // exception crossing back into wasm takes the calling future with it.
+        let interval = arvo_data::BarInterval::DAILY;
+        let out = markers(
+            &[
+                trade(at(8, 0, 0), Some(at(9, 0, 0))),
+                trade(at(2, 0, 0), Some(at(3, 0, 0))),
+            ],
+            interval,
+        );
+        assert!(out.windows(2).all(|pair| pair[0].time <= pair[1].time));
+    }
+
+    #[test]
+    fn a_stop_exit_is_marked_differently_from_a_signal_exit() {
+        let out = markers(
+            &[trade(at(2, 0, 0), Some(at(4, 0, 0)))],
+            arvo_data::BarInterval::DAILY,
+        );
+        let exit = out.iter().find(|m| m.kind == "exit").expect("closed");
+        assert_eq!(exit.reason, "stop");
+    }
+
+    fn point(day: u32, equity: f64) -> arvo_research::EquityPoint {
+        arvo_research::EquityPoint {
+            at: at(day, 0, 0),
+            equity,
+        }
+    }
+
+    #[test]
+    fn underwater_is_depth_below_the_running_peak() {
+        let curve = [
+            point(1, 100.0),
+            point(2, 120.0),
+            point(3, 90.0),
+            point(4, 120.0),
+        ];
+        let plot = underwater(&curve);
+        assert!((plot[0].value - 0.0).abs() < 1e-9, "a new peak is the surface");
+        assert!((plot[1].value - 0.0).abs() < 1e-9);
+        // 90 against a peak of 120 is 25% down.
+        assert!((plot[2].value + 25.0).abs() < 1e-9, "{:?}", plot[2].value);
+        assert!((plot[3].value - 0.0).abs() < 1e-9, "back to the peak");
+        assert!(
+            plot.iter().all(|p| p.value <= 0.0),
+            "the plot hangs below zero, always"
+        );
+    }
+
+    #[test]
+    fn an_intraday_curve_keeps_every_point_rather_than_one_a_day() {
+        // The previous version keyed points by date and deduplicated, which
+        // silently threw away all but the last point of each day — an
+        // intraday curve of 780 bars became nine points.
+        let curve: Vec<_> = (0..12)
+            .map(|index| arvo_research::EquityPoint {
+                at: at(2, 9, 30) + chrono::Duration::minutes(5 * index),
+                equity: 100.0 + index as f64,
+            })
+            .collect();
+        assert_eq!(curve_points(&curve).len(), 12);
+    }
 }
 
 #[cfg(test)]

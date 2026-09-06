@@ -7,7 +7,7 @@
 use leptos::prelude::*;
 use wasm_bindgen::prelude::*;
 
-use crate::bridge::render_equity_chart;
+use crate::bridge::{render_equity_chart, render_price_chart, render_underwater_chart};
 use crate::format::percent;
 use crate::views::*;
 
@@ -178,4 +178,75 @@ pub(crate) fn ValueChart(points: Vec<CurvePoint>) -> impl IntoView {
             <div class="equity-chart-canvas" node_ref=holder></div>
         </div>
     }
+}
+
+/// The instrument's own bars, with every entry and exit marked on them.
+///
+/// The chart a trading platform is expected to have and that this one did not:
+/// until now Arvo drew equity curves and never once showed a price. It is also
+/// the most honest view in the application. A summary can say a rule returned
+/// 20%; only this can show that every entry landed in one week, or that the
+/// winners came out of a single gap, or that the stop was hit on the wick of
+/// bars that closed green.
+#[component]
+pub(crate) fn PriceChart(candles: Vec<CandlePoint>, markers: Vec<TradeMarkerView>) -> impl IntoView {
+    let holder = NodeRef::<leptos::html::Div>::new();
+    let entries = markers.iter().filter(|m| m.kind == "entry").count();
+    let stops = markers.iter().filter(|m| m.reason == "stop").count();
+    let empty = candles.is_empty();
+
+    Effect::new(move |_| {
+        let Some(el) = holder.get() else {
+            return;
+        };
+        render_price_chart(
+            &el,
+            serde_wasm_bindgen::to_value(&candles).unwrap_or(JsValue::NULL),
+            serde_wasm_bindgen::to_value(&markers).unwrap_or(JsValue::NULL),
+        );
+    });
+
+    view! {
+        <div class="equity-chart">
+            <div class="equity-chart-legend">
+                <span class="equity-chart-key entry">{format!("{entries} entries")}</span>
+                <span class="equity-chart-key stop">{format!("{stops} stopped out")}</span>
+            </div>
+            // Said rather than left as an empty rectangle. A chart with no
+            // data and no explanation is the failure shape this project has
+            // already lost time to more than once.
+            {empty
+                .then(|| {
+                    view! {
+                        <p class="research-hint">
+                            "No bars for this window in the data library."
+                        </p>
+                    }
+                })}
+            <div class="equity-chart-canvas" node_ref=holder></div>
+        </div>
+    }
+}
+
+/// How far below its own running peak the account was, at every moment.
+///
+/// Drawn because one worst-drawdown number cannot distinguish a single deep
+/// hole from a decade spent underwater, and those are very different things to
+/// have had to sit through — which is the question the drawdown ceiling in the
+/// evaluation criteria is really asking.
+#[component]
+pub(crate) fn UnderwaterChart(points: Vec<CurvePoint>) -> impl IntoView {
+    let holder = NodeRef::<leptos::html::Div>::new();
+
+    Effect::new(move |_| {
+        let Some(el) = holder.get() else {
+            return;
+        };
+        render_underwater_chart(
+            &el,
+            serde_wasm_bindgen::to_value(&points).unwrap_or(JsValue::NULL),
+        );
+    });
+
+    view! { <div class="underwater-chart" node_ref=holder></div> }
 }

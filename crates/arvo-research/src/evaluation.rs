@@ -300,6 +300,18 @@ pub struct Evaluation {
     /// the ledger existed still loads, as one with no trade detail.
     #[serde(default)]
     pub strategy_trades: crate::TradeStats,
+    /// The round trips themselves, not just their statistics.
+    ///
+    /// Kept so a finding can be *drawn on the price*, which is the one view
+    /// that shows what a rule actually did rather than what it added up to. A
+    /// summary cannot tell you the entries were all on the same three days,
+    /// or that every winner came out of one gap; a chart with the trades
+    /// marked on it tells you in a second.
+    ///
+    /// Costs a few hundred small records in a stored finding, which is worth
+    /// it: the alternative is re-running the backtest to look at it.
+    #[serde(default)]
+    pub strategy_ledger: Vec<crate::Trade>,
     /// Strategy return minus benchmark return. The number that matters:
     /// absolute return mostly measures whether the market went up.
     pub excess_return: f64,
@@ -315,8 +327,9 @@ impl Evaluation {
     /// curves and the criteria — the verdict must not start depending on
     /// something a stored finding may not have.
     #[must_use]
-    pub fn with_trades(mut self, trades: crate::TradeStats) -> Self {
-        self.strategy_trades = trades;
+    pub fn with_trades(mut self, ledger: Vec<crate::Trade>) -> Self {
+        self.strategy_trades = crate::TradeStats::from_ledger(&ledger);
+        self.strategy_ledger = ledger;
         self
     }
 
@@ -365,6 +378,7 @@ impl Evaluation {
             strategy_curve,
             benchmark_curve,
             strategy_trades: crate::TradeStats::default(),
+            strategy_ledger: Vec::new(),
             excess_return,
             verdict,
             reasons,
@@ -435,7 +449,7 @@ pub fn evaluate_against_benchmark(
         benchmark_result.equity_curve,
         criteria,
     )
-    .with_trades(crate::TradeStats::from_ledger(&strategy_result.ledger));
+    .with_trades(strategy_result.ledger.clone());
 
     Ok(Evidence {
         hypothesis: experiment.hypothesis.clone(),

@@ -84,6 +84,9 @@ pub(crate) struct StudyView {
     pub(crate) excess_return: f64,
     pub(crate) strategy_curve: Vec<CurvePoint>,
     pub(crate) benchmark_curve: Vec<CurvePoint>,
+    pub(crate) price: Vec<CandlePoint>,
+    pub(crate) markers: Vec<TradeMarkerView>,
+    pub(crate) underwater: Vec<CurvePoint>,
     pub(crate) monthly: Vec<MonthlyReturnView>,
     pub(crate) trades_detail: TradesView,
     pub(crate) recommendations: Vec<RecommendationView>,
@@ -131,6 +134,9 @@ pub(crate) struct WalkForwardView {
     pub(crate) excess_return: f64,
     pub(crate) strategy_curve: Vec<CurvePoint>,
     pub(crate) benchmark_curve: Vec<CurvePoint>,
+    pub(crate) price: Vec<CandlePoint>,
+    pub(crate) markers: Vec<TradeMarkerView>,
+    pub(crate) underwater: Vec<CurvePoint>,
     pub(crate) trades_detail: TradesView,
     pub(crate) in_sample_days: i64,
     pub(crate) step_days: i64,
@@ -188,6 +194,25 @@ pub(crate) struct TradesView {
     pub(crate) fees_fraction: f64,
     pub(crate) signal_exits: u32,
     pub(crate) stop_exits: u32,
+}
+
+/// One bar, as the chart wants it.
+#[derive(Clone, Deserialize, serde::Serialize)]
+pub(crate) struct CandlePoint {
+    pub(crate) time: i64,
+    pub(crate) open: f64,
+    pub(crate) high: f64,
+    pub(crate) low: f64,
+    pub(crate) close: f64,
+}
+
+/// Where a trade happened, to be drawn on the price.
+#[derive(Clone, Deserialize, serde::Serialize)]
+pub(crate) struct TradeMarkerView {
+    pub(crate) time: i64,
+    pub(crate) kind: String,
+    pub(crate) reason: String,
+    pub(crate) label: String,
 }
 
 #[derive(Clone, Deserialize, serde::Serialize)]

@@ -8,7 +8,7 @@
 
 use leptos::prelude::*;
 
-use crate::chart::{EquityChart, MetricCard};
+use crate::chart::{EquityChart, MetricCard, PriceChart, UnderwaterChart};
 use crate::format::{percent, ratio, short_hash, verdict_class};
 use crate::research::study::TradeDetail;
 use crate::views::*;
@@ -78,6 +78,16 @@ pub(crate) fn WalkForwardReport(walk: WalkForwardView) -> impl IntoView {
                 strategy=walk.strategy_curve.clone()
                 benchmark=walk.benchmark_curve.clone()
             />
+
+            // Across the whole judged span, with every fold's trades on it.
+            // Seeing the re-selections land on one price series is the only
+            // way to notice that a "new" winner traded identically to the old
+            // one — which a table of parameters cannot show.
+            <h4>"Where it traded"</h4>
+            <PriceChart candles=walk.price.clone() markers=walk.markers.clone() />
+
+            <h4>"Underwater"</h4>
+            <UnderwaterChart points=walk.underwater.clone() />
 
             <h4>"How the selection moved"</h4>
             {(walk.stability.is_empty())
