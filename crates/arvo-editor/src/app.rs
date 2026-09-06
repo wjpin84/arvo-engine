@@ -193,6 +193,16 @@ struct StudyView {
     engine: String,
 }
 
+/// A strategy the workbench can run.
+#[derive(Clone, Deserialize)]
+struct StrategyView {
+    name: String,
+    label: String,
+    premise: String,
+    interval: String,
+    backtests: usize,
+}
+
 /// One thing to do about a finding.
 #[derive(Clone, Deserialize)]
 struct RecommendationView {
@@ -633,6 +643,10 @@ fn ResearchView(
     let (running, set_running) = signal(None::<String>);
     let (error, set_error) = signal(None::<String>);
     let (history, set_history) = signal(Vec::<HistoryEntryView>::new());
+    // What the engine can actually run, fetched rather than hardcoded: a menu
+    // that drifts from the engine offers rules it will then refuse.
+    let (strategies, set_strategies) = signal(Vec::<StrategyView>::new());
+    let (chosen, set_chosen) = signal(String::new());
 
     // Refetched after every run, so a finding appears in the history the
     // moment it is recorded rather than only after a restart.
@@ -652,16 +666,42 @@ fn ResearchView(
             Err(reason) => set_error.set(Some(reason)),
         }
     });
+    spawn_local(async move {
+        if let Ok(found) =
+            call_typed::<Vec<StrategyView>>("list_strategies", JsValue::UNDEFINED).await
+        {
+            if let Some(first) = found.first() {
+                set_chosen.set(first.name.clone());
+            }
+            set_strategies.set(found);
+        }
+    });
     refresh_history();
 
     let run = move |instrument: String| {
-        set_running.set(Some(format!("Running study on {instrument}: 11 backtests")));
+        let strategy = chosen.get_untracked();
+        // The engine's own count for this rule, not a constant: the grids
+        // differ per strategy, and a spinner promising 11 backtests during a
+        // 5-backtest run is worse than one that says nothing.
+        let (label, backtests) = strategies.with_untracked(|found| {
+            found
+                .iter()
+                .find(|plan| plan.name == strategy)
+                .map_or_else(
+                    || (strategy.clone(), 11),
+                    |plan| (plan.label.clone(), plan.backtests),
+                )
+        });
+        set_running.set(Some(format!(
+            "Running {label} on {instrument}: {backtests} backtests"
+        )));
         set_error.set(None);
         // No clearing of previous results: open tabs stay open, which is the
         // point of having them.
         spawn_local(async move {
             let args = serde_wasm_bindgen::to_value(&serde_json::json!({
                 "instrument": instrument,
+                "strategy": strategy,
             }))
             .unwrap_or(JsValue::UNDEFINED);
             match call_typed::<StudyView>("run_study", args).await {
@@ -713,6 +753,49 @@ fn ResearchView(
     view! {
         <div class="sidebar-view">
             <h3>"Research"</h3>
+
+            // Which rule an instrument is tested against, chosen before it is
+            // clicked. The premise line matters as much as the name: these are
+            // four different claims about how prices behave, and a menu of
+            // bare names invites picking one because it sounds impressive.
+            <label class="research-strategy">
+                <span>"Strategy"</span>
+                <select
+                    prop:value=move || chosen.get()
+                    disabled=move || running.get().is_some()
+                    on:change:target=move |ev| set_chosen.set(ev.target().value())
+                >
+                    {move || {
+                        strategies
+                            .get()
+                            .into_iter()
+                            .map(|plan| {
+                                view! {
+                                    <option value=plan.name.clone()>
+                                        {plan.label.clone()}
+                                    </option>
+                                }
+                            })
+                            .collect_view()
+                    }}
+                </select>
+            </label>
+            {move || {
+                strategies
+                    .get()
+                    .into_iter()
+                    .find(|plan| plan.name == chosen.get())
+                    .map(|plan| {
+                        view! {
+                            <p class="research-hint">
+                                {plan.premise.clone()}
+                                " Runs on "
+                                <strong>{plan.interval.clone()}</strong>
+                                " bars."
+                            </p>
+                        }
+                    })
+            }}
 
             // The panel is the run that can actually conclude something: one
             // instrument yields a dozen round trips against a thirty-trade

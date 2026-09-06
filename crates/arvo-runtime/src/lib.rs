@@ -179,6 +179,7 @@ pub fn run() {
             commands::refresh_plugins,
             research::list_instruments,
             research::run_study,
+            research::list_strategies,
             research::run_panel,
             research::list_history,
             research::open_record,

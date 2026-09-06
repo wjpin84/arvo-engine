@@ -174,6 +174,24 @@ impl<P: BarProvider> SimulationProvider for NautilusSimulation<P> {
     }
 }
 
+/// Whether the engine could run this strategy at this resolution.
+///
+/// The same validation `run` does, without the backtest. It exists so a caller
+/// offering a menu of strategies can assert that everything on it is runnable
+/// — a parameter the rule needs and nobody supplied, or a session-anchored
+/// rule pointed at daily bars, is otherwise a failure the user meets after
+/// choosing and waiting.
+///
+/// # Errors
+///
+/// Returns the same reason `run` would have given.
+pub fn check_plan(
+    spec: &StrategySpec,
+    interval: arvo_data::BarInterval,
+) -> Result<(), SimulationError> {
+    Plan::from_spec(spec, interval).map(|_| ())
+}
+
 /// A strategy request, parsed out of the untyped spec and validated before
 /// anything expensive starts.
 enum Plan {

@@ -43,7 +43,137 @@ const COMMISSION_BPS: f64 = 1.0;
 /// merely recorded. See `arvo_nautilus`'s fill model for how it is charged.
 const SLIPPAGE_BPS: f64 = 1.0;
 const TRADE_SIZE: f64 = 100.0;
+
+/// What the workbench offers, and what each one searches over.
+///
+/// The grid is part of the claim, not a convenience. Its size is deflated
+/// against — the more configurations a study tries, the better the best of
+/// them looks by luck alone — so every axis added here makes the verdict
+/// harder to earn. They are deliberately small for that reason, and small
+/// enough that a study can still reach a conclusion: an early version of the
+/// crossover grid ran out to a 200-day average, which crosses about ten times
+/// in twenty years and made every possible verdict `Inconclusive` before the
+/// return check was reached. A bar nothing can clear is not conservative, it
+/// is inert.
+pub struct StrategyPlan {
+    name: &'static str,
+    /// What to call it in a menu.
+    label: &'static str,
+    /// One line on what it trades, because a name is not a description and
+    /// the difference between these rules is the whole point of having them.
+    premise: &'static str,
+    /// Parameters every trial shares.
+    fixed: &'static [(&'static str, f64)],
+    /// What the search varies.
+    axes: &'static [(&'static str, &'static [f64])],
+    /// The resolution this rule is defined at.
+    ///
+    /// Two of them are anchored to a trading session and mean nothing on
+    /// daily bars — the engine refuses that combination rather than running
+    /// it, so the choice belongs here where the data can be checked for it.
+    intraday: bool,
+}
+
+const PLANS: &[StrategyPlan] = &[
+    StrategyPlan {
+        name: "sma_cross",
+        label: "Moving-average crossover",
+        premise: "The control. Not a good idea, a rule nobody disputes.",
+        fixed: &[("trade_size", TRADE_SIZE)],
+        axes: &[
+            ("fast", &[5.0, 10.0, 20.0]),
+            ("slow", &[30.0, 60.0, 120.0]),
+        ],
+        intraday: false,
+    },
+    StrategyPlan {
+        name: "volatility_breakout",
+        label: "Volatility breakout",
+        premise: "A thrust measured in ATRs, so it means the same on any price.",
+        fixed: &[("trade_size", TRADE_SIZE)],
+        axes: &[
+            ("entry_atr_multiple", &[0.5, 1.0, 1.5]),
+            ("atr_period", &[10.0, 20.0]),
+        ],
+        intraday: false,
+    },
+    StrategyPlan {
+        name: "momentum_breakout",
+        label: "Momentum breakout",
+        premise: "Buy a new channel high, leave on a trailing channel low.",
+        fixed: &[("trade_size", TRADE_SIZE)],
+        axes: &[
+            ("entry_period", &[20.0, 55.0, 100.0]),
+            ("exit_period", &[10.0, 20.0]),
+        ],
+        intraday: false,
+    },
+    StrategyPlan {
+        name: "opening_range",
+        label: "Opening range breakout",
+        premise: "The session's first bars set a range; trade the break, once a day.",
+        fixed: &[("trade_size", TRADE_SIZE)],
+        axes: &[
+            ("range_bars", &[3.0, 6.0, 12.0]),
+            ("target_range_multiple", &[1.0, 2.0]),
+        ],
+        intraday: true,
+    },
+    StrategyPlan {
+        name: "vwap_reversion",
+        label: "VWAP reversion",
+        premise: "Stretch away from the session's average price is expected to close.",
+        fixed: &[("trade_size", TRADE_SIZE)],
+        axes: &[("entry_deviations", &[1.0, 1.5, 2.0])],
+        intraday: true,
+    },
+];
+
+/// The resolution intraday studies run at.
+///
+/// Five minutes because that is what the data library holds and what the
+/// Robinhood feed serves without special pleading. Not a parameter: changing
+/// it changes what every session-anchored rule means, so it belongs in the
+/// experiment record rather than in a UI field.
+const INTRADAY: arvo_data::BarInterval =
+    arvo_data::BarInterval::new(5, arvo_data::IntervalUnit::Minute);
+
+/// The default when nobody has chosen: the control.
 const STRATEGY: &str = "sma_cross";
+
+impl StrategyPlan {
+    /// Looks a strategy up by the name the record stores.
+    #[must_use]
+    pub fn find(name: &str) -> Option<&'static Self> {
+        PLANS.iter().find(|plan| plan.name == name)
+    }
+
+    fn interval(&self) -> arvo_data::BarInterval {
+        if self.intraday {
+            INTRADAY
+        } else {
+            arvo_data::BarInterval::DAILY
+        }
+    }
+
+    fn grid(&self) -> ParameterGrid {
+        self.axes.iter().fold(ParameterGrid::new(), |grid, (name, values)| {
+            grid.axis(name, values.to_vec())
+        })
+    }
+
+    /// How many backtests a study of this plan runs, so a progress message can
+    /// say something truer than "working".
+    fn backtests(&self) -> usize {
+        // Every configuration in-sample, then the winner and its benchmark
+        // out-of-sample.
+        self.axes
+            .iter()
+            .map(|(_, values)| values.len())
+            .product::<usize>()
+            + 2
+    }
+}
 
 /// Risk settings for a workbench study, from the middle of the range the
 /// systematic-trading literature actually uses: a 2x ATR stop and 1% of
@@ -437,26 +567,42 @@ pub async fn list_instruments(
 #[tauri::command]
 pub async fn run_study(
     instrument: String,
+    strategy: Option<String>,
     service: tauri::State<'_, ResearchService>,
 ) -> Result<StudyView, CommandError> {
+    let name = strategy.unwrap_or_else(|| STRATEGY.to_owned());
+    let plan = StrategyPlan::find(&name)
+        .ok_or_else(|| CommandError::Failed(format!("no strategy called {name:?}")))?;
+    let interval = plan.interval();
+
     let simulation = service.simulation.clone();
+    // The resolution the *strategy* needs, not whatever the library happens to
+    // hold. Saying which resolution is missing is the difference between a
+    // usable message and "holds no bars" on an instrument the sidebar just
+    // listed.
+    let missing = || {
+        CommandError::Failed(format!(
+            "{instrument} holds no {interval} bars; {} is defined at that resolution",
+            plan.label
+        ))
+    };
     let coverage = service
         .bars
-        .coverage(&instrument, arvo_data::BarInterval::DAILY)
+        .coverage(&instrument, interval)
         .map_err(|err| CommandError::Failed(format!("reading {instrument}: {err}")))?
-        .ok_or_else(|| CommandError::Failed(format!("{instrument} holds no bars")))?;
+        .ok_or_else(missing)?;
 
     let engine = simulation.engine().to_owned();
     let fingerprint = service
         .bars
-        .fingerprint(&instrument, arvo_data::BarInterval::DAILY)
+        .fingerprint(&instrument, interval)
         .map_err(|err| CommandError::Failed(format!("hashing {instrument}: {err}")))?
-        .ok_or_else(|| CommandError::Failed(format!("{instrument} holds no bars")))?;
+        .ok_or_else(missing)?;
 
     tauri::async_runtime::spawn_blocking(move || {
         let window = DateRange::new(coverage.0, coverage.1)
             .map_err(|err| CommandError::Failed(err.to_string()))?;
-        let family = study_for(&instrument, window, &fingerprint);
+        let family = study_for(&instrument, plan, window, &fingerprint);
 
         let found = arvo_research::run_family(
             simulation.as_ref(),
@@ -573,6 +719,41 @@ pub struct PanelView {
     pub commission_bps: f64,
     pub slippage_bps: f64,
     pub engine: String,
+}
+
+/// A strategy the workbench can run.
+#[derive(Serialize)]
+pub struct StrategyView {
+    pub name: String,
+    pub label: String,
+    pub premise: String,
+    /// Spelled out rather than a boolean, because it is the reason a study
+    /// may refuse an instrument the sidebar just listed.
+    pub interval: String,
+    /// Backtests one study will run. A spinner that says how much work is
+    /// coming is the difference between waiting and suspecting a hang.
+    pub backtests: usize,
+}
+
+/// What can be run, so the UI offers the engine's actual list rather than a
+/// copy of it that drifts.
+///
+/// # Errors
+///
+/// Never. Fallible only to match the shape every other command has.
+#[tauri::command]
+#[allow(clippy::unnecessary_wraps, reason = "uniform command signature")]
+pub fn list_strategies() -> Result<Vec<StrategyView>, CommandError> {
+    Ok(PLANS
+        .iter()
+        .map(|plan| StrategyView {
+            name: plan.name.to_owned(),
+            label: plan.label.to_owned(),
+            premise: plan.premise.to_owned(),
+            interval: plan.interval().to_string(),
+            backtests: plan.backtests(),
+        })
+        .collect())
 }
 
 /// Runs one configuration across every instrument that has data.
@@ -735,36 +916,26 @@ pub fn panel_for(
     window: DateRange,
     dataset_version: &str,
 ) -> arvo_research::PanelStudy {
-    let template = template_for("panel", window, dataset_version);
-    arvo_research::PanelStudy::new(template, instruments, grid())
+    let plan = StrategyPlan::find(STRATEGY).expect("the default strategy is in PLANS");
+    let template = template_for("panel", plan, window, dataset_version);
+    arvo_research::PanelStudy::new(template, instruments, plan.grid())
 }
 
-/// The grid both the single-instrument study and the panel sweep.
-///
-/// One definition, because the trial count is deflated against and two
-/// definitions that drifted apart would make one of the two verdicts a lie.
-fn grid() -> ParameterGrid {
-    // Sized so the study can actually reach a conclusion. The first version of
-    // this grid ran out to a 200-day average, which crosses roughly ten times
-    // in twenty years of held-back data — against a 30-trade minimum, that
-    // made every possible verdict Inconclusive before the return and drawdown
-    // checks were even reached. A bar that nothing can clear is not
-    // conservative, it is inert.
-    ParameterGrid::new()
-        .axis("fast", vec![5.0, 10.0, 20.0])
-        .axis("slow", vec![30.0, 60.0, 120.0])
-}
-
-fn template_for(subject: &str, window: DateRange, dataset_version: &str) -> Experiment {
+fn template_for(
+    subject: &str,
+    plan: &StrategyPlan,
+    window: DateRange,
+    dataset_version: &str,
+) -> Experiment {
     Experiment {
         id: ExperimentId(format!("study-{subject}")),
         hypothesis: HypothesisId(format!("trend-following predicts returns in {subject}")),
         instrument: subject.to_owned(),
         window,
-        // Daily for the workbench study. Intraday is now expressible
-        // end-to-end; what it still needs is intraday bars in the data
-        // library, which is a fetching problem rather than a modelling one.
-        interval: arvo_data::BarInterval::DAILY,
+        // From the strategy, not fixed. An opening range on daily bars is not
+        // a slower opening range, it is a different rule — and the engine
+        // refuses the combination rather than producing a curve for it.
+        interval: plan.interval(),
         dataset: DatasetRef {
             id: subject.to_owned(),
             // A content hash of the bars, so a stored result knows exactly
@@ -774,9 +945,11 @@ fn template_for(subject: &str, window: DateRange, dataset_version: &str) -> Expe
             version: dataset_version.to_owned(),
         },
         strategy: StrategySpec {
-            name: STRATEGY.to_owned(),
-            params: [("trade_size".to_owned(), TRADE_SIZE)]
-                .into_iter()
+            name: plan.name.to_owned(),
+            params: plan
+                .fixed
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), *value))
                 .collect(),
         },
         costs: CostModel::proportional(COMMISSION_BPS, SLIPPAGE_BPS),
@@ -801,8 +974,16 @@ fn template_for(subject: &str, window: DateRange, dataset_version: &str) -> Expe
 /// The grid is fixed at nine configurations. That number is itself part of the
 /// claim — [`arvo_research::run_family`] deflates the result by it — so it is
 /// written here in the open rather than tuned per run.
-pub fn study_for(instrument: &str, window: DateRange, dataset_version: &str) -> ExperimentFamily {
-    ExperimentFamily::new(template_for(instrument, window, dataset_version), grid())
+pub fn study_for(
+    instrument: &str,
+    plan: &StrategyPlan,
+    window: DateRange,
+    dataset_version: &str,
+) -> ExperimentFamily {
+    ExperimentFamily::new(
+        template_for(instrument, plan, window, dataset_version),
+        plan.grid(),
+    )
 }
 
 #[cfg(test)]
@@ -810,19 +991,64 @@ mod tests {
     use super::*;
     use chrono::NaiveDate;
 
-    #[test]
-    fn the_study_grid_is_nine_configurations_and_says_so() {
-        let window = DateRange::new(
+    fn window() -> DateRange {
+        DateRange::new(
             NaiveDate::from_ymd_opt(2020, 1, 1).expect("valid"),
             NaiveDate::from_ymd_opt(2024, 1, 1).expect("valid"),
         )
-        .expect("ordered");
+        .expect("ordered")
+    }
 
-        let family = study_for("AAPL.NASDAQ", window, "test-fingerprint");
+    #[test]
+    fn every_offered_strategy_can_be_planned_by_the_engine() {
+        // `PLANS` is what the sidebar menu shows. A plan the engine rejects —
+        // a missing parameter, a period pair the rule refuses — is a failure
+        // the user only discovers after choosing it and waiting.
+        for plan in PLANS {
+            let family = study_for("AAPL.NASDAQ", plan, window(), "test-fingerprint");
+            for combination in family.grid.combinations() {
+                let mut spec = family.template.strategy.clone();
+                spec.params.extend(combination);
+                assert!(
+                    arvo_nautilus::check_plan(&spec, family.template.interval).is_ok(),
+                    "{} cannot be planned: {:?}",
+                    plan.name,
+                    spec.params
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_session_anchored_strategy_asks_for_intraday_bars() {
+        // The reason the interval lives on the plan: an opening range on daily
+        // bars is a different rule, and the engine refuses it. Getting this
+        // wrong means the study fails at the last moment instead of asking
+        // for the right data.
+        for plan in PLANS {
+            let family = study_for("AAPL.NASDAQ", plan, window(), "test-fingerprint");
+            assert_eq!(
+                family.template.interval.is_intraday(),
+                plan.intraday,
+                "{} asked for the wrong resolution",
+                plan.name
+            );
+        }
+    }
+
+    #[test]
+    fn the_study_grid_is_nine_configurations_and_says_so() {
+        let plan = StrategyPlan::find(STRATEGY).expect("the default is offered");
+        let family = study_for("AAPL.NASDAQ", plan, window(), "test-fingerprint");
         assert_eq!(
             family.grid.size(),
             9,
             "the trial count is deflated against, so it must be what it claims"
+        );
+        assert_eq!(
+            plan.backtests(),
+            11,
+            "the spinner promises this many, so it has to be what runs"
         );
         assert_eq!(family.template.strategy.name, STRATEGY);
         assert_eq!(

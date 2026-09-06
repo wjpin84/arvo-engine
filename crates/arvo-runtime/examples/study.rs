@@ -1,6 +1,6 @@
 //! Runs a study from the command line, without launching the window.
 //!
-//!     cargo run -p arvo-runtime --example study -- <data-dir> [instrument...]
+//!     cargo run -p arvo-runtime --example study -- <data-dir> [--strategy NAME] [instrument...]
 //!
 //! Exists because the research path and the GUI fail in completely different
 //! ways, and only one of them can be checked in a terminal. This runs exactly
@@ -16,10 +16,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let root = args
         .next()
-        .ok_or("usage: study <data-dir> [instrument...]")?;
+        .ok_or("usage: study <data-dir> [--strategy NAME] [instrument...]")?;
 
     let bars = CsvBars::new(&root);
-    let requested: Vec<String> = args.collect();
+    // `--strategy NAME` anywhere in the tail; everything else is an
+    // instrument. Enough argument parsing for an example, and no more.
+    let mut requested: Vec<String> = args.collect();
+    let mut strategy = "sma_cross".to_owned();
+    if let Some(flag) = requested.iter().position(|arg| arg == "--strategy") {
+        strategy = requested
+            .get(flag + 1)
+            .ok_or("--strategy needs a name")?
+            .clone();
+        requested.drain(flag..=flag + 1);
+    }
+    let strategy = strategy.as_str();
     let instruments = if requested.is_empty() {
         bars.instruments()?
     } else {
@@ -49,7 +60,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .fingerprint(&instrument, arvo_data::BarInterval::DAILY)?
             .ok_or("instrument holds no bars")?;
         println!("  dataset {}", &fingerprint[..16]);
-        let family = arvo_runtime_lib::research::study_for(&instrument, window, &fingerprint);
+        let plan = arvo_runtime_lib::research::StrategyPlan::find(strategy)
+            .ok_or_else(|| format!("no strategy called {strategy:?}"))?;
+        let family =
+            arvo_runtime_lib::research::study_for(&instrument, plan, window, &fingerprint);
         match arvo_research::run_family(&simulation, &family, &criteria) {
             Err(err) => println!("  FAILED: {err}"),
             Ok(found) => {
