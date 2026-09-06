@@ -11,6 +11,7 @@ use leptos::prelude::*;
 use crate::chart::{EquityChart, MetricCard, PriceChart, UnderwaterChart};
 use crate::format::{percent, ratio, short_hash, verdict_class};
 use crate::research::study::TradeDetail;
+use crate::trades::TradesTable;
 use crate::views::*;
 
 /// A rolling re-selection: what the procedure did, fold by fold.
@@ -169,6 +170,10 @@ pub(crate) fn WalkForwardReport(walk: WalkForwardView) -> impl IntoView {
 
             <h4>"The trades behind it"</h4>
             <TradeDetail trades=walk.trades_detail.clone() />
+            <TradesTable
+                rows=walk.trades.clone()
+                name=format!("{}-walk-forward", walk.instrument)
+            />
 
             <h4>"How this was arrived at"</h4>
             <dl class="research-provenance">

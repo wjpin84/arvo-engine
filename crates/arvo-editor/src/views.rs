@@ -88,6 +88,7 @@ pub(crate) struct StudyView {
     pub(crate) price: Vec<CandlePoint>,
     pub(crate) markers: Vec<TradeMarkerView>,
     pub(crate) underwater: Vec<CurvePoint>,
+    pub(crate) trades: Vec<TradeRowView>,
     pub(crate) monthly: Vec<MonthlyReturnView>,
     pub(crate) trades_detail: TradesView,
     pub(crate) recommendations: Vec<RecommendationView>,
@@ -138,6 +139,7 @@ pub(crate) struct WalkForwardView {
     pub(crate) price: Vec<CandlePoint>,
     pub(crate) markers: Vec<TradeMarkerView>,
     pub(crate) underwater: Vec<CurvePoint>,
+    pub(crate) trades: Vec<TradeRowView>,
     pub(crate) trades_detail: TradesView,
     pub(crate) in_sample_days: i64,
     pub(crate) step_days: i64,
@@ -195,6 +197,25 @@ pub(crate) struct TradesView {
     pub(crate) fees_fraction: f64,
     pub(crate) signal_exits: u32,
     pub(crate) stop_exits: u32,
+}
+
+/// One round trip, as a table row.
+///
+/// `Serialize` as well as `Deserialize`: the export sends back exactly the
+/// rows on screen, in the order the reader sorted them. An export that
+/// silently differed from the table above it would be worse than none.
+#[derive(Clone, Deserialize, serde::Serialize)]
+pub(crate) struct TradeRowView {
+    pub(crate) opened: String,
+    pub(crate) closed: String,
+    pub(crate) direction: String,
+    pub(crate) quantity: f64,
+    pub(crate) entry: f64,
+    pub(crate) exit: Option<f64>,
+    pub(crate) pnl: f64,
+    pub(crate) commission: f64,
+    pub(crate) held_days: Option<f64>,
+    pub(crate) exit_reason: String,
 }
 
 /// One configuration's cell on the search surface.

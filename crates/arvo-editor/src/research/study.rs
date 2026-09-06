@@ -11,6 +11,7 @@ use crate::chart::{
     EquityChart, MetricCard, MonthlyReturns, ParameterSurface, PriceChart, UnderwaterChart,
 };
 use crate::format::{percent, ratio, short_hash, verdict_class};
+use crate::trades::TradesTable;
 use crate::views::*;
 
 /// Month-by-month returns as a grid of years against months.
@@ -269,6 +270,7 @@ pub(crate) fn StudyReport(study: StudyView) -> impl IntoView {
 
             <h4>"The trades behind it"</h4>
             <TradeDetail trades=study.trades_detail.clone() />
+            <TradesTable rows=study.trades.clone() name=study.instrument.clone() />
 
             <h4>"How this was arrived at"</h4>
             <dl class="research-provenance">

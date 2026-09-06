@@ -5,6 +5,7 @@ mod portfolio;
 mod research;
 mod format;
 mod theme;
+mod trades;
 mod views;
 
 use app::*;

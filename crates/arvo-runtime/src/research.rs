@@ -525,6 +525,8 @@ pub struct StudyView {
     pub markers: Vec<TradeMarkerView>,
     /// Depth below the running peak, as a percentage.
     pub underwater: Vec<CurvePoint>,
+    /// Every round trip, so nobody has to take the summary on trust.
+    pub trades: Vec<TradeRowView>,
     /// Month-by-month, so a total return can be read as steady or as one
     /// lucky quarter. Derived from the same curve, not a second measurement.
     pub monthly: Vec<MonthlyReturnView>,
@@ -596,6 +598,7 @@ pub struct WalkForwardView {
     pub price: Vec<CandlePoint>,
     pub markers: Vec<TradeMarkerView>,
     pub underwater: Vec<CurvePoint>,
+    pub trades: Vec<TradeRowView>,
     pub trades_detail: TradesView,
     pub recommendations: Vec<RecommendationView>,
 
@@ -608,6 +611,35 @@ pub struct WalkForwardView {
     pub commission_bps: f64,
     pub slippage_bps: f64,
     pub engine: String,
+}
+
+/// One round trip, as a table row.
+///
+/// Every field the ledger holds, because the point of a table is that nobody
+/// has to decide in advance which column someone will want to sort by. The
+/// aggregate statistics above it answer "how did it do"; this answers "what
+/// did it actually do", and those are different questions with different
+/// failure modes — an expectancy of +£300 built from one +£9,000 trade and
+/// nineteen losses is a fact only the rows show.
+#[derive(Serialize)]
+pub struct TradeRowView {
+    pub opened: String,
+    /// Empty while the position is still open at the end of the run.
+    pub closed: String,
+    pub direction: String,
+    pub quantity: f64,
+    pub entry: f64,
+    /// `None` while still open, so the table shows a gap rather than a price
+    /// nobody traded at.
+    pub exit: Option<f64>,
+    pub pnl: f64,
+    pub commission: f64,
+    /// Days held. Fractional, because an intraday trade held forty minutes is
+    /// not "0 days" — it is 0.03, and rounding it away would make every
+    /// intraday ledger look like a column of zeroes.
+    pub held_days: Option<f64>,
+    /// `signal`, `stop`, or `open`.
+    pub exit_reason: String,
 }
 
 /// One configuration's cell on the search surface.
@@ -1202,6 +1234,124 @@ pub async fn run_walk_forward(
     .and_then(|outcome| outcome.and_then(|outcome| remember(&service, outcome)))
 }
 
+/// Where exports are written.
+pub const EXPORTS_SUBDIR: &str = "exports";
+
+/// Writes a ledger to CSV and reveals it in the file manager.
+///
+/// A fixed directory beside the evidence rather than a save dialog: a dialog
+/// needs another Tauri plugin and another capability, and the thing anyone
+/// actually wants is the file, in a place they can find twice. Revealing it
+/// with the opener already in the app is the whole of the "where did it go"
+/// problem.
+///
+/// Quoting is real, not assumed away. A ledger holds timestamps and numbers
+/// today, and the moment a strategy name or a note reaches a cell, an
+/// unquoted writer silently shifts every column after it — the same failure
+/// that ate a fund name in the portfolio importer.
+///
+/// # Errors
+///
+/// Returns [`CommandError::Failed`] if the directory cannot be created, the
+/// file cannot be written, or the file manager cannot be opened.
+#[tauri::command]
+pub fn export_trades(
+    name: String,
+    rows: Vec<TradeRowExport>,
+    app: tauri::AppHandle,
+    service: tauri::State<'_, ResearchService>,
+) -> Result<String, CommandError> {
+    use tauri_plugin_opener::OpenerExt as _;
+
+    let directory = service.data_dir.parent().map_or_else(
+        || service.data_dir.join(EXPORTS_SUBDIR),
+        |root| root.join(EXPORTS_SUBDIR),
+    );
+    std::fs::create_dir_all(&directory)
+        .map_err(|err| CommandError::Failed(format!("creating {}: {err}", directory.display())))?;
+
+    // Slugged, because the name comes from an instrument id and a path
+    // separator in it would write somewhere nobody asked for.
+    let slug: String = name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let path = directory.join(format!("{slug}-trades.csv"));
+
+    let out = trades_csv(&rows);
+
+    std::fs::write(&path, out)
+        .map_err(|err| CommandError::Failed(format!("writing {}: {err}", path.display())))?;
+
+    // Reveal rather than open: a CSV opened in whatever owns the extension is
+    // a spreadsheet nobody asked to launch.
+    app.opener()
+        .reveal_item_in_dir(&path)
+        .map_err(|err| CommandError::Failed(format!("showing {}: {err}", path.display())))?;
+    Ok(path.display().to_string())
+}
+
+/// A ledger as CSV.
+///
+/// Quoting is real, not assumed away. The rows hold timestamps and numbers
+/// today, and the moment a strategy name or a note reaches a cell an unquoted
+/// writer silently shifts every column after it — the same failure that ate a
+/// fund name in the portfolio importer, found only because a file that should
+/// have held forty holdings held none.
+fn trades_csv(rows: &[TradeRowExport]) -> String {
+    let cell = |text: &str| {
+        if text.contains([',', '"', '\n', '\r']) {
+            format!("\"{}\"", text.replace('"', "\"\""))
+        } else {
+            text.to_owned()
+        }
+    };
+    // An absent number is an empty cell, not a zero: a still-open position has
+    // no exit price, and writing 0 there would read as a trade closed at zero.
+    let number = |value: Option<f64>| value.map(|v| format!("{v}")).unwrap_or_default();
+
+    let mut out = String::with_capacity(rows.len() * 96 + 128);
+    out.push_str(
+        "opened,closed,direction,quantity,entry,exit,pnl,commission,held_days,exit_reason\n",
+    );
+    for row in rows {
+        out.push_str(&format!(
+            "{},{},{},{},{},{},{},{},{},{}\n",
+            cell(&row.opened),
+            cell(&row.closed),
+            cell(&row.direction),
+            row.quantity,
+            row.entry,
+            number(row.exit),
+            row.pnl,
+            row.commission,
+            number(row.held_days),
+            cell(&row.exit_reason),
+        ));
+    }
+    out
+}
+
+/// A row as it comes back from the view.
+///
+/// Deserialized rather than re-derived from the stored finding: the table
+/// exports what is on screen, including whatever sort the reader applied. An
+/// export that silently differed from the table above it would be worse than
+/// none.
+#[derive(serde::Deserialize)]
+pub struct TradeRowExport {
+    pub opened: String,
+    pub closed: String,
+    pub direction: String,
+    pub quantity: f64,
+    pub entry: f64,
+    pub exit: Option<f64>,
+    pub pnl: f64,
+    pub commission: f64,
+    pub held_days: Option<f64>,
+    pub exit_reason: String,
+}
+
 /// Runs one configuration across every instrument that has data.
 ///
 /// This is the study that can actually reach a verdict: a single instrument
@@ -1243,6 +1393,39 @@ pub async fn run_panel(
 /// identically to one just produced. Two projections would drift, and a
 /// history that showed something subtly different from the live run would be
 /// worse than no history.
+/// The ledger as table rows.
+fn trade_rows(ledger: &[arvo_research::Trade]) -> Vec<TradeRowView> {
+    ledger
+        .iter()
+        .map(|trade| TradeRowView {
+            opened: trade.opened.format("%Y-%m-%d %H:%M").to_string(),
+            closed: trade
+                .closed
+                .map(|at| at.format("%Y-%m-%d %H:%M").to_string())
+                .unwrap_or_default(),
+            direction: match trade.direction {
+                arvo_research::Direction::Long => "long",
+                arvo_research::Direction::Short => "short",
+            }
+            .to_owned(),
+            quantity: trade.quantity,
+            entry: trade.entry,
+            exit: trade.exit,
+            pnl: trade.pnl,
+            commission: trade.commission,
+            held_days: trade
+                .holding_period()
+                .map(|held| held.num_seconds() as f64 / 86_400.0),
+            exit_reason: match trade.exit_reason {
+                arvo_research::ExitReason::Signal => "signal",
+                arvo_research::ExitReason::Stop => "stop",
+                arvo_research::ExitReason::StillOpen => "open",
+            }
+            .to_owned(),
+        })
+        .collect()
+}
+
 /// Turns the search surface into something drawable.
 ///
 /// `None` when the grid varies fewer than two parameters — a surface needs two
@@ -1380,6 +1563,7 @@ pub fn study_view(
             &found.out_of_sample,
         ),
         markers: markers(&evaluation.strategy_ledger, found.selected.interval),
+        trades: trade_rows(&evaluation.strategy_ledger),
         underwater: underwater(&evaluation.strategy_curve),
         monthly: arvo_research::evaluation::monthly_returns(&evaluation.strategy_curve)
             .into_iter()
@@ -1503,6 +1687,19 @@ pub fn walk_forward_view(
             template.interval,
         ),
         underwater: underwater(&found.combined_curve),
+        trades: trade_rows(
+            &found
+                .folds
+                .iter()
+                .flat_map(|fold| {
+                    fold.out_of_sample_evidence
+                        .evaluation
+                        .strategy_ledger
+                        .iter()
+                        .cloned()
+                })
+                .collect::<Vec<_>>(),
+        ),
         trades_detail: TradesView::build(&found.combined_trades, template.starting_cash),
         // Recommendations are keyed to a single study's evidence shape. A
         // walk-forward's own diagnostics live in `reasons` above — the
@@ -1695,6 +1892,82 @@ pub fn study_for(
         template_for(instrument, plan, window, dataset_version),
         plan.grid(),
     )
+}
+
+#[cfg(test)]
+mod csv_tests {
+    use super::*;
+
+    fn row(reason: &str) -> TradeRowExport {
+        TradeRowExport {
+            opened: "2024-01-02 00:00".to_owned(),
+            closed: "2024-01-05 00:00".to_owned(),
+            direction: "long".to_owned(),
+            quantity: 100.0,
+            entry: 10.5,
+            exit: Some(11.25),
+            pnl: 74.0,
+            commission: 1.0,
+            held_days: Some(3.0),
+            exit_reason: reason.to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_header_and_one_line_per_row() {
+        let text = trades_csv(&[row("signal"), row("stop")]);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].starts_with("opened,closed,direction"));
+        assert_eq!(lines[0].split(',').count(), 10);
+        assert_eq!(lines[1].split(',').count(), 10);
+    }
+
+    #[test]
+    fn a_comma_in_a_cell_does_not_shift_every_column_after_it() {
+        // The failure this quoting exists for, and one this codebase has
+        // already met: a naive comma split ate a quoted fund name in the
+        // portfolio importer and silently produced an empty file.
+        let text = trades_csv(&[row("stopped, then re-entered")]);
+        let line = text.lines().nth(1).expect("one row");
+        assert!(
+            line.contains("\"stopped, then re-entered\""),
+            "the cell must be quoted: {line}"
+        );
+    }
+
+    #[test]
+    fn a_quote_in_a_cell_is_doubled_rather_than_ending_the_field() {
+        let mut awkward = row("signal");
+        awkward.direction = "he said \"long\"".to_owned();
+        let line = trades_csv(&[awkward]).lines().nth(1).expect("one row").to_owned();
+        assert!(line.contains("\"he said \"\"long\"\"\""), "{line}");
+    }
+
+    #[test]
+    fn an_open_position_writes_an_empty_cell_not_a_zero() {
+        // A zero exit price reads as a trade closed at nothing, which is a
+        // real-looking number for something that did not happen.
+        let mut open = row("open");
+        open.closed = String::new();
+        open.exit = None;
+        open.held_days = None;
+
+        let line = trades_csv(&[open]).lines().nth(1).expect("one row").to_owned();
+        let cells: Vec<&str> = line.split(',').collect();
+        assert_eq!(cells[1], "", "no close time");
+        assert_eq!(cells[5], "", "no exit price");
+        assert_eq!(cells[8], "", "no holding period");
+    }
+
+    #[test]
+    fn an_empty_ledger_is_a_header_and_nothing_else() {
+        // Not an empty file: a spreadsheet opening a zero-byte CSV shows an
+        // error, and the honest thing to say is "these are the columns, there
+        // were no trades".
+        let text = trades_csv(&[]);
+        assert_eq!(text.lines().count(), 1);
+    }
 }
 
 #[cfg(test)]
