@@ -1,4 +1,11 @@
 mod app;
+mod bridge;
+mod chart;
+mod portfolio;
+mod research;
+mod format;
+mod theme;
+mod views;
 
 use app::*;
 use leptos::prelude::*;
