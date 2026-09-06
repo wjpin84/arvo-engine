@@ -112,6 +112,17 @@ pub struct PanelEvidence {
     pub selection: Selection,
     pub per_instrument: Vec<InstrumentOutcome>,
     pub pooled: PooledOutcome,
+    /// How much of the panel's apparent breadth is real.
+    ///
+    /// The pooled statistics read as evidence in proportion to the number of
+    /// instruments — three that agree feel like three times the confidence of
+    /// one. They are not, if the three moved together, and until this was
+    /// measured nothing in the panel could tell the difference.
+    ///
+    /// `default` because it is a persisted format: a panel recorded before
+    /// this existed loads as one that does not know its own breadth.
+    #[serde(default)]
+    pub breadth: Option<crate::Breadth>,
     /// Instrument/configuration combinations that could not be run.
     pub failures: Vec<String>,
     pub verdict: Verdict,
@@ -229,6 +240,10 @@ pub fn run_panel(
 
     // --- Judgement: that one configuration, on data it never saw -----------
     let mut per_instrument = Vec::new();
+    // Kept only long enough to measure how much the members moved together.
+    // Storing N curves in a panel record would add megabytes to say something
+    // the correlation matrix says in a few numbers.
+    let mut curves: Vec<(String, Vec<crate::EquityPoint>)> = Vec::new();
     for instrument in &study.instruments {
         let experiment = variant(
             &study.template,
@@ -246,12 +261,15 @@ pub fn run_panel(
                 Metrics::from_curve(&result.equity_curve, result.trades, periods)
             };
             match (metrics(&strategy_result), metrics(&benchmark_result)) {
-                (Some(strategy), Some(benchmark)) => Ok(InstrumentOutcome {
-                    instrument: instrument.clone(),
-                    excess_return: strategy.total_return - benchmark.total_return,
-                    strategy,
-                    benchmark,
-                }),
+                (Some(strategy), Some(benchmark)) => Ok((
+                    InstrumentOutcome {
+                        instrument: instrument.clone(),
+                        excess_return: strategy.total_return - benchmark.total_return,
+                        strategy,
+                        benchmark,
+                    },
+                    strategy_result.equity_curve,
+                )),
                 _ => Err(SimulationError::Rejected(
                     "out-of-sample run produced too few equity points to evaluate".to_owned(),
                 )),
@@ -259,7 +277,10 @@ pub fn run_panel(
         });
 
         match outcome {
-            Ok(outcome) => per_instrument.push(outcome),
+            Ok((outcome, curve)) => {
+                curves.push((outcome.instrument.clone(), curve));
+                per_instrument.push(outcome);
+            }
             Err(err) => failures.push(format!("{instrument} out-of-sample: {err}")),
         }
     }
@@ -272,7 +293,8 @@ pub fn run_panel(
     }
 
     let pooled = pool(&per_instrument);
-    let (verdict, reasons) = judge(&pooled, &selection, criteria, &failures);
+    let breadth = crate::breadth::measure(&curves);
+    let (verdict, reasons) = judge(&pooled, &selection, criteria, &failures, &breadth);
 
     Ok(PanelEvidence {
         hypothesis: study.hypothesis.clone(),
@@ -283,6 +305,7 @@ pub fn run_panel(
         selection,
         per_instrument,
         pooled,
+        breadth: Some(breadth),
         failures,
         verdict,
         reasons,
@@ -311,13 +334,35 @@ fn pool(outcomes: &[InstrumentOutcome]) -> PooledOutcome {
     }
 }
 
+/// Below this, the panel's members are near enough independent to be counted.
+///
+/// 1.25 means the pooled average's standard error is a quarter larger than its
+/// instrument count implies — small enough to ignore, and the point at which
+/// saying so stops being pedantry and starts being a correction.
+const OVERSTATEMENT_WORTH_SAYING: f64 = 1.25;
+
 fn judge(
     pooled: &PooledOutcome,
     selection: &Selection,
     criteria: &EvaluationCriteria,
     failures: &[String],
+    breadth: &crate::Breadth,
 ) -> (Verdict, Vec<String>) {
     let mut reasons = Vec::new();
+
+    // Said before the verdict rather than after it, because it changes what
+    // every number below means. The pooled statistics read as evidence in
+    // proportion to the instrument count; if the instruments moved together,
+    // that count is not the sample size it looks like.
+    if let (Some(effective), Some(overstatement)) = (breadth.effective, breadth.overstatement()) {
+        if overstatement >= OVERSTATEMENT_WORTH_SAYING {
+            reasons.push(format!(
+                "these {} instruments behave like {effective:.1} independent ones (average                  correlation {:.2}), so the pooled average is about {overstatement:.1}x less                  certain than its instrument count suggests",
+                breadth.instruments.len(),
+                breadth.mean_correlation.unwrap_or_default(),
+            ));
+        }
+    }
 
     let verdict = if !selection.survived_deflation {
         reasons.push(format!(
@@ -431,6 +476,12 @@ mod tests {
         }
     }
 
+    /// A panel whose members were never measured against each other, so the
+    /// breadth line stays out of tests that are about something else.
+    fn unmeasured() -> crate::Breadth {
+        crate::breadth::measure(&[])
+    }
+
     fn selection(survived: bool) -> Selection {
         Selection {
             trials: 9,
@@ -457,6 +508,7 @@ mod tests {
             &selection(true),
             &EvaluationCriteria::default(),
             &[],
+            &unmeasured(),
         );
         assert_eq!(verdict, Verdict::Supported);
     }
@@ -469,6 +521,7 @@ mod tests {
             &selection(true),
             &EvaluationCriteria::default(),
             &[],
+            &unmeasured(),
         );
         assert_eq!(verdict, Verdict::Inconclusive);
         assert!(reasons[0].contains("trades"), "{reasons:?}");
@@ -485,6 +538,7 @@ mod tests {
             &selection(false),
             &EvaluationCriteria::default(),
             &[],
+            &unmeasured(),
         );
         assert_eq!(verdict, Verdict::NotSupported);
         assert!(reasons[0].contains("no-skill"), "{reasons:?}");
@@ -509,6 +563,7 @@ mod tests {
             &selection(true),
             &EvaluationCriteria::default(),
             &[],
+            &unmeasured(),
         );
         assert_eq!(verdict, Verdict::Supported, "the numbers do clear the bar");
         assert!(

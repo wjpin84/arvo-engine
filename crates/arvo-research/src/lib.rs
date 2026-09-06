@@ -25,6 +25,7 @@
 //! anticipating an implementation nobody has asked for.
 
 pub mod advice;
+pub mod breadth;
 pub mod evaluation;
 pub mod family;
 pub mod memory;
@@ -33,6 +34,7 @@ pub mod trade;
 pub mod walk_forward;
 
 pub use advice::{recommend, Recommendation, Severity};
+pub use breadth::Breadth;
 pub use evaluation::{
     evaluate_against_benchmark, Evaluation, EvaluationCriteria, Evidence, Metrics, Verdict,
 };

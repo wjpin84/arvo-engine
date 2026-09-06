@@ -430,6 +430,7 @@ pub struct PanelView {
     pub mean_excess_return: f64,
     pub beat_benchmark: usize,
     pub mean_max_drawdown: f64,
+    pub breadth: Option<BreadthView>,
     pub worst_max_drawdown: f64,
 
     pub trials: usize,
@@ -463,6 +464,25 @@ pub struct StrategyView {
     /// Backtests one study will run. A spinner that says how much work is
     /// coming is the difference between waiting and suspecting a hang.
     pub backtests: usize,
+}
+
+/// How much of a panel's apparent breadth is real.
+///
+/// The pooled statistics read as evidence in proportion to the instrument
+/// count — three that agree feel like three times the confidence of one. They
+/// are not, if the three moved together.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BreadthView {
+    pub instruments: Vec<String>,
+    /// Square and symmetric. `None` where a pair had too little overlap to
+    /// say — which is different from a correlation of zero.
+    pub correlations: Vec<Vec<Option<f64>>>,
+    pub mean_correlation: Option<f64>,
+    /// How many independent instruments the panel behaves like.
+    pub effective: Option<f64>,
+    /// How much the pooled average's certainty is overstated by counting
+    /// instruments instead of independent ones.
+    pub overstatement: Option<f64>,
 }
 
 /// One finding in a side-by-side comparison.

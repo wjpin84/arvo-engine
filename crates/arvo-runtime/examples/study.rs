@@ -298,6 +298,19 @@ fn run_panel_over(
                     outcome.strategy.trades
                 );
             }
+            // How much of the panel's apparent breadth is real. Three
+            // instruments that moved together are one observation wearing a
+            // three, and the pooled numbers above cannot tell you which.
+            if let Some(breadth) = &found.breadth {
+                match (breadth.effective, breadth.overstatement()) {
+                    (Some(effective), Some(overstatement)) => println!(
+                        "  breadth: {} instruments behave like {effective:.2} independent ones (mean correlation {:.2}); pooled average {overstatement:.2}x less certain than the count suggests",
+                        breadth.instruments.len(),
+                        breadth.mean_correlation.unwrap_or_default(),
+                    ),
+                    _ => println!("  breadth: too little overlap to say"),
+                }
+            }
             for reason in &found.reasons {
                 println!("  - {reason}");
             }

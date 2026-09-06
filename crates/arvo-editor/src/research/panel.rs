@@ -150,6 +150,17 @@ pub(crate) fn PanelReport(panel: PanelView) -> impl IntoView {
                 </tbody>
             </table>
 
+            {panel
+                .breadth
+                .clone()
+                .filter(|breadth| breadth.instruments.len() > 1)
+                .map(|breadth| {
+                    view! {
+                        <h4>"How independent these instruments are"</h4>
+                        <PanelBreadth breadth=breadth />
+                    }
+                })}
+
             <h4>"How this was arrived at"</h4>
             <dl class="research-provenance">
                 <dt>"Chosen on"</dt>
@@ -191,6 +202,96 @@ pub(crate) fn PanelReport(panel: PanelView) -> impl IntoView {
                         </div>
                     }
                 })}
+        </div>
+    }
+}
+
+/// How much of a panel's apparent breadth is real.
+///
+/// A panel's pooled numbers read as evidence in proportion to how many
+/// instruments produced them. If those instruments moved together, the count
+/// is not the sample size it looks like — three that agree are one observation
+/// wearing a three.
+///
+/// The matrix is here so the number above it can be argued with. An effective
+/// breadth of 1.2 out of three is a strong claim about a result, and a reader
+/// should be able to see which pair is responsible for it.
+#[component]
+pub(crate) fn PanelBreadth(breadth: BreadthView) -> impl IntoView {
+    let count = breadth.instruments.len();
+    let columns = format!("auto repeat({}, minmax(3em, 1fr))", count.max(1));
+    let headline = match (breadth.effective, breadth.overstatement) {
+        (Some(effective), Some(overstatement)) => format!(
+            "These {count} instruments behave like {effective:.1} independent ones. \
+             The pooled average is about {overstatement:.1}x less certain than its \
+             instrument count suggests."
+        ),
+        _ => "Too little overlap between these instruments to say how independent they are."
+            .to_owned(),
+    };
+    let labels = breadth.instruments.clone();
+
+    view! {
+        <div class="surface">
+            <p class="research-hint">{headline}</p>
+            <div class="surface-grid" style=format!("grid-template-columns: {columns}")>
+                <span class="surface-corner"></span>
+                {labels
+                    .iter()
+                    .map(|name| {
+                        // Tickers, not full ids: a matrix of `MSFT.NASDAQ`
+                        // headers is unreadable at this width.
+                        let short = name.split('.').next().unwrap_or(name).to_owned();
+                        view! { <span class="surface-head" title=name.clone()>{short}</span> }
+                    })
+                    .collect_view()}
+                {breadth
+                    .correlations
+                    .iter()
+                    .enumerate()
+                    .map(|(row, values)| {
+                        let name = labels.get(row).cloned().unwrap_or_default();
+                        let short = name.split('.').next().unwrap_or(&name).to_owned();
+                        let cells = values
+                            .iter()
+                            .map(|value| {
+                                match value {
+                                    // A pair with too little overlap makes no
+                                    // claim, which is not the same as a
+                                    // correlation of zero.
+                                    None => {
+                                        view! { <span class="surface-cell empty">"·"</span> }
+                                            .into_any()
+                                    }
+                                    Some(value) => {
+                                        // Shaded by magnitude, not by sign:
+                                        // strongly negative correlation is
+                                        // just as much a departure from
+                                        // independence as strongly positive.
+                                        let depth = value.abs().clamp(0.0, 1.0);
+                                        let style = format!(
+                                            "background: color-mix(in srgb, \
+                                             var(--color-verdict-inconclusive) {:.0}%, \
+                                             transparent)",
+                                            depth * 90.0,
+                                        );
+                                        view! {
+                                            <span class="surface-cell" style=style>
+                                                {format!("{value:.2}")}
+                                            </span>
+                                        }
+                                            .into_any()
+                                    }
+                                }
+                            })
+                            .collect_view();
+                        view! {
+                            <span class="surface-head" title=name>{short}</span>
+                            {cells}
+                        }
+                    })
+                    .collect_view()}
+            </div>
         </div>
     }
 }

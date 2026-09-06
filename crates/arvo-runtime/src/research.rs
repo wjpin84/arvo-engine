@@ -22,7 +22,8 @@ use arvo_research::{
 // The view shapes live in `arvo-views` so the window cannot drift from
 // them. See that crate for what two hand-mirrored copies cost.
 pub use arvo_views::{
-    CandlePoint, ComparisonRowView, ComparisonView, DataFindingView, HistoryView, MatchView,
+    BreadthView, CandlePoint, ComparisonRowView, ComparisonView, DataFindingView, HistoryView,
+    MatchView,
     NamedCurveView, UnreadableView, CurvePoint, DataLibraryView, FetchView, FoldView, HistoryEntryView, InstrumentView, MetricsView, MonthlyReturnView, OutcomeView, PanelView, RecommendationView, RecordView, StabilityView, StrategyView, StudyView, SurfaceCell, SurfaceView, TradeMarkerView, TradeRowView, TradesView, WalkForwardView};
 
 use crate::commands::CommandError;
@@ -1606,6 +1607,13 @@ fn panel_view(found: &arvo_research::PanelEvidence, engine: &str) -> PanelView {
         mean_excess_return: found.pooled.mean_excess_return,
         beat_benchmark: found.pooled.beat_benchmark,
         mean_max_drawdown: found.pooled.mean_max_drawdown,
+        breadth: found.breadth.as_ref().map(|breadth| BreadthView {
+            instruments: breadth.instruments.clone(),
+            correlations: breadth.correlations.clone(),
+            mean_correlation: breadth.mean_correlation,
+            effective: breadth.effective,
+            overstatement: breadth.overstatement(),
+        }),
         worst_max_drawdown: found.pooled.worst_max_drawdown,
         trials: found.selection.trials,
         best_sharpe: found.selection.best_sharpe,
