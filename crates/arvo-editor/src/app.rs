@@ -16,9 +16,9 @@
 //! | [`crate::theme`] | which palette the window is wearing |
 
 use crate::bridge::{
-    call, call_typed, close_window, init_shell, minimize_window, set_output_visible_js,
-    set_sidebar_visible, toggle_maximize_window, PANEL_PANEL_ID, PORTFOLIO_PANEL_ID,
-    STUDY_PANEL_PREFIX, WALK_PANEL_PREFIX,
+    call, call_typed, capture_layout, close_window, init_shell, minimize_window, on_layout_settled,
+    restore_layout, set_output_visible_js, set_sidebar_visible, toggle_maximize_window,
+    PANEL_PANEL_ID, PORTFOLIO_PANEL_ID, STUDY_PANEL_PREFIX, WALK_PANEL_PREFIX,
 };
 use crate::portfolio::{PortfolioSidebar, PortfolioTab};
 use crate::research::{PanelTab, ResearchView, StudyTab, WalkTab};
@@ -56,6 +56,33 @@ enum MenuId {
 /// it are.
 /// Clicking the already-active icon collapses the sidebar, same as VS
 /// Code — this is a toggle, not a plain select.
+impl ActivityView {
+    /// The spelling a stored session uses.
+    const fn slug(self) -> &'static str {
+        match self {
+            Self::Portfolio => "portfolio",
+            Self::Research => "research",
+            Self::Extensions => "extensions",
+            Self::Alerts => "alerts",
+            Self::Settings => "settings",
+        }
+    }
+
+    /// `None` for a view this build does not have — a session from a newer
+    /// build should open with the sidebar closed, not fail to open.
+    fn from_slug(slug: &str) -> Option<Self> {
+        [
+            Self::Portfolio,
+            Self::Research,
+            Self::Extensions,
+            Self::Alerts,
+            Self::Settings,
+        ]
+        .into_iter()
+        .find(|view| view.slug() == slug)
+    }
+}
+
 fn toggle_view(
     view: ActivityView,
     active_view: ReadSignal<Option<ActivityView>>,
@@ -290,6 +317,8 @@ fn SidebarPanel(
     set_studies: WriteSignal<std::collections::HashMap<String, StudyView>>,
     walks: ReadSignal<std::collections::HashMap<String, WalkForwardView>>,
     set_walks: WriteSignal<std::collections::HashMap<String, WalkForwardView>>,
+    chosen: ReadSignal<String>,
+    set_chosen: WriteSignal<String>,
     panel: ReadSignal<Option<PanelView>>,
     set_panel: WriteSignal<Option<PanelView>>,
     portfolios: ReadSignal<Option<PortfolioLibraryView>>,
@@ -318,6 +347,8 @@ fn SidebarPanel(
                             set_studies=set_studies
                             walks=walks
                             set_walks=set_walks
+                            chosen=chosen
+                            set_chosen=set_chosen
                             panel=panel
                             set_panel=set_panel
                         />
@@ -832,6 +863,9 @@ pub fn App() -> impl IntoView {
     // its own study when dockview mounts it.
     let (studies, set_studies) = signal(std::collections::HashMap::<String, StudyView>::new());
     let (walks, set_walks) = signal(std::collections::HashMap::<String, WalkForwardView>::new());
+    // Up here rather than inside the research sidebar so the saved workspace
+    // can hold it: which strategy is selected is part of where you left off.
+    let (chosen, set_chosen) = signal(String::new());
     // One panel at a time: there is only one panel, and re-running it should
     // replace what the tab shows rather than accumulate tabs.
     let (panel, set_panel) = signal(None::<PanelView>);
@@ -907,6 +941,8 @@ pub fn App() -> impl IntoView {
                                 set_studies=set_studies
                                 walks=walks
                                 set_walks=set_walks
+                                chosen=chosen
+                                set_chosen=set_chosen
                                 panel=panel
                                 set_panel=set_panel
                                 portfolios=portfolios
@@ -992,6 +1028,69 @@ pub fn App() -> impl IntoView {
         );
         on_panel_created.forget();
         on_panel_removed.forget();
+
+        // The workspace, put back. After `init_shell`, because restoring
+        // drives the same panel-created callback a fresh layout does and
+        // there has to be something listening when it fires.
+        spawn_local(async move {
+            let session = call_typed::<SessionView>("load_session", JsValue::UNDEFINED)
+                .await
+                .unwrap_or_default();
+
+            if let Some(theme) = session.theme.as_deref().and_then(Theme::from_slug) {
+                set_theme.set(theme);
+            }
+            if let Some(strategy) = session.strategy {
+                set_chosen.set(strategy);
+            }
+            // Set before the layout goes back: the sidebar's own panel is part
+            // of that layout, and an active view that disagreed with it would
+            // show a sidebar with nothing in it.
+            set_active_view.set(
+                session
+                    .active_view
+                    .as_deref()
+                    .and_then(ActivityView::from_slug),
+            );
+            set_output_visible.set(session.output_visible);
+
+            if let Some(layout) = session.layout {
+                let value = serde_wasm_bindgen::to_value(&layout).unwrap_or(JsValue::NULL);
+                // A layout that will not restore is discarded rather than
+                // fought with. The default arrangement is already on screen;
+                // opening to a blank window is the one failure a workspace
+                // file must never cause.
+                restore_layout(value);
+            }
+
+            // Only now: restoring is itself a layout change, and saving
+            // during it would race the thing that produced it.
+            let record = Closure::<dyn FnMut()>::new(move || {
+                let session = SessionView {
+                    layout: serde_wasm_bindgen::from_value(capture_layout()).ok(),
+                    active_view: active_view
+                        .get_untracked()
+                        .map(|view| view.slug().to_owned()),
+                    output_visible: output_visible.get_untracked(),
+                    theme: Some(theme.get_untracked().slug().to_owned()),
+                    strategy: Some(chosen.get_untracked()).filter(|name| !name.is_empty()),
+                };
+                spawn_local(async move {
+                    let args = serde_wasm_bindgen::to_value(&serde_json::json!({
+                        "session": session,
+                    }))
+                    .unwrap_or(JsValue::UNDEFINED);
+                    // Logged, not surfaced. A workspace that failed to save is
+                    // worth knowing about and is not worth interrupting anyone
+                    // over — nothing they were doing has been lost.
+                    if let Err(reason) = call_typed::<()>("save_session", args).await {
+                        web_sys::console::warn_1(&reason.into());
+                    }
+                });
+            });
+            on_layout_settled(record.as_ref());
+            record.forget();
+        });
     });
 
     // Keeps dockview's actual panels in sync with each toggle — real

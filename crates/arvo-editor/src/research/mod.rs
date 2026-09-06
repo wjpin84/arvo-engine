@@ -37,6 +37,10 @@ pub(crate) fn ResearchView(
     set_studies: WriteSignal<std::collections::HashMap<String, StudyView>>,
     walks: ReadSignal<std::collections::HashMap<String, WalkForwardView>>,
     set_walks: WriteSignal<std::collections::HashMap<String, WalkForwardView>>,
+    /// Hoisted out of this component so the saved workspace can hold it —
+    /// which strategy is selected is part of where you left off.
+    chosen: ReadSignal<String>,
+    set_chosen: WriteSignal<String>,
     panel: ReadSignal<Option<PanelView>>,
     set_panel: WriteSignal<Option<PanelView>>,
 ) -> impl IntoView {
@@ -51,7 +55,7 @@ pub(crate) fn ResearchView(
     // What the engine can actually run, fetched rather than hardcoded: a menu
     // that drifts from the engine offers rules it will then refuse.
     let (strategies, set_strategies) = signal(Vec::<StrategyView>::new());
-    let (chosen, set_chosen) = signal(String::new());
+
     // Whether a broker token is held, never the token itself. A getter for the
     // credential would put it on the wire to the web view for no reason the UI
     // actually has.
@@ -81,8 +85,13 @@ pub(crate) fn ResearchView(
         if let Ok(found) =
             call_typed::<Vec<StrategyView>>("list_strategies", JsValue::UNDEFINED).await
         {
-            if let Some(first) = found.first() {
-                set_chosen.set(first.name.clone());
+            // Only when nothing was restored: a strategy remembered from the
+            // last session must not be overwritten by whichever one happens
+            // to come first in the engine's list.
+            if chosen.get_untracked().is_empty() {
+                if let Some(first) = found.first() {
+                    set_chosen.set(first.name.clone());
+                }
             }
             set_strategies.set(found);
         }
@@ -745,13 +754,39 @@ pub(crate) fn StudyTab(
 ) -> impl IntoView {
     view! {
         <div class="study-panel">
-            {move || {
-                studies
-                    .get()
-                    .get(&instrument)
-                    .cloned()
-                    .map(|study| view! { <StudyReport study=study /> })
+            {move || match studies.get().get(&instrument).cloned() {
+                Some(study) => view! { <StudyReport study=study /> }.into_any(),
+                // A tab restored from a saved workspace, whose result lives in
+                // memory and did not survive the restart. Said, rather than
+                // left as an empty panel: a blank rectangle is the failure
+                // shape this project has lost time to more than once, and
+                // silently re-running a study on launch would spend a minute
+                // of work nobody asked for.
+                None => {
+                    view! {
+                        <NotLoaded subject=instrument.clone() />
+                    }
+                        .into_any()
+                }
             }}
+        </div>
+    }
+}
+
+/// A tab whose result is not in memory.
+///
+/// The durable copy is in research memory — every run is recorded — so the
+/// honest instruction is to open it from History rather than to re-run it.
+#[component]
+fn NotLoaded(subject: String) -> impl IntoView {
+    view! {
+        <div class="study-panel-empty">
+            <p class="sidebar-empty">{format!("{subject} is not loaded")}</p>
+            <p class="research-hint">
+                "This tab was restored from your last session. The finding itself is in \
+                 research memory — open it from History in the Research sidebar, or run it \
+                 again."
+            </p>
         </div>
     }
 }
@@ -764,12 +799,11 @@ pub(crate) fn WalkTab(
 ) -> impl IntoView {
     view! {
         <div class="study-panel">
-            {move || {
-                walks
-                    .get()
-                    .get(&instrument)
-                    .cloned()
-                    .map(|walk| view! { <WalkForwardReport walk=walk /> })
+            {move || match walks.get().get(&instrument).cloned() {
+                Some(walk) => view! { <WalkForwardReport walk=walk /> }.into_any(),
+                None => {
+                    view! { <NotLoaded subject=format!("{instrument} rolling") /> }.into_any()
+                }
             }}
         </div>
     }

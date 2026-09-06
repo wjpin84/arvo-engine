@@ -199,6 +199,20 @@ pub(crate) struct TradesView {
     pub(crate) stop_exits: u32,
 }
 
+/// The workspace as it was left.
+///
+/// `Serialize` too: this goes back out on every layout change. Every field is
+/// optional so a session written by an older build still opens, as a session
+/// that knows less rather than as a failure that costs the layout.
+#[derive(Clone, Default, Deserialize, serde::Serialize)]
+pub(crate) struct SessionView {
+    pub(crate) layout: Option<serde_json::Value>,
+    pub(crate) active_view: Option<String>,
+    pub(crate) output_visible: bool,
+    pub(crate) theme: Option<String>,
+    pub(crate) strategy: Option<String>,
+}
+
 /// One round trip, as a table row.
 ///
 /// `Serialize` as well as `Deserialize`: the export sends back exactly the

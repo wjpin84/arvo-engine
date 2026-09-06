@@ -32,6 +32,21 @@ extern "C" {
     #[wasm_bindgen(js_namespace = window, js_name = initShell)]
     pub(crate) fn init_shell(host_id: &str, on_panel_created: &JsValue, on_panel_removed: &JsValue);
 
+    // The layout, as dockview encodes it. Opaque on this side deliberately:
+    // treating it as data is what stops a dockview upgrade from becoming a
+    // Rust change.
+    #[wasm_bindgen(js_namespace = window, js_name = captureLayout)]
+    pub(crate) fn capture_layout() -> JsValue;
+    // Returns whether it worked. A layout naming a panel this build no longer
+    // has throws, and the caller has to fall back to the default arrangement
+    // rather than open to a blank window.
+    #[wasm_bindgen(js_namespace = window, js_name = restoreLayout)]
+    pub(crate) fn restore_layout(layout: JsValue) -> bool;
+    // Debounced in JS, where the events are: a file write per animation frame
+    // is the obvious way to make dragging a panel stutter.
+    #[wasm_bindgen(js_namespace = window, js_name = onLayoutSettled)]
+    pub(crate) fn on_layout_settled(callback: &JsValue);
+
     // Real width-collapse — add/remove the dockview panel, not just clear
     // its content. See ActivityBar's toggle_view.
     #[wasm_bindgen(js_namespace = window, js_name = setSidebarVisible)]

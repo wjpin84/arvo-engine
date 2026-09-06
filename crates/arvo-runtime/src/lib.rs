@@ -12,6 +12,7 @@ pub mod feed;
 pub mod portfolio;
 pub mod research;
 pub mod scheduler;
+pub mod session;
 
 use arvo_core::{config, notifications};
 use arvo_plugin_host::registry;
@@ -178,6 +179,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::list_plugins,
             commands::refresh_plugins,
+            commands::load_session,
+            commands::save_session,
             research::list_instruments,
             research::run_study,
             research::run_walk_forward,

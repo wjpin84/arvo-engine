@@ -93,3 +93,40 @@ pub async fn refresh_plugins(
         .map(PluginView::from)
         .collect())
 }
+
+/// The workspace as it was left.
+///
+/// # Errors
+///
+/// Never — a missing or unreadable session is an empty one. Fallible only to
+/// match the shape every other command has.
+#[tauri::command]
+#[allow(clippy::unnecessary_wraps, reason = "uniform command signature")]
+pub fn load_session(app: tauri::AppHandle) -> Result<crate::session::Session, CommandError> {
+    Ok(session_dir(&app).map(|dir| crate::session::load(&dir)).unwrap_or_default())
+}
+
+/// Remembers the workspace.
+///
+/// Called on every layout change — including while a panel is being dragged —
+/// so it has to be cheap and it has to be crash-safe. Both are the session
+/// module's problem; this is the wiring.
+///
+/// # Errors
+///
+/// Returns [`CommandError::Failed`] if the app has no data directory or the
+/// file cannot be written.
+#[tauri::command]
+pub fn save_session(
+    session: crate::session::Session,
+    app: tauri::AppHandle,
+) -> Result<(), CommandError> {
+    let dir = session_dir(&app)
+        .ok_or_else(|| CommandError::Failed("no application data directory".to_owned()))?;
+    crate::session::save(&dir, &session).map_err(|err| CommandError::Failed(err.to_string()))
+}
+
+fn session_dir(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
+    use tauri::Manager as _;
+    app.path().app_data_dir().ok()
+}
