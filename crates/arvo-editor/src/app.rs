@@ -18,10 +18,11 @@
 use crate::bridge::{
     call, call_typed, capture_layout, close_window, init_shell, minimize_window, on_layout_settled,
     restore_layout, set_output_visible_js, set_sidebar_visible, toggle_maximize_window,
-    PANEL_PANEL_ID, PORTFOLIO_PANEL_ID, STUDY_PANEL_PREFIX, WALK_PANEL_PREFIX,
+    COMPARE_PANEL_ID, PANEL_PANEL_ID, PORTFOLIO_PANEL_ID, STUDY_PANEL_PREFIX,
+    WALK_PANEL_PREFIX,
 };
 use crate::portfolio::{PortfolioSidebar, PortfolioTab};
-use crate::research::{PanelTab, ResearchView, StudyTab, WalkTab};
+use crate::research::{ComparisonReport, PanelTab, ResearchView, StudyTab, WalkTab};
 use crate::theme::{apply_theme, prefers_dark, Theme};
 use crate::views::*;
 
@@ -321,6 +322,7 @@ fn SidebarPanel(
     set_chosen: WriteSignal<String>,
     panel: ReadSignal<Option<PanelView>>,
     set_panel: WriteSignal<Option<PanelView>>,
+    set_comparison: WriteSignal<Option<ComparisonView>>,
     portfolios: ReadSignal<Option<PortfolioLibraryView>>,
     set_open_portfolio: WriteSignal<Option<PortfolioView>>,
 ) -> impl IntoView {
@@ -351,6 +353,7 @@ fn SidebarPanel(
                             set_chosen=set_chosen
                             panel=panel
                             set_panel=set_panel
+                            set_comparison=set_comparison
                         />
                     }
                         .into_any()
@@ -869,6 +872,7 @@ pub fn App() -> impl IntoView {
     // One panel at a time: there is only one panel, and re-running it should
     // replace what the tab shows rather than accumulate tabs.
     let (panel, set_panel) = signal(None::<PanelView>);
+    let (comparison, set_comparison) = signal(None::<ComparisonView>);
     let (portfolios, set_portfolios) = signal(None::<PortfolioLibraryView>);
     let (open_portfolio, set_open_portfolio) = signal(None::<PortfolioView>);
 
@@ -945,6 +949,7 @@ pub fn App() -> impl IntoView {
                                 set_chosen=set_chosen
                                 panel=panel
                                 set_panel=set_panel
+                                set_comparison=set_comparison
                                 portfolios=portfolios
                                 set_open_portfolio=set_open_portfolio
                             />
@@ -968,6 +973,27 @@ pub fn App() -> impl IntoView {
                     study_mounts_created
                         .borrow_mut()
                         .insert(PORTFOLIO_PANEL_ID.to_owned(), handle);
+                }
+                COMPARE_PANEL_ID => {
+                    let handle = mount_to(el, move || {
+                        view! {
+                            <div class="study-panel">
+                                {move || {
+                                    comparison
+                                        .get()
+                                        .map(|comparison| {
+                                            view! {
+                                                <ComparisonReport comparison=comparison />
+                                            }
+                                        })
+                                }}
+                            </div>
+                        }
+                            .into_any()
+                    });
+                    study_mounts_created
+                        .borrow_mut()
+                        .insert(COMPARE_PANEL_ID.to_owned(), handle);
                 }
                 PANEL_PANEL_ID => {
                     let handle =
@@ -1011,6 +1037,7 @@ pub fn App() -> impl IntoView {
                 // map, so reopening the same instrument is instant and does
                 // not re-run eleven backtests.
                 id if id == PANEL_PANEL_ID
+                    || id == COMPARE_PANEL_ID
                     || id == PORTFOLIO_PANEL_ID
                     || id.starts_with(STUDY_PANEL_PREFIX)
                     || id.starts_with(WALK_PANEL_PREFIX) =>

@@ -69,6 +69,8 @@ extern "C" {
     // same reading of the app's CSS variables for its palette.
     #[wasm_bindgen(js_namespace = window, js_name = renderPriceChart)]
     pub(crate) fn render_price_chart(el: &web_sys::HtmlElement, candles: JsValue, markers: JsValue);
+    #[wasm_bindgen(js_namespace = window, js_name = renderCurves)]
+    pub(crate) fn render_curves(el: &web_sys::HtmlElement, series: JsValue);
     #[wasm_bindgen(js_namespace = window, js_name = renderUnderwaterChart)]
     pub(crate) fn render_underwater_chart(el: &web_sys::HtmlElement, points: JsValue);
 
@@ -137,3 +139,8 @@ pub(crate) const STUDY_PANEL_PREFIX: &str = "study:";
 /// open at once — they answer different questions about the same rule, and
 /// reading them side by side is the point.
 pub(crate) const WALK_PANEL_PREFIX: &str = "walk:";
+
+/// The comparison's own tab. One at a time: a second comparison replaces the
+/// first, because two of them side by side is a comparison of comparisons and
+/// nobody asked for that.
+pub(crate) const COMPARE_PANEL_ID: &str = "compare";

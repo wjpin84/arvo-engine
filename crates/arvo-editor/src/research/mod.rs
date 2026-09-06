@@ -6,10 +6,12 @@
 //! the reasons before the number, the recommendations above the equity curve
 //! that would otherwise be believed before they were read.
 
+mod compare;
 mod panel;
 mod study;
 mod walk;
 
+pub(crate) use compare::ComparisonReport;
 pub(crate) use panel::PanelTab;
 pub(crate) use study::StudyReport;
 pub(crate) use walk::WalkForwardReport;
@@ -19,7 +21,8 @@ use leptos::task::spawn_local;
 use wasm_bindgen::JsValue;
 
 use crate::bridge::{
-    call_typed, open_study_panel, PANEL_PANEL_ID, STUDY_PANEL_PREFIX, WALK_PANEL_PREFIX,
+    call_typed, open_study_panel, COMPARE_PANEL_ID, PANEL_PANEL_ID, STUDY_PANEL_PREFIX,
+    WALK_PANEL_PREFIX,
 };
 use crate::format::{percent, verdict_dot};
 use crate::chart::DataQuality;
@@ -44,6 +47,7 @@ pub(crate) fn ResearchView(
     set_chosen: WriteSignal<String>,
     panel: ReadSignal<Option<PanelView>>,
     set_panel: WriteSignal<Option<PanelView>>,
+    set_comparison: WriteSignal<Option<ComparisonView>>,
 ) -> impl IntoView {
     let (library, set_library) = signal(None::<DataLibraryView>);
     // What is running, not merely that something is. A panel is a few dozen
@@ -57,6 +61,10 @@ pub(crate) fn ResearchView(
     // lost to a field rename and the only trace was a warning nobody had
     // reason to look at.
     let (unreadable, set_unreadable) = signal(Vec::<UnreadableView>::new());
+    // Which findings are ticked for comparison. A set rather than a pair:
+    // comparing two is the common case and comparing six is the one where the
+    // selection-noise arithmetic actually matters.
+    let (selected, set_selected) = signal(Vec::<String>::new());
     // What the engine can actually run, fetched rather than hardcoded: a menu
     // that drifts from the engine offers rules it will then refuse.
     let (strategies, set_strategies) = signal(Vec::<StrategyView>::new());
@@ -246,6 +254,26 @@ pub(crate) fn ResearchView(
             }
             set_running.set(None);
             refresh_history();
+        });
+    };
+
+    let compare = move |_| {
+        let ids = selected.get_untracked();
+        if ids.len() < 2 {
+            set_error.set(Some("Tick at least two findings to compare".to_owned()));
+            return;
+        }
+        set_error.set(None);
+        spawn_local(async move {
+            let args = serde_wasm_bindgen::to_value(&serde_json::json!({ "ids": ids }))
+                .unwrap_or(JsValue::UNDEFINED);
+            match call_typed::<ComparisonView>("compare_records", args).await {
+                Ok(result) => {
+                    set_comparison.set(Some(result));
+                    open_study_panel(COMPARE_PANEL_ID, "Comparison");
+                }
+                Err(reason) => set_error.set(Some(reason)),
+            }
         });
     };
 
@@ -782,6 +810,21 @@ pub(crate) fn ResearchView(
                                         }
                                     })
                             }}
+                            {move || {
+                                let count = selected.get().len();
+                                (count > 0)
+                                    .then(|| {
+                                        view! {
+                                            <button
+                                                class="research-panel-run"
+                                                disabled=move || selected.get().len() < 2
+                                                on:click=compare
+                                            >
+                                                {format!("Compare {count} findings")}
+                                            </button>
+                                        }
+                                    })
+                            }}
                             <ul class="research-history">
                                 {entries
                                     .into_iter()
@@ -837,8 +880,35 @@ pub(crate) fn ResearchView(
                                             None => "data no longer present",
                                             Some(false) => "",
                                         };
+                                        // Ticked for comparison. Beside the row rather than
+                                        // replacing the click, because opening one finding and
+                                        // choosing several to read together are different acts
+                                        // and a single control cannot mean both.
+                                        let ticked = entry.id.clone();
+                                        let is_ticked = {
+                                            let id = entry.id.clone();
+                                            move || selected.with(|ids| ids.contains(&id))
+                                        };
+                                        let toggle = move |_| {
+                                            let id = ticked.clone();
+                                            set_selected
+                                                .update(|ids| {
+                                                    if let Some(at) = ids.iter().position(|held| *held == id)
+                                                    {
+                                                        ids.remove(at);
+                                                    } else {
+                                                        ids.push(id);
+                                                    }
+                                                });
+                                        };
                                         view! {
-                                            <li>
+                                            <li class="research-history-row">
+                                                <input
+                                                    type="checkbox"
+                                                    title="Compare with others"
+                                                    prop:checked=is_ticked
+                                                    on:change=toggle
+                                                />
                                                 <button class="research-history-entry" on:click=open>
                                                     <span class="research-history-line">
                                                         <span class=verdict_dot(&entry.verdict) />

@@ -21,7 +21,9 @@ use arvo_research::{
 };
 // The view shapes live in `arvo-views` so the window cannot drift from
 // them. See that crate for what two hand-mirrored copies cost.
-pub use arvo_views::{CandlePoint, DataFindingView, HistoryView, MatchView, UnreadableView, CurvePoint, DataLibraryView, FetchView, FoldView, HistoryEntryView, InstrumentView, MetricsView, MonthlyReturnView, OutcomeView, PanelView, RecommendationView, RecordView, StabilityView, StrategyView, StudyView, SurfaceCell, SurfaceView, TradeMarkerView, TradeRowView, TradesView, WalkForwardView};
+pub use arvo_views::{
+    CandlePoint, ComparisonRowView, ComparisonView, DataFindingView, HistoryView, MatchView,
+    NamedCurveView, UnreadableView, CurvePoint, DataLibraryView, FetchView, FoldView, HistoryEntryView, InstrumentView, MetricsView, MonthlyReturnView, OutcomeView, PanelView, RecommendationView, RecordView, StabilityView, StrategyView, StudyView, SurfaceCell, SurfaceView, TradeMarkerView, TradeRowView, TradesView, WalkForwardView};
 
 use crate::commands::CommandError;
 
@@ -782,6 +784,162 @@ pub async fn connect_feed(app: tauri::AppHandle) -> Result<bool, CommandError> {
 pub fn disconnect_feed() -> Result<bool, CommandError> {
     crate::feed::disconnect().map_err(|err| CommandError::Failed(err.to_string()))?;
     Ok(false)
+}
+
+/// Reads several stored findings against each other.
+///
+/// # The comparison is itself a search, and this is where that gets counted
+///
+/// Each finding already deflates the grid *inside* it: a study that tried nine
+/// configurations knows it tried nine. What none of them can know is that they
+/// are one of six findings a person is about to pick a winner from. Choosing
+/// the best of six is a search of size six, and the best of six no-skill
+/// searches still looks better than the average of them.
+///
+/// So the same bar is applied here, across the findings' out-of-sample
+/// Sharpes. It is a weaker claim than the per-study one and is stated as such:
+/// these are out-of-sample results rather than in-sample scores, and the
+/// approximation assumes independent draws, which six strategies on the same
+/// instrument over the same window are emphatically not. Both of those make it
+/// conservative in the same direction — it is easier to pass than it should
+/// be, which is the safe way for a check like this to be wrong.
+///
+/// # Errors
+///
+/// Returns [`CommandError::Failed`] if a named finding cannot be read.
+#[tauri::command]
+pub async fn compare_records(
+    ids: Vec<String>,
+    service: tauri::State<'_, ResearchService>,
+) -> Result<ComparisonView, CommandError> {
+    let mut rows = Vec::with_capacity(ids.len());
+    let mut curves = Vec::with_capacity(ids.len());
+    let mut notes = Vec::new();
+
+    for id in &ids {
+        let stored = service
+            .memory
+            .open(id)
+            .map_err(|err| CommandError::Failed(err.to_string()))?;
+        let summary = stored.summary();
+
+        let Some((evaluation, strategy_name)) = comparable(&stored.record) else {
+            // A panel is one configuration across many instruments; a study is
+            // one instrument. Putting them in the same table would invite
+            // reading one number against the other, and they are not the same
+            // number.
+            notes.push(format!(
+                "{} is a panel and is not comparable row-for-row with a single study",
+                summary.subject
+            ));
+            continue;
+        };
+
+        let live = live_version(&service, &summary);
+        rows.push(ComparisonRowView {
+            id: id.clone(),
+            subject: summary.subject.clone(),
+            kind: summary.kind.clone(),
+            strategy_name,
+            verdict: verdict_label(summary.verdict).to_owned(),
+            recorded_at: summary.recorded_at.format("%Y-%m-%d %H:%M").to_string(),
+            total_return: evaluation.strategy.total_return,
+            excess_return: evaluation.excess_return,
+            sharpe: evaluation.strategy.sharpe,
+            max_drawdown: evaluation.strategy.max_drawdown,
+            trades: evaluation.strategy.trades,
+            win_rate: evaluation.strategy_trades.win_rate,
+            profit_factor: evaluation.strategy_trades.profit_factor,
+            stale: live.map(|live| live != summary.dataset_version),
+        });
+        curves.push(NamedCurveView {
+            name: format!("{} · {}", summary.subject, summary.kind),
+            points: curve_points(&evaluation.strategy_curve),
+        });
+    }
+
+    let judged = judge_comparison(&rows, notes);
+    Ok(ComparisonView {
+        rows,
+        curves,
+        best_sharpe: judged.best,
+        expected_best_under_null: judged.bar,
+        survived_deflation: judged.survived,
+        notes: judged.notes,
+    })
+}
+
+/// What a comparison is worth, and what is wrong with it.
+struct Judged {
+    best: Option<f64>,
+    bar: Option<f64>,
+    survived: bool,
+    notes: Vec<String>,
+}
+
+/// Applies the same multiple-testing bar to the comparison that each study
+/// applies to its own grid.
+///
+/// Separated from the command so it can be tested: this is the claim the whole
+/// screen exists to make, and a comparison table that silently sorted by
+/// return would be the most persuasive way this application could mislead
+/// someone.
+fn judge_comparison(rows: &[ComparisonRowView], mut notes: Vec<String>) -> Judged {
+    let sharpes: Vec<f64> = rows.iter().filter_map(|row| row.sharpe).collect();
+    let best = sharpes.iter().copied().fold(None::<f64>, |best, value| {
+        Some(best.map_or(value, |held: f64| held.max(value)))
+    });
+    let bar = arvo_research::family::expected_best_under_null(&sharpes);
+    let survived = best.is_some_and(|best| bar.is_none_or(|bar| best > bar));
+
+    if let (Some(best), Some(bar)) = (best, bar) {
+        if best <= bar {
+            notes.push(format!(
+                "the best of these is a Sharpe of {best:.2}, and the best of {} results with no                  skill at all would be expected to reach {bar:.2} — picking the winner of this                  comparison is picking noise",
+                sharpes.len(),
+            ));
+        }
+    }
+    if rows.iter().any(|row| row.stale == Some(true)) {
+        notes.push(
+            "at least one of these was produced from data that has since changed, so they were              not all measured on the same thing"
+                .to_owned(),
+        );
+    }
+    // Different instruments are the quiet way a comparison stops being one.
+    let subjects: std::collections::HashSet<&str> =
+        rows.iter().map(|row| row.subject.as_str()).collect();
+    if subjects.len() > 1 {
+        notes.push(
+            "these are different instruments, so the differences between them are as much about              the instruments as about the rules"
+                .to_owned(),
+        );
+    }
+
+    Judged {
+        best,
+        bar,
+        survived,
+        notes,
+    }
+}
+
+/// The evaluation and strategy name of a finding that can sit in a comparison
+/// row, or `None` for one that cannot.
+fn comparable(record: &Record) -> Option<(&arvo_research::Evaluation, String)> {
+    match record {
+        Record::Study(evidence) => Some((
+            &evidence.out_of_sample_evidence.evaluation,
+            evidence.selected.strategy.name.clone(),
+        )),
+        Record::WalkForward(evidence) => evidence.folds.first().map(|fold| {
+            (
+                &fold.out_of_sample_evidence.evaluation,
+                format!("{} (rolling)", evidence.template.strategy.name),
+            )
+        }),
+        Record::Panel(_) => None,
+    }
 }
 
 /// Finds instruments by name or ticker.
@@ -1611,6 +1769,112 @@ pub fn study_for(
         template_for(instrument, plan, window, dataset_version),
         plan.grid(),
     )
+}
+
+#[cfg(test)]
+mod comparison_tests {
+    use super::*;
+
+    fn row(subject: &str, sharpe: f64) -> ComparisonRowView {
+        ComparisonRowView {
+            id: format!("{subject}-{sharpe}"),
+            subject: subject.to_owned(),
+            kind: "study".to_owned(),
+            strategy_name: "sma_cross".to_owned(),
+            verdict: "Not supported".to_owned(),
+            recorded_at: "2026-01-01 00:00".to_owned(),
+            total_return: 0.1,
+            excess_return: -0.02,
+            sharpe: Some(sharpe),
+            max_drawdown: 0.1,
+            trades: 40,
+            win_rate: Some(0.4),
+            profit_factor: Some(1.2),
+            stale: Some(false),
+        }
+    }
+
+    #[test]
+    fn picking_the_best_of_several_is_a_search_of_that_size() {
+        // The claim the whole screen exists to make. Each finding already
+        // deflates the grid inside it; none of them knows it is one of six a
+        // person is about to pick a winner from.
+        let rows: Vec<_> = (0..6)
+            .map(|index| row("MSFT.NASDAQ", 0.3 + f64::from(index) * 0.05))
+            .collect();
+        let judged = judge_comparison(&rows, Vec::new());
+
+        assert_eq!(judged.best, Some(0.55));
+        let bar = judged.bar.expect("six results is enough to say");
+        assert!(
+            bar > 0.55,
+            "a spread this tight is what a no-skill search of six produces: bar {bar}"
+        );
+        assert!(!judged.survived);
+        assert!(
+            judged.notes.iter().any(|note| note.contains("picking noise")),
+            "{:?}",
+            judged.notes
+        );
+    }
+
+    #[test]
+    fn a_clear_winner_survives_the_same_bar() {
+        // The check has to be passable, or it says nothing.
+        let mut rows: Vec<_> = (0..6).map(|_| row("MSFT.NASDAQ", 0.10)).collect();
+        rows.push(row("MSFT.NASDAQ", 2.5));
+        let judged = judge_comparison(&rows, Vec::new());
+
+        assert!(judged.survived, "bar {:?}", judged.bar);
+        assert!(!judged.notes.iter().any(|note| note.contains("picking noise")));
+    }
+
+    #[test]
+    fn two_findings_are_still_a_choice_between_two() {
+        // `expected_best_under_null` needs at least two draws, which is
+        // exactly the smallest comparison anyone would make.
+        let rows = vec![row("MSFT.NASDAQ", 0.4), row("MSFT.NASDAQ", 0.42)];
+        assert!(judge_comparison(&rows, Vec::new()).bar.is_some());
+    }
+
+    #[test]
+    fn comparing_different_instruments_is_said_out_loud() {
+        // The quiet way a comparison stops being one: the differences are then
+        // as much about the instruments as about the rules.
+        let rows = vec![row("MSFT.NASDAQ", 0.4), row("AAPL.NASDAQ", 0.9)];
+        let judged = judge_comparison(&rows, Vec::new());
+        assert!(
+            judged.notes.iter().any(|note| note.contains("different instruments")),
+            "{:?}",
+            judged.notes
+        );
+    }
+
+    #[test]
+    fn a_stale_finding_is_flagged_rather_than_quietly_included() {
+        let mut rows = vec![row("MSFT.NASDAQ", 0.4), row("MSFT.NASDAQ", 0.9)];
+        rows[1].stale = Some(true);
+        let judged = judge_comparison(&rows, Vec::new());
+        assert!(
+            judged.notes.iter().any(|note| note.contains("since changed")),
+            "{:?}",
+            judged.notes
+        );
+    }
+
+    #[test]
+    fn findings_with_no_sharpe_do_not_become_a_bar_of_their_own() {
+        // A curve that never moved has no Sharpe. Treating that as a zero
+        // would drag the no-skill bar down and make everything else look good.
+        let mut rows = vec![row("MSFT.NASDAQ", 1.2)];
+        rows.push(ComparisonRowView {
+            sharpe: None,
+            ..row("MSFT.NASDAQ", 0.0)
+        });
+        let judged = judge_comparison(&rows, Vec::new());
+        assert_eq!(judged.best, Some(1.2));
+        assert_eq!(judged.bar, None, "one measurable result is not a comparison");
+    }
 }
 
 #[cfg(test)]

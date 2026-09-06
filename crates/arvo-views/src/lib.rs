@@ -465,6 +465,52 @@ pub struct StrategyView {
     pub backtests: usize,
 }
 
+/// One finding in a side-by-side comparison.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComparisonRowView {
+    pub id: String,
+    pub subject: String,
+    pub kind: String,
+    pub strategy_name: String,
+    pub verdict: String,
+    pub recorded_at: String,
+    pub total_return: f64,
+    pub excess_return: f64,
+    pub sharpe: Option<f64>,
+    pub max_drawdown: f64,
+    pub trades: u32,
+    pub win_rate: Option<f64>,
+    pub profit_factor: Option<f64>,
+    /// Whether the data behind it has changed since it was recorded.
+    pub stale: Option<bool>,
+}
+
+/// A named equity curve, for drawing several on one chart.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NamedCurveView {
+    pub name: String,
+    pub points: Vec<CurvePoint>,
+}
+
+/// Several findings, read against each other.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComparisonView {
+    pub rows: Vec<ComparisonRowView>,
+    pub curves: Vec<NamedCurveView>,
+    /// The best out-of-sample Sharpe among them, and the score the best of a
+    /// comparison this size would be expected to reach with no skill at all.
+    ///
+    /// The point of the whole screen. Comparing six strategies and keeping the
+    /// best one is a search of size six, and until now nothing counted it:
+    /// each finding deflated the grid *inside* it and none of them knew about
+    /// the other five.
+    pub best_sharpe: Option<f64>,
+    pub expected_best_under_null: Option<f64>,
+    pub survived_deflation: bool,
+    /// What is worth saying about the comparison itself.
+    pub notes: Vec<String>,
+}
+
 /// One instrument the broker knows about.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MatchView {

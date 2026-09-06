@@ -191,6 +191,7 @@ pub fn run() {
             research::disconnect_feed,
             research::fetch_bars,
             research::search_instruments,
+            research::compare_records,
             research::run_panel,
             research::list_history,
             research::open_record,
