@@ -47,9 +47,8 @@ use std::sync::Once;
 
 use arvo_data::BarProvider;
 use arvo_research::{
-    EquityPoint, Experiment, SimulationError, SimulationProvider, SimulationResult, StrategySpec,
+    Experiment, SimulationError, SimulationProvider, SimulationResult, StrategySpec,
 };
-use chrono::NaiveTime;
 use nautilus_backtest::{
     config::{BacktestEngineConfig, SimulatedVenueConfig},
     engine::BacktestEngine,
@@ -76,6 +75,29 @@ const ENGINE: &str = "nautilus 0.63.0";
 /// The strategies wired up so far. See [`strategy`] for why these two.
 const SMA_CROSS: &str = "sma_cross";
 const BUY_AND_HOLD: &str = arvo_research::evaluation::BUY_AND_HOLD;
+const OPENING_RANGE: &str = "opening_range";
+const VOLATILITY_BREAKOUT: &str = "volatility_breakout";
+const VWAP_REVERSION: &str = "vwap_reversion";
+const MOMENTUM_BREAKOUT: &str = "momentum_breakout";
+
+/// Every strategy this engine can run, for a caller that wants to offer a
+/// choice rather than hardcode one.
+pub const STRATEGIES: &[&str] = &[
+    SMA_CROSS,
+    OPENING_RANGE,
+    VOLATILITY_BREAKOUT,
+    VWAP_REVERSION,
+    MOMENTUM_BREAKOUT,
+    BUY_AND_HOLD,
+];
+
+/// The strategies defined against a trading *session*, which therefore mean
+/// nothing on daily bars.
+///
+/// On a daily series a session is one bar: an opening range is the whole day
+/// and a session VWAP is that day's typical price. Both rules would still run
+/// and produce a curve, which is exactly why this list exists.
+pub const SESSION_ANCHORED: &[&str] = &[OPENING_RANGE, VWAP_REVERSION];
 
 /// US equity conventions. Daily bars from the free exports are quoted in cents
 /// and traded in whole shares; nothing yet needs another instrument class, and
@@ -105,7 +127,7 @@ impl<P: BarProvider> SimulationProvider for NautilusSimulation<P> {
     }
 
     fn run(&self, experiment: &Experiment) -> Result<SimulationResult, SimulationError> {
-        let plan = Plan::from_spec(&experiment.strategy)?;
+        let plan = Plan::from_spec(&experiment.strategy, experiment.interval)?;
         experiment
             .risk
             .check()
@@ -160,13 +182,41 @@ enum Plan {
         slow_period: usize,
         trade_size: f64,
     },
+    OpeningRange {
+        range_bars: usize,
+        target_range_multiple: f64,
+        trade_size: f64,
+    },
+    VolatilityBreakout {
+        entry_atr_multiple: f64,
+        atr_period: usize,
+        trade_size: f64,
+    },
+    VwapReversion {
+        entry_deviations: f64,
+        trade_size: f64,
+    },
+    MomentumBreakout {
+        entry_period: usize,
+        exit_period: usize,
+        trade_size: f64,
+    },
     BuyAndHold {
         trade_size: f64,
     },
 }
 
 impl Plan {
-    fn from_spec(spec: &StrategySpec) -> Result<Self, SimulationError> {
+    /// Parses and validates a strategy request.
+    ///
+    /// The interval is needed as well as the spec because two of these rules
+    /// are only defined intraday, and a resolution mismatch is not something
+    /// the result would show: the run completes, the curve looks ordinary, and
+    /// the numbers describe a rule nobody meant to test.
+    fn from_spec(
+        spec: &StrategySpec,
+        interval: arvo_data::BarInterval,
+    ) -> Result<Self, SimulationError> {
         let param = |name: &str| -> Result<f64, SimulationError> {
             spec.params.get(name).copied().ok_or_else(|| {
                 SimulationError::Rejected(format!("{} requires a {name:?} parameter", spec.name))
@@ -193,6 +243,25 @@ impl Plan {
             Ok(value)
         };
 
+        let multiple = |name: &str| -> Result<f64, SimulationError> {
+            let value = param(name)?;
+            if !value.is_finite() || value <= 0.0 || value > 100.0 {
+                return Err(SimulationError::Rejected(format!(
+                    "{name} must be a positive multiple no greater than 100, got {value}"
+                )));
+            }
+            Ok(value)
+        };
+
+        if SESSION_ANCHORED.contains(&spec.name.as_str()) && !interval.is_intraday() {
+            return Err(SimulationError::Rejected(format!(
+                "{} is defined against a trading session and cannot run on {interval} bars; at \
+                 that resolution a session is a single bar, so the rule would still produce a \
+                 curve while measuring something nobody asked for",
+                spec.name
+            )));
+        }
+
         match spec.name.as_str() {
             SMA_CROSS => {
                 let fast_period = period("fast")?;
@@ -208,6 +277,36 @@ impl Plan {
                     trade_size: trade_size()?,
                 })
             }
+            OPENING_RANGE => Ok(Self::OpeningRange {
+                range_bars: period("range_bars")?,
+                target_range_multiple: multiple("target_range_multiple")?,
+                trade_size: trade_size()?,
+            }),
+            VOLATILITY_BREAKOUT => Ok(Self::VolatilityBreakout {
+                entry_atr_multiple: multiple("entry_atr_multiple")?,
+                atr_period: period("atr_period")?,
+                trade_size: trade_size()?,
+            }),
+            VWAP_REVERSION => Ok(Self::VwapReversion {
+                entry_deviations: multiple("entry_deviations")?,
+                trade_size: trade_size()?,
+            }),
+            MOMENTUM_BREAKOUT => {
+                let entry_period = period("entry_period")?;
+                let exit_period = period("exit_period")?;
+                if exit_period > entry_period {
+                    return Err(SimulationError::Rejected(format!(
+                        "exit period {exit_period} must not exceed entry period {entry_period}; a \
+                         rule that needs more evidence to leave than to enter gives most of a \
+                         trend back before it admits the trend ended"
+                    )));
+                }
+                Ok(Self::MomentumBreakout {
+                    entry_period,
+                    exit_period,
+                    trade_size: trade_size()?,
+                })
+            }
             BUY_AND_HOLD => Ok(Self::BuyAndHold {
                 trade_size: trade_size()?,
             }),
@@ -219,6 +318,14 @@ impl Plan {
     const fn min_bars(&self) -> usize {
         match self {
             Self::SmaCross { slow_period, .. } => *slow_period,
+            // The range itself. A window that only covers the range has not
+            // given the rule a single bar to break out on.
+            Self::OpeningRange { range_bars, .. } => *range_bars,
+            Self::VolatilityBreakout { atr_period, .. } => *atr_period,
+            // Enough of a session for a volume-weighted deviation to mean
+            // something, which is the gate this rule's entry waits on.
+            Self::VwapReversion { .. } => 5,
+            Self::MomentumBreakout { entry_period, .. } => *entry_period,
             // One to buy on, and at least one more for the position to have
             // done anything.
             Self::BuyAndHold { .. } => 1,
@@ -227,7 +334,12 @@ impl Plan {
 
     const fn trade_size(&self) -> f64 {
         match self {
-            Self::SmaCross { trade_size, .. } | Self::BuyAndHold { trade_size } => *trade_size,
+            Self::SmaCross { trade_size, .. }
+            | Self::OpeningRange { trade_size, .. }
+            | Self::VolatilityBreakout { trade_size, .. }
+            | Self::VwapReversion { trade_size, .. }
+            | Self::MomentumBreakout { trade_size, .. }
+            | Self::BuyAndHold { trade_size } => *trade_size,
         }
     }
 }
@@ -381,6 +493,51 @@ fn run_backtest(
             slow_period,
             risk,
         )),
+        Plan::OpeningRange {
+            range_bars,
+            target_range_multiple,
+            ..
+        } => engine.add_strategy(strategy::OpeningRange::new(
+            core,
+            bar_type,
+            trade_size,
+            range_bars,
+            target_range_multiple,
+            risk,
+        )),
+        Plan::VolatilityBreakout {
+            entry_atr_multiple,
+            atr_period,
+            ..
+        } => engine.add_strategy(strategy::VolatilityBreakout::new(
+            core,
+            bar_type,
+            trade_size,
+            entry_atr_multiple,
+            atr_period,
+            risk,
+        )),
+        Plan::VwapReversion {
+            entry_deviations, ..
+        } => engine.add_strategy(strategy::VwapReversion::new(
+            core,
+            bar_type,
+            trade_size,
+            entry_deviations,
+            risk,
+        )),
+        Plan::MomentumBreakout {
+            entry_period,
+            exit_period,
+            ..
+        } => engine.add_strategy(strategy::MomentumBreakout::new(
+            core,
+            bar_type,
+            trade_size,
+            entry_period,
+            exit_period,
+            risk,
+        )),
         Plan::BuyAndHold { .. } => {
             engine.add_strategy(strategy::BuyAndHold::new(core, bar_type, trade_size))
         }
@@ -394,16 +551,23 @@ fn run_backtest(
         .run(None, None, Some(experiment.id.to_string()), false)
         .map_err(|err| SimulationError::Engine(Box::new(BacktestFailed(err.to_string()))))?;
 
-    let result = engine.get_result();
     // Before `dispose`: the positions live in the kernel's cache, and
     // disposal is what tears it down.
     let ledger = ledger::from_cache(&engine.kernel_mut().cache.borrow());
-    let equity_curve = compound(
-        experiment.starting_cash,
-        experiment.window.from.and_time(NaiveTime::MIN),
-        result.returns_series.iter(),
-    );
     engine.dispose();
+
+    // From the ledger and the prices, not from `engine.get_result()`. Nautilus
+    // reports a `returns_series`, and it is not an equity curve: it is the
+    // day-over-day change in the account's *cash balance*, which on a cash
+    // account excludes the market value of anything held. Buying reads as a
+    // catastrophic loss and selling as an enormous gain, both the size of the
+    // position's notional. See `arvo_research::trade::equity_curve`.
+    let equity_curve = arvo_research::trade::equity_curve(
+        experiment.starting_cash,
+        bars,
+        experiment.interval,
+        &ledger,
+    );
 
     Ok(SimulationResult {
         experiment: experiment.id.clone(),
@@ -514,44 +678,6 @@ fn aggregation_of(
     Ok((step, aggregation))
 }
 
-/// Turns Nautilus's dated period returns into a dated equity curve.
-///
-/// Nautilus reports returns; evaluation wants equity, and everything else
-/// (drawdown, Sharpe, hit rate) derives from equity. The curve opens at the
-/// starting balance so a run with no trades is a flat single point rather than
-/// an empty vector that reads like a failure.
-///
-/// The dates come along. Nautilus keys its returns by timestamp and this used
-/// to drop them on the floor, which made the curve impossible to draw, to
-/// align against another run, or to ask *when* a drawdown happened. Keeping
-/// them costs a conversion.
-fn compound<'a>(
-    starting_cash: f64,
-    opened: chrono::NaiveDateTime,
-    returns: impl Iterator<Item = (&'a UnixNanos, &'a f64)>,
-) -> Vec<EquityPoint> {
-    let mut equity = starting_cash;
-    let mut curve = vec![EquityPoint { at: opened, equity }];
-    for (at, value) in returns {
-        equity *= 1.0 + value;
-        curve.push(EquityPoint {
-            at: instant_of(*at).unwrap_or(opened),
-            equity,
-        });
-    }
-    curve
-}
-
-/// The UTC instant a Nautilus timestamp names.
-///
-/// The whole instant, not just its date: at an intraday resolution many
-/// points share a day, and collapsing them would flatten the curve into one
-/// value per day with no warning.
-fn instant_of(at: UnixNanos) -> Option<chrono::NaiveDateTime> {
-    let nanos = i64::try_from(at.as_u64()).ok()?;
-    Some(chrono::DateTime::from_timestamp_nanos(nanos).naive_utc())
-}
-
 /// Wraps a Nautilus engine failure so it can cross the boundary as a plain
 /// `std::error::Error` without exporting a Nautilus type.
 #[derive(Debug, thiserror::Error)]
@@ -562,6 +688,7 @@ struct BacktestFailed(String);
 mod tests {
     use super::*;
     use arvo_data::InMemoryBars;
+    use chrono::NaiveTime;
     use arvo_research::{
         CostModel, DatasetRef, DateRange, ExperimentId, HypothesisId, StrategySpec,
     };
@@ -595,6 +722,67 @@ mod tests {
         bars
     }
 
+    /// Five-minute bars across whole sessions, shaped so a session-anchored
+    /// rule has something to find: a quiet opening range, then a break, then
+    /// a fade back through the session's average.
+    ///
+    /// Timestamps are UTC and sit inside US regular hours (13:30–20:00), so a
+    /// session never crosses UTC midnight — which is the assumption
+    /// `strategy::indicator::Session` is built on.
+    fn sessions(count: usize, bars_each: usize) -> Vec<arvo_data::Bar> {
+        let mut day = date(2024, 1, 2);
+        let mut bars = Vec::with_capacity(count * bars_each);
+        for session in 0..count {
+            let open = day.and_hms_opt(13, 30, 0).expect("valid");
+            // Alternate the direction of the break so neither a breakout rule
+            // nor a reversion rule is handed a one-sided fixture.
+            let sign = if session % 2 == 0 { 1.0 } else { -1.0 };
+            for index in 0..bars_each {
+                let phase = index as f64 / bars_each as f64;
+                // Flat for the first fifth, then a directional leg, then a
+                // partial retrace.
+                let close = 100.0
+                    + sign
+                        * if phase < 0.2 {
+                            0.0
+                        } else if phase < 0.6 {
+                            (phase - 0.2) * 25.0
+                        } else {
+                            10.0 - (phase - 0.6) * 15.0
+                        };
+                bars.push(arvo_data::Bar {
+                    at: open + chrono::Duration::minutes(5 * index as i64),
+                    open: close,
+                    high: close + 0.2,
+                    low: close - 0.2,
+                    close,
+                    volume: 10_000.0 + index as f64 * 100.0,
+                });
+            }
+            day = day.succ_opt().expect("date stays in range");
+        }
+        bars
+    }
+
+    fn intraday_experiment(
+        name: &str,
+        params: BTreeMap<String, f64>,
+        bars: &[arvo_data::Bar],
+    ) -> Experiment {
+        let mut experiment = experiment(params, bars);
+        experiment.strategy.name = name.to_owned();
+        experiment.interval = arvo_data::BarInterval::new(5, arvo_data::IntervalUnit::Minute);
+        experiment
+    }
+
+    fn intraday_provider(bars: Vec<arvo_data::Bar>) -> NautilusSimulation<InMemoryBars> {
+        NautilusSimulation::new(InMemoryBars::new().with_interval(
+            "AAPL.NASDAQ",
+            arvo_data::BarInterval::new(5, arvo_data::IntervalUnit::Minute),
+            bars,
+        ))
+    }
+
     fn experiment(params: BTreeMap<String, f64>, bars: &[arvo_data::Bar]) -> Experiment {
         Experiment {
             id: ExperimentId::from("e-1"),
@@ -619,6 +807,16 @@ mod tests {
             starting_cash: 100_000.0,
             seed: 42,
         }
+    }
+
+    fn experiment_named(
+        name: &str,
+        params: BTreeMap<String, f64>,
+        bars: &[arvo_data::Bar],
+    ) -> Experiment {
+        let mut experiment = experiment(params, bars);
+        experiment.strategy.name = name.to_owned();
+        experiment
     }
 
     fn params(fast: f64, slow: f64) -> BTreeMap<String, f64> {
@@ -673,6 +871,168 @@ mod tests {
             "reproducibility is the whole point; two identical experiments must agree"
         );
         assert_eq!(first.trades, second.trades);
+    }
+
+    #[test]
+    fn every_advertised_strategy_can_actually_be_planned() {
+        // `STRATEGIES` is what a caller offers in a menu. A name in it that no
+        // arm of `from_spec` matches is a rejection the user only discovers
+        // after picking it.
+        let intraday = arvo_data::BarInterval::new(5, arvo_data::IntervalUnit::Minute);
+        for name in STRATEGIES {
+            let spec = StrategySpec {
+                name: (*name).to_owned(),
+                params: BTreeMap::from([
+                    ("fast".to_owned(), 5.0),
+                    ("slow".to_owned(), 20.0),
+                    ("trade_size".to_owned(), 100.0),
+                    ("range_bars".to_owned(), 6.0),
+                    ("target_range_multiple".to_owned(), 2.0),
+                    ("entry_atr_multiple".to_owned(), 1.5),
+                    ("atr_period".to_owned(), 14.0),
+                    ("entry_deviations".to_owned(), 2.0),
+                    ("entry_period".to_owned(), 20.0),
+                    ("exit_period".to_owned(), 10.0),
+                ]),
+            };
+            assert!(
+                Plan::from_spec(&spec, intraday).is_ok(),
+                "{name} is advertised but cannot be planned"
+            );
+        }
+    }
+
+    #[test]
+    fn a_session_anchored_rule_refuses_daily_bars() {
+        // Both would run happily and produce a curve: on daily bars the
+        // opening range is the whole day and the session VWAP is that day's
+        // typical price. The numbers would describe a rule nobody asked for.
+        let bars = sawtooth(200);
+        for name in SESSION_ANCHORED {
+            let mut experiment = experiment(params(5.0, 20.0), &bars);
+            experiment.strategy.name = (*name).to_owned();
+            experiment
+                .strategy
+                .params
+                .extend([
+                    ("range_bars".to_owned(), 6.0),
+                    ("target_range_multiple".to_owned(), 2.0),
+                    ("entry_deviations".to_owned(), 2.0),
+                ]);
+
+            let err = provider(bars.clone())
+                .run(&experiment)
+                .expect_err("a session is one bar at this resolution");
+            assert!(
+                matches!(err, SimulationError::Rejected(ref why) if why.contains("session")),
+                "{name}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_opening_range_takes_at_most_one_trade_a_session() {
+        // Re-entering on the same range turns one signal into several
+        // correlated bets on the same premise, which inflates the very count
+        // the evaluation criteria use to decide there is enough evidence.
+        let bars = sessions(10, 40);
+        let experiment = intraday_experiment(
+            OPENING_RANGE,
+            BTreeMap::from([
+                ("range_bars".to_owned(), 6.0),
+                ("target_range_multiple".to_owned(), 2.0),
+                ("trade_size".to_owned(), 10.0),
+            ]),
+            &bars,
+        );
+
+        let result = intraday_provider(bars).run(&experiment).expect("runs");
+        assert!(result.trades > 0, "the fixture breaks its range every day");
+        assert!(
+            result.trades <= 10,
+            "{} trades across 10 sessions is more than one a day",
+            result.trades
+        );
+    }
+
+    #[test]
+    fn vwap_reversion_trades_and_exits_at_the_average() {
+        let bars = sessions(10, 40);
+        let experiment = intraday_experiment(
+            VWAP_REVERSION,
+            BTreeMap::from([
+                ("entry_deviations".to_owned(), 1.0),
+                ("trade_size".to_owned(), 10.0),
+            ]),
+            &bars,
+        );
+
+        let result = intraday_provider(bars).run(&experiment).expect("runs");
+        assert!(
+            result.trades > 0,
+            "the fixture stretches away from its VWAP every session"
+        );
+        // Reversion holds for part of a session, never across one.
+        for trade in result.ledger.iter().filter(|t| t.closed.is_some()) {
+            let held = trade.holding_period().expect("closed");
+            assert!(
+                held <= chrono::Duration::days(1),
+                "a session rule held {held} — it should flatten at the boundary"
+            );
+        }
+    }
+
+    #[test]
+    fn a_volatility_breakout_trades_on_a_moving_fixture() {
+        let bars = sawtooth(300);
+        let experiment = experiment_named(
+            VOLATILITY_BREAKOUT,
+            BTreeMap::from([
+                ("entry_atr_multiple".to_owned(), 0.5),
+                ("atr_period".to_owned(), 14.0),
+                ("trade_size".to_owned(), 100.0),
+            ]),
+            &bars,
+        );
+
+        let result = provider(bars).run(&experiment).expect("runs");
+        assert!(result.trades > 0, "a sawtooth thrusts in both directions");
+    }
+
+    #[test]
+    fn a_momentum_breakout_trades_on_a_trending_fixture() {
+        let bars = sawtooth(300);
+        let experiment = experiment_named(
+            MOMENTUM_BREAKOUT,
+            BTreeMap::from([
+                ("entry_period".to_owned(), 20.0),
+                ("exit_period".to_owned(), 10.0),
+                ("trade_size".to_owned(), 100.0),
+            ]),
+            &bars,
+        );
+
+        let result = provider(bars).run(&experiment).expect("runs");
+        assert!(result.trades > 0, "the fixture drifts up through its channel");
+    }
+
+    #[test]
+    fn a_breakout_that_leaves_slower_than_it_enters_is_refused() {
+        let bars = sawtooth(100);
+        let experiment = experiment_named(
+            MOMENTUM_BREAKOUT,
+            BTreeMap::from([
+                ("entry_period".to_owned(), 10.0),
+                ("exit_period".to_owned(), 50.0),
+                ("trade_size".to_owned(), 100.0),
+            ]),
+            &bars,
+        );
+
+        let err = provider(bars)
+            .run(&experiment)
+            .expect_err("a slower exit gives the trend back before admitting it ended");
+        assert!(matches!(err, SimulationError::Rejected(_)), "{err}");
     }
 
     #[test]
@@ -957,18 +1317,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn an_empty_return_series_still_yields_the_opening_balance() {
-        let empty: std::collections::BTreeMap<UnixNanos, f64> = std::collections::BTreeMap::new();
-        let curve = compound(
-            100_000.0,
-            date(2024, 1, 1).and_time(NaiveTime::MIN),
-            empty.iter(),
-        );
-        assert_eq!(curve.len(), 1, "the opening balance is always a point");
-        assert!((curve[0].equity - 100_000.0).abs() < f64::EPSILON);
-        assert_eq!(curve[0].at.date(), date(2024, 1, 1));
-    }
 
     /// A steadily rising market, so buy-and-hold must show a gain. If the
     /// benchmark comes back flat here, the position is being left open and
@@ -1094,27 +1442,64 @@ mod tests {
     }
 
     #[test]
-    fn returns_compound_rather_than_summing() {
-        let day = |d: u32| {
-            close_of_bar(
-                date(2024, 1, d).and_time(NaiveTime::MIN),
-                arvo_data::BarInterval::DAILY,
-            )
-            .expect("representable")
-        };
-        let returns: std::collections::BTreeMap<UnixNanos, f64> =
-            [(day(1), 0.1), (day(2), 0.1)].into_iter().collect();
-
-        let curve = compound(
-            100.0,
-            date(2024, 1, 1).and_time(NaiveTime::MIN),
-            returns.iter(),
+    fn an_intraday_curve_agrees_with_its_ledger() {
+        // The test that was missing. Reconciliation was only checked on daily
+        // bars with a small position, where the engine's own returns series
+        // was wrong in a way that looked like an ordinary wobble and happened
+        // to land on the right endpoint. Put most of the account into one
+        // intraday trade and it reported +98% on two losing trades.
+        let bars = sessions(10, 40);
+        let mut experiment = intraday_experiment(
+            OPENING_RANGE,
+            BTreeMap::from([
+                ("range_bars".to_owned(), 6.0),
+                ("target_range_multiple".to_owned(), 2.0),
+                ("trade_size".to_owned(), 10.0),
+            ]),
+            &bars,
         );
-        assert!((curve[2].equity - 121.0).abs() < 1e-9, "{curve:?}");
+        // Risk-sized, so a position is most of the account — the condition
+        // that made the old curve absurd rather than merely wrong.
+        experiment.risk = arvo_research::RiskModel {
+            stop_atr_multiple: Some(2.0),
+            atr_period: 14,
+            risk_per_trade: Some(0.01),
+            max_position_fraction: Some(1.0),
+        };
+
+        let result = intraday_provider(bars.clone()).run(&experiment).expect("runs");
+        let stats = arvo_research::TradeStats::from_ledger(&result.ledger);
+        assert!(result.trades > 0, "the fixture breaks its range");
+        assert_eq!(stats.still_open, 0, "the fixture closes everything");
+
+        let realised: f64 = result.ledger.iter().map(|trade| trade.pnl).sum();
+        let moved = result.equity_curve.last().expect("non-empty").equity - experiment.starting_cash;
+        assert!(
+            (realised - moved).abs() < 1.0,
+            "ledger realised {realised} but the curve moved {moved}"
+        );
+    }
+
+    #[test]
+    fn a_curve_has_one_point_per_bar_not_one_per_day() {
+        // Metrics annualise by the experiment's own interval. A curve with one
+        // point a day, scaled by the five-minute factor, overstated volatility
+        // by about nine times — and the number looked like a result.
+        let bars = sessions(4, 20);
+        let experiment = intraday_experiment(
+            VWAP_REVERSION,
+            BTreeMap::from([
+                ("entry_deviations".to_owned(), 1.0),
+                ("trade_size".to_owned(), 10.0),
+            ]),
+            &bars,
+        );
+
+        let result = intraday_provider(bars.clone()).run(&experiment).expect("runs");
         assert_eq!(
-            curve[2].at.date(),
-            date(2024, 1, 3),
-            "a bar timestamped at its close lands on the following calendar day"
+            result.equity_curve.len(),
+            bars.len() + 1,
+            "every bar, plus the opening balance"
         );
     }
 }

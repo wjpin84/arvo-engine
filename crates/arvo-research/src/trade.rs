@@ -16,6 +16,8 @@
 use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
 
+use crate::EquityPoint;
+
 /// Which way a position was held.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -221,6 +223,84 @@ impl TradeStats {
     }
 }
 
+/// Account equity at the close of every bar, from the ledger and the prices.
+///
+/// # Why this is not the engine's own returns series
+///
+/// Nautilus reports `returns_series`, and using it was wrong in a way that
+/// took a real strategy to expose. It is the *day-over-day change in the
+/// account's cash balance*, keeping one balance per day — and on a cash
+/// account `balance.total` is cash, which excludes the market value of
+/// anything held. So buying reads as a catastrophic loss, selling reads as an
+/// enormous gain, and the size of both is the position's notional rather than
+/// its profit.
+///
+/// It survived undetected because on daily bars with a small position the
+/// distortion was a plausible-looking wobble, and because the endpoints happen
+/// to agree once everything is closed. An intraday run that put most of the
+/// account into one trade reported +98% on two losing trades.
+///
+/// Two things follow from computing it here instead:
+///
+/// * it reconciles with the ledger by construction — the same realised P&L
+///   produces both, so they cannot disagree;
+/// * there is one point per bar rather than one per day, which is what the
+///   annualisation factor already assumed. Annualising a daily series by the
+///   five-minute factor was inflating volatility by about nine times.
+///
+/// Open positions are marked to market at each bar's close, so a drawdown
+/// while holding is visible. That matters: a curve built from realised profit
+/// alone is a step function, and a position that halves and recovers would
+/// show no drawdown at all.
+///
+/// One approximation, stated: commission is charged in [`Trade::pnl`] at the
+/// close, so while a position is open its entry commission is not yet
+/// subtracted. It is a fee's worth of optimism for the length of one trade,
+/// and it is gone by the time the trade lands in the curve.
+#[must_use]
+pub fn equity_curve(
+    starting_cash: f64,
+    bars: &[arvo_data::Bar],
+    interval: arvo_data::BarInterval,
+    ledger: &[Trade],
+) -> Vec<EquityPoint> {
+    let mut curve = Vec::with_capacity(bars.len() + 1);
+    let Some(first) = bars.first() else {
+        return curve;
+    };
+
+    // The account before anything happened, timestamped at the first bar's
+    // open. Without it a curve of one closed trade has a single point and no
+    // return can be computed from it.
+    curve.push(EquityPoint {
+        at: first.at,
+        equity: starting_cash,
+    });
+
+    for bar in bars {
+        // A bar is only knowable once its period has closed — the same
+        // convention the engine boundary timestamps bars with, so trade
+        // instants and curve instants are on the same clock.
+        let at = bar.at + interval.duration();
+        let mut equity = starting_cash;
+
+        for trade in ledger {
+            match trade.closed {
+                Some(closed) if closed <= at => equity += trade.pnl,
+                // Held right now: mark it to this bar's close. Long-only, so
+                // the sign is the price move.
+                _ if trade.opened <= at => {
+                    equity += trade.quantity * (bar.close - trade.entry);
+                }
+                _ => {}
+            }
+        }
+
+        curve.push(EquityPoint { at, equity });
+    }
+    curve
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -243,6 +323,85 @@ mod tests {
             commission: 1.0,
             exit_reason: reason,
         }
+    }
+
+    fn bar(day: u32, close: f64) -> arvo_data::Bar {
+        arvo_data::Bar {
+            at: at(day),
+            open: close,
+            high: close,
+            low: close,
+            close,
+            volume: 1_000.0,
+        }
+    }
+
+    #[test]
+    fn a_curve_ends_where_the_ledger_says_it_should() {
+        // The property the engine's own returns series did not have: the
+        // curve and the ledger are the same statement about the same run.
+        let bars: Vec<_> = (1..=5).map(|day| bar(day, 100.0)).collect();
+        let ledger = [Trade {
+            opened: at(1),
+            closed: Some(at(3)),
+            direction: Direction::Long,
+            quantity: 10.0,
+            entry: 100.0,
+            exit: Some(110.0),
+            pnl: 95.0,
+            commission: 5.0,
+            exit_reason: ExitReason::Signal,
+        }];
+
+        let curve = equity_curve(1_000.0, &bars, arvo_data::BarInterval::DAILY, &ledger);
+        let last = curve.last().expect("non-empty").equity;
+        assert!((last - 1_095.0).abs() < 1e-9, "{last}");
+    }
+
+    #[test]
+    fn an_open_position_is_marked_to_market_rather_than_ignored() {
+        // A curve built from realised profit alone is a step function: a
+        // position that halves and recovers would show no drawdown, and
+        // drawdown is one of the criteria a verdict turns on.
+        let bars = vec![bar(1, 100.0), bar(2, 50.0), bar(3, 100.0)];
+        let ledger = [Trade {
+            opened: at(1),
+            closed: None,
+            direction: Direction::Long,
+            quantity: 10.0,
+            entry: 100.0,
+            exit: None,
+            pnl: 0.0,
+            commission: 0.0,
+            exit_reason: ExitReason::StillOpen,
+        }];
+
+        let curve = equity_curve(1_000.0, &bars, arvo_data::BarInterval::DAILY, &ledger);
+        let trough = curve
+            .iter()
+            .map(|point| point.equity)
+            .fold(f64::INFINITY, f64::min);
+        assert!(
+            (trough - 500.0).abs() < 1e-9,
+            "halving a fully-invested position is a 50% drawdown, got {trough}"
+        );
+    }
+
+    #[test]
+    fn a_curve_has_a_point_for_every_bar_plus_its_opening_balance() {
+        // One point per *bar*, not per day. The annualisation factor already
+        // assumed this; a daily series scaled by the five-minute factor
+        // overstated volatility by about nine times.
+        let bars: Vec<_> = (1..=7).map(|day| bar(day, 100.0)).collect();
+        let curve = equity_curve(1_000.0, &bars, arvo_data::BarInterval::DAILY, &[]);
+        assert_eq!(curve.len(), 8);
+        assert!(curve.iter().all(|point| point.equity == 1_000.0));
+    }
+
+    #[test]
+    fn no_bars_is_an_empty_curve_rather_than_a_lone_opening_balance() {
+        // A single point reads as "the account never moved". Nothing ran.
+        assert!(equity_curve(1_000.0, &[], arvo_data::BarInterval::DAILY, &[]).is_empty());
     }
 
     #[test]

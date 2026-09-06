@@ -1,7 +1,7 @@
 //! Runs one experiment at an explicit resolution, to prove the interval is
 //! honoured end to end.
 //!
-//!     cargo run -p arvo-runtime --example intraday -- //!         <data-dir> <instrument> <interval> [risk-per-trade] [slippage-bps]
+//!     cargo run -p arvo-runtime --example intraday -- //!         <data-dir> <instrument> <interval> [risk] [slippage-bps] [strategy]
 //!
 //! Exists because the interval touches four crates — the data tier, the
 //! record, the engine boundary and annualisation — and a mistake in any of
@@ -19,7 +19,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let root = args
         .next()
-        .ok_or("usage: intraday <data-dir> <instrument> <interval> [risk] [slippage-bps]")?;
+        .ok_or("usage: intraday <data-dir> <instrument> <interval> [risk] [slippage] [strategy]")?;
     let instrument = args.next().ok_or("missing instrument")?;
     let interval: BarInterval = args.next().ok_or("missing interval")?.parse()?;
     // Optional 4th argument: "none" for fixed sizing, so risk-based sizing
@@ -29,6 +29,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // resolution, so being able to vary it here is how that gets checked
     // rather than assumed.
     let slippage_bps: f64 = args.next().unwrap_or_else(|| "0".to_owned()).parse()?;
+    // Optional 6th argument. The session-anchored rules only exist at this
+    // resolution, so this example is the only place they can be exercised on
+    // real data at all.
+    let strategy = args.next().unwrap_or_else(|| "sma_cross".to_owned());
 
     let bars = CsvBars::new(&root);
     let series = bars.bars(
@@ -42,7 +46,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     };
 
-    println!("{instrument} at {interval}, slippage {slippage_bps} bps");
+    println!("{instrument} at {interval}: {strategy}, slippage {slippage_bps} bps");
     println!("  {} bars, {} .. {}", series.len(), first.at, last.at);
     println!(
         "  {:.1} periods a year (a daily bar is {:.0})",
@@ -61,10 +65,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             version: bars.fingerprint(&instrument, interval)?.unwrap_or_default(),
         },
         strategy: StrategySpec {
-            name: "sma_cross".to_owned(),
+            name: strategy.clone(),
+            // Every rule's parameters at once. A strategy takes the ones it
+            // names and ignores the rest, so one example can drive all of
+            // them without a match on the name here.
             params: [
                 ("fast".to_owned(), 10.0),
                 ("slow".to_owned(), 30.0),
+                ("range_bars".to_owned(), 6.0),
+                ("target_range_multiple".to_owned(), 2.0),
+                ("entry_atr_multiple".to_owned(), 1.0),
+                ("atr_period".to_owned(), 14.0),
+                ("entry_deviations".to_owned(), 1.5),
+                ("entry_period".to_owned(), 20.0),
+                ("exit_period".to_owned(), 10.0),
                 ("trade_size".to_owned(), 10.0),
             ]
             .into_iter()
@@ -82,10 +96,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let result = NautilusSimulation::new(CsvBars::new(&root)).run(&experiment)?;
+    let trades = arvo_research::TradeStats::from_ledger(&result.ledger);
     println!(
-        "  ran: {} trades, {} equity points",
+        "  ran: {} trades ({} closed, {} still open), {} equity points",
         result.trades,
+        trades.closed,
+        trades.still_open,
         result.equity_curve.len()
+    );
+    println!(
+        "  win rate {}, profit factor {}, {} stop exits",
+        trades
+            .win_rate
+            .map_or_else(|| "n/a".to_owned(), |v| format!("{:.0}%", v * 100.0)),
+        trades
+            .profit_factor
+            .map_or_else(|| "n/a".to_owned(), |v| format!("{v:.2}")),
+        trades.stop_exits
+    );
+
+    for trade in &result.ledger {
+        println!(
+            "    {} -> {}  {:.0} @ {:.2} -> {:.2}  pnl {:+.2}  {:?}",
+            trade.opened,
+            trade.closed.map_or_else(|| "open".to_owned(), |at| at.to_string()),
+            trade.quantity,
+            trade.entry,
+            trade.exit.unwrap_or(f64::NAN),
+            trade.pnl,
+            trade.exit_reason
+        );
+    }
+    let realised: f64 = result.ledger.iter().map(|t| t.pnl).sum();
+    println!(
+        "  realised {realised:+.2} vs curve {:+.2}",
+        result.equity_curve.last().map_or(0.0, |p| p.equity) - experiment.starting_cash
     );
 
     match Metrics::from_curve(
