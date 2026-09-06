@@ -76,6 +76,7 @@ pub(crate) struct StudyView {
     pub(crate) best_sharpe: f64,
     pub(crate) expected_best_under_null: Option<f64>,
     pub(crate) survived_deflation: bool,
+    pub(crate) surface: Option<SurfaceView>,
     pub(crate) in_sample: String,
     pub(crate) out_of_sample: String,
     pub(crate) selected_params: Vec<(String, f64)>,
@@ -194,6 +195,29 @@ pub(crate) struct TradesView {
     pub(crate) fees_fraction: f64,
     pub(crate) signal_exits: u32,
     pub(crate) stop_exits: u32,
+}
+
+/// One configuration's cell on the search surface.
+#[derive(Clone, Deserialize)]
+pub(crate) struct SurfaceCell {
+    pub(crate) x: f64,
+    pub(crate) y: f64,
+    pub(crate) sharpe: f64,
+    pub(crate) selected: bool,
+    pub(crate) above_null: bool,
+}
+
+/// The in-sample score of every configuration the search tried.
+#[derive(Clone, Deserialize)]
+pub(crate) struct SurfaceView {
+    pub(crate) x_axis: String,
+    pub(crate) y_axis: String,
+    pub(crate) x_values: Vec<f64>,
+    pub(crate) y_values: Vec<f64>,
+    pub(crate) cells: Vec<SurfaceCell>,
+    pub(crate) null_bar: Option<f64>,
+    pub(crate) best: f64,
+    pub(crate) collapsed: Vec<String>,
 }
 
 /// One bar, as the chart wants it.

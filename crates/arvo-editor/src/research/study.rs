@@ -7,7 +7,9 @@
 
 use leptos::prelude::*;
 
-use crate::chart::{EquityChart, MetricCard, MonthlyReturns, PriceChart, UnderwaterChart};
+use crate::chart::{
+    EquityChart, MetricCard, MonthlyReturns, ParameterSurface, PriceChart, UnderwaterChart,
+};
 use crate::format::{percent, ratio, short_hash, verdict_class};
 use crate::views::*;
 
@@ -247,6 +249,18 @@ pub(crate) fn StudyReport(study: StudyView) -> impl IntoView {
             // Directly under the equity curve, because the curve says how
             // much and this says how. A reader who has seen a rising line and
             // not seen where the trades landed has only half the finding.
+            // Above the price, because it answers a prior question: whether
+            // there was anything to find before asking what the winner did.
+            {study
+                .surface
+                .clone()
+                .map(|surface| {
+                    view! {
+                        <h4>"The whole search"</h4>
+                        <ParameterSurface surface=surface />
+                    }
+                })}
+
             <h4>"Where it traded"</h4>
             <PriceChart candles=study.price.clone() markers=study.markers.clone() />
 

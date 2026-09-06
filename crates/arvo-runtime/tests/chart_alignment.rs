@@ -105,3 +105,35 @@ fn the_price_chart_covers_the_period_that_was_judged() {
         .timestamp();
     assert_eq!(view.price.first().expect("non-empty").time, judged_from);
 }
+
+#[test]
+fn the_search_surface_is_the_whole_grid_not_only_its_winner() {
+    // Reporting the maximum alone shows a broad good region and a single lucky
+    // cell identically. The surface is what tells them apart, and it has to
+    // come out of a real search rather than a fixture to prove the scores
+    // survive selection.
+    let (found, view) = report();
+    let surface = view.surface.expect("the workbench grid varies fast and slow");
+
+    assert_eq!(
+        surface.cells.len(),
+        found.selection.trials,
+        "every configuration that ran has a cell"
+    );
+    assert_eq!(surface.x_values.len() * surface.y_values.len(), 9);
+    assert_eq!(
+        surface.cells.iter().filter(|cell| cell.selected).count(),
+        1,
+        "exactly one cell is the winner"
+    );
+
+    // And the shading anchor is the deflation bar the verdict already used, so
+    // the picture and the verdict cannot disagree about what counts as good.
+    assert_eq!(surface.null_bar, found.selection.expected_best_under_null);
+    let best = surface
+        .cells
+        .iter()
+        .find(|cell| cell.selected)
+        .expect("a winner");
+    assert_eq!(best.above_null, found.selection.survived_deflation);
+}

@@ -497,6 +497,8 @@ pub struct StudyView {
     pub best_sharpe: f64,
     pub expected_best_under_null: Option<f64>,
     pub survived_deflation: bool,
+    /// Every configuration the search tried, not only the one it picked.
+    pub surface: Option<SurfaceView>,
 
     // Which days chose the configuration, and which days judged it.
     pub in_sample: String,
@@ -606,6 +608,49 @@ pub struct WalkForwardView {
     pub commission_bps: f64,
     pub slippage_bps: f64,
     pub engine: String,
+}
+
+/// One configuration's cell on the search surface.
+#[derive(Serialize)]
+pub struct SurfaceCell {
+    pub x: f64,
+    pub y: f64,
+    pub sharpe: f64,
+    /// Whether this is the configuration that was chosen.
+    pub selected: bool,
+    /// Whether it beat what a no-skill search of this size would produce.
+    ///
+    /// The distinction the whole chart is drawn around. A cell below the bar
+    /// is not a weak result, it is *not a result* — a score a coin-flipping
+    /// search of the same size would have been expected to reach anyway.
+    pub above_null: bool,
+}
+
+/// The in-sample score of every configuration the search tried.
+///
+/// # Why this exists at all
+///
+/// Reporting only the winner shows two completely different situations
+/// identically: a broad region of configurations that all scored well, which
+/// suggests something real and robust to the exact parameters; and one bright
+/// cell surrounded by nothing, which is what fitting noise looks like from
+/// above. The verdict machinery already deflates for the *size* of the search;
+/// this is the part a person has to look at.
+#[derive(Serialize)]
+pub struct SurfaceView {
+    /// The two axes drawn, by name.
+    pub x_axis: String,
+    pub y_axis: String,
+    pub x_values: Vec<f64>,
+    pub y_values: Vec<f64>,
+    pub cells: Vec<SurfaceCell>,
+    /// The bar a cell has to clear to be worth anything. `None` when there
+    /// were too few trials to say.
+    pub null_bar: Option<f64>,
+    pub best: f64,
+    /// Axes not drawn, because a surface has two dimensions and a grid may
+    /// have more. Named so nobody reads the chart as the whole search.
+    pub collapsed: Vec<String>,
 }
 
 /// A stored finding, summarised for the history list.
@@ -1198,6 +1243,101 @@ pub async fn run_panel(
 /// identically to one just produced. Two projections would drift, and a
 /// history that showed something subtly different from the live run would be
 /// worse than no history.
+/// Turns the search surface into something drawable.
+///
+/// `None` when the grid varies fewer than two parameters — a surface needs two
+/// dimensions, and a single axis is a list, which the fold table and the
+/// winning-parameters line already say.
+///
+/// # Choosing which two axes
+///
+/// The two with the most distinct values, because those are the ones the
+/// search actually explored. Any others are *collapsed by taking the best*
+/// score over them, and named in [`SurfaceView::collapsed`] so the chart is
+/// never mistaken for the whole search. Taking the best rather than the mean
+/// is deliberate: this chart answers "was there a good region", and averaging
+/// a good configuration together with a bad one on a hidden axis would hide
+/// exactly the region being looked for.
+///
+/// Axes tied on distinct-value count break by name. Arbitrary, and
+/// deterministic — a surface that redrew itself differently between runs
+/// would be worse than one that picked oddly.
+fn surface(selection: &arvo_research::Selection) -> Option<SurfaceView> {
+    use std::collections::BTreeMap;
+
+    let mut axes: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+    for trial in &selection.scored {
+        for (name, value) in &trial.params {
+            let values = axes.entry(name.clone()).or_default();
+            if !values.iter().any(|held| (held - value).abs() < f64::EPSILON) {
+                values.push(*value);
+            }
+        }
+    }
+    axes.retain(|_, values| values.len() > 1);
+    if axes.len() < 2 {
+        return None;
+    }
+
+    let mut ranked: Vec<(String, Vec<f64>)> = axes.into_iter().collect();
+    ranked.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
+    let collapsed = ranked
+        .iter()
+        .skip(2)
+        .map(|(name, _)| name.clone())
+        .collect();
+    let (y_axis, mut y_values) = ranked.remove(1);
+    let (x_axis, mut x_values) = ranked.remove(0);
+    x_values.sort_by(f64::total_cmp);
+    y_values.sort_by(f64::total_cmp);
+
+    let best_params = selection
+        .scored
+        .iter()
+        .max_by(|a, b| a.sharpe.total_cmp(&b.sharpe))
+        .map(|trial| trial.params.clone())
+        .unwrap_or_default();
+
+    let mut cells: BTreeMap<(String, String), SurfaceCell> = BTreeMap::new();
+    for trial in &selection.scored {
+        let (Some(x), Some(y)) = (trial.params.get(&x_axis), trial.params.get(&y_axis)) else {
+            continue;
+        };
+        let key = (x.to_string(), y.to_string());
+        let selected = trial.params == best_params;
+        let cell = cells.entry(key).or_insert(SurfaceCell {
+            x: *x,
+            y: *y,
+            sharpe: f64::NEG_INFINITY,
+            selected: false,
+            above_null: false,
+        });
+        // Best over the collapsed axes, not mean. See the note above.
+        if trial.sharpe > cell.sharpe {
+            cell.sharpe = trial.sharpe;
+        }
+        cell.selected |= selected;
+    }
+
+    let mut cells: Vec<SurfaceCell> = cells.into_values().collect();
+    for cell in &mut cells {
+        cell.above_null = selection
+            .expected_best_under_null
+            .is_none_or(|bar| cell.sharpe > bar);
+    }
+
+    Some(SurfaceView {
+        x_axis,
+        y_axis,
+        x_values,
+        y_values,
+        best: selection.best_sharpe,
+        null_bar: selection.expected_best_under_null,
+        cells,
+        collapsed,
+    })
+}
+
 /// Flattens a study for display.
 ///
 /// Public because the projection *is* what this crate does, and because the
@@ -1218,6 +1358,7 @@ pub fn study_view(
         best_sharpe: found.selection.best_sharpe,
         expected_best_under_null: found.selection.expected_best_under_null,
         survived_deflation: found.selection.survived_deflation,
+        surface: surface(&found.selection),
         in_sample: format!("{} → {}", found.in_sample.from, found.in_sample.to),
         out_of_sample: format!("{} → {}", found.out_of_sample.from, found.out_of_sample.to),
         selected_params: found
@@ -1554,6 +1695,168 @@ pub fn study_for(
         template_for(instrument, plan, window, dataset_version),
         plan.grid(),
     )
+}
+
+#[cfg(test)]
+mod surface_tests {
+    use super::*;
+    use arvo_research::{ScoredTrial, Selection};
+
+    fn trial(pairs: &[(&str, f64)], sharpe: f64) -> ScoredTrial {
+        ScoredTrial {
+            params: pairs
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), *value))
+                .collect(),
+            sharpe,
+        }
+    }
+
+    fn selection(scored: Vec<ScoredTrial>, bar: Option<f64>) -> Selection {
+        let best = scored
+            .iter()
+            .map(|trial| trial.sharpe)
+            .fold(f64::NEG_INFINITY, f64::max);
+        Selection {
+            trials: scored.len(),
+            best_sharpe: best,
+            expected_best_under_null: bar,
+            survived_deflation: bar.is_none_or(|bar| best > bar),
+            scored,
+        }
+    }
+
+    #[test]
+    fn a_grid_that_varies_one_thing_has_no_surface_to_draw() {
+        // A surface has two dimensions. One axis is a list, and the winning
+        // parameters line already says what it would say.
+        let scored = vec![
+            trial(&[("fast", 5.0), ("trade_size", 100.0)], 0.4),
+            trial(&[("fast", 10.0), ("trade_size", 100.0)], 0.6),
+        ];
+        assert!(surface(&selection(scored, Some(0.5))).is_none());
+    }
+
+    #[test]
+    fn two_axes_become_the_two_axes() {
+        let mut scored = Vec::new();
+        for fast in [5.0, 10.0] {
+            for slow in [30.0, 60.0, 120.0] {
+                scored.push(trial(&[("fast", fast), ("slow", slow)], fast + slow));
+            }
+        }
+        let drawn = surface(&selection(scored, Some(1.0))).expect("two axes");
+
+        // The one with more distinct values goes on x, so the grid is wider
+        // than it is tall rather than the other way round.
+        assert_eq!(drawn.x_axis, "slow");
+        assert_eq!(drawn.y_axis, "fast");
+        assert_eq!(drawn.x_values, vec![30.0, 60.0, 120.0]);
+        assert_eq!(drawn.y_values, vec![5.0, 10.0]);
+        assert_eq!(drawn.cells.len(), 6);
+        assert!(drawn.collapsed.is_empty());
+    }
+
+    #[test]
+    fn a_third_axis_is_collapsed_by_taking_the_best_and_is_named() {
+        // Averaging over a hidden axis would blend a good configuration with a
+        // bad one and hide exactly the region this chart is drawn to find.
+        // Saying which axis was collapsed is what stops the picture being read
+        // as the whole search.
+        // Distinct counts, no ties: `fast` explores four values, `slow`
+        // three, `atr` two. So `fast` and `slow` are the axes the search
+        // actually explored and the ones drawn, and `atr` is collapsed.
+        let mut scored = Vec::new();
+        for fast in [5.0, 10.0, 15.0, 20.0] {
+            for slow in [30.0, 60.0, 120.0] {
+                for atr in [1.0, 2.0] {
+                    // One standout, hidden on the collapsed axis.
+                    let sharpe = if fast == 5.0 && slow == 30.0 && atr == 2.0 {
+                        1.8
+                    } else {
+                        0.3
+                    };
+                    scored.push(trial(
+                        &[("fast", fast), ("slow", slow), ("atr", atr)],
+                        sharpe,
+                    ));
+                }
+            }
+        }
+        let drawn = surface(&selection(scored, Some(1.0))).expect("three axes");
+
+        assert_eq!(drawn.x_axis, "fast", "the most-explored axis goes across");
+        assert_eq!(drawn.y_axis, "slow");
+        assert_eq!(drawn.collapsed, vec!["atr".to_owned()]);
+        assert_eq!(drawn.cells.len(), 12, "one cell per drawn pair, not per trial");
+
+        let corner = drawn
+            .cells
+            .iter()
+            .find(|cell| {
+                (cell.x - 5.0).abs() < f64::EPSILON && (cell.y - 30.0).abs() < f64::EPSILON
+            })
+            .expect("fast 5, slow 30");
+        assert!(
+            (corner.sharpe - 1.8).abs() < 1e-9,
+            "the best over the collapsed axis, not the mean: {}",
+            corner.sharpe
+        );
+    }
+
+    #[test]
+    fn a_cell_below_the_no_skill_bar_is_marked_as_not_a_result() {
+        // The distinction the whole chart is drawn around. A score a
+        // coin-flipping search of this size would have been expected to reach
+        // anyway is not a weak finding, it is not a finding.
+        let scored = vec![
+            trial(&[("fast", 5.0), ("slow", 30.0)], 0.9),
+            trial(&[("fast", 5.0), ("slow", 60.0)], 1.4),
+            trial(&[("fast", 10.0), ("slow", 30.0)], 0.2),
+            trial(&[("fast", 10.0), ("slow", 60.0)], 0.5),
+        ];
+        let drawn = surface(&selection(scored, Some(1.0))).expect("two axes");
+
+        assert_eq!(
+            drawn.cells.iter().filter(|cell| cell.above_null).count(),
+            1,
+            "only the 1.4 clears a bar of 1.0"
+        );
+        let chosen: Vec<_> = drawn.cells.iter().filter(|cell| cell.selected).collect();
+        assert_eq!(chosen.len(), 1);
+        assert!((chosen[0].sharpe - 1.4).abs() < 1e-9);
+    }
+
+    #[test]
+    fn with_no_bar_to_clear_nothing_is_claimed_to_have_cleared_it() {
+        // Too few trials to say what a no-skill search would produce. Marking
+        // everything as beating a bar that was never computed would be the
+        // most flattering possible default.
+        let scored = vec![
+            trial(&[("fast", 5.0), ("slow", 30.0)], 0.9),
+            trial(&[("fast", 10.0), ("slow", 60.0)], 1.4),
+        ];
+        let drawn = surface(&selection(scored, None)).expect("two axes");
+        assert_eq!(drawn.null_bar, None);
+        assert!(
+            drawn.cells.iter().all(|cell| cell.above_null),
+            "with no bar there is nothing to fail, and the UI shades none of it"
+        );
+    }
+
+    #[test]
+    fn a_configuration_that_never_ran_leaves_a_hole_not_a_zero() {
+        // It did not score badly; it did not score. A zero would be drawn as
+        // a real, poor result.
+        let scored = vec![
+            trial(&[("fast", 5.0), ("slow", 30.0)], 0.9),
+            trial(&[("fast", 5.0), ("slow", 60.0)], 1.4),
+            trial(&[("fast", 10.0), ("slow", 30.0)], 0.2),
+        ];
+        let drawn = surface(&selection(scored, Some(1.0))).expect("two axes");
+        assert_eq!(drawn.x_values.len() * drawn.y_values.len(), 4);
+        assert_eq!(drawn.cells.len(), 3, "the fourth pair is absent, not zero");
+    }
 }
 
 #[cfg(test)]

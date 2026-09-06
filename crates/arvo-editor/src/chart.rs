@@ -250,3 +250,154 @@ pub(crate) fn UnderwaterChart(points: Vec<CurvePoint>) -> impl IntoView {
 
     view! { <div class="underwater-chart" node_ref=holder></div> }
 }
+
+/// Every configuration the search tried, not just the one it picked.
+///
+/// # What the colour means, and why it is not the usual thing
+///
+/// A heatmap normalised to its own maximum always has one brilliant cell,
+/// whatever the numbers behind it — which is exactly the impression this
+/// platform exists to resist. So the scale is anchored to the **no-skill bar**
+/// instead: the score the best of a search this size would be expected to
+/// reach with no edge at all. A cell below the bar is drawn as flat grey,
+/// because it is not a weak result, it is *not a result*. Only what clears the
+/// bar takes colour, and how much colour is how far past it went.
+///
+/// The two pictures this makes distinguishable, which a single reported
+/// maximum cannot:
+///
+/// * a **coloured region** — many neighbouring configurations all clearing the
+///   bar, so the finding does not depend on the exact parameters;
+/// * a **lone bright cell in a grey field** — the shape of a search that found
+///   noise, and the shape a report showing only its winner would hide.
+#[component]
+pub(crate) fn ParameterSurface(surface: SurfaceView) -> impl IntoView {
+    let SurfaceView {
+        x_axis,
+        y_axis,
+        x_values,
+        y_values,
+        cells,
+        null_bar,
+        best,
+        collapsed,
+    } = surface;
+
+    // Depth of colour is distance past the bar, as a share of how far the very
+    // best cell got past it. With no bar to clear — too few trials to say —
+    // nothing is shaded, because there is nothing to shade against.
+    let bar = null_bar.unwrap_or(f64::INFINITY);
+    let headroom = (best - bar).max(f64::EPSILON);
+    let columns = format!(
+        "auto repeat({}, minmax(2.4em, 1fr))",
+        x_values.len().max(1)
+    );
+
+    let lookup = move |x: f64, y: f64| {
+        cells
+            .iter()
+            .find(|cell| {
+                (cell.x - x).abs() < f64::EPSILON && (cell.y - y).abs() < f64::EPSILON
+            })
+            .cloned()
+    };
+
+    view! {
+        <div class="surface">
+            <div class="surface-grid" style=format!("grid-template-columns: {columns}")>
+                <span class="surface-corner">{format!("{y_axis} \\ {x_axis}")}</span>
+                {x_values
+                    .iter()
+                    .map(|x| view! { <span class="surface-head">{format!("{x}")}</span> })
+                    .collect_view()}
+                {y_values
+                    .iter()
+                    .map(|y| {
+                        let y = *y;
+                        let row = x_values
+                            .iter()
+                            .map(|x| {
+                                match lookup(*x, y) {
+                                    // A configuration that failed to run leaves
+                                    // a hole rather than a zero: it did not
+                                    // score badly, it did not score.
+                                    None => {
+                                        view! { <span class="surface-cell empty">"·"</span> }
+                                            .into_any()
+                                    }
+                                    Some(cell) => {
+                                        let depth = if cell.above_null {
+                                            ((cell.sharpe - bar) / headroom).clamp(0.08, 1.0)
+                                        } else {
+                                            0.0
+                                        };
+                                        let style = if depth > 0.0 {
+                                            format!(
+                                                "background: color-mix(in srgb, \
+                                                 var(--color-verdict-supported) {:.0}%, \
+                                                 transparent)",
+                                                depth * 100.0,
+                                            )
+                                        } else {
+                                            String::new()
+                                        };
+                                        let class = if cell.selected {
+                                            "surface-cell chosen"
+                                        } else {
+                                            "surface-cell"
+                                        };
+                                        view! {
+                                            <span
+                                                class=class
+                                                style=style
+                                                title=format!(
+                                                    "{} {} · {} {} · Sharpe {:.3}{}",
+                                                    x_axis, cell.x, y_axis, cell.y, cell.sharpe,
+                                                    if cell.above_null {
+                                                        ""
+                                                    } else {
+                                                        " — within what a search this size \
+                                                         would reach with no edge"
+                                                    },
+                                                )
+                                            >
+                                                {format!("{:.2}", cell.sharpe)}
+                                            </span>
+                                        }
+                                            .into_any()
+                                    }
+                                }
+                            })
+                            .collect_view();
+                        view! {
+                            <span class="surface-head">{format!("{y}")}</span>
+                            {row}
+                        }
+                    })
+                    .collect_view()}
+            </div>
+            <p class="research-hint">
+                {match null_bar {
+                    Some(bar) => {
+                        format!(
+                            "Shaded by how far past {bar:.2} a configuration got — the score the \
+                             best of {} tries would be expected to reach with no edge at all. \
+                             Unshaded cells did not clear it.",
+                            x_values.len() * y_values.len(),
+                        )
+                    }
+                    None => "Too few configurations to say what a no-skill search would have \
+                             produced, so nothing here is shaded."
+                        .to_owned(),
+                }}
+                {(!collapsed.is_empty())
+                    .then(|| {
+                        format!(
+                            " {} also varied; each cell shows the best score over it.",
+                            collapsed.join(", "),
+                        )
+                    })}
+            </p>
+        </div>
+    }
+}

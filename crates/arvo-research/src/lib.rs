@@ -36,7 +36,9 @@ pub use advice::{recommend, Recommendation, Severity};
 pub use evaluation::{
     evaluate_against_benchmark, Evaluation, EvaluationCriteria, Evidence, Metrics, Verdict,
 };
-pub use family::{run_family, ExperimentFamily, FamilyEvidence, ParameterGrid, Selection};
+pub use family::{
+    run_family, ExperimentFamily, FamilyEvidence, ParameterGrid, ScoredTrial, Selection,
+};
 pub use memory::{EvidenceStore, Loaded, MemoryError, Record, StoredRecord};
 pub use panel::{run_panel, InstrumentOutcome, PanelEvidence, PanelStudy, PooledOutcome};
 pub use trade::{Direction, ExitReason, Trade, TradeStats};

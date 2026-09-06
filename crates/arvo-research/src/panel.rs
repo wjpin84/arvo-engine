@@ -197,6 +197,16 @@ pub fn run_panel(
     }
 
     let sharpes: Vec<f64> = scored.iter().map(|(mean, _)| *mean).collect();
+    // The pooled surface, kept for the same reason a single study's is: one
+    // bright cell surrounded by nothing looks identical to a plateau if only
+    // the maximum is reported.
+    let surface: Vec<crate::family::ScoredTrial> = scored
+        .iter()
+        .map(|(mean, params)| crate::family::ScoredTrial {
+            params: params.clone(),
+            sharpe: *mean,
+        })
+        .collect();
     let (best_sharpe, selected_params) = scored
         .into_iter()
         .max_by(|a, b| a.0.total_cmp(&b.0))
@@ -214,6 +224,7 @@ pub fn run_panel(
         best_sharpe,
         expected_best_under_null: expected,
         survived_deflation,
+        scored: surface,
     };
 
     // --- Judgement: that one configuration, on data it never saw -----------
@@ -426,6 +437,7 @@ mod tests {
             best_sharpe: 1.0,
             expected_best_under_null: Some(if survived { 0.5 } else { 2.0 }),
             survived_deflation: survived,
+            scored: Vec::new(),
         }
     }
 

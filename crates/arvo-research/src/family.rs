@@ -113,6 +113,13 @@ impl ExperimentFamily {
     }
 }
 
+/// One configuration and what it scored in-sample.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScoredTrial {
+    pub params: BTreeMap<String, f64>,
+    pub sharpe: f64,
+}
+
 /// What the search over configurations found, and whether it means anything.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Selection {
@@ -128,6 +135,21 @@ pub struct Selection {
     pub expected_best_under_null: Option<f64>,
     /// Whether [`Self::best_sharpe`] cleared that bar.
     pub survived_deflation: bool,
+    /// Every configuration that ran, with its in-sample score.
+    ///
+    /// Kept rather than discarded once the winner is known, and it is the
+    /// difference between a claim and evidence for it. The *shape* of the
+    /// search says whether there was anything to find: a broad region of
+    /// configurations that all scored well is a plateau and suggests
+    /// something real; one bright cell surrounded by nothing is what fitting
+    /// noise looks like from above. Reporting only the maximum shows those
+    /// two cases identically — which is precisely the mistake this crate
+    /// exists to stop someone making.
+    ///
+    /// `default` because it is a persisted format: findings recorded before
+    /// this loads as one with no surface to draw.
+    #[serde(default)]
+    pub scored: Vec<ScoredTrial>,
 }
 
 /// The result of running a family: what was tried, what was picked, and how
@@ -301,6 +323,13 @@ pub fn run_split(
     }
 
     let sharpes: Vec<f64> = scored.iter().map(|(sharpe, _)| *sharpe).collect();
+    let surface: Vec<ScoredTrial> = scored
+        .iter()
+        .map(|(sharpe, params)| ScoredTrial {
+            params: params.clone(),
+            sharpe: *sharpe,
+        })
+        .collect();
     let (best_sharpe, best_params) = scored
         .into_iter()
         .max_by(|a, b| a.0.total_cmp(&b.0))
@@ -318,6 +347,7 @@ pub fn run_split(
         best_sharpe,
         expected_best_under_null: expected,
         survived_deflation,
+        scored: surface,
     };
 
     let selected = variant(&family.template, &best_params, out_of_sample, "oos");
