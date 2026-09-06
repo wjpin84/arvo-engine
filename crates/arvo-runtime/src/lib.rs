@@ -190,6 +190,7 @@ pub fn run() {
             research::connect_feed,
             research::disconnect_feed,
             research::fetch_bars,
+            research::search_instruments,
             research::run_panel,
             research::list_history,
             research::open_record,

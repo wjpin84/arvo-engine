@@ -465,6 +465,20 @@ pub struct StrategyView {
     pub backtests: usize,
 }
 
+/// One instrument the broker knows about.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MatchView {
+    /// The Arvo id it would be filed under, ready to fetch.
+    pub instrument: String,
+    pub symbol: String,
+    pub name: String,
+    pub price: Option<f64>,
+    /// Move since the previous close, as a fraction.
+    pub change: Option<f64>,
+    /// Whether the data library already holds this instrument.
+    pub held: bool,
+}
+
 /// What a fetch pulled in.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FetchView {

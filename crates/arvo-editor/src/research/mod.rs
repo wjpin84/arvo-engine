@@ -21,7 +21,7 @@ use wasm_bindgen::JsValue;
 use crate::bridge::{
     call_typed, open_study_panel, PANEL_PANEL_ID, STUDY_PANEL_PREFIX, WALK_PANEL_PREFIX,
 };
-use crate::format::verdict_dot;
+use crate::format::{percent, verdict_dot};
 use crate::chart::DataQuality;
 use crate::views::*;
 
@@ -67,6 +67,11 @@ pub(crate) fn ResearchView(
     let (connected, set_connected) = signal(false);
     let (symbol, set_symbol) = signal(String::new());
     let (fetched, set_fetched) = signal(None::<FetchView>);
+    // What the broker knows by that name. The box used to require typing
+    // `MSFT.NASDAQ` — both the ticker and a venue convention that is Arvo's
+    // rather than the market's.
+    let (matches, set_matches) = signal(Vec::<MatchView>::new());
+    let (searching, set_searching) = signal(false);
 
     // Refetched after every run, so a finding appears in the history the
     // moment it is recorded rather than only after a restart.
@@ -143,6 +148,25 @@ pub(crate) fn ResearchView(
         });
     };
 
+    let search = move |_| {
+        let query = symbol.get_untracked().trim().to_owned();
+        if query.is_empty() {
+            set_matches.set(Vec::new());
+            return;
+        }
+        set_searching.set(true);
+        set_error.set(None);
+        spawn_local(async move {
+            let args = serde_wasm_bindgen::to_value(&serde_json::json!({ "query": query }))
+                .unwrap_or(JsValue::UNDEFINED);
+            match call_typed::<Vec<MatchView>>("search_instruments", args).await {
+                Ok(found) => set_matches.set(found),
+                Err(reason) => set_error.set(Some(reason)),
+            }
+            set_searching.set(false);
+        });
+    };
+
     let fetch = move |_| {
         let instrument = symbol.get_untracked().trim().to_uppercase();
         if instrument.is_empty() {
@@ -161,6 +185,7 @@ pub(crate) fn ResearchView(
         set_running.set(Some(format!("Fetching {instrument} at {interval}")));
         set_error.set(None);
         set_fetched.set(None);
+        set_matches.set(Vec::new());
         spawn_local(async move {
             let args = serde_wasm_bindgen::to_value(&serde_json::json!({
                 "instrument": instrument,
@@ -351,14 +376,90 @@ pub(crate) fn ResearchView(
                                 <div class="research-fetch-row">
                                     <input
                                         type="text"
-                                        placeholder="MSFT.NASDAQ"
+                                        placeholder="Name or ticker"
                                         prop:value=move || symbol.get()
                                         on:input:target=move |ev| set_symbol.set(ev.target().value())
+                                        // Enter searches. Anyone who already
+                                        // knows the exact id can still type it
+                                        // and press Fetch.
+                                        on:keydown=move |ev| {
+                                            if ev.key() == "Enter" {
+                                                search(());
+                                            }
+                                        }
                                     />
+                                    <button
+                                        disabled=move || searching.get()
+                                        on:click=move |_| search(())
+                                    >
+                                        "Search"
+                                    </button>
                                     <button disabled=move || running.get().is_some() on:click=fetch>
                                         "Fetch"
                                     </button>
                                 </div>
+                                {move || {
+                                    let found = matches.get();
+                                    (!found.is_empty())
+                                        .then(|| {
+                                            view! {
+                                                <ul class="research-matches">
+                                                    {found
+                                                        .into_iter()
+                                                        .map(|item| {
+                                                            let id = item.instrument.clone();
+                                                            // Picking one fills the box rather
+                                                            // than fetching straight away: the
+                                                            // interval comes from the selected
+                                                            // strategy, and a click that
+                                                            // silently started a download would
+                                                            // be a click nobody could take back.
+                                                            let pick = move |_| {
+                                                                set_symbol.set(id.clone());
+                                                                set_matches.set(Vec::new());
+                                                            };
+                                                            let change = item
+                                                                .change
+                                                                .map(percent)
+                                                                .unwrap_or_default();
+                                                            let tone = match item.change {
+                                                                Some(value) if value > 0.0 => {
+                                                                    "research-good"
+                                                                }
+                                                                Some(_) => "research-bad",
+                                                                None => "",
+                                                            };
+                                                            view! {
+                                                                <li>
+                                                                    <button
+                                                                        class="research-match"
+                                                                        on:click=pick
+                                                                    >
+                                                                        <span class="research-match-id">
+                                                                            {item.symbol.clone()}
+                                                                            {item
+                                                                                .held
+                                                                                .then_some(" · held")}
+                                                                        </span>
+                                                                        <span class="research-match-name">
+                                                                            {item.name.clone()}
+                                                                        </span>
+                                                                        <span class=tone>
+                                                                            {item
+                                                                                .price
+                                                                                .map(|price| {
+                                                                                    format!("{price:.2} {change}")
+                                                                                })}
+                                                                        </span>
+                                                                    </button>
+                                                                </li>
+                                                            }
+                                                        })
+                                                        .collect_view()}
+                                                </ul>
+                                            }
+                                        })
+                                }}
                                 <button class="research-linkish" on:click=disconnect>
                                     "Disconnect Robinhood"
                                 </button>

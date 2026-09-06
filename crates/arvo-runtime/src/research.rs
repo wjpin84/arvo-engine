@@ -21,7 +21,7 @@ use arvo_research::{
 };
 // The view shapes live in `arvo-views` so the window cannot drift from
 // them. See that crate for what two hand-mirrored copies cost.
-pub use arvo_views::{CandlePoint, DataFindingView, HistoryView, UnreadableView, CurvePoint, DataLibraryView, FetchView, FoldView, HistoryEntryView, InstrumentView, MetricsView, MonthlyReturnView, OutcomeView, PanelView, RecommendationView, RecordView, StabilityView, StrategyView, StudyView, SurfaceCell, SurfaceView, TradeMarkerView, TradeRowView, TradesView, WalkForwardView};
+pub use arvo_views::{CandlePoint, DataFindingView, HistoryView, MatchView, UnreadableView, CurvePoint, DataLibraryView, FetchView, FoldView, HistoryEntryView, InstrumentView, MetricsView, MonthlyReturnView, OutcomeView, PanelView, RecommendationView, RecordView, StabilityView, StrategyView, StudyView, SurfaceCell, SurfaceView, TradeMarkerView, TradeRowView, TradesView, WalkForwardView};
 
 use crate::commands::CommandError;
 
@@ -782,6 +782,44 @@ pub async fn connect_feed(app: tauri::AppHandle) -> Result<bool, CommandError> {
 pub fn disconnect_feed() -> Result<bool, CommandError> {
     crate::feed::disconnect().map_err(|err| CommandError::Failed(err.to_string()))?;
     Ok(false)
+}
+
+/// Finds instruments by name or ticker.
+///
+/// Exists because the alternative was typing `MSFT.NASDAQ` into an empty box
+/// and knowing both halves of it — the ticker, and a venue convention that is
+/// Arvo's rather than the market's.
+///
+/// # Errors
+///
+/// Returns [`CommandError::Failed`] if there is no broker connection or the
+/// search call fails.
+#[tauri::command]
+pub async fn search_instruments(
+    query: String,
+    service: tauri::State<'_, ResearchService>,
+) -> Result<Vec<MatchView>, CommandError> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let held: std::collections::HashSet<String> =
+        service.bars.instruments().unwrap_or_default().into_iter().collect();
+
+    Ok(crate::feed::search(&service.data_dir, query, 10)
+        .await
+        .map_err(|err| CommandError::Failed(err.to_string()))?
+        .into_iter()
+        .map(|found| MatchView {
+            held: held.contains(&found.instrument),
+            instrument: found.instrument,
+            symbol: found.symbol,
+            name: found.name,
+            price: found.price,
+            change: found.change,
+        })
+        .collect())
 }
 
 /// Pulls one instrument's bars into the data library.

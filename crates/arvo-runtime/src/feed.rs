@@ -53,8 +53,27 @@ pub const FEED_ID: &str = "robinhood";
 /// Robinhood's MCP endpoint.
 const ENDPOINT: &str = "https://agent.robinhood.com/mcp/trading";
 
-/// The only tool this module calls.
+/// The tools this module calls. All three read; none of them trade.
 const HISTORICALS: &str = "get_equity_historicals";
+const SEARCH: &str = "search";
+const QUOTES: &str = "get_equity_quotes";
+
+/// The venue an instrument fetched by search is filed under.
+///
+/// # Why this is not the listing exchange
+///
+/// Because the feed does not say. Neither `search` nor `get_equity_quotes`
+/// returns one, so Arvo cannot know whether a symbol is NASDAQ- or NYSE-listed
+/// and will not invent it.
+///
+/// It costs nothing to be honest here, because the venue in an Arvo instrument
+/// id is a *namespace*, not a routing destination: it names the simulated
+/// exchange a backtest runs against and it separates two files with the same
+/// ticker. What it has never done is decide where an order goes — there are no
+/// orders. So this says where the data came from, which is the one thing that
+/// is actually true and the one thing that matters for telling two series
+/// apart.
+pub const FETCHED_VENUE: &str = "RH";
 
 /// What is kept in the keychain once someone has signed in.
 ///
@@ -167,6 +186,156 @@ pub async fn fetch(
         path,
         quality,
     })
+}
+
+/// One instrument the broker knows about.
+#[derive(Debug, Clone)]
+pub struct Match {
+    /// The Arvo instrument id this would be filed under.
+    pub instrument: String,
+    pub symbol: String,
+    pub name: String,
+    /// Last traded price, when the quote lookup succeeded.
+    pub price: Option<f64>,
+    /// Move since the previous close, as a fraction.
+    pub change: Option<f64>,
+}
+
+/// Finds instruments by name or ticker.
+///
+/// Two calls: one to resolve the query, one to price what came back. The
+/// prices are a convenience and their absence is not an error — a search that
+/// returned names is still a useful search, and failing the whole thing
+/// because a quote lookup timed out would be the wrong trade.
+///
+/// # Errors
+///
+/// Returns [`FeedError`] if there is no stored connection or the search call
+/// fails.
+pub async fn search(
+    root: &std::path::Path,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<Match>, FeedError> {
+    let token = access_token().await?;
+    let client = arvo_mcp::McpClient::new(ENDPOINT, token);
+    client.connect().await?;
+
+    let response = client
+        .call_tool_json(
+            SEARCH,
+            json!({ "query": query, "limit": limit.clamp(1, 20) }),
+        )
+        .await?;
+
+    let mut matches = parse_matches(&response, existing_venues(root));
+    if matches.is_empty() {
+        return Ok(matches);
+    }
+
+    // Best effort. See above: prices are the garnish, not the dish.
+    let symbols: Vec<&str> = matches.iter().map(|found| found.symbol.as_str()).collect();
+    if let Ok(quotes) = client
+        .call_tool_json(QUOTES, json!({ "symbols": symbols }))
+        .await
+    {
+        let priced = parse_quotes(&quotes);
+        for found in &mut matches {
+            if let Some((price, change)) = priced.get(&found.symbol) {
+                found.price = Some(*price);
+                found.change = *change;
+            }
+        }
+    }
+    Ok(matches)
+}
+
+/// Which venue an already-held symbol is filed under.
+///
+/// So a second fetch of something already in the library lands beside the
+/// first rather than becoming a near-duplicate under a different name — a
+/// library holding both `MSFT.NASDAQ` and `MSFT.RH` is two datasets whose
+/// difference nobody can see and every comparison between them is wrong.
+fn existing_venues(root: &std::path::Path) -> std::collections::HashMap<String, String> {
+    CsvBars::new(root)
+        .instruments()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|instrument| {
+            let (symbol, venue) = instrument.split_once('.')?;
+            Some((symbol.to_owned(), venue.to_owned()))
+        })
+        .collect()
+}
+
+fn parse_matches(
+    response: &Value,
+    known: std::collections::HashMap<String, String>,
+) -> Vec<Match> {
+    response
+        .pointer("/data/results")
+        .and_then(Value::as_array)
+        .map(|results| {
+            results
+                .iter()
+                .filter_map(|found| {
+                    let symbol = found.get("symbol").and_then(Value::as_str)?;
+                    // `simple_name` is what a person would call it; `name` is
+                    // the legal one. Prefer the readable, fall back to the
+                    // exact, and never show an empty row.
+                    let name = found
+                        .get("simple_name")
+                        .and_then(Value::as_str)
+                        .or_else(|| found.get("name").and_then(Value::as_str))
+                        .unwrap_or(symbol);
+                    let venue = known
+                        .get(symbol)
+                        .map_or(FETCHED_VENUE, String::as_str);
+                    Some(Match {
+                        instrument: format!("{symbol}.{venue}"),
+                        symbol: symbol.to_owned(),
+                        name: name.to_owned(),
+                        price: None,
+                        change: None,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Last price and the move since the previous close, by symbol.
+fn parse_quotes(response: &Value) -> std::collections::HashMap<String, (f64, Option<f64>)> {
+    let mut out = std::collections::HashMap::new();
+    let Some(results) = response.pointer("/data/results").and_then(Value::as_array) else {
+        return out;
+    };
+
+    for entry in results {
+        let Some(quote) = entry.get("quote") else {
+            continue;
+        };
+        // Prices are strings here as they are everywhere else in this feed.
+        let number = |field: &str| {
+            quote
+                .get(field)
+                .and_then(Value::as_str)
+                .and_then(|text| text.parse::<f64>().ok())
+        };
+        let (Some(symbol), Some(price)) = (
+            quote.get("symbol").and_then(Value::as_str),
+            number("last_trade_price"),
+        ) else {
+            continue;
+        };
+        // Against the *adjusted* previous close, so a split does not read as
+        // a fifty percent crash in the search results.
+        let change = number("adjusted_previous_close")
+            .filter(|previous| *previous > 0.0)
+            .map(|previous| (price - previous) / previous);
+        out.insert(symbol.to_owned(), (price, change));
+    }
+    out
 }
 
 /// The ticker out of an Arvo instrument id: `MSFT.NASDAQ` is `MSFT`.
@@ -446,6 +615,100 @@ mod tests {
             ]}]}}"#,
         )
         .expect("valid fixture")
+    }
+
+    /// A real search response, trimmed. Captured from the live endpoint: the
+    /// fields that matter are the ones a guess gets wrong — there is a
+    /// `simple_name` beside the legal `name`, and there is **no exchange
+    /// anywhere**, which is why `FETCHED_VENUE` exists.
+    fn search_response() -> Value {
+        serde_json::from_str(
+            r#"{"data":{"results":[
+            {"instrument_id":"50810c35","symbol":"MSFT",
+             "name":"Microsoft Corporation Common Stock","simple_name":"Microsoft"},
+            {"instrument_id":"97255329","symbol":"MSFU",
+             "name":"Direxion Daily MSFT Bull 2X ETF"}
+            ]}}"#,
+        )
+        .expect("valid fixture")
+    }
+
+    /// And a real quote response.
+    fn quote_response() -> Value {
+        serde_json::from_str(
+            r#"{"data":{"results":[{"quote":{
+            "symbol":"MSFT","last_trade_price":"499.680000",
+            "adjusted_previous_close":"510.120000","previous_close":"510.120000",
+            "has_traded":true,"state":"active"}}]}}"#,
+        )
+        .expect("valid fixture")
+    }
+
+    #[test]
+    fn a_search_result_becomes_an_instrument_id_ready_to_fetch() {
+        let found = parse_matches(&search_response(), std::collections::HashMap::new());
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].instrument, format!("MSFT.{FETCHED_VENUE}"));
+        assert_eq!(found[0].symbol, "MSFT");
+    }
+
+    #[test]
+    fn a_symbol_already_in_the_library_keeps_the_venue_it_is_filed_under() {
+        // Otherwise the library ends up holding both `MSFT.NASDAQ` and
+        // `MSFT.RH` — two datasets whose difference nobody can see, and every
+        // comparison between them is wrong.
+        let known = [("MSFT".to_owned(), "NASDAQ".to_owned())]
+            .into_iter()
+            .collect();
+        let found = parse_matches(&search_response(), known);
+        assert_eq!(found[0].instrument, "MSFT.NASDAQ");
+        assert_eq!(
+            found[1].instrument,
+            format!("MSFU.{FETCHED_VENUE}"),
+            "and one that is not held still gets the default"
+        );
+    }
+
+    #[test]
+    fn the_readable_name_is_preferred_and_the_legal_one_is_the_fallback() {
+        let found = parse_matches(&search_response(), std::collections::HashMap::new());
+        assert_eq!(found[0].name, "Microsoft", "simple_name when it is there");
+        assert_eq!(
+            found[1].name, "Direxion Daily MSFT Bull 2X ETF",
+            "and the legal name when it is not"
+        );
+    }
+
+    #[test]
+    fn a_quote_is_read_against_the_adjusted_previous_close() {
+        // Against the *adjusted* close, so a split does not read as a fifty
+        // percent crash in a list of search results.
+        let quotes = parse_quotes(&quote_response());
+        let (price, change) = quotes.get("MSFT").expect("one quote");
+        assert!((price - 499.68).abs() < 1e-9);
+        let change = change.expect("a previous close to compare against");
+        assert!((change - (499.68 - 510.12) / 510.12).abs() < 1e-9, "{change}");
+    }
+
+    #[test]
+    fn a_quote_without_a_previous_close_still_gives_a_price() {
+        // A search that returned names and prices is useful; failing the row
+        // because one field is missing is not.
+        let response: Value = serde_json::from_str(
+            r#"{"data":{"results":[{"quote":{"symbol":"NEW","last_trade_price":"12.00"}}]}}"#,
+        )
+        .expect("valid");
+        let quotes = parse_quotes(&response);
+        let (price, change) = quotes.get("NEW").expect("one quote");
+        assert!((price - 12.0).abs() < 1e-9);
+        assert_eq!(*change, None);
+    }
+
+    #[test]
+    fn an_empty_search_is_an_empty_list_not_an_error() {
+        // "No Robinhood-tradable match" is an answer.
+        let empty: Value = serde_json::from_str(r#"{"data":{"results":[]}}"#).expect("valid");
+        assert!(parse_matches(&empty, std::collections::HashMap::new()).is_empty());
     }
 
     #[test]
