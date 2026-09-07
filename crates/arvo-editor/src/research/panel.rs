@@ -8,7 +8,7 @@
 use leptos::prelude::*;
 
 use crate::chart::MetricCard;
-use crate::format::{percent, short_hash, verdict_class};
+use crate::format::{percent, ratio, short_hash, verdict_class};
 use crate::views::*;
 
 /// The panel tab's content, read back out of the signal so a re-run refreshes
@@ -149,6 +149,16 @@ pub(crate) fn PanelReport(panel: PanelView) -> impl IntoView {
                         .collect_view()}
                 </tbody>
             </table>
+
+            {panel
+                .book
+                .clone()
+                .map(|book| {
+                    view! {
+                        <h4>"What holding all of them would have done"</h4>
+                        <PanelBook book=book />
+                    }
+                })}
 
             {panel
                 .breadth
@@ -292,6 +302,72 @@ pub(crate) fn PanelBreadth(breadth: BreadthView) -> impl IntoView {
                     })
                     .collect_view()}
             </div>
+        </div>
+    }
+}
+
+/// What one account holding every member would have done.
+///
+/// The table above reports the members one at a time and the summary averages
+/// them. Neither is a portfolio. An average of drawdowns is the typical fall
+/// of a member, not the fall an account holding all of them would have taken —
+/// and those differ by exactly the amount the members failed to move together.
+/// That difference is the only reason to run more than one instrument, so it
+/// is worth a number rather than an inference.
+#[component]
+pub(crate) fn PanelBook(book: BookView) -> impl IntoView {
+    // Stated rather than assumed: this rescales the members' curves, so it
+    // cannot show two of them competing for the same capital. A reader who
+    // does not know that will read the drawdown as a promise.
+    let caveat = concat!(
+        "Equal weight, divided once at the start and never rebalanced. ",
+        "Each member ran with the whole account behind it, so this rescales their ",
+        "results rather than re-running them together \u{2014} it cannot show two ",
+        "positions competing for the same capital.",
+    );
+
+    // Recovered rather than passed: the panel already knows its mean member
+    // drawdown, and the gap is the whole point of the card.
+    let mean_member = book.metrics.max_drawdown + book.diversification;
+    let diversified = book.diversification > 0.0;
+    let verdict = if diversified {
+        format!(
+            "Holding all of them fell {} less than the average member did. \
+             That gap is the diversification.",
+            percent(book.diversification),
+        )
+    } else {
+        concat!(
+            "Holding all of them fell as hard as the average member did. ",
+            "These instruments went down together, so the panel was one bet.",
+        )
+        .to_owned()
+    };
+    let tone = if diversified { "research-hint" } else { "research-flag" };
+
+    view! {
+        <div class="surface">
+            <p class=tone>{verdict}</p>
+            <div class="metric-cards">
+                <MetricCard
+                    label="Book return"
+                    value=percent(book.metrics.total_return)
+                    tone=book.metrics.total_return
+                    note="equal weight, all members".to_owned()
+                />
+                <MetricCard
+                    label="Book drawdown"
+                    value=percent(book.metrics.max_drawdown)
+                    note=format!("mean member {}", percent(mean_member))
+                />
+                <MetricCard label="Book Sharpe" value=ratio(book.metrics.sharpe) />
+                <MetricCard
+                    label="Book CAGR"
+                    value=percent(book.metrics.cagr)
+                    tone=book.metrics.cagr
+                />
+            </div>
+            <p class="research-hint">{caveat}</p>
         </div>
     }
 }

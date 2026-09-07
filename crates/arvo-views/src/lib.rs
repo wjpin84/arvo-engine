@@ -431,6 +431,7 @@ pub struct PanelView {
     pub beat_benchmark: usize,
     pub mean_max_drawdown: f64,
     pub breadth: Option<BreadthView>,
+    pub book: Option<BookView>,
     pub worst_max_drawdown: f64,
 
     pub trials: usize,
@@ -483,6 +484,19 @@ pub struct BreadthView {
     /// How much the pooled average's certainty is overstated by counting
     /// instruments instead of independent ones.
     pub overstatement: Option<f64>,
+}
+
+/// What one account holding every member of a panel would have done.
+///
+/// The panel's pooled figures average its members. This combines them, which
+/// is a different number in the place that matters: falls that did not
+/// coincide hurt a book less than they hurt its average member.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BookView {
+    pub metrics: MetricsView,
+    /// Mean member drawdown less the book's. Positive is diversification;
+    /// zero or below means the members fell together and the panel was one bet.
+    pub diversification: f64,
 }
 
 /// One finding in a side-by-side comparison.

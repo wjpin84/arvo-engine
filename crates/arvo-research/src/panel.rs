@@ -123,6 +123,18 @@ pub struct PanelEvidence {
     /// this existed loads as one that does not know its own breadth.
     #[serde(default)]
     pub breadth: Option<crate::Breadth>,
+    /// What one account holding every member at equal weight would have done.
+    ///
+    /// [`PooledOutcome`] averages the members; this combines them. The two
+    /// differ in the place that decides whether a rule is usable — falls that
+    /// did not coincide hurt a book less than they hurt its average member,
+    /// and no mean of drawdowns can say so because it averages numbers that
+    /// never happened together.
+    ///
+    /// `None` for a single-instrument panel: one instrument is not a book.
+    /// `default` because it is a persisted format.
+    #[serde(default)]
+    pub book: Option<Metrics>,
     /// Instrument/configuration combinations that could not be run.
     pub failures: Vec<String>,
     pub verdict: Verdict,
@@ -294,6 +306,16 @@ pub fn run_panel(
 
     let pooled = pool(&per_instrument);
     let breadth = crate::breadth::measure(&curves);
+    // The members were each run with the whole account behind them, so this
+    // rescales rather than re-simulates: it cannot show capital contention
+    // between them. See `crate::book` for the rest of what it assumes.
+    let book = crate::book::combine(study.template.starting_cash, &curves).and_then(|curve| {
+        Metrics::from_curve(
+            &curve,
+            pooled.total_trades,
+            study.template.interval.periods_per_year(),
+        )
+    });
     let (verdict, reasons) = judge(&pooled, &selection, criteria, &failures, &breadth);
 
     Ok(PanelEvidence {
@@ -306,6 +328,7 @@ pub fn run_panel(
         per_instrument,
         pooled,
         breadth: Some(breadth),
+        book,
         failures,
         verdict,
         reasons,
