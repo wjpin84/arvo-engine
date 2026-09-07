@@ -436,6 +436,23 @@ pub struct Experiment {
     /// Canonical `SYMBOL.VENUE`, validated at the Nautilus boundary rather
     /// than here — this crate has no opinion on venue naming.
     pub instrument: String,
+    /// Instruments held *alongside* [`Self::instrument`], out of one account.
+    ///
+    /// Empty is the single-instrument run, unchanged in every respect. When it
+    /// is not, the engine loads every one of them, runs the same rule on each,
+    /// and settles them all against the same balance — which is the only way
+    /// capital contention shows up at all. Two positions that a rule wanted at
+    /// once and could only half afford look identical to two it wanted in turn
+    /// when each is simulated with the whole account behind it.
+    ///
+    /// [`Self::instrument`] stays the head of the set rather than becoming one
+    /// of a bag, because it is the experiment's identity: it names the file the
+    /// dataset hash is anchored to and the series a benchmark is drawn against.
+    ///
+    /// `default` because this is a persisted format: every experiment recorded
+    /// before a run could hold more than one loads as what it was.
+    #[serde(default)]
+    pub alongside: Vec<String>,
     pub window: DateRange,
     /// The resolution the rule was evaluated at.
     ///
@@ -457,6 +474,41 @@ pub struct Experiment {
     pub starting_cash: f64,
     /// Pinned so a stochastic strategy replays identically.
     pub seed: u64,
+}
+
+impl Experiment {
+    /// Every instrument this run holds, head first.
+    ///
+    /// The one place that knows [`Self::instrument`] and [`Self::alongside`]
+    /// are halves of the same set, so nothing downstream has to remember to
+    /// chain them and nothing can chain them in a different order.
+    #[must_use]
+    pub fn instruments(&self) -> Vec<String> {
+        let mut all = Vec::with_capacity(1 + self.alongside.len());
+        all.push(self.instrument.clone());
+        all.extend(self.alongside.iter().cloned());
+        all
+    }
+
+    /// Whether the set is usable, as a reason it is not.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason if an instrument appears twice. A duplicate is never
+    /// what was meant and would double the rule's exposure to one name while
+    /// reporting the count of a diversified book.
+    pub fn check_instruments(&self) -> Result<(), String> {
+        let all = self.instruments();
+        for (index, name) in all.iter().enumerate() {
+            if all[..index].contains(name) {
+                return Err(format!(
+                    "{name} appears twice: a run cannot hold the same instrument \
+                     alongside itself"
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// What came back from the engine.

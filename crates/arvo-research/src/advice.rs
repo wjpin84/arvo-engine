@@ -167,6 +167,25 @@ pub fn recommend(found: &FamilyEvidence) -> Vec<Recommendation> {
         ));
     }
 
+    let silent = never_traded(found);
+    if !silent.is_empty() {
+        // Found by running two identical instruments against an account with
+        // room for one: the second was denied every fill, and nothing in the
+        // result said so. The return looked like a single-instrument run, the
+        // trade count looked like a single-instrument run, and the finding
+        // claimed to be about two instruments.
+        out.push(Recommendation::new(
+            Severity::Blocking,
+            "Some instruments in this run never traded.",
+            "Read this as a result about the instruments that did. The usual \
+             cause is an account too small to fund every member at once: the \
+             first to signal takes the capital and the rest are denied, so the \
+             ones missing here are not instruments the rule declined — they \
+             are instruments it could not afford.",
+            format!("{} never opened a position", silent.join(", ")),
+        ));
+    }
+
     if !found.failures.is_empty() {
         out.push(Recommendation::new(
             Severity::Blocking,
@@ -575,6 +594,29 @@ pub fn recommend_walk_forward(found: &WalkForwardEvidence) -> Vec<Recommendation
     out
 }
 
+/// Instruments the run held but never opened a position in.
+///
+/// Only meaningful for a book: a single-instrument run that never traded is
+/// already caught by the trade-count bar, and a ledger recorded before trades
+/// named their instrument cannot answer the question at all — so an empty name
+/// in the ledger means "cannot tell", and this says nothing rather than
+/// accusing every stored finding of crowding out.
+fn never_traded(found: &FamilyEvidence) -> Vec<String> {
+    let experiment = &found.out_of_sample_evidence.experiment;
+    if experiment.alongside.is_empty() {
+        return Vec::new();
+    }
+    let ledger = &found.out_of_sample_evidence.evaluation.strategy_ledger;
+    if ledger.iter().any(|trade| trade.instrument.is_empty()) {
+        return Vec::new();
+    }
+    experiment
+        .instruments()
+        .into_iter()
+        .filter(|name| !ledger.iter().any(|trade| trade.instrument == *name))
+        .collect()
+}
+
 /// Warnings about the *shape* of the trades, as distinct from their total.
 ///
 /// Only computed on enough closed trades to describe: a win rate over four
@@ -692,6 +734,7 @@ mod tests {
             .and_time(chrono::NaiveTime::MIN)
             + chrono::Duration::days(i64::from(day));
         Trade {
+            instrument: String::new(),
             opened,
             closed: Some(opened + chrono::Duration::days(held)),
             direction: Direction::Long,
@@ -994,6 +1037,7 @@ mod tests {
             id: crate::ExperimentId("x".to_owned()),
             hypothesis: crate::HypothesisId("h".to_owned()),
             instrument: "AAPL.NASDAQ".to_owned(),
+            alongside: Vec::new(),
             window: crate::DateRange {
                 from: day(1),
                 to: day(9),
@@ -1148,5 +1192,78 @@ mod tests {
         assert_eq!(out.len(), 1, "{}", findings(&out));
         assert_eq!(out[0].severity, Severity::Note);
         assert!(out[0].action.contains("one claim"), "{}", out[0].action);
+    }
+
+    // ---- books -----------------------------------------------------------
+
+    /// A study of a two-instrument book whose ledger holds `traded`.
+    fn book_study(traded: &[&str]) -> FamilyEvidence {
+        let mut experiment = experiment();
+        experiment.alongside = vec!["MSFT.NASDAQ".to_owned()];
+        let ledger: Vec<crate::Trade> = traded
+            .iter()
+            .enumerate()
+            .map(|(index, name)| {
+                let mut round_trip = trade(
+                    u32::try_from(index).expect("small"),
+                    3,
+                    10.0,
+                    crate::ExitReason::Signal,
+                );
+                round_trip.instrument = (*name).to_owned();
+                round_trip
+            })
+            .collect();
+
+        let mut study = with_folds(clean_walk()).folds.remove(0);
+        study.out_of_sample_evidence.experiment = experiment.clone();
+        study.selected = experiment;
+        study.out_of_sample_evidence.evaluation.strategy_ledger = ledger;
+        study
+    }
+
+    #[test]
+    fn a_book_member_that_never_traded_is_named_and_blocks() {
+        // Found by running two identical instruments against an account with
+        // room for one: the second was denied every fill, the return looked
+        // like a single-instrument run, and the finding claimed to be about
+        // two instruments.
+        let out = recommend(&book_study(&["AAPL.NASDAQ"]));
+        let item = out
+            .iter()
+            .find(|item| item.finding.contains("never traded"))
+            .unwrap_or_else(|| panic!("{}", findings(&out)));
+        assert_eq!(item.severity, Severity::Blocking);
+        assert!(
+            item.evidence.contains("MSFT.NASDAQ"),
+            "the silent member should be named: {}",
+            item.evidence
+        );
+    }
+
+    #[test]
+    fn a_book_where_everyone_traded_says_nothing_about_it() {
+        let out = recommend(&book_study(&["AAPL.NASDAQ", "MSFT.NASDAQ"]));
+        assert!(
+            !out.iter().any(|item| item.finding.contains("never traded")),
+            "{}",
+            findings(&out)
+        );
+    }
+
+    #[test]
+    fn a_ledger_from_before_trades_named_instruments_makes_no_accusation() {
+        // Every stored finding has an unnamed ledger. Reading that as "no
+        // instrument traded" would accuse all of them of crowding out.
+        let mut study = book_study(&["AAPL.NASDAQ"]);
+        for round_trip in &mut study.out_of_sample_evidence.evaluation.strategy_ledger {
+            round_trip.instrument = String::new();
+        }
+        let out = recommend(&study);
+        assert!(
+            !out.iter().any(|item| item.finding.contains("never traded")),
+            "{}",
+            findings(&out)
+        );
     }
 }

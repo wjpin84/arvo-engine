@@ -1813,6 +1813,7 @@ fn template_for(
         id: ExperimentId(format!("study-{subject}")),
         hypothesis: HypothesisId(format!("trend-following predicts returns in {subject}")),
         instrument: subject.to_owned(),
+        alongside: Vec::new(),
         window,
         // From the strategy, not fixed. An opening range on daily bars is not
         // a slower opening range, it is a different rule — and the engine
@@ -2266,6 +2267,7 @@ mod chart_tests {
 
     fn trade(opened: chrono::NaiveDateTime, closed: Option<chrono::NaiveDateTime>) -> Trade {
         Trade {
+            instrument: String::new(),
             opened,
             closed,
             direction: Direction::Long,

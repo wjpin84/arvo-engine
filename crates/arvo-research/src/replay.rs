@@ -300,6 +300,7 @@ mod tests {
             id: ExperimentId("x".to_owned()),
             hypothesis: HypothesisId("h".to_owned()),
             instrument: "AAPL.NASDAQ".to_owned(),
+            alongside: Vec::new(),
             window: DateRange {
                 from: at(1).date(),
                 to: at(9).date(),

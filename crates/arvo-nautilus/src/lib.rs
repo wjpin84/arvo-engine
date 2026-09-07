@@ -137,40 +137,71 @@ impl<P: BarProvider> SimulationProvider for NautilusSimulation<P> {
             .check()
             .map_err(|reason| SimulationError::Rejected(format!("cost model: {reason}")))?;
 
-        let instrument_id = InstrumentId::from_str(&experiment.instrument).map_err(|err| {
-            SimulationError::Rejected(format!("instrument {:?}: {err}", experiment.instrument))
-        })?;
+        experiment
+            .check_instruments()
+            .map_err(SimulationError::Rejected)?;
 
-        let bars = self
-            .bars
-            .bars(
-                &experiment.instrument,
-                experiment.interval,
-                experiment.window.from,
-                experiment.window.to,
-            )
-            .map_err(|err| SimulationError::Engine(Box::new(err)))?;
+        // Every instrument the run holds, each with its own series. All of
+        // them are checked before any of them is simulated: a book that is
+        // going to fail on its third member should say so before spending the
+        // time to run the first two.
+        let mut book: Vec<(InstrumentId, String, Vec<arvo_data::Bar>)> = Vec::new();
+        for name in experiment.instruments() {
+            let id = InstrumentId::from_str(&name).map_err(|err| {
+                SimulationError::Rejected(format!("instrument {name:?}: {err}"))
+            })?;
 
-        if bars.is_empty() {
-            return Err(SimulationError::NoData {
-                instrument: experiment.instrument.clone(),
-                from: experiment.window.from,
-                to: experiment.window.to,
-            });
+            let bars = self
+                .bars
+                .bars(
+                    &name,
+                    experiment.interval,
+                    experiment.window.from,
+                    experiment.window.to,
+                )
+                // Named, because in a book the interesting half of this
+                // failure is *which* member could not be loaded. Without it
+                // the whole run reports "engine failed during the run" and the
+                // reader has to guess which instrument to go and look at.
+                .map_err(|err| {
+                    SimulationError::Rejected(format!("reading {name}: {err}"))
+                })?;
+
+            if bars.is_empty() {
+                return Err(SimulationError::NoData {
+                    instrument: name,
+                    from: experiment.window.from,
+                    to: experiment.window.to,
+                });
+            }
+
+            // A strategy that cannot even warm up has not been tested, and a
+            // run that produces no signal is not evidence that there was none.
+            if bars.len() <= plan.min_bars() {
+                return Err(SimulationError::Rejected(format!(
+                    "{name}: {} bars is not enough for {}, which needs more than {}",
+                    bars.len(),
+                    experiment.strategy.name,
+                    plan.min_bars()
+                )));
+            }
+
+            book.push((id, name, bars));
         }
 
-        // A strategy that cannot even warm up has not been tested, and a run
-        // that produces no signal is not evidence that there was none.
-        if bars.len() <= plan.min_bars() {
+        // A venue per run, taken from the head instrument. Every member has to
+        // settle against the same balance for contention to exist at all, and
+        // Nautilus accounts are per venue — so a book spanning two venues would
+        // silently be two accounts, which is the one thing this must not be.
+        let venue = book[0].0.venue;
+        if let Some((id, name, _)) = book.iter().find(|(id, _, _)| id.venue != venue) {
             return Err(SimulationError::Rejected(format!(
-                "{} bars is not enough for {}, which needs more than {}",
-                bars.len(),
-                experiment.strategy.name,
-                plan.min_bars()
+                "{name} is on {} and {} is on {venue}: a shared account cannot span venues",
+                id.venue, experiment.instrument,
             )));
         }
 
-        run_backtest(experiment, &plan, instrument_id, &bars)
+        run_backtest(experiment, &plan, &book)
     }
 }
 
@@ -392,14 +423,20 @@ fn silence_nautilus_logging() {
 fn run_backtest(
     experiment: &Experiment,
     plan: &Plan,
-    instrument_id: InstrumentId,
-    bars: &[arvo_data::Bar],
+    book: &[(InstrumentId, String, Vec<arvo_data::Bar>)],
 ) -> Result<SimulationResult, SimulationError> {
     let rejected = |context: &str, err: &dyn std::fmt::Display| {
         SimulationError::Rejected(format!("{context}: {err}"))
     };
 
     silence_nautilus_logging();
+
+    // Checked by the caller, which will not build an empty book.
+    let venue = book
+        .first()
+        .ok_or_else(|| SimulationError::Rejected("no instruments to run".to_owned()))?
+        .0
+        .venue;
 
     let mut engine = BacktestEngine::new(BacktestEngineConfig::default())
         .map_err(|err| rejected("creating the engine", &err))?;
@@ -411,7 +448,7 @@ fn run_backtest(
     engine
         .add_venue(
             SimulatedVenueConfig::builder()
-                .venue(instrument_id.venue)
+                .venue(venue)
                 .oms_type(OmsType::Netting)
                 .account_type(AccountType::Cash)
                 .book_type(BookType::L1_MBP)
@@ -437,43 +474,40 @@ fn run_backtest(
     if experiment.costs.slippage_bps != 0.0 {
         let model = fill::BpsSlippage::new(experiment.costs.slippage_bps)
             .map_err(SimulationError::Rejected)?;
-        engine.change_fill_model(instrument_id.venue, FillModelHandle::new(model));
+        engine.change_fill_model(venue, FillModelHandle::new(model));
     }
-
-    let instrument = equity(instrument_id, currency, experiment.costs.commission_bps)
-        .map_err(|err| rejected("building the instrument", &err))?;
-    engine
-        .add_instrument(&instrument)
-        .map_err(|err| rejected("adding the instrument", &err))?;
 
     let (step, aggregation) = aggregation_of(experiment.interval)?;
     let spec = BarSpecification::new_checked(step, aggregation, PriceType::Last)
         .map_err(|err| rejected("bar specification", &err))?;
-    // `External` says these bars arrived already aggregated rather than being
-    // built by the engine from ticks, which is what a daily export is.
-    let bar_type = BarType::new(instrument_id, spec, AggregationSource::External);
 
-    let data = bars
-        .iter()
-        .map(|bar| to_nautilus_bar(bar_type, bar, experiment.interval).map(Data::Bar))
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut bar_types = Vec::with_capacity(book.len());
+    for (instrument_id, _, bars) in book {
+        let instrument = equity(*instrument_id, currency, experiment.costs.commission_bps)
+            .map_err(|err| rejected("building the instrument", &err))?;
+        engine
+            .add_instrument(&instrument)
+            .map_err(|err| rejected("adding the instrument", &err))?;
 
-    engine
-        .add_data(data, None, true, true)
-        .map_err(|err| rejected("adding bar data", &err))?;
+        // `External` says these bars arrived already aggregated rather than
+        // being built by the engine from ticks, which is what a daily export is.
+        let bar_type = BarType::new(*instrument_id, spec, AggregationSource::External);
 
-    let core = StrategyCore::new(StrategyConfig {
-        strategy_id: None,
-        order_id_tag: Some("001".to_owned()),
-        oms_type: Some(OmsType::Netting),
-        // Deliberately NOT `manage_stop`. It looks like the right thing — flatten
-        // open positions when the run ends so nothing is left unrealised — but
-        // Nautilus already marks open positions to market in its returns series,
-        // so it changes no number, and its market-exit loop never completes in a
-        // backtest with no data left to fill against. The trader then never
-        // reaches STOPPED and disposal fails on every single run.
-        ..StrategyConfig::default()
-    });
+        let data = bars
+            .iter()
+            .map(|bar| to_nautilus_bar(bar_type, bar, experiment.interval).map(Data::Bar))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // Once per instrument rather than one merged batch: Nautilus sorts what
+        // it is given, and handing it each series separately keeps the merge its
+        // problem rather than a second place interleaving could go wrong.
+        engine
+            .add_data(data, None, true, true)
+            .map_err(|err| rejected("adding bar data", &err))?;
+
+        bar_types.push(bar_type);
+    }
+
     let trade_size = Quantity::new_checked(plan.trade_size(), SIZE_PRECISION)
         .map_err(|err| rejected("trade size", &err))?;
 
@@ -485,6 +519,11 @@ fn run_backtest(
     // sizing is fixed-fractional rather than compounding. That is a real and
     // common choice, but it is a choice — a compounding version risks more
     // after a win and less after a loss, and would produce a different curve.
+    //
+    // Every member of a book gets the same limits, expressed against the whole
+    // account rather than a share of it. That is deliberate: a per-member cap
+    // of `1/N` would pre-allocate capital and there would be nothing left to
+    // contend for. The contention is the measurement.
     let risk = strategy::Risk {
         stop_atr_multiple: experiment.risk.stop_atr_multiple,
         atr_period: experiment.risk.atr_period,
@@ -499,69 +538,99 @@ fn run_backtest(
         max_drawdown: experiment.risk.max_drawdown,
     };
 
-    match *plan {
-        Plan::SmaCross {
-            fast_period,
-            slow_period,
-            ..
-        } => engine.add_strategy(strategy::SmaCross::new(
-            core,
-            bar_type,
-            trade_size,
-            fast_period,
-            slow_period,
-            risk,
-        )),
-        Plan::OpeningRange {
-            range_bars,
-            target_range_multiple,
-            ..
-        } => engine.add_strategy(strategy::OpeningRange::new(
-            core,
-            bar_type,
-            trade_size,
-            range_bars,
-            target_range_multiple,
-            risk,
-        )),
-        Plan::VolatilityBreakout {
-            entry_atr_multiple,
-            atr_period,
-            ..
-        } => engine.add_strategy(strategy::VolatilityBreakout::new(
-            core,
-            bar_type,
-            trade_size,
-            entry_atr_multiple,
-            atr_period,
-            risk,
-        )),
-        Plan::VwapReversion {
-            entry_deviations, ..
-        } => engine.add_strategy(strategy::VwapReversion::new(
-            core,
-            bar_type,
-            trade_size,
-            entry_deviations,
-            risk,
-        )),
-        Plan::MomentumBreakout {
-            entry_period,
-            exit_period,
-            ..
-        } => engine.add_strategy(strategy::MomentumBreakout::new(
-            core,
-            bar_type,
-            trade_size,
-            entry_period,
-            exit_period,
-            risk,
-        )),
-        Plan::BuyAndHold { .. } => {
-            engine.add_strategy(strategy::BuyAndHold::new(core, bar_type, trade_size))
+    // One strategy instance per instrument, all settling against the one
+    // account added above. This is what makes capital contention real: when two
+    // members want in at the same time, the second is filled out of whatever
+    // the first left, and on a cash account it may not be filled at all. A
+    // simulation that runs each instrument separately with the whole balance
+    // behind it cannot express that, however its results are combined
+    // afterwards.
+    //
+    // The rules themselves are untouched. Each still sees exactly one
+    // instrument; sharing is the account's job, not theirs.
+    for (index, bar_type) in bar_types.iter().copied().enumerate() {
+        let core = StrategyCore::new(StrategyConfig {
+            strategy_id: None,
+            // Distinct per member, because Nautilus builds client order ids
+            // from it. Two strategies sharing a tag collide on their first
+            // simultaneous order — which is exactly the case a book exists to
+            // simulate, so it must not be an id collision instead.
+            order_id_tag: Some(format!("{:03}", index + 1)),
+            oms_type: Some(OmsType::Netting),
+            // Deliberately NOT `manage_stop`. It looks like the right thing —
+            // flatten open positions when the run ends so nothing is left
+            // unrealised — but Nautilus already marks open positions to market
+            // in its returns series, so it changes no number, and its
+            // market-exit loop never completes in a backtest with no data left
+            // to fill against. The trader then never reaches STOPPED and
+            // disposal fails on every single run.
+            ..StrategyConfig::default()
+        });
+
+        match *plan {
+            Plan::SmaCross {
+                fast_period,
+                slow_period,
+                ..
+            } => engine.add_strategy(strategy::SmaCross::new(
+                core,
+                bar_type,
+                trade_size,
+                fast_period,
+                slow_period,
+                risk,
+            )),
+            Plan::OpeningRange {
+                range_bars,
+                target_range_multiple,
+                ..
+            } => engine.add_strategy(strategy::OpeningRange::new(
+                core,
+                bar_type,
+                trade_size,
+                range_bars,
+                target_range_multiple,
+                risk,
+            )),
+            Plan::VolatilityBreakout {
+                entry_atr_multiple,
+                atr_period,
+                ..
+            } => engine.add_strategy(strategy::VolatilityBreakout::new(
+                core,
+                bar_type,
+                trade_size,
+                entry_atr_multiple,
+                atr_period,
+                risk,
+            )),
+            Plan::VwapReversion {
+                entry_deviations, ..
+            } => engine.add_strategy(strategy::VwapReversion::new(
+                core,
+                bar_type,
+                trade_size,
+                entry_deviations,
+                risk,
+            )),
+            Plan::MomentumBreakout {
+                entry_period,
+                exit_period,
+                ..
+            } => engine.add_strategy(strategy::MomentumBreakout::new(
+                core,
+                bar_type,
+                trade_size,
+                entry_period,
+                exit_period,
+                risk,
+            )),
+            Plan::BuyAndHold { .. } => {
+                engine.add_strategy(strategy::BuyAndHold::new(core, bar_type, trade_size))
+            }
         }
+        .map_err(|err| rejected("adding the strategy", &err))?;
     }
-    .map_err(|err| rejected("adding the strategy", &err))?;
 
     // The window is already expressed by the data: bars were filtered to it on
     // the way in, so bounding the run again would only add a way to disagree
@@ -581,9 +650,13 @@ fn run_backtest(
     // account excludes the market value of anything held. Buying reads as a
     // catastrophic loss and selling as an enormous gain, both the size of the
     // position's notional. See `arvo_research::trade::equity_curve`.
+    let series: Vec<(String, Vec<arvo_data::Bar>)> = book
+        .iter()
+        .map(|(_, name, bars)| (name.clone(), bars.clone()))
+        .collect();
     let equity_curve = arvo_research::trade::equity_curve(
         experiment.starting_cash,
-        bars,
+        &series,
         experiment.interval,
         &ledger,
     );
@@ -807,6 +880,7 @@ mod tests {
             id: ExperimentId::from("e-1"),
             hypothesis: HypothesisId::from("h-1"),
             instrument: "AAPL.NASDAQ".to_owned(),
+            alongside: Vec::new(),
             window: DateRange::new(
                 bars.first().expect("fixture is not empty").at.date(),
                 bars.last().expect("fixture is not empty").at.date(),
@@ -1679,6 +1753,197 @@ mod tests {
             result.equity_curve.len(),
             bars.len() + 1,
             "every bar, plus the opening balance"
+        );
+    }
+
+    // ---- books: several instruments out of one account -------------------
+
+    /// A provider holding the same sawtooth under several names, so a book's
+    /// members are identical by construction and any difference between the
+    /// book and a single run is the shared account and nothing else.
+    fn book_provider(names: &[&str], bars: &[arvo_data::Bar]) -> NautilusSimulation<InMemoryBars> {
+        let mut library = InMemoryBars::new();
+        for name in names {
+            library = library.with_instrument(name, bars.to_vec());
+        }
+        NautilusSimulation::new(library)
+    }
+
+    #[test]
+    fn a_book_trades_every_member_and_the_ledger_says_which() {
+        let bars = sawtooth(200);
+        let mut experiment = experiment(params(10.0, 30.0), &bars);
+        experiment.alongside = vec!["MSFT.NASDAQ".to_owned()];
+        let simulation = book_provider(&["AAPL.NASDAQ", "MSFT.NASDAQ"], &bars);
+
+        let result = simulation.run(&experiment).expect("the book should run");
+
+        let instruments: std::collections::BTreeSet<&str> = result
+            .ledger
+            .iter()
+            .map(|trade| trade.instrument.as_str())
+            .collect();
+        assert!(
+            instruments.contains("AAPL.NASDAQ") && instruments.contains("MSFT.NASDAQ"),
+            "both members should appear in the ledger, got {instruments:?}"
+        );
+    }
+
+    #[test]
+    fn a_book_with_room_for_everyone_is_the_sum_of_its_members() {
+        // The control for the test below. When the account can afford every
+        // member at once there is nothing to contend for, and a book of two
+        // identical members should be exactly twice one of them. If this ever
+        // stops holding, the sharing has introduced an effect of its own and
+        // the contention measured below would not be contention.
+        let bars = sawtooth(200);
+        let alone = experiment(params(10.0, 30.0), &bars);
+        let single = provider(bars.clone())
+            .run(&alone)
+            .expect("the single run should work");
+
+        let mut paired = alone.clone();
+        paired.alongside = vec!["MSFT.NASDAQ".to_owned()];
+        let book = book_provider(&["AAPL.NASDAQ", "MSFT.NASDAQ"], &bars)
+            .run(&paired)
+            .expect("the book should run");
+
+        assert!(
+            (realised(&book) - 2.0 * realised(&single)).abs() < 1e-6,
+            "with room for both, a book of two identical members is twice one: \
+             book {:.2}, twice the single run {:.2}",
+            realised(&book),
+            2.0 * realised(&single),
+        );
+    }
+
+    #[test]
+    fn a_book_too_small_for_all_its_members_crowds_the_later_ones_out() {
+        // The measurement the whole thing exists for, and the one no amount of
+        // combining separate runs can produce.
+        //
+        // Each member wants roughly 100 x $100 = $10,000 and the account holds
+        // $12,000. Run separately they both trade in full and their results
+        // add. Sharing one balance, the first member takes the only position
+        // the account can fund and the second is denied every time — so the
+        // book is not *less* than twice the single run, it is exactly *equal*
+        // to it, and one of its two instruments never trades at all.
+        //
+        // That is worth asserting precisely rather than as an inequality: a
+        // reader pointing a rule at more instruments than the account can fund
+        // gets a result whose extra members are silently absent, and the
+        // number that gives it away is the trade count, not the return.
+        let bars = sawtooth(200);
+        let mut alone = experiment(params(10.0, 30.0), &bars);
+        alone.starting_cash = 12_000.0;
+        let single = provider(bars.clone())
+            .run(&alone)
+            .expect("the single run should work");
+
+        let mut paired = alone.clone();
+        paired.alongside = vec!["MSFT.NASDAQ".to_owned()];
+        let book = book_provider(&["AAPL.NASDAQ", "MSFT.NASDAQ"], &bars)
+            .run(&paired)
+            .expect("the book should run");
+
+        assert!(single.trades > 0, "the fixture has to trade");
+        assert_eq!(
+            book.trades, single.trades,
+            "an account with room for one position funds one member, not two"
+        );
+        assert!(
+            (realised(&book) - realised(&single)).abs() < 1e-6,
+            "book {:.2} against the single run {:.2}",
+            realised(&book),
+            realised(&single),
+        );
+
+        let traded: std::collections::BTreeSet<&str> = book
+            .ledger
+            .iter()
+            .map(|trade| trade.instrument.as_str())
+            .collect();
+        assert_eq!(
+            traded.len(),
+            1,
+            "the crowded-out member should not appear in the ledger at all, got {traded:?}"
+        );
+    }
+
+    fn realised(result: &arvo_research::SimulationResult) -> f64 {
+        result.ledger.iter().map(|trade| trade.pnl).sum()
+    }
+
+    #[test]
+    fn a_single_instrument_run_is_untouched_by_the_book_machinery() {
+        // Everything already recorded was produced by the path an empty
+        // `alongside` takes, so that path changing would invalidate every
+        // stored finding at once.
+        let bars = sawtooth(200);
+        let experiment = experiment(params(10.0, 30.0), &bars);
+
+        let result = provider(bars).run(&experiment).expect("should run");
+
+        assert!(
+            result
+                .ledger
+                .iter()
+                .all(|trade| trade.instrument == "AAPL.NASDAQ"),
+            "a single-instrument run trades only its instrument"
+        );
+        assert!(result.trades > 0, "the fixture is meant to trade");
+    }
+
+    #[test]
+    fn an_instrument_held_alongside_itself_is_refused() {
+        // Never what was meant, and it would double the rule's exposure to one
+        // name while reporting the trade count of a diversified book.
+        let bars = sawtooth(200);
+        let mut experiment = experiment(params(10.0, 30.0), &bars);
+        experiment.alongside = vec!["AAPL.NASDAQ".to_owned()];
+
+        let err = provider(bars)
+            .run(&experiment)
+            .expect_err("a duplicate member is not a book");
+        assert!(
+            err.to_string().contains("appears twice"),
+            "the reason should name the problem, got {err}"
+        );
+    }
+
+    #[test]
+    fn a_book_spanning_two_venues_is_refused_rather_than_silently_split() {
+        // Nautilus accounts are per venue, so this would be two balances
+        // wearing one name — the exact opposite of what a book is for, and it
+        // would report contention that never happened.
+        let bars = sawtooth(200);
+        let mut experiment = experiment(params(10.0, 30.0), &bars);
+        experiment.alongside = vec!["MSFT.NYSE".to_owned()];
+        let simulation = book_provider(&["AAPL.NASDAQ", "MSFT.NYSE"], &bars);
+
+        let err = simulation
+            .run(&experiment)
+            .expect_err("a shared account cannot span venues");
+        assert!(
+            err.to_string().contains("cannot span venues"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn a_member_with_no_data_fails_the_whole_book_by_name() {
+        let bars = sawtooth(200);
+        let mut experiment = experiment(params(10.0, 30.0), &bars);
+        experiment.alongside = vec!["NVDA.NASDAQ".to_owned()];
+        // Only the head instrument is in the library.
+        let simulation = provider(bars);
+
+        let err = simulation
+            .run(&experiment)
+            .expect_err("a member with no bars is not runnable");
+        assert!(
+            err.to_string().contains("NVDA.NASDAQ"),
+            "the failure should name the member that caused it, got {err}"
         );
     }
 }

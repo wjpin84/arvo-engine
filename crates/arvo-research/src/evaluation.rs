@@ -695,6 +695,7 @@ mod tests {
             id: ExperimentId::from("e-1"),
             hypothesis: HypothesisId::from("h-1"),
             instrument: "AAPL.NASDAQ".to_owned(),
+            alongside: Vec::new(),
             window: DateRange::new(day(1), day(31)).expect("ordered"),
             interval: arvo_data::BarInterval::DAILY,
             dataset: DatasetRef {

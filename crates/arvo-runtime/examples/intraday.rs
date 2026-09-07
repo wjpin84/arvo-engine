@@ -78,6 +78,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         id: ExperimentId::from("intraday-probe"),
         hypothesis: HypothesisId::from("a moving-average crossover works intraday"),
         instrument: instrument.clone(),
+        alongside: Vec::new(),
         window: DateRange::new(first.at.date(), last.at.date())?,
         interval,
         dataset: DatasetRef {

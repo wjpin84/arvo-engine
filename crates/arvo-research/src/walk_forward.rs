@@ -579,6 +579,7 @@ mod tests {
             id: crate::ExperimentId::from("wf"),
             hypothesis: HypothesisId::from("h"),
             instrument: "AAPL.NASDAQ".to_owned(),
+            alongside: Vec::new(),
             window,
             interval: arvo_data::BarInterval::DAILY,
             dataset: crate::DatasetRef {
@@ -731,6 +732,7 @@ mod tests {
 
     fn trade(pnl: f64) -> Trade {
         Trade {
+            instrument: String::new(),
             opened: date(2024, 1, 1).and_time(chrono::NaiveTime::MIN),
             closed: Some(date(2024, 1, 3).and_time(chrono::NaiveTime::MIN)),
             direction: Direction::Long,

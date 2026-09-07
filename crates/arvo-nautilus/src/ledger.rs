@@ -63,6 +63,10 @@ fn to_trade(cache: &Cache, position: &Position) -> Trade {
     let quantity = position.peak_qty.as_f64();
 
     Trade {
+        // Nautilus's own id for the position's instrument. Once a run can hold
+        // several, a ledger that does not say which one a trade was in cannot
+        // be marked to market at all.
+        instrument: position.instrument_id.to_string(),
         opened: instant(position.ts_opened),
         closed: position.ts_closed.map(instant),
         direction: match position.side {

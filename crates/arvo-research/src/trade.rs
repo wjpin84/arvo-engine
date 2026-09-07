@@ -58,6 +58,18 @@ pub enum ExitReason {
 /// One position, from opening fill to closing fill.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Trade {
+    /// Which instrument this round trip was in, as `SYMBOL.VENUE`.
+    ///
+    /// Empty for a single-instrument run recorded before a run could hold more
+    /// than one, and for one where the ledger's instrument is the experiment's
+    /// and saying so twice would be the only thing it added.
+    ///
+    /// `default` because this is a persisted format: a finding stored before
+    /// the ledger named instruments still loads, as one whose trades do not
+    /// say which instrument they were in — which is the honest description of
+    /// a record from when every trade was in the same one.
+    #[serde(default)]
+    pub instrument: String,
     pub opened: NaiveDateTime,
     /// `None` while the position is still open at the end of the run.
     pub closed: Option<NaiveDateTime>,
@@ -281,12 +293,23 @@ impl TradeStats {
 #[must_use]
 pub fn equity_curve(
     starting_cash: f64,
-    bars: &[arvo_data::Bar],
+    bars: &[(String, Vec<arvo_data::Bar>)],
     interval: arvo_data::BarInterval,
     ledger: &[Trade],
 ) -> Vec<EquityPoint> {
-    let mut curve = Vec::with_capacity(bars.len() + 1);
-    let Some(first) = bars.first() else {
+    // Every instant any instrument reported. A book of instruments on
+    // different calendars is measured on all of their bars rather than only
+    // the ones they share, and a single-instrument run is unchanged: the union
+    // of one series is that series.
+    let mut instants: Vec<NaiveDateTime> = bars
+        .iter()
+        .flat_map(|(_, series)| series.iter().map(|bar| bar.at))
+        .collect();
+    instants.sort_unstable();
+    instants.dedup();
+
+    let mut curve = Vec::with_capacity(instants.len() + 1);
+    let Some(first) = instants.first().copied() else {
         return curve;
     };
 
@@ -294,24 +317,50 @@ pub fn equity_curve(
     // open. Without it a curve of one closed trade has a single point and no
     // return can be computed from it.
     curve.push(EquityPoint {
-        at: first.at,
+        at: first,
         equity: starting_cash,
     });
 
-    for bar in bars {
+    // Last close seen per instrument, so a position in an instrument that did
+    // not print on this instant is marked at its most recent price rather than
+    // vanishing from the account for a bar.
+    let mut last_close: std::collections::HashMap<&str, f64> =
+        std::collections::HashMap::with_capacity(bars.len());
+    let mut cursor: Vec<usize> = vec![0; bars.len()];
+
+    for instant in instants {
         // A bar is only knowable once its period has closed — the same
         // convention the engine boundary timestamps bars with, so trade
         // instants and curve instants are on the same clock.
-        let at = bar.at + interval.duration();
-        let mut equity = starting_cash;
+        let at = instant + interval.duration();
 
+        for (index, (instrument, series)) in bars.iter().enumerate() {
+            while cursor[index] < series.len() && series[cursor[index]].at <= instant {
+                last_close.insert(instrument.as_str(), series[cursor[index]].close);
+                cursor[index] += 1;
+            }
+        }
+
+        let mut equity = starting_cash;
         for trade in ledger {
             match trade.closed {
                 Some(closed) if closed <= at => equity += trade.pnl,
-                // Held right now: mark it to this bar's close. Long-only, so
-                // the sign is the price move.
+                // Held right now: mark it to the latest close of the
+                // instrument it is in. Long-only, so the sign is the price
+                // move.
                 _ if trade.opened <= at => {
-                    equity += trade.quantity * (bar.close - trade.entry);
+                    // An empty instrument is a ledger from before trades named
+                    // one, which only ever happens on a single-instrument run
+                    // — so the one series present is the right one to mark
+                    // against.
+                    let close = if trade.instrument.is_empty() {
+                        bars.first().and_then(|(name, _)| last_close.get(name.as_str()))
+                    } else {
+                        last_close.get(trade.instrument.as_str())
+                    };
+                    if let Some(close) = close {
+                        equity += trade.quantity * (close - trade.entry);
+                    }
                 }
                 _ => {}
             }
@@ -334,6 +383,7 @@ mod tests {
 
     fn trade(open: u32, close: Option<u32>, pnl: f64, reason: ExitReason) -> Trade {
         Trade {
+            instrument: String::new(),
             opened: at(open),
             closed: close.map(at),
             direction: Direction::Long,
@@ -344,6 +394,11 @@ mod tests {
             commission: 1.0,
             exit_reason: reason,
         }
+    }
+
+    /// One instrument's series, in the shape the curve now takes.
+    fn one(instrument: &str, bars: Vec<arvo_data::Bar>) -> Vec<(String, Vec<arvo_data::Bar>)> {
+        vec![(instrument.to_owned(), bars)]
     }
 
     fn bar(day: u32, close: f64) -> arvo_data::Bar {
@@ -363,6 +418,7 @@ mod tests {
         // curve and the ledger are the same statement about the same run.
         let bars: Vec<_> = (1..=5).map(|day| bar(day, 100.0)).collect();
         let ledger = [Trade {
+            instrument: String::new(),
             opened: at(1),
             closed: Some(at(3)),
             direction: Direction::Long,
@@ -374,7 +430,7 @@ mod tests {
             exit_reason: ExitReason::Signal,
         }];
 
-        let curve = equity_curve(1_000.0, &bars, arvo_data::BarInterval::DAILY, &ledger);
+        let curve = equity_curve(1_000.0, &one("X.SIM", bars.clone()), arvo_data::BarInterval::DAILY, &ledger);
         let last = curve.last().expect("non-empty").equity;
         assert!((last - 1_095.0).abs() < 1e-9, "{last}");
     }
@@ -386,6 +442,7 @@ mod tests {
         // drawdown is one of the criteria a verdict turns on.
         let bars = vec![bar(1, 100.0), bar(2, 50.0), bar(3, 100.0)];
         let ledger = [Trade {
+            instrument: String::new(),
             opened: at(1),
             closed: None,
             direction: Direction::Long,
@@ -397,7 +454,7 @@ mod tests {
             exit_reason: ExitReason::StillOpen,
         }];
 
-        let curve = equity_curve(1_000.0, &bars, arvo_data::BarInterval::DAILY, &ledger);
+        let curve = equity_curve(1_000.0, &one("X.SIM", bars.clone()), arvo_data::BarInterval::DAILY, &ledger);
         let trough = curve
             .iter()
             .map(|point| point.equity)
@@ -414,7 +471,7 @@ mod tests {
         // assumed this; a daily series scaled by the five-minute factor
         // overstated volatility by about nine times.
         let bars: Vec<_> = (1..=7).map(|day| bar(day, 100.0)).collect();
-        let curve = equity_curve(1_000.0, &bars, arvo_data::BarInterval::DAILY, &[]);
+        let curve = equity_curve(1_000.0, &one("X.SIM", bars.clone()), arvo_data::BarInterval::DAILY, &[]);
         assert_eq!(curve.len(), 8);
         assert!(curve.iter().all(|point| point.equity == 1_000.0));
     }
@@ -496,5 +553,112 @@ mod tests {
         let stats = TradeStats::from_ledger(&ledger);
         let days = stats.average_holding_secs.expect("two closed") / 86_400.0;
         assert!((days - 1.5).abs() < 1e-9, "two and one day average: {days}");
+    }
+
+    #[test]
+    fn a_position_is_marked_against_its_own_instrument_not_the_first_one() {
+        // The whole reason the ledger names instruments. Marking every open
+        // position against one series would price a held AAPL at MSFT's close,
+        // which is not wrong by a little.
+        let steady: Vec<_> = (1..=3).map(|day| bar(day, 100.0)).collect();
+        let halved = vec![bar(1, 100.0), bar(2, 50.0), bar(3, 50.0)];
+        let bars = vec![
+            ("STEADY.SIM".to_owned(), steady),
+            ("FALLER.SIM".to_owned(), halved),
+        ];
+        let ledger = [Trade {
+            instrument: "FALLER.SIM".to_owned(),
+            opened: at(1),
+            closed: None,
+            direction: Direction::Long,
+            quantity: 10.0,
+            entry: 100.0,
+            exit: None,
+            pnl: 0.0,
+            commission: 0.0,
+            exit_reason: ExitReason::StillOpen,
+        }];
+
+        let curve = equity_curve(1_000.0, &bars, arvo_data::BarInterval::DAILY, &ledger);
+        let last = curve.last().expect("non-empty").equity;
+        assert!(
+            (last - 500.0).abs() < 1e-9,
+            "a halved position is a 500 loss on a 1,000 account, got {last}"
+        );
+    }
+
+    #[test]
+    fn an_instrument_that_did_not_print_holds_its_last_price() {
+        // What actually happens to a position on a day its instrument does not
+        // trade. Dropping it from the account for that bar would draw a
+        // drawdown and a recovery that never happened.
+        let dense: Vec<_> = (1..=3).map(|day| bar(day, 100.0)).collect();
+        let sparse = vec![bar(1, 100.0), bar(3, 100.0)];
+        let bars = vec![
+            ("DENSE.SIM".to_owned(), dense),
+            ("SPARSE.SIM".to_owned(), sparse),
+        ];
+        let ledger = [Trade {
+            instrument: "SPARSE.SIM".to_owned(),
+            opened: at(1),
+            closed: None,
+            direction: Direction::Long,
+            quantity: 10.0,
+            entry: 100.0,
+            exit: None,
+            pnl: 0.0,
+            commission: 0.0,
+            exit_reason: ExitReason::StillOpen,
+        }];
+
+        let curve = equity_curve(1_000.0, &bars, arvo_data::BarInterval::DAILY, &ledger);
+        assert!(
+            curve.iter().all(|point| (point.equity - 1_000.0).abs() < 1e-9),
+            "nothing moved, so the account did not: {curve:?}"
+        );
+    }
+
+    #[test]
+    fn two_instruments_are_measured_on_every_bar_either_of_them_reported() {
+        let dense: Vec<_> = (1..=4).map(|day| bar(day, 100.0)).collect();
+        let sparse = vec![bar(2, 100.0), bar(5, 100.0)];
+        let bars = vec![
+            ("DENSE.SIM".to_owned(), dense),
+            ("SPARSE.SIM".to_owned(), sparse),
+        ];
+
+        let curve = equity_curve(1_000.0, &bars, arvo_data::BarInterval::DAILY, &[]);
+        // Days 1-4 from one and 5 from the other, plus the opening balance.
+        assert_eq!(curve.len(), 6, "{curve:?}");
+    }
+
+    #[test]
+    fn a_ledger_from_before_trades_named_instruments_still_marks_to_market() {
+        // Findings recorded before this field existed load with it empty. They
+        // were all single-instrument, so the one series present is the right
+        // one to mark against — and reading the empty name as "no instrument"
+        // would silently drop the position from the curve.
+        let bars = vec![bar(1, 100.0), bar(2, 50.0)];
+        let ledger = [Trade {
+            instrument: String::new(),
+            opened: at(1),
+            closed: None,
+            direction: Direction::Long,
+            quantity: 10.0,
+            entry: 100.0,
+            exit: None,
+            pnl: 0.0,
+            commission: 0.0,
+            exit_reason: ExitReason::StillOpen,
+        }];
+
+        let curve = equity_curve(
+            1_000.0,
+            &one("X.SIM", bars),
+            arvo_data::BarInterval::DAILY,
+            &ledger,
+        );
+        let last = curve.last().expect("non-empty").equity;
+        assert!((last - 500.0).abs() < 1e-9, "{last}");
     }
 }
