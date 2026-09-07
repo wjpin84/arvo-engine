@@ -31,6 +31,7 @@ pub mod evaluation;
 pub mod family;
 pub mod memory;
 pub mod panel;
+pub mod replay;
 pub mod trade;
 pub mod walk_forward;
 
@@ -46,6 +47,7 @@ pub use family::{
 pub use memory::{
     EvidenceStore, Loaded, MemoryError, Record, StoredRecord, Summary, Unreadable, SCHEMA,
 };
+pub use replay::{replay, Divergence, Replay};
 pub use panel::{run_panel, InstrumentOutcome, PanelEvidence, PanelStudy, PooledOutcome};
 pub use trade::{Direction, ExitReason, Trade, TradeStats};
 pub use walk_forward::{run_walk_forward, AxisStability, WalkForward, WalkForwardEvidence};

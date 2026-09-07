@@ -22,9 +22,13 @@ use arvo_research::{
 // The view shapes live in `arvo-views` so the window cannot drift from
 // them. See that crate for what two hand-mirrored copies cost.
 pub use arvo_views::{
-    BookView, BreadthView, CandlePoint, ComparisonRowView, ComparisonView, DataFindingView, HistoryView,
-    MatchView,
-    NamedCurveView, UnreadableView, CurvePoint, DataLibraryView, FetchView, FoldView, HistoryEntryView, InstrumentView, MetricsView, MonthlyReturnView, OutcomeView, PanelView, RecommendationView, RecordView, StabilityView, StrategyView, StudyView, SurfaceCell, SurfaceView, TradeMarkerView, TradeRowView, TradesView, WalkForwardView};
+    BookView, BreadthView, CandlePoint, ComparisonRowView, ComparisonView, CurvePoint,
+    DataFindingView, DataLibraryView, DivergenceView, FetchView, FoldView, HistoryEntryView,
+    HistoryView, InstrumentView, MatchView, MetricsView, MonthlyReturnView, NamedCurveView,
+    OutcomeView, PanelView, RecommendationView, RecordView, ReplayView, StabilityView,
+    StrategyView, StudyView, SurfaceCell, SurfaceView, TradeMarkerView, TradeRowView,
+    TradesView, UnreadableView, WalkForwardView,
+};
 
 use crate::commands::CommandError;
 
@@ -511,6 +515,104 @@ pub async fn open_record(
     })
 }
 
+
+/// Runs a stored finding again and reports whether it still comes out the same.
+///
+/// The claim `Experiment` makes about itself — that its fields are everything
+/// needed to reproduce a run — is the one the whole evidence store rests on,
+/// and nothing checked it until this existed. A finding whose numbers cannot
+/// be regenerated is not evidence; it is a screenshot of a number.
+///
+/// Costs one engine run: a study records the winning configuration with its
+/// window already set to the period it was judged on, so this repeats the run
+/// that was written down rather than the search that found it.
+#[tauri::command]
+pub async fn replay_record(
+    id: String,
+    service: tauri::State<'_, ResearchService>,
+) -> Result<ReplayView, CommandError> {
+    let stored = service
+        .memory
+        .open(&id)
+        .map_err(|err| CommandError::Failed(err.to_string()))?;
+
+    // Hashed here rather than inside the replay: what the data is now is a
+    // question about this machine, and the research crate has no filesystem.
+    let live = live_version(&service, &stored.summary());
+    let simulation = service.simulation.clone();
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let outcome = arvo_research::replay(simulation.as_ref(), &stored.record, live.as_deref());
+        Ok(replay_view(&outcome))
+    })
+    .await
+    .map_err(|err| CommandError::Failed(format!("replay did not finish: {err}")))?
+}
+
+fn replay_view(outcome: &arvo_research::Replay) -> ReplayView {
+    use arvo_research::Replay;
+    match outcome {
+        Replay::Reproduced { points, trades } => ReplayView {
+            outcome: "reproduced".to_owned(),
+            holds: true,
+            detail: format!(
+                "Ran again and produced the same {points} equity points and the                  same {trades} trades."
+            ),
+            divergence: None,
+        },
+        Replay::DataChanged { recorded, current } => ReplayView {
+            outcome: "data-changed".to_owned(),
+            holds: false,
+            detail: format!(
+                "The data behind this finding is not the data that produced it                  ({} now, {} then), so re-running would measure something else.",
+                short_hash(current),
+                short_hash(recorded),
+            ),
+            divergence: None,
+        },
+        Replay::EngineChanged { recorded, current } => ReplayView {
+            outcome: "engine-changed".to_owned(),
+            holds: false,
+            detail: format!(
+                "Recorded on {recorded}; this build runs {current}. A different                  simulator disagreeing is not evidence about the old one, so the                  run was not attempted."
+            ),
+            divergence: None,
+        },
+        Replay::Diverged(divergence) => ReplayView {
+            outcome: "diverged".to_owned(),
+            holds: false,
+            detail: format!(
+                "Same data, same engine, different answer: {}. Something that                  decides the result is not recorded in the experiment.",
+                divergence.what,
+            ),
+            divergence: Some(DivergenceView {
+                what: divergence.what.clone(),
+                at: divergence.at.map(|at| at as u32),
+                when: divergence.when.map(|when| when.to_string()),
+                recorded: divergence.recorded,
+                replayed: divergence.replayed,
+                relative: divergence.relative,
+            }),
+        },
+        Replay::NotReplayable { why } => ReplayView {
+            outcome: "not-replayable".to_owned(),
+            holds: false,
+            detail: format!("Not checked: {why}."),
+            divergence: None,
+        },
+        Replay::Failed { error } => ReplayView {
+            outcome: "failed".to_owned(),
+            holds: false,
+            detail: format!("It would not run again: {error}."),
+            divergence: None,
+        },
+    }
+}
+
+/// First eight characters of a content hash, or the whole thing if shorter.
+fn short_hash(hash: &str) -> String {
+    hash.chars().take(8).collect()
+}
 
 /// Lists the instruments the workbench can study.
 #[tauri::command]

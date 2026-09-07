@@ -65,6 +65,13 @@ pub(crate) fn ResearchView(
     // comparing two is the common case and comparing six is the one where the
     // selection-noise arithmetic actually matters.
     let (selected, set_selected) = signal(Vec::<String>::new());
+    // Replay outcomes by record id. Kept beside the history rather than in a
+    // panel of its own: the question "does this still hold?" belongs next to
+    // the finding it is asked about, and answering it for one row should not
+    // disturb the others.
+    let (replays, set_replays) = signal(
+        std::collections::HashMap::<String, ReplayView>::new(),
+    );
     // What the engine can actually run, fetched rather than hardcoded: a menu
     // that drifts from the engine offers rules it will then refuse.
     let (strategies, set_strategies) = signal(Vec::<StrategyView>::new());
@@ -872,6 +879,33 @@ pub(crate) fn ResearchView(
                                                 }
                                             });
                                         };
+                                        // Re-runs the finding and reports whether it still comes
+                                        // out the same. Its own control because it costs an engine
+                                        // run — checking every finding on every render would make
+                                        // opening the history expensive enough to avoid.
+                                        let checking = entry.id.clone();
+                                        let check = move |_| {
+                                            let id = checking.clone();
+                                            spawn_local(async move {
+                                                let args = serde_wasm_bindgen::to_value(
+                                                        &serde_json::json!({ "id" : id.clone() }),
+                                                    )
+                                                    .unwrap_or(JsValue::UNDEFINED);
+                                                match call_typed::<ReplayView>("replay_record", args).await {
+                                                    Ok(outcome) => {
+                                                        set_replays.update(|held| {
+                                                            held.insert(id, outcome);
+                                                        });
+                                                    }
+                                                    Err(reason) => set_error.set(Some(reason)),
+                                                }
+                                            });
+                                        };
+                                        let replayed = {
+                                            let id = entry.id.clone();
+                                            move || replays.with(|held| held.get(&id).cloned())
+                                        };
+
                                         // `Some(false)` is current, `Some(true)` is stale, and
                                         // `None` means the data it referenced is gone entirely —
                                         // three different things, shown as three different things.
@@ -933,6 +967,31 @@ pub(crate) fn ResearchView(
                                                             }
                                                         })}
                                                 </button>
+                                                <button
+                                                    class="research-history-check"
+                                                    title="Run this finding again and compare"
+                                                    on:click=check
+                                                >
+                                                    "Check"
+                                                </button>
+                                                {move || {
+                                                    replayed()
+                                                        .map(|outcome| {
+                                                            let tone = if outcome.holds {
+                                                                "research-replay holds"
+                                                            } else {
+                                                                "research-replay research-flag"
+                                                            };
+                                                            view! {
+                                                                <span
+                                                                    class=tone
+                                                                    title=outcome.detail.clone()
+                                                                >
+                                                                    {outcome.outcome.clone()}
+                                                                </span>
+                                                            }
+                                                        })
+                                                }}
                                             </li>
                                         }
                                     })

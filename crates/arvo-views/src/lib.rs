@@ -499,6 +499,37 @@ pub struct BookView {
     pub diversification: f64,
 }
 
+/// What came back from re-running a stored finding.
+///
+/// A finding whose numbers cannot be regenerated is not evidence, so this is
+/// the check the whole evidence store rests on.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplayView {
+    /// `reproduced`, `data-changed`, `engine-changed`, `diverged`,
+    /// `not-replayable` or `failed`. A slug so the window can style it
+    /// without parsing prose.
+    pub outcome: String,
+    /// Whether the finding still stands. Only a clean reproduction counts:
+    /// changed data or a changed engine leaves the claim untested, which is
+    /// not the same as confirmed.
+    pub holds: bool,
+    pub detail: String,
+    pub divergence: Option<DivergenceView>,
+}
+
+/// Where a replay first stopped matching the record.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DivergenceView {
+    pub what: String,
+    pub at: Option<u32>,
+    pub when: Option<String>,
+    pub recorded: f64,
+    pub replayed: f64,
+    /// Gap relative to the recorded value, so a report can separate a
+    /// rounding difference from a different answer.
+    pub relative: f64,
+}
+
 /// One finding in a side-by-side comparison.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ComparisonRowView {
