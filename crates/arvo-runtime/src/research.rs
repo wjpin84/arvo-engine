@@ -732,6 +732,116 @@ pub async fn run_study(
     .and_then(|outcome| outcome.and_then(|outcome| remember(&service, outcome)))
 }
 
+/// Studies one rule across several instruments **sharing one account**.
+///
+/// The difference from a panel is the whole point. A panel runs each member on
+/// its own with the full balance behind it and combines the answers; this runs
+/// them together, so a position one member takes is capital another cannot.
+/// Two rules that look identical when simulated separately — one that wants
+/// three positions at once and one that wants them in turn — are told apart
+/// here and nowhere else.
+///
+/// The window is the intersection of every member's coverage, not the union: a
+/// book cannot hold an instrument over a period it has no prices for, and
+/// running the members over different spans would make the shared balance a
+/// fiction.
+///
+/// # Errors
+///
+/// Returns [`CommandError`] if fewer than two instruments were named, if any
+/// of them holds no bars at the strategy's resolution, or if their coverage
+/// does not overlap.
+#[tauri::command]
+pub async fn run_book(
+    instruments: Vec<String>,
+    strategy: Option<String>,
+    service: tauri::State<'_, ResearchService>,
+) -> Result<StudyView, CommandError> {
+    if instruments.len() < 2 {
+        return Err(CommandError::Failed(
+            "a book needs at least two instruments; one is a study".to_owned(),
+        ));
+    }
+
+    let name = strategy.unwrap_or_else(|| STRATEGY.to_owned());
+    let plan = StrategyPlan::find(&name)
+        .ok_or_else(|| CommandError::Failed(format!("no strategy called {name:?}")))?;
+    let interval = plan.interval();
+
+    // The window every member can be held over, and one hash covering all of
+    // them. Both have to span the whole book: a dataset version naming only the
+    // head instrument would call a book stale when the head changed and fresh
+    // when any other member did.
+    let mut from = chrono::NaiveDate::MIN;
+    let mut to = chrono::NaiveDate::MAX;
+    let mut hasher = blake3::Hasher::new();
+
+    for instrument in &instruments {
+        let missing = || {
+            CommandError::Failed(format!(
+                "{instrument} holds no {interval} bars; {} is defined at that resolution",
+                plan.label
+            ))
+        };
+        let coverage = service
+            .bars
+            .coverage(instrument, interval)
+            .map_err(|err| CommandError::Failed(format!("reading {instrument}: {err}")))?
+            .ok_or_else(missing)?;
+        let fingerprint = service
+            .bars
+            .fingerprint(instrument, interval)
+            .map_err(|err| CommandError::Failed(format!("hashing {instrument}: {err}")))?
+            .ok_or_else(missing)?;
+
+        hasher.update(instrument.as_bytes());
+        hasher.update(fingerprint.as_bytes());
+        from = from.max(coverage.0);
+        to = to.min(coverage.1);
+    }
+
+    let window = DateRange::new(from, to).map_err(|_| {
+        CommandError::Failed(format!(
+            "these {} instruments have no period in common: the latest start is {from} \
+             and the earliest end is {to}",
+            instruments.len(),
+        ))
+    })?;
+    let dataset_version = hasher.finalize().to_hex().to_string();
+
+    let simulation = service.simulation.clone();
+    let engine = simulation.engine().to_owned();
+    let library = service.bars.clone();
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let head = instruments[0].clone();
+        let mut family = study_for(&head, plan, window, &dataset_version);
+        // The head stays the experiment's identity; the rest are what it is
+        // held alongside. `ExperimentFamily` varies parameters, not
+        // instruments, so setting this on the template sets it for every trial.
+        family.template.alongside = instruments[1..].to_vec();
+        family.template.id = ExperimentId(format!("book-{}", instruments.join("+")));
+        family.template.hypothesis = HypothesisId(format!(
+            "{} predicts returns across {} instruments sharing one account",
+            plan.label,
+            instruments.len(),
+        ));
+
+        let found = arvo_research::run_family(
+            simulation.as_ref(),
+            &family,
+            &arvo_research::EvaluationCriteria::default(),
+        )
+        .map_err(|err| CommandError::Failed(err.to_string()))?;
+
+        let view = study_view(&found, &library, &engine);
+        Ok((view, Record::Study(Box::new(found))))
+    })
+    .await
+    .map_err(|err| CommandError::Failed(format!("the book did not finish: {err}")))
+    .and_then(|outcome| outcome.and_then(|outcome| remember(&service, outcome)))
+}
+
 /// Persists a finding and hands back its view.
 ///
 /// A failed write does not fail the run: the result is real and already on
@@ -1512,6 +1622,7 @@ pub fn study_view(
     let evaluation = &found.out_of_sample_evidence.evaluation;
     StudyView {
         instrument: found.selected.instrument.clone(),
+        instruments: found.selected.instruments(),
         verdict: verdict_label(found.verdict).to_owned(),
         reasons: found.reasons.clone(),
         trials: found.selection.trials,

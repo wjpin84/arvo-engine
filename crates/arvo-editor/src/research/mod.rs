@@ -326,6 +326,56 @@ pub(crate) fn ResearchView(
         });
     };
 
+    // A book is the panel's opposite number, on the same instruments: a panel
+    // gives every member the whole balance and combines the answers, a book
+    // makes them share one. Offering both on the same set is what lets the
+    // difference be read, and the difference is the cost of holding them all
+    // at once.
+    let run_book = move |_| {
+        let members: Vec<String> = library.with_untracked(|library| {
+            library.as_ref().map_or_else(Vec::new, |library| {
+                library
+                    .instruments
+                    .iter()
+                    .filter(|instrument| instrument.bars > 0)
+                    .map(|instrument| instrument.id.clone())
+                    .collect()
+            })
+        });
+        if members.len() < 2 {
+            set_error.set(Some(
+                "a book needs at least two instruments with data; one is a study".to_owned(),
+            ));
+            return;
+        }
+        // One engine run per configuration, not per instrument: the members
+        // share an account, so they share a backtest.
+        set_running.set(Some(format!(
+            "Running book: {} instruments in one account, 11 backtests",
+            members.len(),
+        )));
+        set_error.set(None);
+        spawn_local(async move {
+            let args = serde_wasm_bindgen::to_value(
+                    &serde_json::json!({ "instruments" : members }),
+                )
+                .unwrap_or(JsValue::UNDEFINED);
+            match call_typed::<StudyView>("run_book", args).await {
+                Ok(result) => {
+                    let title = book_title(&result);
+                    set_studies
+                        .update(|studies| {
+                            studies.insert(title.clone(), result);
+                        });
+                    open_study_panel(&format!("{STUDY_PANEL_PREFIX}{title}"), &title);
+                }
+                Err(reason) => set_error.set(Some(reason)),
+            }
+            set_running.set(None);
+            refresh_history();
+        });
+    };
+
     let run_panel = move |_| {
         let count = library.with_untracked(|library| {
             library.as_ref().map_or(0, |library| {
@@ -573,6 +623,19 @@ pub(crate) fn ResearchView(
                         "Run panel across all instruments"
                     }
                 }}
+            </button>
+
+            // Beside the panel rather than below the instrument list: the two
+            // are the same question asked two ways, and separating them would
+            // hide that either is an alternative to the other.
+            <button
+                class="research-panel-run"
+                title="Run the same rule on every instrument out of ONE account, so a position \
+                       one takes is capital another cannot have"
+                disabled=move || running.get().is_some()
+                on:click=run_book
+            >
+                "Run book: every instrument, one account"
             </button>
 
             {move || match library.get() {
@@ -1072,4 +1135,23 @@ pub(crate) fn WalkTab(
             }}
         </div>
     }
+}
+
+/// What to call a book in a tab and in the study map.
+///
+/// Not the head instrument's name: a book keyed by its head would collide with
+/// an ordinary study of that instrument, and the two are different findings
+/// about it — one with the account to itself and one sharing.
+fn book_title(study: &StudyView) -> String {
+    if study.instruments.len() < 2 {
+        return study.instrument.clone();
+    }
+    // Tickers, not full ids: a tab reading `AAPL.NASDAQ + MSFT.NASDAQ +
+    // NVDA.NASDAQ` is wider than the panel it sits in.
+    let tickers: Vec<&str> = study
+        .instruments
+        .iter()
+        .map(|name| name.split('.').next().unwrap_or(name))
+        .collect();
+    format!("Book: {}", tickers.join(" + "))
 }

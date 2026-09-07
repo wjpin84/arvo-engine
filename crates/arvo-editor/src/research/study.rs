@@ -118,6 +118,12 @@ pub(crate) fn StudyReport(study: StudyView) -> impl IntoView {
         .collect::<Vec<_>>()
         .join(", ");
 
+    // A book must say so on its own report. Read as an ordinary study of its
+    // head instrument, every number here would be attributed to one name when
+    // several produced it — and the charts below genuinely do show only the
+    // head, which is a thing to state rather than let a reader assume away.
+    let book = (study.instruments.len() > 1).then(|| study.instruments.clone());
+
     let deflation = study.expected_best_under_null.map_or_else(
         || "not applicable: every configuration scored alike".to_owned(),
         |bar| {
@@ -136,7 +142,24 @@ pub(crate) fn StudyReport(study: StudyView) -> impl IntoView {
     view! {
         <div class="research-report">
             <div class=verdict_class>{study.verdict.clone()}</div>
-            <p class="research-subject">{study.instrument.clone()}</p>
+            <p class="research-subject">
+                {book
+                    .as_ref()
+                    .map_or_else(|| study.instrument.clone(), |all| all.join(" + "))}
+            </p>
+            {book
+                .as_ref()
+                .map(|all| {
+                    view! {
+                        <p class="research-hint">
+                            {format!(
+                                "One account across {} instruments. A position any of them                                  takes is capital the others cannot have, so these numbers                                  are not what running them separately would give. The price                                  chart and trade markers below show {} only.",
+                                all.len(),
+                                study.instrument.clone(),
+                            )}
+                        </p>
+                    }
+                })}
 
             <ul class="research-reasons">
                 {study.reasons.iter().map(|r| view! { <li>{r.clone()}</li> }).collect_view()}

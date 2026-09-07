@@ -196,6 +196,7 @@ pub fn run() {
             research::list_history,
             research::open_record,
             research::replay_record,
+            research::run_book,
             portfolio::list_portfolios
         ])
         .run(tauri::generate_context!())

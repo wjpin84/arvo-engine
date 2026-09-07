@@ -160,6 +160,16 @@ pub struct TradesView {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StudyView {
     pub instrument: String,
+    /// Every instrument the run held, head first.
+    ///
+    /// One entry is an ordinary study. More than one is a book: the same rule
+    /// on several instruments settling against a single account, where a
+    /// position one member takes is capital another cannot have.
+    ///
+    /// `default` because this is a persisted format — a finding recorded
+    /// before a run could hold more than one loads as what it was.
+    #[serde(default)]
+    pub instruments: Vec<String>,
     pub verdict: String,
     pub reasons: Vec<String>,
 
