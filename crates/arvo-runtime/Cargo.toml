@@ -30,8 +30,25 @@ serde.workspace = true
 serde_json = "1"
 # For the one discovery GET the refresh path needs; already in the graph.
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
-tokio.workspace = true
+# `time` for the stream's heartbeat and reconnect backoff — the workspace
+# default is rt+macros only, and relying on another crate in the graph to
+# have turned this on is how a feature-unification change becomes a build
+# break in an unrelated crate.
+tokio = { workspace = true, features = ["time"] }
 tauri = { version = "2", features = [] }
+# The live price stream. rustls with the platform's own roots, matching what
+# reqwest already pulls in, so this adds a websocket rather than a second TLS
+# stack. See `stream`.
+tokio-tungstenite = { version = "0.30", default-features = false, features = [
+    "connect",
+    "rustls-tls-native-roots",
+] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+# Yahoo frames the stream as base64 protobuf. Both are already compiled in
+# this graph — prost via the plugin host, base64 via reqwest — so decoding it
+# costs two direct dependency lines and no new build.
+prost.workspace = true
+base64 = "0.22"
 tauri-plugin-opener = "2"
 tauri-plugin-notification = "2.4.0"
 tracing = "0.1.44"

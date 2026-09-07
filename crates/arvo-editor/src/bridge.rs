@@ -9,7 +9,7 @@
 
 use wasm_bindgen::prelude::*;
 
-use crate::views::PluginView;
+use crate::views::{EventView, PluginView, QuoteTick, EVENT_CHANNEL, QUOTE_CHANNEL};
 
 #[wasm_bindgen]
 extern "C" {
@@ -20,6 +20,14 @@ extern "C" {
     // can read and show.
     #[wasm_bindgen(catch, js_namespace = ["window", "__TAURI__", "core"])]
     pub(crate) async fn invoke(cmd: &str, args: JsValue) -> Result<JsValue, JsValue>;
+
+    // The other direction. Reached directly rather than through glue in
+    // index.html because there is nothing to glue — `withGlobalTauri` already
+    // exposes it, and `core:default` already permits it. Returns a promise
+    // for an unlisten function, which nothing here wants: the listener is
+    // installed once for the life of the window.
+    #[wasm_bindgen(catch, js_namespace = ["window", "__TAURI__", "event"], js_name = listen)]
+    async fn listen_raw(event: &str, handler: &JsValue) -> Result<JsValue, JsValue>;
 
     // app-shell ticket 04 — glue defined in index.html. on_panel_created
     // is a JS-callable closure invoked with (panel_name, element) at the
@@ -120,6 +128,73 @@ pub(crate) async fn call(cmd: &str) -> Vec<PluginView> {
     }
 }
 
+/// Runs `sink` for every event the backend pushes.
+///
+/// The counterpart to [`invoke`]: that one asks a question, this one hears
+/// what happened without asking. Installed once from `App` — a second caller
+/// would get its own listener, which is not wrong but is not what anyone
+/// means.
+///
+/// A payload this build cannot read is logged and dropped rather than
+/// panicking across the wasm boundary. The event stream is how the window
+/// learns something went wrong; killing the window when one message is
+/// malformed would be the worst possible failure mode for it.
+pub(crate) fn on_event(sink: impl FnMut(EventView) + 'static) {
+    on_channel(EVENT_CHANNEL, sink);
+}
+
+/// Runs `sink` for every live price the backend pushes.
+///
+/// Its own channel rather than more events: ticks arrive several times a
+/// second, and every event is a candidate for an OS notification.
+pub(crate) fn on_quote(sink: impl FnMut(QuoteTick) + 'static) {
+    on_channel(QUOTE_CHANNEL, sink);
+}
+
+/// Runs `sink` for everything that arrives on one Tauri channel.
+///
+/// The counterpart to [`invoke`]: that one asks a question, this one hears
+/// what happened without asking. One listener per channel for the life of the
+/// window — a second caller would get its own, which is not wrong but is not
+/// what anyone means.
+///
+/// A payload this build cannot read is logged and dropped rather than
+/// panicking across the wasm boundary. The push channels are how the window
+/// learns something went wrong; killing the window when one message is
+/// malformed would be the worst possible failure mode for it.
+fn on_channel<T>(channel: &'static str, mut sink: impl FnMut(T) + 'static)
+where
+    T: serde::de::DeserializeOwned,
+{
+    let handler = Closure::<dyn FnMut(JsValue)>::new(move |message: JsValue| {
+        // Tauri wraps the payload: `{ event, id, payload }`.
+        let payload = match js_sys::Reflect::get(&message, &JsValue::from_str("payload")) {
+            Ok(payload) => payload,
+            Err(_) => {
+                web_sys::console::error_1(&"an event arrived with no payload".into());
+                return;
+            }
+        };
+        match serde_wasm_bindgen::from_value::<T>(payload) {
+            Ok(value) => sink(value),
+            Err(err) => {
+                web_sys::console::error_1(&format!("unreadable {channel} message: {err}").into());
+            }
+        }
+    });
+
+    // Detached: the promise resolves to an unlisten function nobody calls,
+    // and the closure has to outlive this call by the life of the window.
+    let handler = handler.into_js_value();
+    wasm_bindgen_futures::spawn_local(async move {
+        if let Err(err) = listen_raw(channel, &handler).await {
+            web_sys::console::error_1(
+                &format!("could not subscribe to {channel}: {err:?}").into(),
+            );
+        }
+    });
+}
+
 /// How a panel is addressed.
 ///
 /// Beside [`open_study_panel`] rather than with the components, because these
@@ -139,6 +214,10 @@ pub(crate) const STUDY_PANEL_PREFIX: &str = "study:";
 /// open at once — they answer different questions about the same rule, and
 /// reading them side by side is the point.
 pub(crate) const WALK_PANEL_PREFIX: &str = "walk:";
+
+/// The watchlist's own tab. One at a time — it is one live view of one set
+/// of instruments, and a second copy would be the same table polling twice.
+pub(crate) const WATCHLIST_PANEL_ID: &str = "watchlist";
 
 /// The comparison's own tab. One at a time: a second comparison replaces the
 /// first, because two of them side by side is a comparison of comparisons and

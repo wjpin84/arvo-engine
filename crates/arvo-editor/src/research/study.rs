@@ -120,8 +120,7 @@ pub(crate) fn StudyReport(study: StudyView) -> impl IntoView {
 
     // A book must say so on its own report. Read as an ordinary study of its
     // head instrument, every number here would be attributed to one name when
-    // several produced it — and the charts below genuinely do show only the
-    // head, which is a thing to state rather than let a reader assume away.
+    // several produced it.
     let book = (study.instruments.len() > 1).then(|| study.instruments.clone());
 
     let deflation = study.expected_best_under_null.map_or_else(
@@ -153,9 +152,10 @@ pub(crate) fn StudyReport(study: StudyView) -> impl IntoView {
                     view! {
                         <p class="research-hint">
                             {format!(
-                                "One account across {} instruments. A position any of them                                  takes is capital the others cannot have, so these numbers                                  are not what running them separately would give. The price                                  chart and trade markers below show {} only.",
+                                "One account across {} instruments. A position any of them \
+                                 takes is capital the others cannot have, so these numbers \
+                                 are not what running them separately would give.",
                                 all.len(),
-                                study.instrument.clone(),
                             )}
                         </p>
                     }
@@ -291,7 +291,12 @@ pub(crate) fn StudyReport(study: StudyView) -> impl IntoView {
                 })}
 
             <h4>"Where it traded"</h4>
-            <PriceChart candles=study.price.clone() markers=study.markers.clone() />
+            <BookCharts
+                head=study.instrument.clone()
+                price=study.price.clone()
+                markers=study.markers.clone()
+                rest=study.alongside_charts.clone()
+            />
 
             <h4>"Underwater"</h4>
             <UnderwaterChart points=study.underwater.clone() />
@@ -411,4 +416,94 @@ pub(crate) fn Members(rows: Vec<MemberView>) -> impl IntoView {
             </table>
         </div>
     }
+}
+
+/// The price chart, for however many instruments the run held.
+///
+/// One member at a time rather than stacked: five charts down a panel is five
+/// charts nobody scrolls to, and the question asked here — *where did it trade
+/// in this name* — is asked of one instrument at a time.
+///
+/// Each member is drawn with its own trades only. That is the whole reason
+/// this exists rather than one chart: a book's ledger holds every member's
+/// round trips, and plotting all of them against one member's prices marks
+/// entries on days that instrument never traded.
+#[component]
+pub(crate) fn BookCharts(
+    head: String,
+    price: Vec<CandlePoint>,
+    markers: Vec<TradeMarkerView>,
+    rest: Vec<InstrumentChartView>,
+) -> impl IntoView {
+    // A single study has nothing to choose between, and a picker with one
+    // option is a control that only ever says the same thing.
+    if rest.is_empty() {
+        return view! { <PriceChart candles=price markers=markers /> }.into_any();
+    }
+
+    // The head is not carried in `rest` — it is `price`/`markers` — so it goes
+    // back at the front here, which is also the order the book names it in.
+    let mut all = Vec::with_capacity(1 + rest.len());
+    all.push(InstrumentChartView {
+        instrument: head,
+        price,
+        markers,
+    });
+    all.extend(rest);
+
+    let (shown, set_shown) = signal(0_usize);
+    // Name and entry count per tab, read once: an instrument that never traded
+    // is the thing most worth noticing here, and its chart alone is just a
+    // price series that looks like any other.
+    let tabs: Vec<(String, usize)> = all
+        .iter()
+        .map(|chart| {
+            let entries = chart
+                .markers
+                .iter()
+                .filter(|marker| marker.kind == "entry")
+                .count();
+            (chart.instrument.clone(), entries)
+        })
+        .collect();
+
+    view! {
+        <div class="chart-picker">
+            {tabs
+                .into_iter()
+                .enumerate()
+                .map(|(index, (name, entries))| {
+                    let active = move || shown.get() == index;
+                    let count = if entries == 0 {
+                        " · never traded".to_owned()
+                    } else {
+                        format!(" · {entries}")
+                    };
+                    view! {
+                        <button
+                            class="chart-picker-tab"
+                            class:active=active
+                            class:silent=entries == 0
+                            on:click=move |_| set_shown.set(index)
+                        >
+                            {name}
+                            <span class="chart-picker-count">{count}</span>
+                        </button>
+                    }
+                })
+                .collect_view()}
+        </div>
+        {move || {
+            all.get(shown.get())
+                .map(|chart| {
+                    view! {
+                        <PriceChart
+                            candles=chart.price.clone()
+                            markers=chart.markers.clone()
+                        />
+                    }
+                })
+        }}
+    }
+        .into_any()
 }

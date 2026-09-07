@@ -207,6 +207,16 @@ pub struct StudyView {
     /// every winner came out of one gap; this says it at a glance.
     pub price: Vec<CandlePoint>,
     pub markers: Vec<TradeMarkerView>,
+    /// The rest of a book's instruments, each with its own bars and its own
+    /// trades. Empty for a single study.
+    ///
+    /// The head instrument is deliberately *not* repeated here — it is already
+    /// [`Self::price`] and [`Self::markers`] above. The shape mirrors
+    /// `Experiment.alongside`, which is head plus the rest for the same reason:
+    /// carrying the head twice would put a third of a three-member book's
+    /// candles on the wire for nothing.
+    #[serde(default)]
+    pub alongside_charts: Vec<InstrumentChartView>,
     /// Depth below the running peak, as a percentage.
     pub underwater: Vec<CurvePoint>,
     /// What is wrong with the bars this was produced from.
@@ -335,6 +345,18 @@ pub struct TradeRowView {
     pub held_days: Option<f64>,
     /// `signal`, `stop`, or `open`.
     pub exit_reason: String,
+}
+
+/// One instrument's bars with its own trades marked on them.
+///
+/// A book holds several, and each chart must show only the round trips that
+/// happened in *its* instrument. Plotting the whole ledger on one member's
+/// prices puts entries on days that instrument never traded.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstrumentChartView {
+    pub instrument: String,
+    pub price: Vec<CandlePoint>,
+    pub markers: Vec<TradeMarkerView>,
 }
 
 /// What one member of a book actually contributed.
@@ -750,4 +772,139 @@ pub enum PluginStatusView {
     Unreachable {
         reason: String,
     },
+}
+
+/// One row of the watchlist: an instrument, priced now.
+///
+/// `held` is why this is not just a ticker — the same move means something
+/// different depending on whether you own the thing.
+///
+/// # What is deliberately not here
+///
+/// The position's value. A holding is valued from the statement or the last
+/// close on disk, never from the network (see `arvo_runtime::portfolio`), and
+/// putting that figure beside a live price would show two numbers priced two
+/// ways as though they agreed. The live price belongs to the watchlist; the
+/// valuation belongs to the portfolio, and they stay apart.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct QuoteView {
+    pub instrument: String,
+    pub symbol: String,
+    /// `None` when the row exists but nothing has priced it yet — no broker
+    /// session for the snapshot, and no tick arrived for it yet. Optional
+    /// rather than zero because `$0.00` is a price, and a wrong one.
+    pub price: Option<f64>,
+    /// Move since the previous close, as a fraction. `None` when there is a
+    /// price but no previous close to measure it against.
+    pub change: Option<f64>,
+    pub held: bool,
+}
+
+/// One saved arrangement of the window.
+///
+/// # A list, not a map
+///
+/// Deliberately, and for the reason recorded in `arvo_runtime::session`: a
+/// Rust map crossing into the webview through `serde_wasm_bindgen` becomes a
+/// JavaScript `Map` rather than a plain object by default, which already cost
+/// this app one wiped workspace. A list has no such trap, and it keeps the
+/// order they were created in — which is the order someone expects to see
+/// their own workspaces listed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceView {
+    pub name: String,
+    /// dockview's own serialisation, as text. Opaque here exactly as it is in
+    /// the session: treating it as data is what stops a dockview upgrade from
+    /// becoming a Rust change.
+    pub layout: String,
+}
+
+/// One price, as it arrived.
+///
+/// Separate from [`QuoteView`] and deliberately thinner: a tick carries only
+/// what moved. Which rows exist, and which of them you hold, is settled once
+/// by the `watchlist` command — a stream that also decided the row set would
+/// make a socket blip look like a portfolio change.
+///
+/// `regular` is not decoration. Outside 09:30–16:00 the stream keeps sending,
+/// on thin volume and wide spreads, and a pre-market print rendered
+/// identically to a regular-session one is a worse answer than no price at
+/// all. The panel marks it; it does not hide it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct QuoteTick {
+    /// The bare ticker, matching [`QuoteView::symbol`].
+    pub symbol: String,
+    pub price: f64,
+    /// Move since the previous close, as a fraction.
+    pub change: Option<f64>,
+    /// Whether this print happened in the regular session.
+    pub regular: bool,
+}
+
+/// The channel name the live prices arrive on.
+///
+/// Its own channel rather than an [`EventView`]: every event is a candidate
+/// for an OS notification and lands in a capped alerts log, and a price tick
+/// is neither. Ticks arrive several times a second and are worth nothing once
+/// the next one lands.
+pub const QUOTE_CHANNEL: &str = "arvo://quote";
+
+/// The channel name the push events arrive on.
+///
+/// Here rather than in either crate that uses it for the same reason every
+/// shape above is: a name only one side changes is a channel that goes quiet
+/// with nothing failing to compile.
+pub const EVENT_CHANNEL: &str = "arvo://event";
+
+/// Something the backend reports without being asked.
+///
+/// Everything else in this file answers a question the window put to a
+/// command. This is the other direction — what happened while nobody was
+/// looking: a plugin dropped, a broker session ended.
+///
+/// # Why the text is in the payload
+///
+/// `title` and `detail` are filled in by the backend rather than derived from
+/// `kind` by whoever renders it. There are two renderers — the OS
+/// notification and the in-app alerts list — and text derived twice is text
+/// that drifts. `kind` is left for what a renderer needs *structurally*: the
+/// status bar needs to know a feed is down, not how to phrase it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EventView {
+    pub kind: EventKindView,
+    pub title: String,
+    pub detail: String,
+    pub severity: SeverityView,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "of")]
+pub enum EventKindView {
+    Plugin { id: String, reachable: bool },
+    /// A broker connection came up or went away. `connected: false` covers
+    /// both signing out and a session that expired underneath you — which of
+    /// the two it was is in `detail`, because the difference matters to a
+    /// person reading it and not at all to the status bar.
+    Feed { id: String, connected: bool },
+    /// The live price stream stopped or came back.
+    ///
+    /// Its own variant rather than another `Feed`: the status bar reads
+    /// `Feed` to decide whether a broker session is held, and a price socket
+    /// dropping says nothing about that. Folding the two together would have
+    /// a Yahoo reconnect claim you had been signed out of your broker.
+    ///
+    /// Worth an event at all because the failure is otherwise invisible: a
+    /// dead socket looks exactly like a market where nothing is trading.
+    Stream { live: bool },
+}
+
+/// Whether this is worth interrupting someone for.
+///
+/// The one thing that decides it: `Warning` raises an OS notification,
+/// `Info` only lands in the alerts list. Both are always recorded, so the
+/// distinction costs nothing but noise.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SeverityView {
+    Info,
+    Warning,
 }

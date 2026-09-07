@@ -109,6 +109,32 @@ pub enum FeedError {
     Write(#[from] arvo_data::DataError),
 }
 
+impl FeedError {
+    /// Whether this failure means the stored connection is no good.
+    ///
+    /// On the error rather than at each call site deliberately: three
+    /// distinct failures mean the same thing to a person — nobody signed in,
+    /// the refresh was rejected, the server refused the token — and a caller
+    /// that checked for only the one it had seen would leave the other two
+    /// looking like network trouble. Every command that touches the feed asks
+    /// this one question.
+    ///
+    /// Narrow on purpose. `OAuthError::Http` is a refresh that could not
+    /// *reach* the authorization server, which is a network problem wearing
+    /// an auth error's clothing; reporting it as a dead session would sign
+    /// someone out over flaky wifi and make them re-authorize in a browser to
+    /// fix it.
+    #[must_use]
+    pub fn needs_sign_in(&self) -> bool {
+        matches!(
+            self,
+            Self::NoToken
+                | Self::OAuth(arvo_oauth::OAuthError::Denied { .. })
+                | Self::Transport(arvo_mcp::ClientError::Unauthorized { .. })
+        )
+    }
+}
+
 /// What one fetch did, so the caller can say so rather than just succeeding.
 #[derive(Debug, Clone)]
 pub struct FetchReport {
@@ -248,6 +274,59 @@ pub async fn search(
         }
     }
     Ok(matches)
+}
+
+/// One instrument, priced now.
+#[derive(Debug, Clone)]
+pub struct Quote {
+    /// The Arvo instrument id asked for, echoed back so a caller can match a
+    /// reply to a row without re-deriving the ticker.
+    pub instrument: String,
+    pub price: f64,
+    /// Move since the adjusted previous close, as a fraction.
+    pub change: Option<f64>,
+}
+
+/// Prices several instruments in one call.
+///
+/// One request for the whole list rather than one per symbol: a watchlist
+/// polling every few seconds would otherwise be a request per row per tick,
+/// which is a rate limit waiting to happen and a great deal of latency to
+/// pay for the same answer.
+///
+/// An instrument the feed does not price is simply absent from the result
+/// rather than an error. A watchlist with one bad ticker in it should still
+/// show the other nine.
+///
+/// # Errors
+///
+/// Returns [`FeedError`] if there is no stored connection or the call fails.
+pub async fn quotes(instruments: &[String]) -> Result<Vec<Quote>, FeedError> {
+    if instruments.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let token = access_token().await?;
+    let client = arvo_mcp::McpClient::new(ENDPOINT, token);
+    client.connect().await?;
+
+    let symbols: Vec<&str> = instruments.iter().map(|id| symbol_of(id)).collect();
+    let response = client
+        .call_tool_json(QUOTES, json!({ "symbols": symbols }))
+        .await?;
+    let priced = parse_quotes(&response);
+
+    Ok(instruments
+        .iter()
+        .filter_map(|instrument| {
+            let (price, change) = priced.get(symbol_of(instrument))?;
+            Some(Quote {
+                instrument: instrument.clone(),
+                price: *price,
+                change: *change,
+            })
+        })
+        .collect())
 }
 
 /// Which venue an already-held symbol is filed under.
@@ -597,6 +676,26 @@ fn store(connection: &Connection) -> Result<(), FeedError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The three failures that all mean "sign in again", against the ones
+    /// that do not — an unserved resolution is not an auth problem, and a
+    /// refresh that could not reach the network is not either.
+    #[test]
+    fn every_way_a_session_can_die_asks_for_a_sign_in() {
+        assert!(FeedError::NoToken.needs_sign_in());
+        assert!(
+            FeedError::Transport(arvo_mcp::ClientError::Unauthorized { status: 401 })
+                .needs_sign_in()
+        );
+        assert!(FeedError::OAuth(arvo_oauth::OAuthError::Denied {
+            error: "invalid_grant".into(),
+            description: None,
+        })
+        .needs_sign_in());
+
+        assert!(!FeedError::Unsupported("3-minute bars".into()).needs_sign_in());
+        assert!(!FeedError::Malformed("no bars array".into()).needs_sign_in());
+    }
 
     /// A real response, trimmed. Captured from the live endpoint rather than
     /// invented: the fields that matter here are the ones a guess gets wrong —

@@ -31,4 +31,8 @@ pub(crate) struct SessionView {
     pub(crate) output_visible: bool,
     pub(crate) theme: Option<String>,
     pub(crate) strategy: Option<String>,
+    /// Saved arrangements, in the order they were made. `default` so a
+    /// session written before workspaces existed still opens.
+    #[serde(default)]
+    pub(crate) workspaces: Vec<WorkspaceView>,
 }

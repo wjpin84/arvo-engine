@@ -70,6 +70,13 @@ pub struct Session {
     pub theme: Option<String>,
     /// The strategy the research sidebar had selected.
     pub strategy: Option<String>,
+    /// Arrangements saved by name, in the order they were made.
+    ///
+    /// Beside `layout` rather than replacing it: `layout` is where you left
+    /// off and is written on every change, these are arrangements someone
+    /// chose to keep. Conflating them would mean every panel drag quietly
+    /// rewrote a saved workspace.
+    pub workspaces: Vec<arvo_views::WorkspaceView>,
 }
 
 /// Reads the stored workspace.
@@ -156,6 +163,18 @@ mod tests {
             output_visible: true,
             theme: Some("catppuccin-mocha".to_owned()),
             strategy: Some("opening_range".to_owned()),
+            // Two, so the round trip proves order is kept as well as content
+            // — these are listed back to someone in the order they made them.
+            workspaces: vec![
+                arvo_views::WorkspaceView {
+                    name: "Research".to_owned(),
+                    layout: r#"{"grid":{"root":"research"}}"#.to_owned(),
+                },
+                arvo_views::WorkspaceView {
+                    name: "Trading".to_owned(),
+                    layout: r#"{"grid":{"root":"trading"}}"#.to_owned(),
+                },
+            ],
         };
 
         save(dir.path(), &session).expect("saves");
@@ -171,6 +190,10 @@ mod tests {
 
         let session = load(dir.path());
         assert_eq!(session.theme.as_deref(), Some("dark"));
+        // The newest field, absent from that file. A session from before
+        // workspaces existed opens with none rather than failing to parse and
+        // costing someone their layout.
+        assert!(session.workspaces.is_empty());
         assert_eq!(session.layout, None);
         assert!(!session.output_visible);
     }

@@ -9,6 +9,7 @@
 //! of configurations tried, the bar a no-skill search would clear, the costs
 //! assumed. A verdict shown without those is a number that looks like a fact.
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -19,13 +20,17 @@ use arvo_research::{
     CostModel, DatasetRef, DateRange, Experiment, ExperimentFamily, ExperimentId, HypothesisId,
     Metrics, ParameterGrid, SimulationProvider, StrategySpec, Verdict,
 };
+
 // The view shapes live in `arvo-views` so the window cannot drift from
 // them. See that crate for what two hand-mirrored copies cost.
+//
+// `pub use`, not `use`: these are re-exported as this module's own surface
+// and `tests/chart_alignment.rs` reaches them through it.
 pub use arvo_views::{
     BookView, BreadthView, CandlePoint, ComparisonRowView, ComparisonView, CurvePoint,
     DataFindingView, DataLibraryView, DivergenceView, FetchView, FoldView, HistoryEntryView,
     HistoryView, InstrumentView, MatchView, MemberView, MetricsView, MonthlyReturnView, NamedCurveView,
-    OutcomeView, PanelView, RecommendationView, RecordView, ReplayView, StabilityView,
+    InstrumentChartView, OutcomeView, PanelView, QuoteView, RecommendationView, RecordView, ReplayView, StabilityView,
     StrategyView, StudyView, SurfaceCell, SurfaceView, TradeMarkerView, TradeRowView,
     TradesView, UnreadableView, WalkForwardView,
 };
@@ -327,6 +332,33 @@ fn candles(
 /// do not look for it: the chart would render, the markers would sit on
 /// plausible candles, and every entry would appear to have been taken one bar
 /// after the rule fired.
+/// The round trips that happened in one instrument.
+///
+/// A book's ledger holds every member's trades, and a chart of one member must
+/// show only its own — otherwise entries appear on days that instrument never
+/// traded, which is not a small error on a price chart.
+///
+/// A trade with no instrument comes from a ledger recorded before they were
+/// named. Those runs were all single-instrument, so it belongs to the head,
+/// and dropping it would empty the chart of every stored finding at once.
+fn trades_in(
+    ledger: &[arvo_research::Trade],
+    instrument: &str,
+    head: &str,
+) -> Vec<arvo_research::Trade> {
+    ledger
+        .iter()
+        .filter(|trade| {
+            if trade.instrument.is_empty() {
+                instrument == head
+            } else {
+                trade.instrument == instrument
+            }
+        })
+        .cloned()
+        .collect()
+}
+
 fn markers(
     ledger: &[arvo_research::Trade],
     interval: arvo_data::BarInterval,
@@ -989,6 +1021,7 @@ pub async fn connect_feed(app: tauri::AppHandle) -> Result<bool, CommandError> {
         CommandError::Failed(err.to_string())
     })?;
     tracing::info!("{} sign-in complete", crate::feed::FEED_ID);
+    crate::events::emit(&app, crate::events::feed_connected(crate::feed::FEED_ID));
     Ok(true)
 }
 
@@ -998,8 +1031,16 @@ pub async fn connect_feed(app: tauri::AppHandle) -> Result<bool, CommandError> {
 ///
 /// Returns [`CommandError::Failed`] if the keychain rejects the delete.
 #[tauri::command]
-pub fn disconnect_feed() -> Result<bool, CommandError> {
+pub fn disconnect_feed(app: tauri::AppHandle) -> Result<bool, CommandError> {
     crate::feed::disconnect().map_err(|err| CommandError::Failed(err.to_string()))?;
+    // Announced even though the window already knows — the status bar and the
+    // alerts list read the event stream, not the return value, so an
+    // un-announced sign-out would leave the status bar claiming a connection
+    // that is gone.
+    crate::events::emit(
+        &app,
+        crate::events::feed_disconnected(crate::feed::FEED_ID, "you signed out", true),
+    );
     Ok(false)
 }
 
@@ -1163,6 +1204,128 @@ fn comparable(record: &Record) -> Option<(&arvo_research::Evaluation, String)> {
     }
 }
 
+/// How many instruments one watchlist refresh will price.
+///
+/// A ceiling on the request, not a preference: this is one batch call on a
+/// poll, and an unbounded list would grow with the data library until a
+/// refresh timed out. Holdings come first, so the cap falls on the library
+/// tail rather than on anything you own.
+const WATCHLIST_LIMIT: usize = 30;
+
+/// What to price, in the order it matters: what you hold, then what you have
+/// data for.
+///
+/// Deduplicated, because an instrument you both hold and have bars for is one
+/// row, and a watchlist that listed it twice would be visibly wrong.
+fn watchlist_symbols(held: BTreeSet<String>, library: Vec<String>) -> Vec<String> {
+    let mut chosen: Vec<String> = held.iter().cloned().collect();
+    chosen.extend(library.into_iter().filter(|id| !held.contains(id)));
+    chosen.truncate(WATCHLIST_LIMIT);
+    chosen
+}
+
+/// The bare ticker in an instrument id: `AAPL.RH` -> `AAPL`.
+///
+/// One definition because three things have to agree on it — the row's label,
+/// what the stream subscribes to, and the symbol a tick arrives under. Two of
+/// those splitting the string themselves is a watchlist that silently stops
+/// updating for anything filed under a venue.
+fn symbol_only(instrument: &str) -> String {
+    instrument.split('.').next().unwrap_or(instrument).to_owned()
+}
+
+/// The watchlist: what you hold and what you have data for, priced now.
+///
+/// # Snapshot here, movement over the stream
+///
+/// This settles the row set — which instruments, which of them you hold, and
+/// a price for each so nothing renders blank — and hands the same symbols to
+/// [`crate::stream`], which pushes every subsequent move. The window calls
+/// this when the panel opens or a session comes back, not on a timer.
+///
+/// The two halves are split that way on purpose. A stream that also decided
+/// which rows exist would make a socket blip look like a portfolio change,
+/// and a poll fast enough to look live is a request per row per tick against
+/// a rate limit.
+///
+/// # Why the window does not pass a list
+///
+/// There is no stored watchlist to pass. The set is derived from what already
+/// exists — holdings first, then the data library — which means it is right on
+/// first launch with nothing configured, and cannot drift out of step with a
+/// portfolio you re-import. A hand-picked list is a real feature and a
+/// different one; it needs somewhere to live and a way to edit it.
+///
+/// # Why a dead broker session is not an error here
+///
+/// The stream needs no broker — that is the point of it — and the row set is
+/// derived from holdings and the data library, neither of which does either.
+/// So a failed snapshot returns the rows unpriced and lets the socket fill
+/// them in, rather than emptying a panel that is about to start working. The
+/// session failure is still announced on the way past, as everywhere else.
+#[tauri::command]
+pub async fn watchlist(
+    app: tauri::AppHandle,
+    service: tauri::State<'_, ResearchService>,
+    portfolios: tauri::State<'_, crate::portfolio::PortfolioService>,
+    stream: tauri::State<'_, crate::stream::Stream>,
+) -> Result<Vec<QuoteView>, CommandError> {
+    let held = portfolios.held();
+    let library = service.bars.instruments().unwrap_or_default();
+    let chosen = watchlist_symbols(held.clone(), library);
+
+    // Before the quote call rather than after: if the broker session is dead
+    // the snapshot below fails, and the stream — which needs no broker at all
+    // — is the only thing that can still price these rows.
+    stream.watch(chosen.iter().map(|id| symbol_only(id)).collect());
+
+    let priced: std::collections::HashMap<String, crate::feed::Quote> =
+        match crate::feed::quotes(&chosen).await {
+            Ok(quotes) => quotes
+                .into_iter()
+                .map(|quote| (quote.instrument.clone(), quote))
+                .collect(),
+            Err(err) => {
+                // Announced, then dropped. Every row below still renders, and
+                // the stream prices them within a tick.
+                let _ = feed_failure(&app, err);
+                std::collections::HashMap::new()
+            }
+        };
+
+    Ok(chosen
+        .into_iter()
+        .map(|instrument| QuoteView {
+            symbol: symbol_only(&instrument),
+            held: held.contains(&instrument),
+            price: priced.get(&instrument).map(|quote| quote.price),
+            change: priced.get(&instrument).and_then(|quote| quote.change),
+            instrument,
+        })
+        .collect())
+}
+
+/// Turns a feed failure into a command error, announcing a dead session on the
+/// way past.
+///
+/// Every command that touches the broker goes through here rather than
+/// mapping the error itself. A session can expire between any two calls, and
+/// the command that happens to discover it is not the one a person is
+/// looking at — before this, an expired token surfaced as a red line in
+/// whichever panel happened to be open, or nowhere at all if the sidebar was
+/// closed. Now it reaches the status bar and the alerts list no matter which
+/// call found it.
+fn feed_failure(app: &tauri::AppHandle, err: crate::feed::FeedError) -> CommandError {
+    let message = err.to_string();
+    if err.needs_sign_in() {
+        crate::events::emit(
+            app,
+            crate::events::feed_disconnected(crate::feed::FEED_ID, &message, false),
+        );
+    }
+    CommandError::Failed(message)
+}
+
 /// Finds instruments by name or ticker.
 ///
 /// Exists because the alternative was typing `MSFT.NASDAQ` into an empty box
@@ -1175,6 +1338,7 @@ fn comparable(record: &Record) -> Option<(&arvo_research::Evaluation, String)> {
 /// search call fails.
 #[tauri::command]
 pub async fn search_instruments(
+    app: tauri::AppHandle,
     query: String,
     service: tauri::State<'_, ResearchService>,
 ) -> Result<Vec<MatchView>, CommandError> {
@@ -1188,7 +1352,7 @@ pub async fn search_instruments(
 
     Ok(crate::feed::search(&service.data_dir, query, 10)
         .await
-        .map_err(|err| CommandError::Failed(err.to_string()))?
+        .map_err(|err| feed_failure(&app, err))?
         .into_iter()
         .map(|found| MatchView {
             held: held.contains(&found.instrument),
@@ -1215,6 +1379,7 @@ pub async fn search_instruments(
 /// one the broker does not serve, or nothing comes back.
 #[tauri::command]
 pub async fn fetch_bars(
+    app: tauri::AppHandle,
     instrument: String,
     interval: String,
     days: Option<u32>,
@@ -1232,7 +1397,7 @@ pub async fn fetch_bars(
 
     let report = crate::feed::fetch(&service.data_dir, &instrument, interval, from, to)
         .await
-        .map_err(|err| CommandError::Failed(err.to_string()))?;
+        .map_err(|err| feed_failure(&app, err))?;
 
     Ok(FetchView {
         instrument: report.instrument,
@@ -1706,7 +1871,37 @@ pub fn study_view(
             found.selected.interval,
             &found.out_of_sample,
         ),
-        markers: markers(&evaluation.strategy_ledger, found.selected.interval),
+        markers: markers(
+            &trades_in(
+                &evaluation.strategy_ledger,
+                &found.selected.instrument,
+                &found.selected.instrument,
+            ),
+            found.selected.interval,
+        ),
+        // Every member but the head, which is `price`/`markers` above.
+        alongside_charts: found
+            .selected
+            .alongside
+            .iter()
+            .map(|instrument| InstrumentChartView {
+                instrument: instrument.clone(),
+                price: candles(
+                    bars,
+                    instrument,
+                    found.selected.interval,
+                    &found.out_of_sample,
+                ),
+                markers: markers(
+                    &trades_in(
+                        &evaluation.strategy_ledger,
+                        instrument,
+                        &found.selected.instrument,
+                    ),
+                    found.selected.interval,
+                ),
+            })
+            .collect(),
         trades: trade_rows(&evaluation.strategy_ledger),
         data_findings: data_findings(
             bars,
@@ -2477,6 +2672,39 @@ mod chart_tests {
     }
 
     #[test]
+    fn a_chart_shows_only_the_trades_that_happened_in_its_own_instrument() {
+        // The bug this exists to stop: a book's ledger holds every member's
+        // round trips, so plotting all of them on one member's prices puts
+        // entries on days that instrument never traded.
+        let mut mine = trade(at(2, 0, 0), Some(at(4, 0, 0)));
+        mine.instrument = "AAPL.NASDAQ".to_owned();
+        let mut theirs = trade(at(6, 0, 0), Some(at(8, 0, 0)));
+        theirs.instrument = "MSFT.NASDAQ".to_owned();
+        let ledger = [mine, theirs];
+
+        let head = trades_in(&ledger, "AAPL.NASDAQ", "AAPL.NASDAQ");
+        assert_eq!(head.len(), 1);
+        assert_eq!(head[0].instrument, "AAPL.NASDAQ");
+
+        let member = trades_in(&ledger, "MSFT.NASDAQ", "AAPL.NASDAQ");
+        assert_eq!(member.len(), 1);
+        assert_eq!(member[0].instrument, "MSFT.NASDAQ");
+    }
+
+    #[test]
+    fn a_ledger_from_before_instruments_were_named_still_charts_against_the_head() {
+        // Every stored finding has an unnamed ledger, and all of those runs
+        // were single-instrument. Filtering them out by name would empty the
+        // price chart of every finding already on disk.
+        let ledger = [trade(at(2, 0, 0), Some(at(4, 0, 0)))];
+        assert_eq!(trades_in(&ledger, "AAPL.NASDAQ", "AAPL.NASDAQ").len(), 1);
+        assert!(
+            trades_in(&ledger, "MSFT.NASDAQ", "AAPL.NASDAQ").is_empty(),
+            "an unnamed trade belongs to the head and to nothing else"
+        );
+    }
+
+    #[test]
     fn a_daily_marker_lands_on_its_own_day() {
         let out = markers(&[trade(at(3, 0, 0), None)], arvo_data::BarInterval::DAILY);
         assert_eq!(out[0].time, at(2, 0, 0).and_utc().timestamp());
@@ -2561,6 +2789,58 @@ mod chart_tests {
             })
             .collect();
         assert_eq!(curve_points(&curve).len(), 12);
+    }
+}
+
+#[cfg(test)]
+mod watchlist_tests {
+    use super::{watchlist_symbols, WATCHLIST_LIMIT};
+    use std::collections::BTreeSet;
+
+    fn set(ids: &[&str]) -> BTreeSet<String> {
+        ids.iter().map(|id| (*id).to_owned()).collect()
+    }
+
+    fn list(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|id| (*id).to_owned()).collect()
+    }
+
+    #[test]
+    fn what_you_hold_comes_first() {
+        let chosen = watchlist_symbols(set(&["MSFT.RH"]), list(&["AAPL.RH", "TSLA.RH"]));
+        assert_eq!(chosen.first().map(String::as_str), Some("MSFT.RH"));
+        assert_eq!(chosen.len(), 3);
+    }
+
+    /// An instrument both held and backed by bars is one row. Listing it
+    /// twice would be visibly wrong, and would waste a slot under the cap.
+    #[test]
+    fn an_instrument_held_and_downloaded_appears_once() {
+        let chosen = watchlist_symbols(set(&["MSFT.RH"]), list(&["MSFT.RH", "AAPL.RH"]));
+        assert_eq!(chosen, list(&["MSFT.RH", "AAPL.RH"]));
+    }
+
+    /// The cap has to fall on the library tail, never on a position. Someone
+    /// with more downloaded instruments than the limit must still see
+    /// everything they own.
+    #[test]
+    fn the_cap_falls_on_the_library_not_on_your_positions() {
+        let held = set(&["OWNED1.RH", "OWNED2.RH"]);
+        let library: Vec<String> = (0..WATCHLIST_LIMIT + 20)
+            .map(|i| format!("LIB{i}.RH"))
+            .collect();
+
+        let chosen = watchlist_symbols(held.clone(), library);
+
+        assert_eq!(chosen.len(), WATCHLIST_LIMIT);
+        for owned in &held {
+            assert!(chosen.contains(owned), "{owned} was dropped for library rows");
+        }
+    }
+
+    #[test]
+    fn nothing_held_and_nothing_downloaded_asks_for_no_quotes() {
+        assert!(watchlist_symbols(BTreeSet::new(), Vec::new()).is_empty());
     }
 }
 

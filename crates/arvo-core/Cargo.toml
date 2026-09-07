@@ -1,6 +1,6 @@
 [package]
 name = "arvo-core"
-description = "Platform primitives shared across Arvo: config, events, notifications, secrets."
+description = "Platform primitives shared across Arvo: config, events, secrets."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

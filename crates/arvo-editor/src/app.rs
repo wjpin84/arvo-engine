@@ -11,19 +11,22 @@
 //! | [`crate::bridge`] | the single `invoke` seam and the names dockview knows a panel by |
 //! | [`crate::format`] | number and verdict formatting, shared so one figure never renders two ways |
 //! | [`crate::chart`] | cards, equity curves, the monthly grid |
+//! | [`crate::dashboard`] | the Welcome tab: what you hold, what is wrong, what was last run |
 //! | [`crate::research`] | the studies, panels and walk-forwards — the application |
 //! | [`crate::portfolio`] | what you hold |
 //! | [`crate::theme`] | which palette the window is wearing |
 
 use crate::bridge::{
-    call, call_typed, capture_layout, close_window, init_shell, minimize_window, on_layout_settled,
-    restore_layout, set_output_visible_js, set_sidebar_visible, toggle_maximize_window,
-    COMPARE_PANEL_ID, PANEL_PANEL_ID, PORTFOLIO_PANEL_ID, STUDY_PANEL_PREFIX,
-    WALK_PANEL_PREFIX,
+    call, call_typed, capture_layout, close_window, init_shell, minimize_window, on_event,
+    on_layout_settled, on_quote, restore_layout, set_output_visible_js, set_sidebar_visible,
+    open_study_panel, toggle_maximize_window, COMPARE_PANEL_ID, PANEL_PANEL_ID,
+    PORTFOLIO_PANEL_ID, STUDY_PANEL_PREFIX, WALK_PANEL_PREFIX, WATCHLIST_PANEL_ID,
 };
+use crate::dashboard::{problems, Dashboard, ProblemList};
 use crate::portfolio::{PortfolioSidebar, PortfolioTab};
 use crate::research::{ComparisonReport, PanelTab, ResearchView, StudyTab, WalkTab};
 use crate::theme::{apply_theme, prefers_dark, Theme};
+use crate::watchlist::WatchlistTab;
 use crate::views::*;
 
 use leptos::mount::mount_to;
@@ -47,7 +50,6 @@ enum ActivityView {
 /// `ActivityView` — these are transient menus, not sidebar sections.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MenuId {
-    File,
     View,
     Help,
 }
@@ -148,10 +150,37 @@ fn SettingsIcon() -> impl IntoView {
     }
 }
 
+/// How many things are wrong *now*: the badge, and the status bar's count.
+///
+/// Current state, deliberately, not a tally of events. Two reasons, and the
+/// running app demonstrated both:
+///
+/// * Something already broken when the window opened produces no event,
+///   because nothing transitioned. A launch with an expired token, or a
+///   plugin that was unreachable on the first probe, is invisible to an
+///   event count — the status bar read "No alerts" beside a red `1/2
+///   plugins` segment, which is the app disagreeing with itself.
+/// * A problem that has since been fixed should stop counting. An expired
+///   session you then signed back into is not an outstanding alert, and a
+///   badge that only ever climbs is one people learn to ignore.
+///
+/// The alerts list still shows the whole history. That is what a list is
+/// for; a badge is for what is outstanding.
+fn attention(
+    plugins: ReadSignal<Vec<PluginView>>,
+    feed_held: ReadSignal<bool>,
+) -> Memo<usize> {
+    // The same list the dashboard and the alerts sidebar render, counted.
+    // Counting here with a filter of its own is how a badge starts disagreeing
+    // with the panel it points at.
+    Memo::new(move |_| problems(&plugins.get(), feed_held.get()).len())
+}
+
 #[component]
 fn ActivityBar(
     active_view: ReadSignal<Option<ActivityView>>,
     set_active_view: WriteSignal<Option<ActivityView>>,
+    attention: Memo<usize>,
 ) -> impl IntoView {
     view! {
         <nav class="activity-bar" class:integrated=move || active_view.get().is_some()>
@@ -186,6 +215,13 @@ fn ActivityBar(
                 on:click=move |_| toggle_view(ActivityView::Alerts, active_view, set_active_view)
             >
                 <AlertsIcon />
+                // Only when there is something. A badge reading "0" is a
+                // badge that has to be read before it can be ignored.
+                {move || {
+                    let count = attention.get();
+                    (count > 0)
+                        .then(|| view! { <span class="activity-badge">{count}</span> })
+                }}
             </button>
             <div class="activity-bar-spacer" />
             <button
@@ -200,11 +236,12 @@ fn ActivityBar(
     }
 }
 
-/// Extensions: one unified list of everything installable — plugins and
-/// theme packs together, matching VS Code's own Extensions view rather
-/// than a separate icon per install-type. Theme packs have no loader yet
-/// (app-shell ticket 03, sequenced after this one) — shown empty, not
-/// faked.
+/// Extensions: what is installed, and whether it answers.
+///
+/// The "Theme Packs" heading and its permanent "none installed" line are
+/// gone. There is no loader for them (app-shell ticket 03), so the section
+/// advertised a capability the build does not have and could only ever read
+/// empty. It comes back with the loader, not before.
 #[component]
 fn ExtensionsView(
     plugins: ReadSignal<Vec<PluginView>>,
@@ -229,7 +266,6 @@ fn ExtensionsView(
                 on:input=move |ev| set_filter.set(event_target_value(&ev))
             />
 
-            <h4>"Plugins"</h4>
             <button on:click=refresh>"Refresh"</button>
             <ul class="extension-list">
                 {move || {
@@ -263,19 +299,38 @@ fn ExtensionsView(
                         .collect_view()
                 }}
             </ul>
-
-            <h4>"Theme Packs"</h4>
-            <p class="sidebar-empty">"No theme packs installed"</p>
         </div>
     }
 }
 
+/// What the backend has said unprompted, in the order it said it.
+///
+/// Was a hardcoded "No active alerts" — not because nothing ever happened,
+/// but because nothing could reach the window to say so. Everything here
+/// arrives on the push channel; see [`crate::bridge::on_event`].
+///
+/// Warnings first, then the rest. Not two lists: a session that expired and
+/// the sign-in that fixed it are the same story and reading it out of order
+/// is worse than reading it slightly ranked.
 #[component]
-fn AlertsView() -> impl IntoView {
+fn AlertsView(
+    plugins: ReadSignal<Vec<PluginView>>,
+    feed_held: ReadSignal<bool>,
+    set_feed_held: WriteSignal<bool>,
+) -> impl IntoView {
     view! {
         <div class="sidebar-view">
             <h3>"Alerts"</h3>
-            <p class="sidebar-empty">"No active alerts"</p>
+
+            // What is wrong now, from state rather than from the event log: a
+            // launch already signed out, or a plugin unreachable on the very
+            // first probe, never transitioned and so never announced itself.
+            //
+            // Only that. The log of everything that has happened moved to the
+            // Output panel, which had been an empty placeholder — these are
+            // two different questions ("what should I do about it" and "what
+            // has this thing been doing") and one list answered neither well.
+            <ProblemList plugins=plugins feed_held=feed_held set_feed_held=set_feed_held />
         </div>
     }
 }
@@ -284,7 +339,15 @@ fn AlertsView() -> impl IntoView {
 /// activity-bar sun/moon toggle, which only had room for two states and
 /// stopped fitting once Catppuccin Mocha became a third option.
 #[component]
-fn SettingsView(theme: ReadSignal<Theme>, set_theme: WriteSignal<Theme>) -> impl IntoView {
+fn SettingsView(
+    theme: ReadSignal<Theme>,
+    set_theme: WriteSignal<Theme>,
+    workspaces: ReadSignal<Vec<WorkspaceView>>,
+    set_workspaces: WriteSignal<Vec<WorkspaceView>>,
+    /// Writes the session. Saving a workspace changes no panel, so nothing
+    /// else would ever write it to disk.
+    persist: Callback<()>,
+) -> impl IntoView {
     let option = |value: Theme| {
         view! {
             <button
@@ -296,6 +359,36 @@ fn SettingsView(theme: ReadSignal<Theme>, set_theme: WriteSignal<Theme>) -> impl
             </button>
         }
     };
+
+    let (name, set_name) = signal(String::new());
+
+    // Saving is the only place a layout is deliberately frozen; everywhere
+    // else it is whatever the window happens to look like. A blank name is
+    // refused rather than saved as "" — an unnameable entry in the list is
+    // one nobody can tell from another.
+    let save = move |_| {
+        let chosen = name.get_untracked().trim().to_owned();
+        if chosen.is_empty() {
+            return;
+        }
+        let Some(layout) = capture_layout() else {
+            // dockview could not serialise. Nothing is saved rather than an
+            // entry that restores to a blank window.
+            web_sys::console::error_1(&"the current layout could not be captured".into());
+            return;
+        };
+        set_workspaces.update(|saved| {
+            // Same name replaces rather than duplicates: "save over it" is
+            // what typing an existing name means everywhere else.
+            match saved.iter_mut().find(|existing| existing.name == chosen) {
+                Some(existing) => existing.layout = layout,
+                None => saved.push(WorkspaceView { name: chosen, layout }),
+            }
+        });
+        set_name.set(String::new());
+        persist.run(());
+    };
+
     view! {
         <div class="sidebar-view">
             <h3>"Settings"</h3>
@@ -303,6 +396,83 @@ fn SettingsView(theme: ReadSignal<Theme>, set_theme: WriteSignal<Theme>) -> impl
             <div class="theme-picker">
                 {option(Theme::Light)} {option(Theme::Dark)} {option(Theme::CatppuccinMocha)}
             </div>
+
+            <h4>"Workspaces"</h4>
+            <p class="research-hint">
+                "A workspace is the arrangement of tabs and panels, saved by name.                  The window always reopens where you left off; these are the                  arrangements you choose to keep."
+            </p>
+            <div class="workspace-save">
+                <input
+                    type="text"
+                    placeholder="Name this arrangement"
+                    prop:value=move || name.get()
+                    on:input:target=move |ev| set_name.set(ev.target().value())
+                    on:keydown=move |ev| {
+                        if ev.key() == "Enter" {
+                            save(());
+                        }
+                    }
+                />
+                <button
+                    disabled=move || name.get().trim().is_empty()
+                    on:click=move |_| save(())
+                >
+                    "Save"
+                </button>
+            </div>
+
+            {move || {
+                let saved = workspaces.get();
+                if saved.is_empty() {
+                    return view! { <p class="sidebar-empty">"No saved workspaces"</p> }
+                        .into_any();
+                }
+                view! {
+                    <ul class="workspace-list">
+                        {saved
+                            .into_iter()
+                            .map(|workspace| {
+                                let layout = workspace.layout.clone();
+                                let switch = move |_| {
+                                    // A layout naming a panel this build no
+                                    // longer has throws, and dockview is left
+                                    // half-applied. Say so rather than leave
+                                    // someone looking at a broken window with
+                                    // no idea which click did it.
+                                    if !restore_layout(&layout) {
+                                        web_sys::console::error_1(
+                                            &"that workspace could not be restored".into(),
+                                        );
+                                    }
+                                };
+                                let dropped = workspace.name.clone();
+                                let remove = move |_| {
+                                    set_workspaces
+                                        .update(|saved| {
+                                            saved.retain(|existing| existing.name != dropped);
+                                        });
+                                    persist.run(());
+                                };
+                                view! {
+                                    <li class="workspace-row">
+                                        <button class="workspace-open" on:click=switch>
+                                            {workspace.name.clone()}
+                                        </button>
+                                        <button
+                                            class="workspace-remove"
+                                            title="Forget this workspace"
+                                            on:click=remove
+                                        >
+                                            "×"
+                                        </button>
+                                    </li>
+                                }
+                            })
+                            .collect_view()}
+                    </ul>
+                }
+                    .into_any()
+            }}
         </div>
     }
 }
@@ -310,10 +480,15 @@ fn SettingsView(theme: ReadSignal<Theme>, set_theme: WriteSignal<Theme>) -> impl
 #[component]
 fn SidebarPanel(
     active_view: ReadSignal<Option<ActivityView>>,
+    feed_held: ReadSignal<bool>,
+    set_feed_held: WriteSignal<bool>,
     plugins: ReadSignal<Vec<PluginView>>,
     set_plugins: WriteSignal<Vec<PluginView>>,
     theme: ReadSignal<Theme>,
     set_theme: WriteSignal<Theme>,
+    workspaces: ReadSignal<Vec<WorkspaceView>>,
+    set_workspaces: WriteSignal<Vec<WorkspaceView>>,
+    persist: Callback<()>,
     studies: ReadSignal<std::collections::HashMap<String, StudyView>>,
     set_studies: WriteSignal<std::collections::HashMap<String, StudyView>>,
     walks: ReadSignal<std::collections::HashMap<String, WalkForwardView>>,
@@ -345,6 +520,8 @@ fn SidebarPanel(
                 Some(ActivityView::Research) => {
                     view! {
                         <ResearchView
+                            connected=feed_held
+                            set_connected=set_feed_held
                             studies=studies
                             set_studies=set_studies
                             walks=walks
@@ -362,9 +539,27 @@ fn SidebarPanel(
                     view! { <ExtensionsView plugins=plugins set_plugins=set_plugins /> }
                         .into_any()
                 }
-                Some(ActivityView::Alerts) => view! { <AlertsView /> }.into_any(),
+                Some(ActivityView::Alerts) => {
+                    view! {
+                        <AlertsView
+                            plugins=plugins
+                            feed_held=feed_held
+                            set_feed_held=set_feed_held
+                        />
+                    }
+                        .into_any()
+                }
                 Some(ActivityView::Settings) => {
-                    view! { <SettingsView theme=theme set_theme=set_theme /> }.into_any()
+                    view! {
+                        <SettingsView
+                            theme=theme
+                            set_theme=set_theme
+                            workspaces=workspaces
+                            set_workspaces=set_workspaces
+                            persist=persist
+                        />
+                    }
+                        .into_any()
                 }
                 // ponytail: the dockview panel itself stays present (see
                 // ActivityBar's toggle) — this collapses its *content*,
@@ -424,7 +619,9 @@ struct Command {
     /// Shown as "Category: Title", and matched against in that combined form
     /// so typing "theme dark" finds "Theme: Dark".
     category: &'static str,
-    title: &'static str,
+    /// Owned, not `&'static str`: the palette lists your own portfolios and
+    /// workspaces by name, and those names are not known at compile time.
+    title: String,
     run: Arc<dyn Fn() + Send + Sync>,
 }
 
@@ -477,15 +674,52 @@ fn commands(
     output_visible: ReadSignal<bool>,
     set_output_visible: WriteSignal<bool>,
     set_theme: WriteSignal<Theme>,
+    portfolios: ReadSignal<Option<PortfolioLibraryView>>,
+    set_open_portfolio: WriteSignal<Option<PortfolioView>>,
+    workspaces: ReadSignal<Vec<WorkspaceView>>,
 ) -> Vec<Command> {
     let show = move |view: ActivityView| {
         Arc::new(move || set_active_view.set(Some(view))) as Arc<dyn Fn() + Send + Sync>
     };
 
-    vec![
+    // Read, not captured: this whole function re-runs inside the palette's
+    // reactive scope, so a portfolio imported or a workspace saved while the
+    // app is open is in the list the next time it opens.
+    let named: Vec<Command> = portfolios
+        .get()
+        .map(|library| library.portfolios)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|portfolio| {
+            let title = portfolio.name.clone();
+            Command {
+                category: "Portfolio",
+                title,
+                // The same two calls the sidebar and the dashboard make, so
+                // an already-open tab is focused rather than duplicated.
+                run: Arc::new(move || {
+                    set_open_portfolio.set(Some(portfolio.clone()));
+                    open_study_panel(PORTFOLIO_PANEL_ID, "Portfolio");
+                }),
+            }
+        })
+        .chain(workspaces.get().into_iter().map(|workspace| Command {
+            category: "Workspace",
+            title: workspace.name.clone(),
+            run: Arc::new(move || {
+                if !restore_layout(&workspace.layout) {
+                    web_sys::console::error_1(
+                        &"that workspace could not be restored".into(),
+                    );
+                }
+            }),
+        }))
+        .collect();
+
+    let mut all = vec![
         Command {
             category: "View",
-            title: "Toggle Sidebar",
+            title: "Toggle Sidebar".to_owned(),
             run: Arc::new(move || {
                 set_active_view.update(|current| {
                     *current = match *current {
@@ -497,60 +731,72 @@ fn commands(
         },
         Command {
             category: "View",
-            title: "Toggle Output Panel",
+            title: "Watchlist".to_owned(),
+            run: Arc::new(|| open_study_panel(WATCHLIST_PANEL_ID, "Watchlist")),
+        },
+        Command {
+            category: "View",
+            title: "Toggle Output Panel".to_owned(),
             run: Arc::new(move || set_output_visible.set(!output_visible.get_untracked())),
         },
         Command {
             category: "View",
-            title: "Research",
+            title: "Research".to_owned(),
             run: show(ActivityView::Research),
         },
         Command {
             category: "View",
-            title: "Extensions",
+            title: "Extensions".to_owned(),
             run: show(ActivityView::Extensions),
         },
         Command {
             category: "View",
-            title: "Alerts",
+            title: "Alerts".to_owned(),
             run: show(ActivityView::Alerts),
         },
         Command {
             category: "Preferences",
-            title: "Settings",
+            title: "Settings".to_owned(),
             run: show(ActivityView::Settings),
         },
         Command {
             category: "Theme",
-            title: "Light",
+            title: "Light".to_owned(),
             run: Arc::new(move || set_theme.set(Theme::Light)),
         },
         Command {
             category: "Theme",
-            title: "Dark",
+            title: "Dark".to_owned(),
             run: Arc::new(move || set_theme.set(Theme::Dark)),
         },
         Command {
             category: "Theme",
-            title: "Catppuccin Mocha",
+            title: "Catppuccin Mocha".to_owned(),
             run: Arc::new(move || set_theme.set(Theme::CatppuccinMocha)),
         },
         Command {
             category: "Window",
-            title: "Minimize",
+            title: "Minimize".to_owned(),
             run: Arc::new(minimize_window),
         },
         Command {
             category: "Window",
-            title: "Toggle Maximize",
+            title: "Toggle Maximize".to_owned(),
             run: Arc::new(toggle_maximize_window),
         },
         Command {
             category: "Window",
-            title: "Close",
+            title: "Close".to_owned(),
             run: Arc::new(close_window),
         },
-    ]
+    ];
+
+    // After the fixed ones. Scoring reorders anything the query actually
+    // matches, so this only decides ties — and on an empty query, where every
+    // command scores the same, "Toggle Sidebar" is a better first row than
+    // whichever portfolio happens to sort first.
+    all.extend(named);
+    all
 }
 
 /// VS Code's command palette: a filter box over everything the shell can do.
@@ -561,7 +807,10 @@ fn commands(
 fn CommandPalette(
     open: ReadSignal<bool>,
     set_open: WriteSignal<bool>,
-    commands: Vec<Command>,
+    /// Called for every filter pass rather than taken once. The list is no
+    /// longer fixed — it carries your portfolios and saved workspaces, and one
+    /// captured at startup would be missing everything made since.
+    commands: Arc<dyn Fn() -> Vec<Command> + Send + Sync>,
 ) -> impl IntoView {
     let (query, set_query) = signal(String::new());
     let (selected, set_selected) = signal(0_usize);
@@ -571,7 +820,8 @@ fn CommandPalette(
         let commands = commands.clone();
         move || {
             let query = query.get();
-            let mut scored: Vec<(u32, Command)> = commands
+            let available = commands();
+            let mut scored: Vec<(u32, Command)> = available
                 .iter()
                 .filter_map(|command| {
                     fuzzy_score(&command.label(), &query).map(|score| (score, command.clone()))
@@ -731,9 +981,6 @@ fn TopMenuBar(
             />
             <img class="app-icon" src="/tauri.svg" alt="" data-tauri-drag-region="true" />
             <nav class="menu-bar">
-                <MenuDropdown id=MenuId::File label="File" open_menu=open_menu set_open_menu=set_open_menu>
-                    <div class="menu-item-static">"No commands yet"</div>
-                </MenuDropdown>
                 <MenuDropdown id=MenuId::View label="View" open_menu=open_menu set_open_menu=set_open_menu>
                     <button
                         class="menu-item"
@@ -795,51 +1042,123 @@ fn TopMenuBar(
     }
 }
 
-/// Real content, not an empty placeholder — a plugin reachability summary
-/// from data already in `plugins`, no new state. Not interactive; this is
-/// a visual-consistency ask, not a notifications center.
+/// The row that says what state the app is in.
+///
+/// It used to render one string — a plugin count — with a comment admitting
+/// it was there for visual consistency. The reason it could not say more was
+/// structural: nothing pushed to the window, so there was no live state to
+/// report. Now there is.
+///
+/// Every segment is a button. A status bar that only tells you a thing is
+/// wrong, without being the place you go about it, makes you hunt for the
+/// screen that can — which for the broker session meant finding a sign-in
+/// button below a strategy picker in a sidebar that might be closed.
 #[component]
-fn StatusBar(plugins: ReadSignal<Vec<PluginView>>) -> impl IntoView {
+fn StatusBar(
+    plugins: ReadSignal<Vec<PluginView>>,
+    attention: Memo<usize>,
+    feed_held: ReadSignal<bool>,
+    set_active_view: WriteSignal<Option<ActivityView>>,
+) -> impl IntoView {
+    // ponytail: the feed segment opens Alerts, where the sign-in button is,
+    // rather than starting the sign-in itself. The connect flow has a
+    // five-minute wait and its own error surface, and giving it a second
+    // entry point means duplicating both. Call `connect_feed` from here when
+    // that flow reports progress somewhere shared.
+    let show = move |view: ActivityView| move |_| set_active_view.set(Some(view));
+
     view! {
         <div class="status-bar">
+            <button
+                class="status-segment"
+                class:status-warn=move || !feed_held.get()
+                title="Robinhood market data"
+                on:click=show(ActivityView::Alerts)
+            >
+                {move || if feed_held.get() { "◆ Robinhood" } else { "◇ Signed out" }}
+            </button>
+
+            <button
+                class="status-segment"
+                class:status-warn=move || {
+                    plugins
+                        .get()
+                        .iter()
+                        .any(|p| matches!(p.status, PluginStatusView::Unreachable { .. }))
+                }
+                title="Plugin reachability"
+                on:click=show(ActivityView::Extensions)
+            >
+                {move || {
+                    let all = plugins.get();
+                    let reachable = all
+                        .iter()
+                        .filter(|p| matches!(p.status, PluginStatusView::Reachable { .. }))
+                        .count();
+                    format!("{reachable}/{} plugins", all.len())
+                }}
+            </button>
+
+            <div class="status-spacer" />
+
+            <button
+                class="status-segment"
+                class:status-warn=move || { attention.get() > 0 }
+                title="Alerts"
+                on:click=show(ActivityView::Alerts)
+            >
+                {move || {
+                    let count = attention.get();
+                    if count == 0 {
+                        "No alerts".to_owned()
+                    } else {
+                        format!("{count} alert{}", if count == 1 { "" } else { "s" })
+                    }
+                }}
+            </button>
+        </div>
+    }
+}
+
+/// Everything the backend has said, newest first.
+///
+/// Was the string "Output" in an otherwise empty panel — a toggle in the View
+/// menu that revealed a placeholder. It is the natural home for the event log
+/// that the alerts sidebar was carrying: alerts answer "what should I do
+/// about it", this answers "what has this been doing", and the second is a
+/// transcript rather than a to-do list.
+///
+/// Chronological, not sorted by severity. A log reordered by importance is
+/// one you cannot read a sequence of events out of, which is the only reason
+/// to keep a log.
+#[component]
+fn BottomPanel(events: ReadSignal<Vec<EventView>>) -> impl IntoView {
+    view! {
+        <div class="output-panel">
             {move || {
-                let all = plugins.get();
-                let reachable = all
-                    .iter()
-                    .filter(|p| matches!(p.status, PluginStatusView::Reachable { .. }))
-                    .count();
-                format!("{reachable}/{} plugins reachable", all.len())
+                let log = events.get();
+                if log.is_empty() {
+                    return view! { <p class="sidebar-empty">"Nothing has happened yet"</p> }
+                        .into_any();
+                }
+                view! {
+                    <ul class="output-log">
+                        {log
+                            .into_iter()
+                            .map(|event| {
+                                let warning = event.severity == SeverityView::Warning;
+                                view! {
+                                    <li class="output-line" class:output-warning=warning>
+                                        <span class="output-title">{event.title}</span>
+                                        <span class="output-detail">{event.detail}</span>
+                                    </li>
+                                }
+                            })
+                            .collect_view()}
+                    </ul>
+                }
+                    .into_any()
             }}
-        </div>
-    }
-}
-
-/// Default "Welcome" tab content. Wordmark, subtitle and tagline are the
-/// real strings off `images/arvo_logos.png`'s own primary lockup; the mark
-/// is a simplified line-art take on the same logo (peak + underlying
-/// sweep), not a pixel copy of its 3D-rendered artwork.
-#[component]
-fn MainPanel() -> impl IntoView {
-    view! {
-        <div class="welcome">
-            <svg class="welcome-mark" viewBox="0 0 100 100" aria-hidden="true">
-                <path d="M28 82 L50 16 L72 82" />
-                <path class="welcome-mark-sweep" d="M30 54 Q50 76 70 66" />
-            </svg>
-            <h1 class="welcome-title">"ARVO"</h1>
-            <p class="welcome-subtitle">"Financial Intelligence Platform"</p>
-            <p class="welcome-tagline">
-                "Analyze" <span>"•"</span> "Simulate" <span>"•"</span> "Invest" <span>"•"</span> "Grow"
-            </p>
-        </div>
-    }
-}
-
-#[component]
-fn BottomPanel() -> impl IntoView {
-    view! {
-        <div class="sidebar-view">
-            <p class="sidebar-empty">"Output"</p>
         </div>
     }
 }
@@ -875,6 +1194,82 @@ pub fn App() -> impl IntoView {
     let (comparison, set_comparison) = signal(None::<ComparisonView>);
     let (portfolios, set_portfolios) = signal(None::<PortfolioLibraryView>);
     let (open_portfolio, set_open_portfolio) = signal(None::<PortfolioView>);
+    // Everything the backend has said unprompted, newest first. Held here
+    // rather than in the alerts sidebar because the sidebar is unmounted
+    // whenever it is closed, and an alert that only exists while you are
+    // looking at it is not an alert.
+    let (events, set_events) = signal(Vec::<EventView>::new());
+    // Whether a broker session is held. Hoisted out of ResearchView for the
+    // same reason `chosen` was — two owners of this became two answers the
+    // moment the status bar wanted to show it, and the event stream can
+    // change it from underneath both.
+    let (feed_held, set_feed_held) = signal(false);
+    let attention = attention(plugins, feed_held);
+    // Saved arrangements. Held in the shell because the autosave below writes
+    // the whole session on every layout change — a copy owned by the Settings
+    // view would be absent from that write, and every panel drag would erase
+    // every saved workspace.
+    let (workspaces, set_workspaces) = signal(Vec::<WorkspaceView>::new());
+    // Every symbol's latest price, keyed by ticker. Here rather than in the
+    // watchlist panel because the panel is unmounted whenever its tab is
+    // closed, and a listener installed per mount would leave one dead closure
+    // per open writing into a signal nobody can see. The panel reads this;
+    // the socket that fills it does not care whether anyone is looking.
+    let quotes = RwSignal::new(std::collections::HashMap::<String, QuoteTick>::new());
+    provide_context(quotes);
+
+    // Live prices. Separate from the event channel below: a tick is not an
+    // alert, is worth nothing once the next one lands, and must never reach
+    // the capped alerts log.
+    Effect::new(move |_| {
+        on_quote(move |tick| {
+            quotes.update(|latest| {
+                latest.insert(tick.symbol.clone(), tick);
+            });
+        });
+    });
+
+    // The push channel. One listener for the window's lifetime.
+    Effect::new(move |_| {
+        on_event(move |event| {
+            match event.kind {
+                EventKindView::Feed { connected, .. } => set_feed_held.set(connected),
+                // The event is a signal to go and re-read, not the new state
+                // itself — `arvo_core::events` says so, and this is the half
+                // that was missing. Without it the log announced a plugin had
+                // come back while the badge, the status bar and the alerts
+                // list all still read the snapshot from startup and called it
+                // unreachable.
+                EventKindView::Plugin { .. } => {
+                    spawn_local(async move {
+                        set_plugins.set(call("list_plugins").await);
+                    });
+                }
+                // Nothing to re-read: the prices themselves arrive on their
+                // own channel, and this only says whether they are still
+                // arriving. It lands in the alerts log like everything else.
+                EventKindView::Stream { .. } => {}
+            }
+            set_events.update(|log| {
+                log.insert(0, event);
+                // ponytail: a flat cap, not a ring buffer or a persisted log.
+                // 200 events is more than anyone scrolls; swap in something
+                // durable when alerts need to survive a restart.
+                log.truncate(200);
+            });
+        });
+    });
+
+    Effect::new(move |_| {
+        spawn_local(async move {
+            // The cold-start answer. Events cover every change after this,
+            // but a launch with an already-expired token has no event to
+            // announce it — nothing transitioned, it was already dead.
+            if let Ok(held) = call_typed::<bool>("feed_connected", JsValue::UNDEFINED).await {
+                set_feed_held.set(held);
+            }
+        });
+    });
 
     Effect::new(move |_| {
         spawn_local(async move {
@@ -908,6 +1303,40 @@ pub fn App() -> impl IntoView {
         on_cleanup(move || handle.remove());
     });
 
+    // Writing the session, as one thing anything can ask for.
+    //
+    // It used to live inside the layout-settled callback and nowhere else,
+    // which quietly made "the layout changed" the only reason the session was
+    // ever written. Saving a workspace moves no panel, so it fired nothing:
+    // the new workspace sat in memory looking saved and was gone on the next
+    // launch. Anything that changes persisted state calls this.
+    let persist = Callback::new(move |()| {
+        let session = SessionView {
+            layout: capture_layout(),
+            active_view: active_view
+                .get_untracked()
+                .map(|view| view.slug().to_owned()),
+            output_visible: output_visible.get_untracked(),
+            theme: Some(theme.get_untracked().slug().to_owned()),
+            strategy: Some(chosen.get_untracked()).filter(|name| !name.is_empty()),
+            // Every field, every time: this writes the whole file, so
+            // anything omitted here is deleted from disk.
+            workspaces: workspaces.get_untracked(),
+        };
+        spawn_local(async move {
+            let args = serde_wasm_bindgen::to_value(&serde_json::json!({
+                "session": session,
+            }))
+            .unwrap_or(JsValue::UNDEFINED);
+            // Logged, not surfaced. A workspace that failed to save is worth
+            // knowing about and is not worth interrupting anyone over —
+            // nothing they were doing has been lost.
+            if let Err(reason) = call_typed::<()>("save_session", args).await {
+                web_sys::console::warn_1(&reason.into());
+            }
+        });
+    });
+
     // Sidebar and Output's mount handles are tracked (not `.forget()`-ten,
     // unlike the permanent main panel) so removing either actually unmounts
     // the Leptos root instead of leaking it — see the extern block's notes.
@@ -937,10 +1366,15 @@ pub fn App() -> impl IntoView {
                         view! {
                             <SidebarPanel
                                 active_view=active_view
+                                feed_held=feed_held
+                                set_feed_held=set_feed_held
                                 plugins=plugins
                                 set_plugins=set_plugins
                                 theme=theme
                                 set_theme=set_theme
+                                workspaces=workspaces
+                                set_workspaces=set_workspaces
+                                persist=persist
                                 studies=studies
                                 set_studies=set_studies
                                 walks=walks
@@ -958,10 +1392,29 @@ pub fn App() -> impl IntoView {
                     *sidebar_mount_created.borrow_mut() = Some(handle);
                 }
                 "main" => {
-                    mount_to(el, || view! { <MainPanel /> }).forget();
+                    // The Welcome tab is the dashboard now. It was a wordmark
+                    // and a tagline, which is the right default for an editor
+                    // that knows nothing until you open a folder and the
+                    // wrong one here, where the app already knows what you
+                    // hold and what it cannot reach.
+                    mount_to(
+                            el,
+                            move || {
+                                view! {
+                                    <Dashboard
+                                        portfolios=portfolios
+                                        set_open_portfolio=set_open_portfolio
+                                        plugins=plugins
+                                        feed_held=feed_held
+                                        set_feed_held=set_feed_held
+                                    />
+                                }
+                            },
+                        )
+                        .forget();
                 }
                 "bottom" => {
-                    let handle = mount_to(el, || view! { <BottomPanel /> });
+                    let handle = mount_to(el, move || view! { <BottomPanel events=events /> });
                     *bottom_mount_created.borrow_mut() = Some(handle);
                 }
                 // `into_any` on both: a study tab and the panel tab are
@@ -973,6 +1426,14 @@ pub fn App() -> impl IntoView {
                     study_mounts_created
                         .borrow_mut()
                         .insert(PORTFOLIO_PANEL_ID.to_owned(), handle);
+                }
+                WATCHLIST_PANEL_ID => {
+                    let handle = mount_to(el, move || {
+                        view! { <WatchlistTab connected=feed_held /> }.into_any()
+                    });
+                    study_mounts_created
+                        .borrow_mut()
+                        .insert(WATCHLIST_PANEL_ID.to_owned(), handle);
                 }
                 COMPARE_PANEL_ID => {
                     let handle = mount_to(el, move || {
@@ -1039,6 +1500,7 @@ pub fn App() -> impl IntoView {
                 id if id == PANEL_PANEL_ID
                     || id == COMPARE_PANEL_ID
                     || id == PORTFOLIO_PANEL_ID
+                    || id == WATCHLIST_PANEL_ID
                     || id.starts_with(STUDY_PANEL_PREFIX)
                     || id.starts_with(WALK_PANEL_PREFIX) =>
                 {
@@ -1070,6 +1532,7 @@ pub fn App() -> impl IntoView {
             if let Some(strategy) = session.strategy {
                 set_chosen.set(strategy);
             }
+            set_workspaces.set(session.workspaces);
             // Set before the layout goes back: the sidebar's own panel is part
             // of that layout, and an active view that disagreed with it would
             // show a sidebar with nothing in it.
@@ -1092,29 +1555,7 @@ pub fn App() -> impl IntoView {
 
             // Only now: restoring is itself a layout change, and saving
             // during it would race the thing that produced it.
-            let record = Closure::<dyn FnMut()>::new(move || {
-                let session = SessionView {
-                    layout: capture_layout(),
-                    active_view: active_view
-                        .get_untracked()
-                        .map(|view| view.slug().to_owned()),
-                    output_visible: output_visible.get_untracked(),
-                    theme: Some(theme.get_untracked().slug().to_owned()),
-                    strategy: Some(chosen.get_untracked()).filter(|name| !name.is_empty()),
-                };
-                spawn_local(async move {
-                    let args = serde_wasm_bindgen::to_value(&serde_json::json!({
-                        "session": session,
-                    }))
-                    .unwrap_or(JsValue::UNDEFINED);
-                    // Logged, not surfaced. A workspace that failed to save is
-                    // worth knowing about and is not worth interrupting anyone
-                    // over — nothing they were doing has been lost.
-                    if let Err(reason) = call_typed::<()>("save_session", args).await {
-                        web_sys::console::warn_1(&reason.into());
-                    }
-                });
-            });
+            let record = Closure::<dyn FnMut()>::new(move || persist.run(()));
             on_layout_settled(record.as_ref());
             record.forget();
         });
@@ -1139,22 +1580,36 @@ pub fn App() -> impl IntoView {
             <CommandPalette
                 open=palette_open
                 set_open=set_palette_open
-                commands=commands(
-                    set_active_view,
-                    output_visible,
-                    set_output_visible,
-                    set_theme,
-                )
+                commands=Arc::new(move || {
+                    commands(
+                        set_active_view,
+                        output_visible,
+                        set_output_visible,
+                        set_theme,
+                        portfolios,
+                        set_open_portfolio,
+                        workspaces,
+                    )
+                })
             />
             <div class="shell">
-                <ActivityBar active_view=active_view set_active_view=set_active_view />
+                <ActivityBar
+                active_view=active_view
+                set_active_view=set_active_view
+                attention=attention
+            />
                 <div
                     id="shell-host"
                     class="shell-host"
                     class:sidebar-open=move || active_view.get().is_some()
                 ></div>
             </div>
-            <StatusBar plugins=plugins />
+            <StatusBar
+                plugins=plugins
+                attention=attention
+                feed_held=feed_held
+                set_active_view=set_active_view
+            />
         </div>
     }
 }

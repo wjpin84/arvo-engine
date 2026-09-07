@@ -45,6 +45,11 @@ pub(crate) fn ResearchView(
     /// which strategy is selected is part of where you left off.
     chosen: ReadSignal<String>,
     set_chosen: WriteSignal<String>,
+    /// Whether a broker session is held. Hoisted for the same reason
+    /// `chosen` was: the status bar shows it too, and the push channel can
+    /// change it from underneath both — two copies became two answers.
+    connected: ReadSignal<bool>,
+    set_connected: WriteSignal<bool>,
     panel: ReadSignal<Option<PanelView>>,
     set_panel: WriteSignal<Option<PanelView>>,
     set_comparison: WriteSignal<Option<ComparisonView>>,
@@ -76,10 +81,6 @@ pub(crate) fn ResearchView(
     // that drifts from the engine offers rules it will then refuse.
     let (strategies, set_strategies) = signal(Vec::<StrategyView>::new());
 
-    // Whether a broker token is held, never the token itself. A getter for the
-    // credential would put it on the wire to the web view for no reason the UI
-    // actually has.
-    let (connected, set_connected) = signal(false);
     let (symbol, set_symbol) = signal(String::new());
     let (fetched, set_fetched) = signal(None::<FetchView>);
     // What the broker knows by that name. The box used to require typing
@@ -133,12 +134,6 @@ pub(crate) fn ResearchView(
             }
         });
     };
-    spawn_local(async move {
-        if let Ok(held) = call_typed::<bool>("feed_connected", JsValue::UNDEFINED).await {
-            set_connected.set(held);
-        }
-    });
-
     let connect = move |_| {
         // A slow command by design: it returns when the sign-in finishes in
         // the browser, or after five minutes. Saying so beats a spinner that

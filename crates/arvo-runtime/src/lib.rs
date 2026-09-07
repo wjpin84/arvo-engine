@@ -8,18 +8,19 @@
 //! implementation is bound to `tauri::async_runtime` — see [`scheduler`].
 
 pub mod commands;
+pub mod events;
 pub mod feed;
 pub mod portfolio;
 pub mod research;
 pub mod scheduler;
 pub mod session;
+pub mod stream;
 
-use arvo_core::{config, notifications};
+use arvo_core::config;
 use arvo_plugin_host::registry;
 use std::sync::Arc;
 use std::time::Duration;
 use tauri::Manager;
-use tauri_plugin_notification::NotificationExt;
 
 /// Sets up diagnostics, writing to both stderr and a file under Tauri's app
 /// log directory.
@@ -101,24 +102,15 @@ pub fn run() {
                 registry::PluginRegistry::connect(&plugins_config),
             ));
 
-            // Subscribe before the registry moves into app.manage().
-            let mut events = plugin_registry.subscribe();
+            // Subscribe before the registry moves into app.manage(). The window
+            // hears about every transition through the same seam that raises the
+            // OS notification — see `events`.
+            let mut transitions = plugin_registry.subscribe();
             let app_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 loop {
-                    match events.recv().await {
-                        Ok(event) => {
-                            let notification = notifications::event_to_notification(&event);
-                            if let Err(err) = app_handle
-                                .notification()
-                                .builder()
-                                .title(notification.title)
-                                .body(notification.body)
-                                .show()
-                            {
-                                tracing::warn!(error = %err, "failed to show notification");
-                            }
-                        }
+                    match transitions.recv().await {
+                        Ok(event) => events::emit(&app_handle, events::plugin(&event)),
                         // A slow subscriber missed some events — keep going,
                         // don't die over a lag on a low-volume stream.
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
@@ -172,6 +164,11 @@ pub fn run() {
                 snapshot_dir,
             ));
 
+            // The live price stream. Started here and held for the life of
+            // the app: it is a socket, not a request, and the thing that
+            // decides what it carries is the watchlist command.
+            app.manage(stream::start(app.handle().clone()));
+
             app.manage(plugins_config);
             app.manage(plugin_registry);
             Ok(())
@@ -191,6 +188,7 @@ pub fn run() {
             research::disconnect_feed,
             research::fetch_bars,
             research::search_instruments,
+            research::watchlist,
             research::compare_records,
             research::run_panel,
             research::list_history,

@@ -6,7 +6,7 @@
 //! exists it slots in beside the reader without changing the domain, the
 //! valuation or this view.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use arvo_data::{BarProvider, CsvBars};
@@ -44,6 +44,46 @@ impl PortfolioService {
             snapshots: SnapshotStore::new(snapshot_dir),
         }
     }
+
+    /// Every *priceable* instrument held, across every portfolio.
+    ///
+    /// Identifiers only — no quantities, no values. A caller wants to know
+    /// what you hold so it can look those up; what they are worth is this
+    /// module's answer and comes from disk, never from the network.
+    ///
+    /// # Cash is not a ticker
+    ///
+    /// `CASH` is excluded, and that is a bug fix rather than tidiness. The
+    /// domain is explicit that cash is worth its face value and never needs a
+    /// price looked up — but `CASH` is also a real listed symbol, so asking
+    /// an equity feed about it returns a genuine quote for a company nobody
+    /// here holds. The watchlist showed a cash line at $83.11, up 0.41%,
+    /// which is precisely the unverifiable number beside real money that this
+    /// module exists to refuse.
+    ///
+    /// An unreadable holdings file yields nothing rather than an error: this
+    /// feeds a convenience, and refusing to show prices because one CSV is
+    /// malformed would be the wrong trade.
+    #[must_use]
+    pub fn held(&self) -> BTreeSet<String> {
+        self.holdings
+            .portfolios(chrono::Utc::now().date_naive())
+            .unwrap_or_default()
+            .iter()
+            .flat_map(|imported| imported.portfolio.holdings.iter())
+            .map(|holding| holding.instrument.clone())
+            .filter(|instrument| !is_cash(instrument))
+            .collect()
+    }
+}
+
+/// Whether an instrument id names cash rather than something with a price.
+///
+/// Case-insensitively, matching how the importer and the valuation both test
+/// it — a holdings file written `cash` is the same line as one written
+/// `CASH`, and a third spelling of this check is a third chance to disagree.
+fn is_cash(instrument: &str) -> bool {
+    instrument.eq_ignore_ascii_case(arvo_portfolio::CASH)
 }
 
 /// Every portfolio, valued.
@@ -175,5 +215,23 @@ fn view_of(
             rows_skipped: report.rows_skipped.clone(),
             cost_basis_derived: report.cost_basis_derived,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_cash;
+
+    /// The watchlist showed a cash line priced at $83.11, up 0.41% — `CASH`
+    /// is a real listed symbol, so an equity feed answers for it happily.
+    /// Cash is worth its face value and is never looked up.
+    #[test]
+    fn cash_is_never_something_to_price() {
+        assert!(is_cash("CASH"));
+        assert!(is_cash("cash"), "the importer matches case-insensitively; so does this");
+        assert!(!is_cash("MSFT"));
+        // Not a prefix match: a real ticker that starts with the letters is
+        // a real holding, and dropping it would hide a position.
+        assert!(!is_cash("CASHX"));
     }
 }

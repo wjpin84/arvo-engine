@@ -17,5 +17,4 @@
 
 pub mod config;
 pub mod events;
-pub mod notifications;
 pub mod secrets;
