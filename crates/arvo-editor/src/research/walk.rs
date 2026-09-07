@@ -12,6 +12,7 @@ use crate::chart::{DataQuality, EquityChart, MetricCard, PriceChart, UnderwaterC
 use crate::format::{percent, ratio, short_hash, verdict_class};
 use crate::research::study::TradeDetail;
 use crate::trades::TradesTable;
+use crate::research::study::Recommendations;
 use crate::views::*;
 
 /// A rolling re-selection: what the procedure did, fold by fold.
@@ -41,6 +42,8 @@ pub(crate) fn WalkForwardReport(walk: WalkForwardView) -> impl IntoView {
             <ul class="research-reasons">
                 {walk.reasons.iter().map(|r| view! { <li>{r.clone()}</li> }).collect_view()}
             </ul>
+
+            <Recommendations items=walk.recommendations.clone() />
 
             <DataQuality findings=walk.data_findings.clone() />
 

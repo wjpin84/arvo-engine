@@ -232,7 +232,8 @@ mod tests {
         // precisely what Nautilus needs to be true when it starts up.
         assert!(
             log::set_boxed_logger(Box::new(Discard)).is_ok(),
-            "init_tracing claimed the `log` global; Nautilus cannot install              its logger and will refuse to build an engine"
+            "init_tracing claimed the `log` global; Nautilus cannot install its logger and will \
+             refuse to build an engine"
         );
     }
 }

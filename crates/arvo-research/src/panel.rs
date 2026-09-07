@@ -362,7 +362,7 @@ fn pool(outcomes: &[InstrumentOutcome]) -> PooledOutcome {
 /// 1.25 means the pooled average's standard error is a quarter larger than its
 /// instrument count implies — small enough to ignore, and the point at which
 /// saying so stops being pedantry and starts being a correction.
-const OVERSTATEMENT_WORTH_SAYING: f64 = 1.25;
+pub(crate) const OVERSTATEMENT_WORTH_SAYING: f64 = 1.25;
 
 fn judge(
     pooled: &PooledOutcome,
@@ -380,7 +380,9 @@ fn judge(
     if let (Some(effective), Some(overstatement)) = (breadth.effective, breadth.overstatement()) {
         if overstatement >= OVERSTATEMENT_WORTH_SAYING {
             reasons.push(format!(
-                "these {} instruments behave like {effective:.1} independent ones (average                  correlation {:.2}), so the pooled average is about {overstatement:.1}x less                  certain than its instrument count suggests",
+                "these {} instruments behave like {effective:.1} independent ones (average \
+                 correlation {:.2}), so the pooled average is about {overstatement:.1}x less \
+                 certain than its instrument count suggests",
                 breadth.instruments.len(),
                 breadth.mean_correlation.unwrap_or_default(),
             ));

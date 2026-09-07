@@ -253,6 +253,7 @@ pub struct WalkForwardView {
     pub instrument: String,
     pub verdict: String,
     pub reasons: Vec<String>,
+    pub recommendations: Vec<RecommendationView>,
 
     pub folds: Vec<FoldView>,
     pub folds_surviving_deflation: usize,
@@ -424,6 +425,7 @@ pub struct OutcomeView {
 pub struct PanelView {
     pub verdict: String,
     pub reasons: Vec<String>,
+    pub recommendations: Vec<RecommendationView>,
 
     pub instruments: usize,
     pub total_trades: u32,

@@ -78,7 +78,8 @@ fn every_marker_lands_on_a_candle_that_exists() {
     for marker in &view.markers {
         assert!(
             candles.contains(&marker.time),
-            "marker at {} ({}) is on no candle — every entry would be drawn one              bar from where it happened",
+            "marker at {} ({}) is on no candle — every entry would be drawn one bar from where \
+             it happened",
             marker.time,
             marker.kind
         );

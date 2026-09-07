@@ -556,7 +556,8 @@ fn replay_view(outcome: &arvo_research::Replay) -> ReplayView {
             outcome: "reproduced".to_owned(),
             holds: true,
             detail: format!(
-                "Ran again and produced the same {points} equity points and the                  same {trades} trades."
+                "Ran again and produced the same {points} equity points and the same {trades} \
+                 trades."
             ),
             divergence: None,
         },
@@ -564,7 +565,8 @@ fn replay_view(outcome: &arvo_research::Replay) -> ReplayView {
             outcome: "data-changed".to_owned(),
             holds: false,
             detail: format!(
-                "The data behind this finding is not the data that produced it                  ({} now, {} then), so re-running would measure something else.",
+                "The data behind this finding is not the data that produced it \
+                 ({} now, {} then), so re-running would measure something else.",
                 short_hash(current),
                 short_hash(recorded),
             ),
@@ -574,7 +576,8 @@ fn replay_view(outcome: &arvo_research::Replay) -> ReplayView {
             outcome: "engine-changed".to_owned(),
             holds: false,
             detail: format!(
-                "Recorded on {recorded}; this build runs {current}. A different                  simulator disagreeing is not evidence about the old one, so the                  run was not attempted."
+                "Recorded on {recorded}; this build runs {current}. A different simulator \
+                 disagreeing is not evidence about the old one, so the run was not attempted."
             ),
             divergence: None,
         },
@@ -582,7 +585,8 @@ fn replay_view(outcome: &arvo_research::Replay) -> ReplayView {
             outcome: "diverged".to_owned(),
             holds: false,
             detail: format!(
-                "Same data, same engine, different answer: {}. Something that                  decides the result is not recorded in the experiment.",
+                "Same data, same engine, different answer: {}. Something that decides the result \
+                 is not recorded in the experiment.",
                 divergence.what,
             ),
             divergence: Some(DivergenceView {
@@ -998,14 +1002,17 @@ fn judge_comparison(rows: &[ComparisonRowView], mut notes: Vec<String>) -> Judge
     if let (Some(best), Some(bar)) = (best, bar) {
         if best <= bar {
             notes.push(format!(
-                "the best of these is a Sharpe of {best:.2}, and the best of {} results with no                  skill at all would be expected to reach {bar:.2} — picking the winner of this                  comparison is picking noise",
+                "the best of these is a Sharpe of {best:.2}, and the best of {} results with no \
+                 skill at all would be expected to reach {bar:.2} — picking the winner of this \
+                 comparison is picking noise",
                 sharpes.len(),
             ));
         }
     }
     if rows.iter().any(|row| row.stale == Some(true)) {
         notes.push(
-            "at least one of these was produced from data that has since changed, so they were              not all measured on the same thing"
+            "at least one of these was produced from data that has since changed, so they were \
+             not all measured on the same thing"
                 .to_owned(),
         );
     }
@@ -1014,7 +1021,8 @@ fn judge_comparison(rows: &[ComparisonRowView], mut notes: Vec<String>) -> Judge
         rows.iter().map(|row| row.subject.as_str()).collect();
     if subjects.len() > 1 {
         notes.push(
-            "these are different instruments, so the differences between them are as much about              the instruments as about the rules"
+            "these are different instruments, so the differences between them are as much about \
+             the instruments as about the rules"
                 .to_owned(),
         );
     }
@@ -1552,15 +1560,7 @@ pub fn study_view(
             &evaluation.strategy_trades,
             found.selected.starting_cash,
         ),
-        recommendations: arvo_research::recommend(found)
-            .into_iter()
-            .map(|item| RecommendationView {
-                severity: item.severity.label().to_owned(),
-                finding: item.finding,
-                action: item.action,
-                evidence: item.evidence,
-            })
-            .collect(),
+        recommendations: advice(arvo_research::recommend(found)),
         dataset_version: found.selected.dataset.version.clone(),
         strategy_name: found.selected.strategy.name.clone(),
         starting_cash: found.selected.starting_cash,
@@ -1583,6 +1583,7 @@ pub fn walk_forward_view(
         instrument: template.instrument.clone(),
         verdict: verdict_label(found.verdict).to_owned(),
         reasons: found.reasons.clone(),
+        recommendations: advice(arvo_research::recommend_walk_forward(found)),
         folds: found
             .folds
             .iter()
@@ -1700,10 +1701,29 @@ pub fn walk_forward_view(
 }
 
 /// Flattens a stored panel for display. Same reasoning as [`study_view`].
+/// Recommendations as the window shows them.
+fn advice(items: Vec<arvo_research::Recommendation>) -> Vec<RecommendationView> {
+    items
+        .into_iter()
+        .map(|item| RecommendationView {
+            severity: item.severity.label().to_owned(),
+            finding: item.finding,
+            action: item.action,
+            evidence: item.evidence,
+        })
+        .collect()
+}
+
 fn panel_view(found: &arvo_research::PanelEvidence, engine: &str) -> PanelView {
     PanelView {
         verdict: verdict_label(found.verdict).to_owned(),
         reasons: found.reasons.clone(),
+        // The same criteria the panel was judged against. Passed rather than
+        // read off the evidence because a panel does not store its own bar.
+        recommendations: advice(arvo_research::recommend_panel(
+            found,
+            &arvo_research::EvaluationCriteria::default(),
+        )),
         instruments: found.pooled.instruments,
         total_trades: found.pooled.total_trades,
         mean_excess_return: found.pooled.mean_excess_return,
@@ -2431,7 +2451,8 @@ mod tests {
         );
         assert!(
             family.template.costs.slippage_bps > 0.0,
-            "a study that assumes free fills is the optimistic one, and the engine              honours slippage now"
+            "a study that assumes free fills is the optimistic one, and the engine honours \
+             slippage now"
         );
     }
 }

@@ -9,6 +9,7 @@ use leptos::prelude::*;
 
 use crate::chart::MetricCard;
 use crate::format::{percent, ratio, short_hash, verdict_class};
+use crate::research::study::Recommendations;
 use crate::views::*;
 
 /// The panel tab's content, read back out of the signal so a re-run refreshes
@@ -64,6 +65,8 @@ pub(crate) fn PanelReport(panel: PanelView) -> impl IntoView {
             <ul class="research-reasons">
                 {panel.reasons.iter().map(|r| view! { <li>{r.clone()}</li> }).collect_view()}
             </ul>
+
+            <Recommendations items=panel.recommendations.clone() />
 
             <div class="metric-cards">
                 <MetricCard

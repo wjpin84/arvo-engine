@@ -35,7 +35,9 @@ pub mod replay;
 pub mod trade;
 pub mod walk_forward;
 
-pub use advice::{recommend, Recommendation, Severity};
+pub use advice::{
+    recommend, recommend_panel, recommend_walk_forward, Recommendation, Severity,
+};
 pub use book::combine;
 pub use breadth::Breadth;
 pub use evaluation::{
@@ -331,7 +333,8 @@ impl RiskModel {
             }
             if self.stop_atr_multiple.is_none() {
                 return Err(
-                    "risk_per_trade needs a stop: position size is capital-at-risk divided by                      the distance to the exit, and without a stop there is no distance"
+                    "risk_per_trade needs a stop: position size is capital-at-risk divided by \
+                     the distance to the exit, and without a stop there is no distance"
                         .to_owned(),
                 );
             }

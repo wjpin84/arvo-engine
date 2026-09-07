@@ -562,7 +562,7 @@ pub(crate) fn ResearchView(
             // bar, and no amount of history fixes that.
             <button
                 class="research-panel-run"
-                title="Choose one configuration across every instrument, then judge it on data it                        has not seen"
+                title="Choose one configuration across every instrument, then judge it on data it has not seen"
                 disabled=move || running.get().is_some()
                 on:click=run_panel
             >

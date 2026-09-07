@@ -22,7 +22,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{FamilyEvidence, TradeStats, Verdict};
+use crate::{
+    EvaluationCriteria, FamilyEvidence, PanelEvidence, TradeStats, Verdict,
+    WalkForwardEvidence,
+};
 
 /// Below this many closed trades, a shape statistic is describing a handful of
 /// coin flips. Separate from `EvaluationCriteria::min_trades`, which decides a
@@ -43,6 +46,30 @@ const FEE_SHARE: f64 = 0.25;
 
 /// Days a position must be held for long-term US capital-gains treatment.
 const LONG_TERM_DAYS: f64 = 365.0;
+
+/// Below this share of a panel's members beating their own benchmark, a
+/// positive pooled average is being carried by a minority of them.
+///
+/// Half, because that is where "it worked on these instruments" stops being a
+/// fair description: the same average comes from every member edging ahead and
+/// from one member carrying five, and the mean cannot tell those apart.
+const PANEL_MAJORITY: f64 = 0.5;
+
+/// Below this share of folds whose selection survived deflation, the
+/// *procedure* has not been shown to select.
+///
+/// A walk-forward tests a process, not a configuration. If the search picked
+/// noise in most folds, the combined curve is what noise happened to do,
+/// however good it looks.
+const FOLD_SELECTION_SHARE: f64 = 0.5;
+
+/// Below this modal share, a parameter axis is being chosen at random.
+///
+/// If the most commonly selected value on an axis wins fewer than half the
+/// folds, re-selection is not converging on anything: the axis is adding
+/// search width — and therefore raising the deflation bar — without adding an
+/// answer.
+const MODAL_SHARE_FLOOR: f64 = 0.5;
 
 /// How much a recommendation should stop someone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -159,7 +186,9 @@ pub fn recommend(found: &FamilyEvidence) -> Vec<Recommendation> {
         out.push(Recommendation::new(
             Severity::Blocking,
             "The run stopped early: the account hit its drawdown limit.",
-            "Read every number here as covering a window that was not              finished. The return is what it was at the halt, not what the              rule would have made — and the rule was stopped precisely where              it was going worst, so what came after is unmeasured.",
+            "Read every number here as covering a window that was not finished. The return is \
+             what it was at the halt, not what the rule would have made — and the rule was \
+             stopped precisely where it was going worst, so what came after is unmeasured.",
             format!(
                 "{} round trips before the limit was reached",
                 trades.closed
@@ -251,6 +280,293 @@ pub fn recommend(found: &FamilyEvidence) -> Vec<Recommendation> {
                 "{} trades, {:.1}% excess over buy-and-hold",
                 evaluation.strategy.trades,
                 evaluation.excess_return * 100.0
+            ),
+        ));
+    }
+
+    out.sort_by_key(|item| item.severity);
+    out
+}
+
+/// Everything worth saying about a panel, most stopping first.
+///
+/// A panel's findings are not a study's. Whether its members were independent,
+/// whether a positive average is carried by a minority of them, whether
+/// holding all of them would have been holdable — none of these arise for a
+/// single instrument, and none have an equivalent in [`recommend`].
+///
+/// `criteria` is passed rather than read off the evidence because a panel does
+/// not store the bar it was judged against.
+#[must_use]
+pub fn recommend_panel(
+    found: &PanelEvidence,
+    criteria: &EvaluationCriteria,
+) -> Vec<Recommendation> {
+    let pooled = &found.pooled;
+    let mut out = Vec::new();
+
+    // ---- blocking: the result cannot be read -----------------------------
+
+    if pooled.total_trades < criteria.min_trades {
+        out.push(Recommendation::new(
+            Severity::Blocking,
+            "Too few round trips across the whole panel to tell skill from luck.",
+            "Add instruments or lengthen the window. Pooling is what a panel is for, and this \
+             one has not pooled enough to read.",
+            format!(
+                "{} trades across {} instruments, against a {} minimum",
+                pooled.total_trades, pooled.instruments, criteria.min_trades
+            ),
+        ));
+    }
+
+    if !found.selection.survived_deflation {
+        out.push(Recommendation::new(
+            Severity::Blocking,
+            "The search explains the winning configuration.",
+            "Shrink the grid or lengthen the in-sample window, then re-run. One configuration \
+             chosen across every instrument is still one configuration chosen out of many.",
+            match found.selection.expected_best_under_null {
+                Some(expected) => format!(
+                    "best in-sample Sharpe {:.2} across {} configurations, against {expected:.2} \
+                     expected from a no-skill search of that size",
+                    found.selection.best_sharpe, found.selection.trials
+                ),
+                None => format!(
+                    "{} configurations, too few to say what a no-skill search would produce",
+                    found.selection.trials
+                ),
+            },
+        ));
+    }
+
+    if !found.failures.is_empty() {
+        // Worse here than in a study: an instrument that failed is one the
+        // conclusion quietly excludes, and the ones that fail are rarely a
+        // random sample of the panel.
+        out.push(Recommendation::new(
+            Severity::Blocking,
+            "Part of the panel never ran.",
+            "Fix the failing members before reading the pooled numbers. A panel that silently \
+             dropped instruments is a panel of the instruments that happened to work.",
+            format!(
+                "{} instrument/configuration runs failed",
+                found.failures.len()
+            ),
+        ));
+    }
+
+    // ---- warning: readable, but resting on something fragile -------------
+
+    if let Some(breadth) = &found.breadth {
+        if let (Some(effective), Some(overstatement)) =
+            (breadth.effective, breadth.overstatement())
+        {
+            if overstatement > crate::panel::OVERSTATEMENT_WORTH_SAYING {
+                out.push(Recommendation::new(
+                    Severity::Warning,
+                    "These instruments are not as independent as their count suggests.",
+                    "Read the pooled average as resting on fewer observations than it appears \
+                     to. Adding more instruments that move like these will not fix it; adding \
+                     ones that do not move like them will.",
+                    format!(
+                        "{} instruments behaving like {effective:.1} independent ones, average \
+                         correlation {:.2}",
+                        breadth.instruments.len(),
+                        breadth.mean_correlation.unwrap_or_default(),
+                    ),
+                ));
+            }
+        }
+    }
+
+    #[expect(clippy::cast_precision_loss, reason = "panel sizes are small")]
+    let beat_share = if pooled.instruments == 0 {
+        0.0
+    } else {
+        pooled.beat_benchmark as f64 / pooled.instruments as f64
+    };
+    if pooled.mean_excess_return > 0.0 && beat_share < PANEL_MAJORITY {
+        out.push(Recommendation::new(
+            Severity::Warning,
+            "The positive average is carried by a minority of the instruments.",
+            "Look at which members produced it before calling this something that works across \
+             instruments. A rule that wins on one and loses on the rest is a finding about \
+             that one.",
+            format!(
+                "{} of {} instruments beat their own benchmark, mean excess {:.1}%",
+                pooled.beat_benchmark,
+                pooled.instruments,
+                pooled.mean_excess_return * 100.0,
+            ),
+        ));
+    }
+
+    if let Some(book) = &found.book {
+        let diversification = pooled.mean_max_drawdown - book.max_drawdown;
+        if diversification <= 0.0 && pooled.instruments > 1 {
+            out.push(Recommendation::new(
+                Severity::Warning,
+                "Holding all of them would have fallen as hard as holding the average one.",
+                "Treat this panel as one bet rather than several. The instruments went down \
+                 together, so spreading capital across them bought no protection.",
+                format!(
+                    "book drawdown {:.1}% against a mean member drawdown of {:.1}%",
+                    book.max_drawdown * 100.0,
+                    pooled.mean_max_drawdown * 100.0,
+                ),
+            ));
+        }
+    }
+
+    if pooled.worst_max_drawdown > criteria.max_drawdown
+        && pooled.mean_max_drawdown <= criteria.max_drawdown
+    {
+        // The mean passed and a member did not. Averaging is what hid it, so
+        // the average is the wrong place to go looking.
+        out.push(Recommendation::new(
+            Severity::Warning,
+            "One instrument breached the drawdown ceiling even though the average did not.",
+            "Decide whether the panel is judged on its average member or its worst one. \
+             Capital is committed per instrument, and nobody holds the average.",
+            format!(
+                "worst member {:.1}% against a {:.1}% ceiling, mean {:.1}%",
+                pooled.worst_max_drawdown * 100.0,
+                criteria.max_drawdown * 100.0,
+                pooled.mean_max_drawdown * 100.0,
+            ),
+        ));
+    }
+
+    // ---- notes -----------------------------------------------------------
+
+    if out.is_empty() && found.verdict == Verdict::Supported {
+        out.push(Recommendation::new(
+            Severity::Note,
+            "Nothing in the evidence undercuts this panel.",
+            "Re-run it on a later window, or on instruments that move differently from these. \
+             A panel that survives is where the work starts, not where it ends.",
+            format!(
+                "{} trades across {} instruments, mean excess {:.1}%",
+                pooled.total_trades,
+                pooled.instruments,
+                pooled.mean_excess_return * 100.0,
+            ),
+        ));
+    }
+
+    out.sort_by_key(|item| item.severity);
+    out
+}
+
+/// Everything worth saying about a walk-forward run, most stopping first.
+///
+/// A walk-forward tests a *procedure* — re-select on recent data, trade the
+/// next stretch, repeat — so its findings are about the procedure. Whether the
+/// search selected anything real, whether it kept selecting the same thing,
+/// and whether the folds were long enough for the rule to start are questions
+/// a single study cannot ask, and they decide more than the combined return
+/// does.
+#[must_use]
+pub fn recommend_walk_forward(found: &WalkForwardEvidence) -> Vec<Recommendation> {
+    let folds = found.folds.len();
+    let mut out = Vec::new();
+
+    // ---- blocking: the result cannot be read -----------------------------
+
+    if folds == 0 {
+        out.push(Recommendation::new(
+            Severity::Blocking,
+            "The window produced no folds.",
+            "Shorten the in-sample length or the step, or fetch more history. There is nothing \
+             here to read.",
+            "0 folds".to_owned(),
+        ));
+        return out;
+    }
+
+    #[expect(clippy::cast_precision_loss, reason = "fold counts are small")]
+    let selecting = found.folds_surviving_deflation as f64 / folds as f64;
+    if selecting < FOLD_SELECTION_SHARE {
+        // The finding the combined curve cannot show: a procedure whose
+        // selections are noise still produces a curve, and the curve looks
+        // exactly the same either way.
+        out.push(Recommendation::new(
+            Severity::Blocking,
+            "The re-selection is picking noise in most folds.",
+            "Shrink the grid or lengthen the in-sample window before reading the combined \
+             return. What is under test here is the procedure, and a procedure that selects \
+             noise most of the time has not been shown to select.",
+            format!(
+                "{} of {folds} folds chose a configuration beating what a no-skill search of \
+                 that size would produce",
+                found.folds_surviving_deflation,
+            ),
+        ));
+    }
+
+    if found.folds_without_trades > 0 {
+        out.push(Recommendation::new(
+            Severity::Blocking,
+            "Some folds never opened a position.",
+            "Lengthen the step so each fold outlasts the rule's warm-up. An empty fold is not \
+             evidence the rule does nothing — it is evidence the fold was too short to let it \
+             start — and it enters the combined curve as a flat stretch either way.",
+            format!(
+                "{} of {folds} folds traded not at all",
+                found.folds_without_trades
+            ),
+        ));
+    }
+
+    // ---- warning: readable, but resting on something fragile -------------
+
+    for axis in &found.stability {
+        if axis.distinct > 1 && axis.modal_share < MODAL_SHARE_FLOOR {
+            out.push(Recommendation::new(
+                Severity::Warning,
+                &format!("The search never settled on a value for `{}`.", axis.axis),
+                "Consider fixing this axis or dropping it. One re-chosen differently every fold \
+                 is widening the search — and so raising the bar the result has to clear — \
+                 without converging on an answer.",
+                format!(
+                    "{} distinct values across {folds} folds; the most common won {:.0}% of them",
+                    axis.distinct,
+                    axis.modal_share * 100.0,
+                ),
+            ));
+        }
+    }
+
+    out.extend(shape_warnings(&found.combined_trades));
+
+    if found.excess_return <= 0.0 && found.verdict != Verdict::Inconclusive {
+        out.push(Recommendation::new(
+            Severity::Warning,
+            "Re-selecting did not beat holding the instrument.",
+            "Compare against the single-window study before concluding the procedure adds \
+             anything. Re-selection pays a warm-up at every fold boundary, and that cost is \
+             real whether or not it buys something.",
+            format!(
+                "{:.1}% combined against {:.1}% buy-and-hold over the same stitched period",
+                found.combined.total_return * 100.0,
+                found.benchmark.total_return * 100.0,
+            ),
+        ));
+    }
+
+    // ---- notes -----------------------------------------------------------
+
+    if out.is_empty() && found.verdict == Verdict::Supported {
+        out.push(Recommendation::new(
+            Severity::Note,
+            "Nothing in the evidence undercuts this procedure.",
+            "Re-run it on another instrument before believing it. Surviving a walk-forward is a \
+             stronger claim than surviving one study, and it is still one claim.",
+            format!(
+                "{folds} folds, {} of them selecting above the no-skill bar, {:.1}% excess",
+                found.folds_surviving_deflation,
+                found.excess_return * 100.0,
             ),
         ));
     }
@@ -472,5 +788,365 @@ mod tests {
             severities,
             [Severity::Blocking, Severity::Warning, Severity::Note]
         );
+    }
+
+    // ---- panels ----------------------------------------------------------
+
+    /// A panel that clears every bar, so each test can break exactly one thing.
+    fn clean_panel() -> PanelEvidence {
+        let day = |d: u32| chrono::NaiveDate::from_ymd_opt(2024, 1, d).expect("valid");
+        PanelEvidence {
+            hypothesis: crate::HypothesisId("h".to_owned()),
+            dataset: crate::DatasetRef {
+                id: "bars".to_owned(),
+                version: "v1".to_owned(),
+            },
+            in_sample: crate::DateRange {
+                from: day(1),
+                to: day(4),
+            },
+            out_of_sample: crate::DateRange {
+                from: day(5),
+                to: day(9),
+            },
+            selected_params: std::collections::BTreeMap::new(),
+            selection: crate::Selection {
+                trials: 9,
+                best_sharpe: 1.5,
+                expected_best_under_null: Some(0.5),
+                survived_deflation: true,
+                scored: Vec::new(),
+            },
+            per_instrument: Vec::new(),
+            pooled: crate::PooledOutcome {
+                instruments: 4,
+                total_trades: 60,
+                mean_excess_return: 0.1,
+                beat_benchmark: 4,
+                mean_max_drawdown: 0.1,
+                worst_max_drawdown: 0.12,
+            },
+            breadth: None,
+            book: None,
+            failures: Vec::new(),
+            verdict: Verdict::Supported,
+            reasons: Vec::new(),
+        }
+    }
+
+    fn findings(items: &[Recommendation]) -> String {
+        items
+            .iter()
+            .map(|item| format!("{}: {}", item.severity.label(), item.finding))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn a_panel_average_carried_by_a_minority_is_named_as_such() {
+        // The finding a mean cannot express. One member carrying five and
+        // every member edging ahead produce the same positive average, and
+        // only one of them is a result about instruments in general.
+        let mut panel = clean_panel();
+        panel.pooled.beat_benchmark = 1;
+
+        let out = recommend_panel(&panel, &EvaluationCriteria::default());
+        assert!(
+            out.iter().any(|item| item.finding.contains("minority")),
+            "{}",
+            findings(&out)
+        );
+    }
+
+    #[test]
+    fn a_panel_where_most_members_won_says_nothing_about_minorities() {
+        let out = recommend_panel(&clean_panel(), &EvaluationCriteria::default());
+        assert!(
+            !out.iter().any(|item| item.finding.contains("minority")),
+            "{}",
+            findings(&out)
+        );
+    }
+
+    #[test]
+    fn a_worst_member_through_the_ceiling_is_reported_even_when_the_mean_passed() {
+        // Averaging is exactly what hides this, so the average is the wrong
+        // place to notice it.
+        let mut panel = clean_panel();
+        panel.pooled.worst_max_drawdown = 0.55;
+
+        let out = recommend_panel(&panel, &EvaluationCriteria::default());
+        let item = out
+            .iter()
+            .find(|item| item.finding.contains("breached the drawdown ceiling"))
+            .unwrap_or_else(|| panic!("{}", findings(&out)));
+        assert_eq!(item.severity, Severity::Warning);
+    }
+
+    #[test]
+    fn a_panel_whose_members_fell_together_is_called_one_bet() {
+        let mut panel = clean_panel();
+        // A book that fell as hard as the average member: no diversification.
+        panel.book = Some(crate::Metrics {
+            total_return: 0.1,
+            cagr: 0.1,
+            max_drawdown: 0.1,
+            volatility: 0.2,
+            sharpe: Some(1.0),
+            sortino: Some(1.2),
+            calmar: Some(0.9),
+            trades: 60,
+        });
+
+        let out = recommend_panel(&panel, &EvaluationCriteria::default());
+        assert!(
+            out.iter().any(|item| item.action.contains("one bet")),
+            "{}",
+            findings(&out)
+        );
+    }
+
+    #[test]
+    fn a_panel_that_diversified_is_not_warned_about_it() {
+        let mut panel = clean_panel();
+        // Fell less than the average member did: the point of the panel.
+        panel.book = Some(crate::Metrics {
+            total_return: 0.1,
+            cagr: 0.1,
+            max_drawdown: 0.04,
+            volatility: 0.2,
+            sharpe: Some(1.0),
+            sortino: Some(1.2),
+            calmar: Some(0.9),
+            trades: 60,
+        });
+
+        let out = recommend_panel(&panel, &EvaluationCriteria::default());
+        assert!(
+            !out.iter().any(|item| item.action.contains("one bet")),
+            "{}",
+            findings(&out)
+        );
+    }
+
+    #[test]
+    fn a_panel_that_dropped_instruments_blocks_rather_than_warns() {
+        // The ones that fail are rarely a random sample of the panel.
+        let mut panel = clean_panel();
+        panel.failures = vec!["MSFT.NASDAQ out-of-sample: no bars".to_owned()];
+
+        let out = recommend_panel(&panel, &EvaluationCriteria::default());
+        let item = out
+            .iter()
+            .find(|item| item.finding.contains("never ran"))
+            .unwrap_or_else(|| panic!("{}", findings(&out)));
+        assert_eq!(item.severity, Severity::Blocking);
+    }
+
+    #[test]
+    fn a_clean_panel_still_says_one_finding_is_where_the_work_starts() {
+        let out = recommend_panel(&clean_panel(), &EvaluationCriteria::default());
+        assert_eq!(out.len(), 1, "{}", findings(&out));
+        assert_eq!(out[0].severity, Severity::Note);
+    }
+
+    // ---- walk-forward ----------------------------------------------------
+
+    fn metrics(total_return: f64) -> crate::Metrics {
+        crate::Metrics {
+            total_return,
+            cagr: total_return,
+            max_drawdown: 0.1,
+            volatility: 0.2,
+            sharpe: Some(1.0),
+            sortino: Some(1.2),
+            calmar: Some(0.9),
+            trades: 40,
+        }
+    }
+
+    /// A walk-forward that clears every bar.
+    fn clean_walk() -> WalkForwardEvidence {
+        WalkForwardEvidence {
+            hypothesis: crate::HypothesisId("h".to_owned()),
+            template: experiment(),
+            in_sample_days: 365,
+            step_days: 90,
+            anchored: false,
+            folds: vec![],
+            combined: metrics(0.3),
+            benchmark: metrics(0.1),
+            excess_return: 0.2,
+            combined_curve: Vec::new(),
+            benchmark_curve: Vec::new(),
+            combined_trades: TradeStats::default(),
+            stability: Vec::new(),
+            folds_surviving_deflation: 4,
+            folds_without_trades: 0,
+            verdict: Verdict::Supported,
+            reasons: Vec::new(),
+        }
+    }
+
+    fn experiment() -> crate::Experiment {
+        let day = |d: u32| chrono::NaiveDate::from_ymd_opt(2024, 1, d).expect("valid");
+        crate::Experiment {
+            id: crate::ExperimentId("x".to_owned()),
+            hypothesis: crate::HypothesisId("h".to_owned()),
+            instrument: "AAPL.NASDAQ".to_owned(),
+            window: crate::DateRange {
+                from: day(1),
+                to: day(9),
+            },
+            interval: arvo_data::BarInterval::DAILY,
+            dataset: crate::DatasetRef {
+                id: "bars".to_owned(),
+                version: "v1".to_owned(),
+            },
+            strategy: crate::StrategySpec {
+                name: "sma_cross".to_owned(),
+                params: std::collections::BTreeMap::new(),
+            },
+            costs: crate::CostModel::proportional(0.0, 0.0),
+            risk: crate::RiskModel::default(),
+            starting_cash: 100_000.0,
+            seed: 7,
+        }
+    }
+
+    /// Four folds, because the interesting walk-forward rules are ratios.
+    fn with_folds(mut walk: WalkForwardEvidence) -> WalkForwardEvidence {
+        walk.folds = (0..4)
+            .map(|_| crate::FamilyEvidence {
+                hypothesis: crate::HypothesisId("h".to_owned()),
+                in_sample: experiment().window,
+                out_of_sample: experiment().window,
+                selection: crate::Selection {
+                    trials: 9,
+                    best_sharpe: 1.5,
+                    expected_best_under_null: Some(0.5),
+                    survived_deflation: true,
+                    scored: Vec::new(),
+                },
+                selected: experiment(),
+                out_of_sample_evidence: crate::Evidence {
+                    hypothesis: crate::HypothesisId("h".to_owned()),
+                    experiment: experiment(),
+                    benchmark: crate::ExperimentId("b".to_owned()),
+                    engine: "test 1".to_owned(),
+                    criteria: EvaluationCriteria::default(),
+                    evaluation: crate::Evaluation {
+                        strategy: metrics(0.3),
+                        benchmark: metrics(0.1),
+                        strategy_curve: Vec::new(),
+                        benchmark_curve: Vec::new(),
+                        strategy_trades: TradeStats::default(),
+                        strategy_ledger: Vec::new(),
+                        excess_return: 0.2,
+                        verdict: Verdict::Supported,
+                        reasons: Vec::new(),
+                    },
+                },
+                failures: Vec::new(),
+                verdict: Verdict::Supported,
+                reasons: Vec::new(),
+            })
+            .collect();
+        walk
+    }
+
+    #[test]
+    fn a_procedure_that_selects_noise_in_most_folds_blocks_the_combined_return() {
+        // The finding the combined curve cannot show: a procedure whose
+        // selections are noise still draws a curve, and it looks the same.
+        let mut walk = with_folds(clean_walk());
+        walk.folds_surviving_deflation = 1;
+
+        let out = recommend_walk_forward(&walk);
+        let item = out
+            .iter()
+            .find(|item| item.finding.contains("picking noise"))
+            .unwrap_or_else(|| panic!("{}", findings(&out)));
+        assert_eq!(item.severity, Severity::Blocking);
+    }
+
+    #[test]
+    fn an_empty_fold_is_reported_as_too_short_rather_than_as_a_rule_doing_nothing() {
+        let mut walk = with_folds(clean_walk());
+        walk.folds_without_trades = 2;
+
+        let out = recommend_walk_forward(&walk);
+        let item = out
+            .iter()
+            .find(|item| item.finding.contains("never opened a position"))
+            .unwrap_or_else(|| panic!("{}", findings(&out)));
+        assert!(item.action.contains("warm-up"), "{}", item.action);
+    }
+
+    #[test]
+    fn an_axis_the_search_never_settled_on_is_named_by_name() {
+        let mut walk = with_folds(clean_walk());
+        walk.stability = vec![crate::AxisStability {
+            axis: "fast".to_owned(),
+            distinct: 4,
+            modal: 10.0,
+            modal_share: 0.25,
+        }];
+
+        let out = recommend_walk_forward(&walk);
+        assert!(
+            out.iter().any(|item| item.finding.contains("`fast`")),
+            "{}",
+            findings(&out)
+        );
+    }
+
+    #[test]
+    fn an_axis_the_search_agreed_on_is_left_alone() {
+        let mut walk = with_folds(clean_walk());
+        walk.stability = vec![crate::AxisStability {
+            axis: "fast".to_owned(),
+            distinct: 2,
+            modal: 10.0,
+            modal_share: 0.75,
+        }];
+
+        let out = recommend_walk_forward(&walk);
+        assert!(
+            !out.iter().any(|item| item.finding.contains("never settled")),
+            "{}",
+            findings(&out)
+        );
+    }
+
+    #[test]
+    fn a_procedure_that_did_not_beat_holding_is_told_to_compare_against_one_window() {
+        let mut walk = with_folds(clean_walk());
+        walk.excess_return = -0.05;
+        walk.verdict = Verdict::NotSupported;
+
+        let out = recommend_walk_forward(&walk);
+        assert!(
+            out.iter()
+                .any(|item| item.finding.contains("did not beat holding")),
+            "{}",
+            findings(&out)
+        );
+    }
+
+    #[test]
+    fn a_walk_forward_with_no_folds_says_so_and_stops() {
+        let out = recommend_walk_forward(&clean_walk());
+        assert_eq!(out.len(), 1, "{}", findings(&out));
+        assert_eq!(out[0].severity, Severity::Blocking);
+        assert!(out[0].finding.contains("no folds"), "{}", out[0].finding);
+    }
+
+    #[test]
+    fn a_clean_walk_forward_is_still_told_it_is_one_claim() {
+        let out = recommend_walk_forward(&with_folds(clean_walk()));
+        assert_eq!(out.len(), 1, "{}", findings(&out));
+        assert_eq!(out[0].severity, Severity::Note);
+        assert!(out[0].action.contains("one claim"), "{}", out[0].action);
     }
 }
