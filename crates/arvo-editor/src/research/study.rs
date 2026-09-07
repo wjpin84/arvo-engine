@@ -11,7 +11,7 @@ use crate::chart::{
     DataQuality, EquityChart, MetricCard, MonthlyReturns, ParameterSurface, PriceChart,
     UnderwaterChart,
 };
-use crate::format::{percent, ratio, short_hash, verdict_class};
+use crate::format::{money, percent, ratio, short_hash, verdict_class};
 use crate::trades::TradesTable;
 use crate::views::*;
 
@@ -164,6 +164,9 @@ pub(crate) fn StudyReport(study: StudyView) -> impl IntoView {
             <ul class="research-reasons">
                 {study.reasons.iter().map(|r| view! { <li>{r.clone()}</li> }).collect_view()}
             </ul>
+
+            {(!study.members.is_empty())
+                .then(|| view! { <Members rows=study.members.clone() /> })}
 
             <Recommendations items=study.recommendations.clone() />
             <DataQuality findings=study.data_findings.clone() />
@@ -322,6 +325,90 @@ pub(crate) fn StudyReport(study: StudyView) -> impl IntoView {
                 <dt>"Engine"</dt>
                 <dd>{study.engine.clone()}</dd>
             </dl>
+        </div>
+    }
+}
+
+/// Which member of a book produced its result.
+///
+/// A book reports one return for several instruments, and its headline number
+/// cannot say which of them earned it. That matters more here than in a panel:
+/// a panel's members are independent runs and can simply be listed, while a
+/// book's interfere, so a member contributing nothing may have been unable to
+/// rather than unwilling.
+///
+/// A member with no trades is shown, flagged, rather than left out — an absent
+/// row reads as an instrument nobody chose, when in fact it was chosen and
+/// funded by nothing.
+#[component]
+pub(crate) fn Members(rows: Vec<MemberView>) -> impl IntoView {
+    let silent = rows.iter().filter(|member| member.silent).count();
+
+    view! {
+        <h4>"What each instrument contributed"</h4>
+        {(silent > 0)
+            .then(|| {
+                view! {
+                    <p class="research-flag">
+                        {format!(
+                            "{silent} of {} instruments never opened a position. On a shared \
+                             account the usual cause is capital: the first to signal takes it \
+                             and the rest are denied, so these are not instruments the rule \
+                             declined.",
+                            rows.len(),
+                        )}
+                    </p>
+                }
+            })}
+        <div class="research-scroll">
+            <table class="research-metrics">
+                <thead>
+                    <tr>
+                        <th class="research-left">"Instrument"</th>
+                        <th>"Trades"</th>
+                        <th>"Realised"</th>
+                        <th>"Share"</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {rows
+                        .into_iter()
+                        .map(|member| {
+                            let tone = if member.pnl > 0.0 {
+                                "research-good"
+                            } else if member.pnl < 0.0 {
+                                "research-bad"
+                            } else {
+                                ""
+                            };
+                            // A share of nothing is not zero percent. Both the
+                            // book that realised nothing and the member that
+                            // never traded print a dash rather than a figure
+                            // that would read as a measurement.
+                            let share = member
+                                .share
+                                .map_or_else(|| "\u{2014}".to_owned(), percent);
+                            view! {
+                                <tr>
+                                    <td class="research-left">
+                                        {member.instrument.clone()}
+                                        {member
+                                            .silent
+                                            .then(|| {
+                                                view! {
+                                                    <span class="research-stale">" never traded"</span>
+                                                }
+                                            })}
+                                    </td>
+                                    <td>{member.trades}</td>
+                                    <td class=tone>{money(member.pnl)}</td>
+                                    <td>{share}</td>
+                                </tr>
+                            }
+                        })
+                        .collect_view()}
+                </tbody>
+            </table>
         </div>
     }
 }

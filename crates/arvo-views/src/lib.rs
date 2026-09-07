@@ -170,6 +170,9 @@ pub struct StudyView {
     /// before a run could hold more than one loads as what it was.
     #[serde(default)]
     pub instruments: Vec<String>,
+    /// What each member of a book contributed. Empty for a single study.
+    #[serde(default)]
+    pub members: Vec<MemberView>,
     pub verdict: String,
     pub reasons: Vec<String>,
 
@@ -308,6 +311,13 @@ pub struct WalkForwardView {
 /// nineteen losses is a fact only the rows show.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TradeRowView {
+    /// Which instrument this round trip was in.
+    ///
+    /// Empty for a run recorded before the ledger named instruments, and for
+    /// an ordinary single-instrument study where the subject line already
+    /// says it. Only a book shows the column.
+    #[serde(default)]
+    pub instrument: String,
     pub opened: String,
     /// Empty while the position is still open at the end of the run.
     pub closed: String,
@@ -325,6 +335,30 @@ pub struct TradeRowView {
     pub held_days: Option<f64>,
     /// `signal`, `stop`, or `open`.
     pub exit_reason: String,
+}
+
+/// What one member of a book actually contributed.
+///
+/// A book reports one return for several instruments, and the single most
+/// useful question about it is which of them produced that return. The panel
+/// answers the same question by running members separately; a book cannot,
+/// because the members interfere — so it has to be read out of the ledger.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemberView {
+    pub instrument: String,
+    pub trades: u32,
+    /// Realised profit, net of what the venue charged.
+    pub pnl: f64,
+    /// This member's share of the book's total realised profit.
+    ///
+    /// `None` when the book realised nothing at all, rather than a share of
+    /// zero — which would read as a measurement.
+    pub share: Option<f64>,
+    /// True when the member never opened a position.
+    ///
+    /// The failure mode a shared account introduces: an instrument that was
+    /// asked for, funded by nothing, and silently absent from every number.
+    pub silent: bool,
 }
 
 /// One configuration's cell on the search surface.

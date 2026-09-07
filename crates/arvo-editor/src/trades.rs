@@ -23,6 +23,7 @@ use crate::views::TradeRowView;
 /// component holds the choice, not a closure over the rows.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SortBy {
+    Instrument,
     Opened,
     Held,
     Quantity,
@@ -33,6 +34,7 @@ enum SortBy {
 impl SortBy {
     const fn label(self) -> &'static str {
         match self {
+            Self::Instrument => "Instrument",
             Self::Opened => "Opened",
             Self::Held => "Held",
             Self::Quantity => "Size",
@@ -47,6 +49,20 @@ impl SortBy {
 /// produces tens of thousands, and not before.
 #[component]
 pub(crate) fn TradesTable(rows: Vec<TradeRowView>, name: String) -> impl IntoView {
+    // Only when the rows come from more than one instrument. On an ordinary
+    // study the column would repeat the subject line on every row; on a book,
+    // leaving it out means listing round trips from three instruments with no
+    // way to tell which is which.
+    let per_instrument = {
+        let mut seen: Vec<&str> = rows
+            .iter()
+            .map(|row| row.instrument.as_str())
+            .filter(|instrument| !instrument.is_empty())
+            .collect();
+        seen.sort_unstable();
+        seen.dedup();
+        seen.len() > 1
+    };
     // Newest-worst-first is not a default anyone can defend, so it opens in
     // the order the trades happened — the one ordering that is a fact about
     // the run rather than an opinion about it.
@@ -72,6 +88,7 @@ pub(crate) fn TradesTable(rows: Vec<TradeRowView>, name: String) -> impl IntoVie
                 SortBy::Quantity => rows.sort_by(|a, b| a.quantity.total_cmp(&b.quantity)),
                 SortBy::Pnl => rows.sort_by(|a, b| a.pnl.total_cmp(&b.pnl)),
                 SortBy::Reason => rows.sort_by(|a, b| a.exit_reason.cmp(&b.exit_reason)),
+                SortBy::Instrument => rows.sort_by(|a, b| a.instrument.cmp(&b.instrument)),
             }
             if descending.get() {
                 rows.reverse();
@@ -150,6 +167,7 @@ pub(crate) fn TradesTable(rows: Vec<TradeRowView>, name: String) -> impl IntoVie
                 <table class="research-metrics">
                     <thead>
                         <tr>
+                            {per_instrument.then(|| header(SortBy::Instrument))}
                             {header(SortBy::Opened)}
                             <th class="research-left">"Closed"</th>
                             {header(SortBy::Held)}
@@ -199,6 +217,14 @@ pub(crate) fn TradesTable(rows: Vec<TradeRowView>, name: String) -> impl IntoVie
                                     };
                                     view! {
                                         <tr>
+                                            {per_instrument
+                                                .then(|| {
+                                                    view! {
+                                                        <td class="research-left">
+                                                            {row.instrument.clone()}
+                                                        </td>
+                                                    }
+                                                })}
                                             <td class="research-left">{row.opened.clone()}</td>
                                             <td class="research-left">{closed}</td>
                                             <td>{held}</td>

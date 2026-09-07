@@ -24,7 +24,7 @@ use arvo_research::{
 pub use arvo_views::{
     BookView, BreadthView, CandlePoint, ComparisonRowView, ComparisonView, CurvePoint,
     DataFindingView, DataLibraryView, DivergenceView, FetchView, FoldView, HistoryEntryView,
-    HistoryView, InstrumentView, MatchView, MetricsView, MonthlyReturnView, NamedCurveView,
+    HistoryView, InstrumentView, MatchView, MemberView, MetricsView, MonthlyReturnView, NamedCurveView,
     OutcomeView, PanelView, RecommendationView, RecordView, ReplayView, StabilityView,
     StrategyView, StudyView, SurfaceCell, SurfaceView, TradeMarkerView, TradeRowView,
     TradesView, UnreadableView, WalkForwardView,
@@ -1397,12 +1397,19 @@ fn trades_csv(rows: &[TradeRowExport]) -> String {
     let number = |value: Option<f64>| value.map(|v| format!("{v}")).unwrap_or_default();
 
     let mut out = String::with_capacity(rows.len() * 96 + 128);
+    // The instrument first, and always — including for a single study, where
+    // every cell holds the same name. A column that appears only sometimes is
+    // one a script reading these files has to detect, and a header that
+    // changes shape between exports is the same silent column shift the
+    // quoting above exists to prevent.
     out.push_str(
-        "opened,closed,direction,quantity,entry,exit,pnl,commission,held_days,exit_reason\n",
+        "instrument,opened,closed,direction,quantity,entry,exit,pnl,commission,held_days,\
+         exit_reason\n",
     );
     for row in rows {
         out.push_str(&format!(
-            "{},{},{},{},{},{},{},{},{},{}\n",
+            "{},{},{},{},{},{},{},{},{},{},{}\n",
+            cell(&row.instrument),
             cell(&row.opened),
             cell(&row.closed),
             cell(&row.direction),
@@ -1426,6 +1433,15 @@ fn trades_csv(rows: &[TradeRowExport]) -> String {
 /// none.
 #[derive(serde::Deserialize)]
 pub struct TradeRowExport {
+    /// Which instrument the round trip was in.
+    ///
+    /// `default` because an ordinary study's rows do not carry one: the
+    /// subject line already says it, and a column repeating the same name on
+    /// every line is noise. On a book it is the difference between a usable
+    /// export and a list of trades from three instruments with no way to tell
+    /// them apart.
+    #[serde(default)]
+    pub instrument: String,
     pub opened: String,
     pub closed: String,
     pub direction: String,
@@ -1480,10 +1496,49 @@ pub async fn run_panel(
 /// history that showed something subtly different from the live run would be
 /// worse than no history.
 /// The ledger as table rows.
+/// What each instrument in a book contributed, in the order the book names
+/// them.
+///
+/// Empty for anything but a book: a single study's whole ledger is its one
+/// instrument, and a table saying so would be a column of the same name.
+///
+/// A member with no trades is reported rather than omitted. It is the failure
+/// mode a shared account introduces — asked for, funded by nothing, absent
+/// from every other number — and a row that is simply missing looks like an
+/// instrument nobody chose.
+fn members(experiment: &arvo_research::Experiment, ledger: &[arvo_research::Trade]) -> Vec<MemberView> {
+    let all = experiment.instruments();
+    if all.len() < 2 {
+        return Vec::new();
+    }
+    // Signed, and summed before any share is taken: a book whose winners and
+    // losers cancel has no meaningful denominator, and dividing by a total near
+    // zero would hand out shares in the hundreds.
+    let total: f64 = ledger.iter().map(|trade| trade.pnl).sum();
+
+    all.into_iter()
+        .map(|instrument| {
+            let mine: Vec<&arvo_research::Trade> = ledger
+                .iter()
+                .filter(|trade| trade.instrument == instrument)
+                .collect();
+            let pnl: f64 = mine.iter().map(|trade| trade.pnl).sum();
+            MemberView {
+                instrument,
+                trades: u32::try_from(mine.len()).unwrap_or(u32::MAX),
+                pnl,
+                share: (total.abs() > f64::EPSILON).then(|| pnl / total),
+                silent: mine.is_empty(),
+            }
+        })
+        .collect()
+}
+
 fn trade_rows(ledger: &[arvo_research::Trade]) -> Vec<TradeRowView> {
     ledger
         .iter()
         .map(|trade| TradeRowView {
+            instrument: trade.instrument.clone(),
             opened: trade.opened.format("%Y-%m-%d %H:%M").to_string(),
             closed: trade
                 .closed
@@ -1623,6 +1678,7 @@ pub fn study_view(
     StudyView {
         instrument: found.selected.instrument.clone(),
         instruments: found.selected.instruments(),
+        members: members(&found.selected, &evaluation.strategy_ledger),
         verdict: verdict_label(found.verdict).to_owned(),
         reasons: found.reasons.clone(),
         trials: found.selection.trials,
@@ -2132,6 +2188,7 @@ mod csv_tests {
 
     fn row(reason: &str) -> TradeRowExport {
         TradeRowExport {
+            instrument: "AAPL.NASDAQ".to_owned(),
             opened: "2024-01-02 00:00".to_owned(),
             closed: "2024-01-05 00:00".to_owned(),
             direction: "long".to_owned(),
@@ -2150,9 +2207,9 @@ mod csv_tests {
         let text = trades_csv(&[row("signal"), row("stop")]);
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 3);
-        assert!(lines[0].starts_with("opened,closed,direction"));
-        assert_eq!(lines[0].split(',').count(), 10);
-        assert_eq!(lines[1].split(',').count(), 10);
+        assert!(lines[0].starts_with("instrument,opened,closed,direction"));
+        assert_eq!(lines[0].split(',').count(), 11);
+        assert_eq!(lines[1].split(',').count(), 11);
     }
 
     #[test]
@@ -2187,9 +2244,23 @@ mod csv_tests {
 
         let line = trades_csv(&[open]).lines().nth(1).expect("one row").to_owned();
         let cells: Vec<&str> = line.split(',').collect();
-        assert_eq!(cells[1], "", "no close time");
-        assert_eq!(cells[5], "", "no exit price");
-        assert_eq!(cells[8], "", "no holding period");
+        assert_eq!(cells[2], "", "no close time");
+        assert_eq!(cells[6], "", "no exit price");
+        assert_eq!(cells[9], "", "no holding period");
+    }
+
+    #[test]
+    fn a_book_export_says_which_instrument_each_row_was_in() {
+        // Without it the file is a list of round trips from several
+        // instruments with no way to tell them apart, which is worse than
+        // useless: it looks complete.
+        let mut second = row("signal");
+        second.instrument = "MSFT.NASDAQ".to_owned();
+        let text = trades_csv(&[row("signal"), second]);
+        let lines: Vec<&str> = text.lines().collect();
+
+        assert!(lines[1].starts_with("AAPL.NASDAQ,"), "{}", lines[1]);
+        assert!(lines[2].starts_with("MSFT.NASDAQ,"), "{}", lines[2]);
     }
 
     #[test]
@@ -2567,5 +2638,123 @@ mod tests {
             "a study that assumes free fills is the optimistic one, and the engine honours \
              slippage now"
         );
+    }
+}
+
+#[cfg(test)]
+mod member_tests {
+    use super::*;
+
+    fn experiment(head: &str, rest: &[&str]) -> arvo_research::Experiment {
+        arvo_research::Experiment {
+            id: ExperimentId("book".to_owned()),
+            hypothesis: HypothesisId("h".to_owned()),
+            instrument: head.to_owned(),
+            alongside: rest.iter().map(|name| (*name).to_owned()).collect(),
+            window: DateRange::new(
+                chrono::NaiveDate::from_ymd_opt(2024, 1, 1).expect("valid"),
+                chrono::NaiveDate::from_ymd_opt(2024, 6, 1).expect("valid"),
+            )
+            .expect("ordered"),
+            interval: arvo_data::BarInterval::DAILY,
+            dataset: arvo_research::DatasetRef {
+                id: "bars".to_owned(),
+                version: "v1".to_owned(),
+            },
+            strategy: arvo_research::StrategySpec {
+                name: "sma_cross".to_owned(),
+                params: std::collections::BTreeMap::new(),
+            },
+            costs: arvo_research::CostModel::proportional(0.0, 0.0),
+            risk: arvo_research::RiskModel::default(),
+            starting_cash: 100_000.0,
+            seed: 7,
+        }
+    }
+
+    fn trade(instrument: &str, pnl: f64) -> arvo_research::Trade {
+        let opened = chrono::NaiveDate::from_ymd_opt(2024, 2, 1)
+            .expect("valid")
+            .and_time(chrono::NaiveTime::MIN);
+        arvo_research::Trade {
+            instrument: instrument.to_owned(),
+            opened,
+            closed: Some(opened + chrono::Duration::days(3)),
+            direction: arvo_research::Direction::Long,
+            quantity: 10.0,
+            entry: 100.0,
+            exit: Some(110.0),
+            pnl,
+            commission: 1.0,
+            exit_reason: arvo_research::ExitReason::Signal,
+        }
+    }
+
+    #[test]
+    fn a_member_that_never_traded_is_reported_rather_than_left_out() {
+        // The failure mode a shared account introduces. A row that is simply
+        // missing looks like an instrument nobody chose, when in fact it was
+        // chosen and could not be funded.
+        let book = experiment("AAPL.NASDAQ", &["MSFT.NASDAQ"]);
+        let split = members(&book, &[trade("AAPL.NASDAQ", 100.0)]);
+
+        assert_eq!(split.len(), 2, "both members belong in the table");
+        let quiet = split
+            .iter()
+            .find(|member| member.instrument == "MSFT.NASDAQ")
+            .expect("the silent member is still a member");
+        assert!(quiet.silent);
+        assert_eq!(quiet.trades, 0);
+    }
+
+    #[test]
+    fn shares_say_which_member_produced_the_return() {
+        // The single most useful question about a book, and the one its own
+        // headline return cannot answer.
+        let book = experiment("AAPL.NASDAQ", &["MSFT.NASDAQ"]);
+        let split = members(
+            &book,
+            &[
+                trade("AAPL.NASDAQ", 90.0),
+                trade("MSFT.NASDAQ", 10.0),
+            ],
+        );
+
+        let head = &split[0];
+        assert!(
+            (head.share.expect("a book that made money has shares") - 0.9).abs() < 1e-9,
+            "{:?}",
+            head.share
+        );
+    }
+
+    #[test]
+    fn a_book_that_realised_nothing_reports_no_share_rather_than_zero() {
+        // Winners and losers that cancel leave no denominator. Dividing by a
+        // total near zero hands out shares in the hundreds, which reads as a
+        // measurement rather than as the absence of one.
+        let book = experiment("AAPL.NASDAQ", &["MSFT.NASDAQ"]);
+        let split = members(
+            &book,
+            &[
+                trade("AAPL.NASDAQ", 100.0),
+                trade("MSFT.NASDAQ", -100.0),
+            ],
+        );
+
+        assert!(
+            split.iter().all(|member| member.share.is_none()),
+            "{split:?}"
+        );
+        // The P&L itself is still real and still reported.
+        assert!((split[0].pnl - 100.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_single_instrument_study_has_no_member_table() {
+        // Its whole ledger is its one instrument, so the table would be a
+        // column of the same name repeated.
+        let study = experiment("AAPL.NASDAQ", &[]);
+        assert!(members(&study, &[trade("AAPL.NASDAQ", 100.0)]).is_empty());
     }
 }
