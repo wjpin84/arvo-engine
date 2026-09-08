@@ -1231,11 +1231,44 @@ const WATCHLIST_LIMIT: usize = 30;
 ///
 /// Deduplicated, because an instrument you both hold and have bars for is one
 /// row, and a watchlist that listed it twice would be visibly wrong.
-fn watchlist_symbols(held: BTreeSet<String>, library: Vec<String>) -> Vec<String> {
+fn watchlist_symbols(held: &BTreeSet<String>, library: Vec<String>) -> Vec<String> {
     let mut chosen: Vec<String> = held.iter().cloned().collect();
     chosen.extend(library.into_iter().filter(|id| !held.contains(id)));
+
+    // By bare ticker, not by instrument id. The rows, the subscription and the
+    // arriving tick all key on the ticker, so `AAPL.SCHWAB` from a statement
+    // and `AAPL.RH` from a fetch are two ids and one row DASH and keeping both
+    // renders AAPL twice, moving in lockstep, one of them flagged as held.
+    let mut seen = std::collections::HashSet::new();
+    chosen.retain(|id| seen.insert(symbol_only(id)));
+
     chosen.truncate(WATCHLIST_LIMIT);
     chosen
+}
+
+/// Whether Arvo has grounds to believe this id names something with a market.
+///
+/// Held instruments came from a real statement and fetched ones came from the
+/// broker, so both name securities that exist. Anything else in the library is
+/// a file somebody put there, and the venue in its name is whatever they typed.
+///
+/// This matters because pricing strips the venue: `symbol_only` turns
+/// `DRIFT.SIM` into `DRIFT`, and both the quote call and the socket will
+/// happily answer for a listed ticker of that name. A synthetic fixture would
+/// then display a real market price, moving, under the name of a series that
+/// was generated. That is the worst shape a wrong number can take DASH it is
+/// not implausible, it is not flagged, and it is exactly as convincing as a
+/// right one.
+///
+/// The cost of being wrong the other way is a real instrument in a
+/// hand-dropped CSV showing its last close instead of a live price. The row is
+/// still there and the backtests are unaffected. That is the cheaper mistake,
+/// so it is the one this makes.
+fn is_priceable(instrument: &str, held: &BTreeSet<String>) -> bool {
+    held.contains(instrument)
+        || instrument
+            .rsplit_once('.')
+            .is_some_and(|(_, venue)| venue == crate::feed::FETCHED_VENUE)
 }
 
 /// The bare ticker in an instrument id: `AAPL.RH` -> `AAPL`.
@@ -1286,15 +1319,24 @@ pub async fn watchlist(
 ) -> Result<Vec<QuoteView>, CommandError> {
     let held = portfolios.held();
     let library = service.bars.instruments().unwrap_or_default();
-    let chosen = watchlist_symbols(held.clone(), library);
+    let chosen = watchlist_symbols(&held, library);
+
+    // Only the rows there is any reason to think name a real security. The
+    // rest still appear — they are what you have data for — they simply are
+    // never claimed to have a market price. See `is_priceable`.
+    let priceable: Vec<String> = chosen
+        .iter()
+        .filter(|id| is_priceable(id, &held))
+        .cloned()
+        .collect();
 
     // Before the quote call rather than after: if the broker session is dead
     // the snapshot below fails, and the stream — which needs no broker at all
     // — is the only thing that can still price these rows.
-    stream.watch(chosen.iter().map(|id| symbol_only(id)).collect());
+    stream.watch(priceable.iter().map(|id| symbol_only(id)).collect());
 
     let priced: std::collections::HashMap<String, crate::feed::Quote> =
-        match crate::feed::quotes(&chosen).await {
+        match crate::feed::quotes(&priceable).await {
             Ok(quotes) => quotes
                 .into_iter()
                 .map(|quote| (quote.instrument.clone(), quote))
@@ -2848,7 +2890,7 @@ mod chart_tests {
 
 #[cfg(test)]
 mod watchlist_tests {
-    use super::{watchlist_symbols, WATCHLIST_LIMIT};
+    use super::{is_priceable, symbol_only, watchlist_symbols, WATCHLIST_LIMIT};
     use std::collections::BTreeSet;
 
     fn set(ids: &[&str]) -> BTreeSet<String> {
@@ -2860,8 +2902,61 @@ mod watchlist_tests {
     }
 
     #[test]
+    fn one_ticker_under_two_venues_is_one_row() {
+        // The rows, the subscription and the arriving tick all key on the bare
+        // ticker. A statement filed under one venue and a fetch filed under
+        // another are two ids and one security, and keeping both renders AAPL
+        // twice, moving in lockstep, one of them flagged as held.
+        let chosen = watchlist_symbols(
+            &set(&["AAPL.SCHWAB"]),
+            list(&["AAPL.RH", "MSFT.RH"]),
+        );
+        let tickers: Vec<String> = chosen.iter().map(|id| symbol_only(id)).collect();
+        assert_eq!(tickers, vec!["AAPL", "MSFT"], "{chosen:?}");
+        // The held one wins, because holdings are listed first.
+        assert_eq!(chosen[0], "AAPL.SCHWAB");
+    }
+
+    #[test]
+    fn a_synthetic_fixture_is_never_asked_for_a_market_price() {
+        // The worst shape a wrong number can take. Pricing strips the venue,
+        // so `DRIFT.SIM` is asked for as `DRIFT` — and there is nothing
+        // stopping a quote service answering for a listed ticker of that name.
+        // The row would then show a real, moving, market price under the name
+        // of a series that was generated, as convincing as a right one.
+        let held = set(&["MSFT.RH"]);
+        assert!(!is_priceable("DRIFT.SIM", &held));
+        assert!(!is_priceable("TREND.SIM", &held));
+        assert!(!is_priceable("NOISE.SIM", &held));
+    }
+
+    #[test]
+    fn what_the_broker_supplied_or_you_actually_hold_is_priceable() {
+        // Held came from a real statement; fetched came from the broker. Both
+        // name securities that exist.
+        let held = set(&["VTSAX.VANGUARD"]);
+        assert!(is_priceable("VTSAX.VANGUARD", &held), "a real holding");
+        assert!(is_priceable("MSFT.RH", &held), "fetched from the broker");
+    }
+
+    #[test]
+    fn a_hand_dropped_csv_still_gets_a_row_even_though_it_gets_no_live_price() {
+        // The cheaper mistake, made deliberately. A real instrument in a
+        // hand-dropped CSV shows its last close rather than a live price; the
+        // row is still there and every backtest is unaffected.
+        let chosen = watchlist_symbols(&BTreeSet::new(), list(&["DRIFT.SIM", "MSFT.RH"]));
+        assert!(chosen.contains(&"DRIFT.SIM".to_owned()), "{chosen:?}");
+        assert!(!is_priceable("DRIFT.SIM", &BTreeSet::new()));
+    }
+
+    #[test]
+    fn an_instrument_with_no_venue_at_all_is_not_assumed_real() {
+        assert!(!is_priceable("AAPL", &BTreeSet::new()));
+    }
+
+    #[test]
     fn what_you_hold_comes_first() {
-        let chosen = watchlist_symbols(set(&["MSFT.RH"]), list(&["AAPL.RH", "TSLA.RH"]));
+        let chosen = watchlist_symbols(&set(&["MSFT.RH"]), list(&["AAPL.RH", "TSLA.RH"]));
         assert_eq!(chosen.first().map(String::as_str), Some("MSFT.RH"));
         assert_eq!(chosen.len(), 3);
     }
@@ -2870,7 +2965,7 @@ mod watchlist_tests {
     /// twice would be visibly wrong, and would waste a slot under the cap.
     #[test]
     fn an_instrument_held_and_downloaded_appears_once() {
-        let chosen = watchlist_symbols(set(&["MSFT.RH"]), list(&["MSFT.RH", "AAPL.RH"]));
+        let chosen = watchlist_symbols(&set(&["MSFT.RH"]), list(&["MSFT.RH", "AAPL.RH"]));
         assert_eq!(chosen, list(&["MSFT.RH", "AAPL.RH"]));
     }
 
@@ -2884,7 +2979,7 @@ mod watchlist_tests {
             .map(|i| format!("LIB{i}.RH"))
             .collect();
 
-        let chosen = watchlist_symbols(held.clone(), library);
+        let chosen = watchlist_symbols(&held, library);
 
         assert_eq!(chosen.len(), WATCHLIST_LIMIT);
         for owned in &held {
@@ -2894,7 +2989,7 @@ mod watchlist_tests {
 
     #[test]
     fn nothing_held_and_nothing_downloaded_asks_for_no_quotes() {
-        assert!(watchlist_symbols(BTreeSet::new(), Vec::new()).is_empty());
+        assert!(watchlist_symbols(&BTreeSet::new(), Vec::new()).is_empty());
     }
 }
 
