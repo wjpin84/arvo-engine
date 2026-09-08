@@ -41,6 +41,7 @@
 mod indicator;
 mod rules;
 
+use nautilus_common::actor::DataActorNative;
 use nautilus_model::{enums::OrderSide, identifiers::InstrumentId, types::Quantity};
 use nautilus_trading::strategy::{Strategy, StrategyNative};
 
@@ -68,6 +69,9 @@ pub(crate) struct Risk {
     /// How far the account may fall below its own peak before the rule stops,
     /// as a fraction.
     pub(crate) max_drawdown: Option<f64>,
+    /// The most positions the account may hold at once, across every member of
+    /// a book.
+    pub(crate) max_concurrent_positions: Option<usize>,
 }
 
 /// The long position a strategy is managing, and the levels around it.
@@ -220,7 +224,7 @@ impl Position {
 /// A trait rather than free functions because the bodies need the strategy's
 /// own `order()`, `submit_order()` and `portfolio()`, which only exist on a
 /// registered Nautilus component.
-pub(crate) trait Managed: Strategy + StrategyNative {
+pub(crate) trait Managed: Strategy + StrategyNative + DataActorNative {
     fn position(&self) -> &Position;
     fn position_mut(&mut self) -> &mut Position;
     fn instrument(&self) -> InstrumentId;
@@ -236,6 +240,9 @@ pub(crate) trait Managed: Strategy + StrategyNative {
         atr: Option<f64>,
         target: Option<f64>,
     ) -> anyhow::Result<bool> {
+        if self.at_position_limit() {
+            return Ok(false);
+        }
         let Some((size, stop)) = self.position().plan(price, atr) else {
             return Ok(false);
         };
@@ -247,6 +254,28 @@ pub(crate) trait Managed: Strategy + StrategyNative {
         }
         self.send(OrderSide::Buy, size, None)?;
         Ok(true)
+    }
+
+    /// Whether the account already holds as many positions as it may.
+    ///
+    /// Asked of the engine, not of this strategy. A book's members are
+    /// separate strategy instances sharing one account and knowing nothing of
+    /// each other, so each counting only its own position would give N caps of
+    /// one and cap nothing at all.
+    ///
+    /// A strategy already holding something is not blocked by the limit: it is
+    /// one of the positions being counted, and refusing it here would stop a
+    /// rule managing what it already owns.
+    fn at_position_limit(&self) -> bool {
+        let Some(limit) = self.position().risk.max_concurrent_positions else {
+            return false;
+        };
+        if self.position().is_open() {
+            return false;
+        }
+        self.cache()
+            .positions_open_count(None, None, None, None, None)
+            >= limit
     }
 
     /// Closes whatever is held. Does nothing when flat.
@@ -423,6 +452,7 @@ mod tests {
         risk_amount: None,
         max_position_value: None,
         max_drawdown: None,
+        max_concurrent_positions: None,
     };
 
     #[test]
@@ -484,6 +514,7 @@ mod tests {
         risk_amount: None,
         max_position_value: None,
         max_drawdown: Some(0.10),
+        max_concurrent_positions: None,
     };
 
     #[test]

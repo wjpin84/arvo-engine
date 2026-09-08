@@ -352,7 +352,13 @@ pub(crate) fn ResearchView(
         set_error.set(None);
         spawn_local(async move {
             let args = serde_wasm_bindgen::to_value(
-                    &serde_json::json!({ "instruments" : members }),
+                    &serde_json::json!({
+                        "instruments" : members,
+                        // Uncapped, as every run before books was. A cap is a
+                        // decision about how much of the account one idea may
+                        // occupy, and the workbench has nowhere to ask yet.
+                        "maxConcurrentPositions" : Option::< usize >::None,
+                    }),
                 )
                 .unwrap_or(JsValue::UNDEFINED);
             match call_typed::<StudyView>("run_book", args).await {

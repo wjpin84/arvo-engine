@@ -778,6 +778,17 @@ pub async fn run_study(
 /// running the members over different spans would make the shared balance a
 /// fiction.
 ///
+/// `max_concurrent_positions` is the most the account may hold at once across
+/// every member. `None` is uncapped, which is what every run before books did
+/// and what the workbench sends today — deliberately not defaulted to a
+/// number, because a cap is a decision about how much of the account one idea
+/// may occupy and inventing one here would change every result without being
+/// asked.
+///
+/// Uncapped is not unlimited in practice: the account still runs out of cash.
+/// But that is a fact about the balance rather than a risk decision, and the
+/// two are worth not confusing for each other.
+///
 /// # Errors
 ///
 /// Returns [`CommandError`] if fewer than two instruments were named, if any
@@ -787,6 +798,7 @@ pub async fn run_study(
 pub async fn run_book(
     instruments: Vec<String>,
     strategy: Option<String>,
+    max_concurrent_positions: Option<usize>,
     service: tauri::State<'_, ResearchService>,
 ) -> Result<StudyView, CommandError> {
     if instruments.len() < 2 {
@@ -852,6 +864,7 @@ pub async fn run_book(
         // held alongside. `ExperimentFamily` varies parameters, not
         // instruments, so setting this on the template sets it for every trial.
         family.template.alongside = instruments[1..].to_vec();
+        family.template.risk.max_concurrent_positions = max_concurrent_positions;
         family.template.id = ExperimentId(format!("book-{}", instruments.join("+")));
         family.template.hypothesis = HypothesisId(format!(
             "{} predicts returns across {} instruments sharing one account",

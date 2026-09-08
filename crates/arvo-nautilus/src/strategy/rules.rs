@@ -138,6 +138,7 @@ impl BuyAndHold {
                     // strategy, and every excess return measured against it
                     // would be measured against the wrong thing.
                     max_drawdown: None,
+                max_concurrent_positions: None,
                 },
                 trade_size,
             ),

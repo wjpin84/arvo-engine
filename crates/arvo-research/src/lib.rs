@@ -274,6 +274,23 @@ pub struct RiskModel {
     /// finish, and the ledger's last trade says so.
     #[serde(default)]
     pub max_drawdown: Option<f64>,
+    /// The most positions the account may hold at once, across every
+    /// instrument in the run.
+    ///
+    /// Only reachable once a run could hold more than one instrument. Before
+    /// books there was one position or none and the question could not arise;
+    /// now a rule pointed at eight instruments can be in all eight, and the
+    /// only thing that stops it is running out of cash — which is a fact about
+    /// the account, not a risk decision.
+    ///
+    /// Counted against what the *engine* holds rather than what any one
+    /// strategy believes it holds. The members of a book are separate strategy
+    /// instances that share an account and know nothing of each other, so a
+    /// cap kept per strategy would be N caps of one.
+    ///
+    /// `None` is no limit, which is every run recorded before this existed.
+    #[serde(default)]
+    pub max_concurrent_positions: Option<usize>,
 }
 
 impl Default for RiskModel {
@@ -290,6 +307,11 @@ impl Default for RiskModel {
             // much of an idea you are willing to fund before concluding it is
             // wrong, and inventing one would silently change every result.
             max_drawdown: None,
+            // No cap either, for the same reason: a limit on concurrent
+            // positions is a decision about how much of the account one idea
+            // may occupy, and choosing one here would change every book that
+            // has ever run without anyone asking for it.
+            max_concurrent_positions: None,
         }
     }
 }

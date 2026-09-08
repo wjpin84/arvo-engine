@@ -536,6 +536,7 @@ fn run_backtest(
             .max_position_fraction
             .map(|fraction| fraction * experiment.starting_cash),
         max_drawdown: experiment.risk.max_drawdown,
+        max_concurrent_positions: experiment.risk.max_concurrent_positions,
     };
 
     // One strategy instance per instrument, all settling against the one
@@ -1286,6 +1287,7 @@ mod tests {
             risk_per_trade: None,
             max_position_fraction: Some(1.0),
             max_drawdown: Some(0.05),
+            max_concurrent_positions: None,
         };
 
         let result = provider(bars.clone()).run(&experiment).expect("runs");
@@ -1337,6 +1339,7 @@ mod tests {
             risk_per_trade: None,
             max_position_fraction: Some(1.0),
             max_drawdown: None,
+            max_concurrent_positions: None,
         };
 
         let result = provider(bars).run(&experiment).expect("runs");
@@ -1718,6 +1721,7 @@ mod tests {
             risk_per_trade: Some(0.01),
             max_position_fraction: Some(1.0),
             max_drawdown: None,
+            max_concurrent_positions: None,
         };
 
         let result = intraday_provider(bars.clone()).run(&experiment).expect("runs");
@@ -1874,6 +1878,95 @@ mod tests {
             held(&simulation.run(&cramped_bench).expect("runs")) < 3,
             "an account with room for one cannot buy and hold three"
         );
+    }
+
+    /// Counts how many of a book's instruments were held at the same instant.
+    ///
+    /// From the ledger's own open/close times rather than from anything the
+    /// strategies reported, so it measures what the account actually did.
+    fn peak_concurrent(result: &arvo_research::SimulationResult) -> usize {
+        let mut edges: Vec<(chrono::NaiveDateTime, i32)> = Vec::new();
+        for trade in &result.ledger {
+            edges.push((trade.opened, 1));
+            if let Some(closed) = trade.closed {
+                edges.push((closed, -1));
+            }
+        }
+        // Closes before opens at the same instant: a position that ended on
+        // the bar another began did not overlap with it.
+        edges.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+        let (mut live, mut peak) = (0, 0);
+        for (_, delta) in edges {
+            live += delta;
+            peak = peak.max(live);
+        }
+        usize::try_from(peak).unwrap_or(0)
+    }
+
+    #[test]
+    fn a_position_cap_binds_across_a_books_separate_strategies() {
+        // The control and the cap in one test, because the cap only means
+        // something if the uncapped run exceeded it. A book's members are
+        // separate strategy instances that know nothing of each other, so a
+        // cap counted per strategy would be three caps of one and would bind
+        // nothing.
+        let bars = sawtooth(200);
+        let names = ["AAPL.NASDAQ", "MSFT.NASDAQ", "NVDA.NASDAQ"];
+        let simulation = book_provider(&names, &bars);
+
+        let mut uncapped = experiment(params(10.0, 30.0), &bars);
+        uncapped.alongside = names[1..].iter().map(|n| (*n).to_owned()).collect();
+        let free = simulation.run(&uncapped).expect("runs");
+        assert!(
+            peak_concurrent(&free) > 1,
+            "the fixture has to hold more than one at once for a cap to mean anything"
+        );
+
+        let mut capped = uncapped.clone();
+        capped.risk.max_concurrent_positions = Some(1);
+        let held = simulation.run(&capped).expect("runs");
+        assert_eq!(
+            peak_concurrent(&held),
+            1,
+            "a cap of one must hold across every member of the book"
+        );
+    }
+
+    #[test]
+    fn a_cap_does_not_stop_a_rule_managing_what_it_already_holds() {
+        // A strategy already holding something is one of the positions being
+        // counted. Blocking it would leave a rule unable to stop out or take
+        // its target — a cap that traps capital instead of limiting it.
+        let bars = sawtooth(200);
+        let mut experiment = experiment(params(10.0, 30.0), &bars);
+        experiment.risk.max_concurrent_positions = Some(1);
+
+        let result = provider(bars).run(&experiment).expect("runs");
+        assert!(
+            result.trades > 1,
+            "a single instrument under a cap of one still trades repeatedly, got {}",
+            result.trades
+        );
+        assert!(
+            result.ledger.iter().filter(|t| t.closed.is_some()).count() > 1,
+            "positions must still close under a cap"
+        );
+    }
+
+    #[test]
+    fn no_cap_is_the_behaviour_every_recorded_run_had() {
+        // `None` has to leave the engine untouched, or every stored finding
+        // becomes unreproducible at once.
+        let bars = sawtooth(200);
+        let experiment = experiment(params(10.0, 30.0), &bars);
+        assert!(experiment.risk.max_concurrent_positions.is_none());
+
+        let result = provider(bars.clone()).run(&experiment).expect("runs");
+        let mut explicit = experiment.clone();
+        explicit.risk.max_concurrent_positions = None;
+        let again = provider(bars).run(&explicit).expect("runs");
+
+        assert_eq!(result.trades, again.trades);
     }
 
     #[test]
