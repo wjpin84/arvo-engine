@@ -63,6 +63,14 @@ const PANEL_MAJORITY: f64 = 0.5;
 /// however good it looks.
 const FOLD_SELECTION_SHARE: f64 = 0.5;
 
+/// Above this share of the window spent holding, the dividend gap between a
+/// strategy and buy-and-hold is too small to be worth a line.
+///
+/// A strategy in the market 95% of the time forgoes 95% of the dividends the
+/// benchmark also forgoes, so the two are biased almost identically and the
+/// comparison is very nearly fair. Below it, the gap grows with every day out.
+const EXPOSURE_WORTH_SAYING: f64 = 0.9;
+
 /// Below this modal share, a parameter axis is being chosen at random.
 ///
 /// If the most commonly selected value on an axis wins fewer than half the
@@ -295,6 +303,29 @@ pub fn recommend(found: &FamilyEvidence) -> Vec<Recommendation> {
                 criteria.max_drawdown * 100.0
             ),
         ));
+    }
+
+    if let Some(exposure) = time_in_market(found) {
+        if exposure < EXPOSURE_WORTH_SAYING {
+            // The bias nothing else here can see, and it always points the
+            // same way: in the strategy's favour.
+            out.push(Recommendation::new(
+                Severity::Warning,
+                "The excess return is flattered by dividends neither side received.",
+                "Treat the margin over buy-and-hold as smaller than it reads, by roughly \
+                 the instrument's dividend yield times the share of the window this rule \
+                 sat out. Prices here are split-adjusted but not total-return adjusted, so \
+                 no dividend is paid to anything — and the benchmark holds through every \
+                 ex-date while this rule holds through only some.",
+                format!(
+                    "in the market {:.0}% of the window against the benchmark's 100%, so \
+                     about {:.0}% of the period's dividends are missing from the benchmark \
+                     and not from the strategy",
+                    exposure * 100.0,
+                    (1.0 - exposure) * 100.0,
+                ),
+            ));
+        }
     }
 
     // ---- notes -----------------------------------------------------------
@@ -633,6 +664,37 @@ pub fn recommend_walk_forward(found: &WalkForwardEvidence) -> Vec<Recommendation
 
     out.sort_by_key(|item| item.severity);
     out
+}
+
+/// What share of the window the rule actually held something.
+///
+/// The denominator is the window times the number of instruments, so a book
+/// whose members can hold at once is measured as average exposure per member
+/// rather than being allowed to exceed one.
+///
+/// `None` when nothing closed, or the window has no length — there is no
+/// exposure to speak of, and inventing a zero would fire this on every run
+/// that did not trade.
+fn time_in_market(found: &FamilyEvidence) -> Option<f64> {
+    let experiment = &found.out_of_sample_evidence.experiment;
+    let trades = &found.out_of_sample_evidence.evaluation.strategy_trades;
+
+    let held = trades.average_holding_secs? * f64::from(trades.closed);
+    if trades.closed == 0 {
+        return None;
+    }
+
+    let days = (experiment.window.to - experiment.window.from).num_days();
+    if days <= 0 {
+        return None;
+    }
+    #[expect(clippy::cast_precision_loss, reason = "windows are years, not eons")]
+    let window = days as f64 * 86_400.0 * experiment.instruments().len() as f64;
+
+    // Clamped rather than trusted. Holding periods are measured to the bar and
+    // the window to the day, so a rule that is in the market continuously can
+    // round to just over one.
+    Some((held / window).clamp(0.0, 1.0))
 }
 
 /// How many instruments the benchmark held, when that is fewer than the book
@@ -1376,6 +1438,70 @@ mod tests {
         let out = recommend(&study);
         assert!(
             !out.iter().any(|item| item.finding.contains("benchmark could not hold")),
+            "{}",
+            findings(&out)
+        );
+    }
+
+    #[test]
+    fn a_rule_that_sits_out_most_of_the_window_is_told_the_margin_is_flattered() {
+        // The bias nothing else here can see, and it always favours the
+        // strategy: prices are split-adjusted but not total-return adjusted,
+        // so no dividend is paid to anything — and the benchmark holds through
+        // every ex-date while the rule holds through only some.
+        let mut study = book_study(&["AAPL.NASDAQ"]);
+        study.out_of_sample_evidence.experiment.alongside.clear();
+        study.out_of_sample_evidence.experiment.window = crate::DateRange::new(
+            chrono::NaiveDate::from_ymd_opt(2024, 1, 1).expect("valid"),
+            chrono::NaiveDate::from_ymd_opt(2024, 12, 31).expect("valid"),
+        )
+        .expect("ordered");
+        let trades = &mut study.out_of_sample_evidence.evaluation.strategy_trades;
+        trades.closed = 10;
+        // Ten trades of three days each across a year: about 8% of it.
+        trades.average_holding_secs = Some(3.0 * 86_400.0);
+
+        let out = recommend(&study);
+        let item = out
+            .iter()
+            .find(|item| item.finding.contains("flattered by dividends"))
+            .unwrap_or_else(|| panic!("{}", findings(&out)));
+        assert_eq!(item.severity, Severity::Warning);
+        assert!(item.evidence.contains("8%"), "{}", item.evidence);
+    }
+
+    #[test]
+    fn a_rule_that_is_always_in_the_market_is_not_warned() {
+        // It forgoes the same dividends the benchmark does, so the comparison
+        // is very nearly fair and the line would be noise.
+        let mut study = book_study(&["AAPL.NASDAQ"]);
+        study.out_of_sample_evidence.experiment.alongside.clear();
+        study.out_of_sample_evidence.experiment.window = crate::DateRange::new(
+            chrono::NaiveDate::from_ymd_opt(2024, 1, 1).expect("valid"),
+            chrono::NaiveDate::from_ymd_opt(2024, 12, 31).expect("valid"),
+        )
+        .expect("ordered");
+        let trades = &mut study.out_of_sample_evidence.evaluation.strategy_trades;
+        trades.closed = 1;
+        trades.average_holding_secs = Some(365.0 * 86_400.0);
+
+        let out = recommend(&study);
+        assert!(
+            !out.iter().any(|item| item.finding.contains("flattered by dividends")),
+            "{}",
+            findings(&out)
+        );
+    }
+
+    #[test]
+    fn a_run_that_never_closed_a_trade_makes_no_exposure_claim() {
+        // Zero exposure would fire this on every run that did not trade, where
+        // the trade-count bar has already said the only useful thing.
+        let mut study = book_study(&["AAPL.NASDAQ"]);
+        study.out_of_sample_evidence.evaluation.strategy_trades = TradeStats::default();
+        let out = recommend(&study);
+        assert!(
+            !out.iter().any(|item| item.finding.contains("flattered by dividends")),
             "{}",
             findings(&out)
         );
