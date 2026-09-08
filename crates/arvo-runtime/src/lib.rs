@@ -15,6 +15,7 @@ pub mod research;
 pub mod scheduler;
 pub mod session;
 pub mod stream;
+pub mod yahoo;
 
 use arvo_core::config;
 use arvo_plugin_host::registry;
