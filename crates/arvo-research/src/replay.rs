@@ -111,6 +111,17 @@ pub fn replay(
     record: &Record,
     current_dataset_version: Option<&str>,
 ) -> Replay {
+    // A panel and a walk-forward are procedures, not single runs: replaying
+    // one means performing the whole procedure again, so they take their own
+    // paths below rather than pretending to be one experiment.
+    match record {
+        Record::Panel(evidence) => return replay_panel(provider, evidence, current_dataset_version),
+        Record::WalkForward(evidence) => {
+            return replay_walk_forward(provider, evidence, current_dataset_version)
+        }
+        Record::Study(_) => {}
+    }
+
     let Some(evidence) = replayable(record) else {
         return Replay::NotReplayable {
             why: format!(
@@ -160,14 +171,239 @@ pub fn replay(
     }
 }
 
-/// The stored evidence a finding can be checked against, if it kept any.
+/// Runs a panel's whole study again and compares what it concluded.
 ///
-/// Only a study keeps the curve behind its numbers. A panel deliberately does
-/// not — storing every member's curve would add megabytes to say what its
-/// correlation matrix says in a few numbers — and a walk-forward's stitched
-/// curve is assembled from folds rather than produced by one run, so neither
-/// can be checked by running a single experiment. Saying so is more useful
-/// than silently reporting them as fine.
+/// Costs the entire panel — the grid on every instrument in-sample, then
+/// the winner and its benchmark out-of-sample on each. Far more than a study's
+/// single run, and the honest price of checking a procedure rather than a
+/// result.
+///
+/// Compared on the pooled figures rather than on curves, because those are
+/// what a panel *is*: the per-instrument curves were deliberately never
+/// stored, and the pooled numbers are the claim anybody read.
+fn replay_panel(
+    provider: &dyn SimulationProvider,
+    evidence: &crate::PanelEvidence,
+    current_dataset_version: Option<&str>,
+) -> Replay {
+    let Some(study) = &evidence.study else {
+        return Replay::NotReplayable {
+            why: "this panel was recorded before the study behind it was kept, so there is \
+                  nothing to run again"
+                .to_owned(),
+        };
+    };
+
+    if let Some(changed) = data_or_engine_changed(
+        provider,
+        &evidence.dataset.version,
+        // A panel's engine is not stored on the panel; every member ran on
+        // whatever the build supplied, and a divergence caused by a different
+        // engine would show up as a divergence. Named here so that is a stated
+        // limitation rather than an omission.
+        None,
+        current_dataset_version,
+    ) {
+        return changed;
+    }
+
+    let found = match crate::run_panel(provider, study, &crate::EvaluationCriteria::default()) {
+        Ok(found) => found,
+        Err(error) => {
+            return Replay::Failed {
+                error: error.to_string(),
+            }
+        }
+    };
+
+    // Trades first: a different count means different runs, and every pooled
+    // average after it would be an average of something else.
+    if found.pooled.total_trades != evidence.pooled.total_trades {
+        return Replay::Diverged(Divergence {
+            what: "the panel traded a different number of times".to_owned(),
+            at: None,
+            when: None,
+            recorded: f64::from(evidence.pooled.total_trades),
+            replayed: f64::from(found.pooled.total_trades),
+            relative: 1.0,
+        });
+    }
+
+    if !agrees(evidence.pooled.mean_excess_return, found.pooled.mean_excess_return) {
+        return Replay::Diverged(Divergence {
+            what: "the panel's mean excess return moved".to_owned(),
+            at: None,
+            when: None,
+            recorded: evidence.pooled.mean_excess_return,
+            replayed: found.pooled.mean_excess_return,
+            relative: (found.pooled.mean_excess_return - evidence.pooled.mean_excess_return).abs(),
+        });
+    }
+
+    if found.selected_params != evidence.selected_params {
+        return Replay::Diverged(Divergence {
+            what: "the search chose a different configuration".to_owned(),
+            at: None,
+            when: None,
+            recorded: 0.0,
+            replayed: 0.0,
+            relative: 1.0,
+        });
+    }
+
+    Replay::Reproduced {
+        points: found.pooled.instruments,
+        trades: found.pooled.total_trades,
+    }
+}
+
+/// Runs a walk-forward's whole procedure again and compares what it concluded.
+///
+/// The stitched curve is stored, but the folds are what produced it, so the
+/// comparison is on the procedure's own findings: how many folds there were,
+/// how many of them selected above the no-skill bar, and where the combined
+/// track record ended.
+fn replay_walk_forward(
+    provider: &dyn SimulationProvider,
+    evidence: &crate::WalkForwardEvidence,
+    current_dataset_version: Option<&str>,
+) -> Replay {
+    let Some(grid) = &evidence.grid else {
+        return Replay::NotReplayable {
+            why: "this run was recorded before the grid it searched was kept, so the \
+                  procedure cannot be performed again"
+                .to_owned(),
+        };
+    };
+
+    if let Some(changed) = data_or_engine_changed(
+        provider,
+        &evidence.template.dataset.version,
+        None,
+        current_dataset_version,
+    ) {
+        return changed;
+    }
+
+    let plan = crate::WalkForward {
+        hypothesis: evidence.hypothesis.clone(),
+        template: evidence.template.clone(),
+        grid: grid.clone(),
+        in_sample_days: evidence.in_sample_days,
+        step_days: evidence.step_days,
+        anchored: evidence.anchored,
+    };
+
+    let found =
+        match crate::run_walk_forward(provider, &plan, &crate::EvaluationCriteria::default()) {
+            Ok(found) => found,
+            Err(error) => {
+                return Replay::Failed {
+                    error: error.to_string(),
+                }
+            }
+        };
+
+    if found.folds.len() != evidence.folds.len() {
+        return Replay::Diverged(Divergence {
+            what: "the procedure produced a different number of folds".to_owned(),
+            at: None,
+            when: None,
+            recorded: found.folds.len() as f64,
+            replayed: evidence.folds.len() as f64,
+            relative: 1.0,
+        });
+    }
+
+    if found.folds_surviving_deflation != evidence.folds_surviving_deflation {
+        return Replay::Diverged(Divergence {
+            what: "a different number of folds selected above the no-skill bar".to_owned(),
+            at: None,
+            when: None,
+            recorded: evidence.folds_surviving_deflation as f64,
+            replayed: found.folds_surviving_deflation as f64,
+            relative: 1.0,
+        });
+    }
+
+    if !agrees(evidence.combined.total_return, found.combined.total_return) {
+        return Replay::Diverged(Divergence {
+            what: "the combined track record ended somewhere else".to_owned(),
+            at: None,
+            when: None,
+            recorded: evidence.combined.total_return,
+            replayed: found.combined.total_return,
+            relative: (found.combined.total_return - evidence.combined.total_return).abs(),
+        });
+    }
+
+    Replay::Reproduced {
+        points: found.folds.len(),
+        trades: found.combined.trades,
+    }
+}
+
+/// Whether two independently produced figures agree.
+///
+/// Replay's own tolerance, not `reconcile`'s: that one absorbs per-fill
+/// currency rounding inside a single run, and this one absorbs the
+/// accumulation order of a run performed twice. They are different quantities
+/// and sharing a constant between them would tie two unrelated decisions
+/// together.
+fn agrees(recorded: f64, replayed: f64) -> bool {
+    (replayed - recorded).abs() / recorded.abs().max(1.0) <= TOLERANCE
+}
+
+/// The two checks that come before any re-run, shared by all three kinds.
+///
+/// `recorded_engine` is `None` where the record does not pin one. A panel and
+/// a walk-forward do not: every member ran on whatever the build supplied, so
+/// an engine change shows up as a divergence rather than as its own answer.
+/// Stated rather than silently skipped.
+fn data_or_engine_changed(
+    provider: &dyn SimulationProvider,
+    recorded_dataset: &str,
+    recorded_engine: Option<&str>,
+    current_dataset_version: Option<&str>,
+) -> Option<Replay> {
+    match current_dataset_version {
+        None => {
+            return Some(Replay::DataChanged {
+                recorded: recorded_dataset.to_owned(),
+                current: "not on disk".to_owned(),
+            })
+        }
+        Some(current) if current != recorded_dataset => {
+            return Some(Replay::DataChanged {
+                recorded: recorded_dataset.to_owned(),
+                current: current.to_owned(),
+            })
+        }
+        Some(_) => {}
+    }
+
+    match recorded_engine {
+        Some(engine) if engine != provider.engine() => Some(Replay::EngineChanged {
+            recorded: engine.to_owned(),
+            current: provider.engine().to_owned(),
+        }),
+        _ => None,
+    }
+}
+
+/// The stored evidence a study can be checked against.
+///
+/// Studies only: a panel and a walk-forward are procedures rather than single
+/// runs, and are replayed by performing the procedure again — see
+/// `replay_panel` and `replay_walk_forward`.
+///
+/// This used to say that neither could be checked at all, on the grounds that
+/// a panel stores no member curves and a walk-forward's curve is stitched
+/// rather than produced by one run. Both facts are true and neither was the
+/// obstacle. The comparison targets were always there — pooled figures,
+/// fold counts, the combined return. What was missing was the *inputs*: a
+/// panel kept no template, instruments or grid, and a walk-forward kept no
+/// grid, so nobody could re-derive the run that produced any of it.
 fn replayable(record: &Record) -> Option<&Evidence> {
     match record {
         Record::Study(evidence) => Some(&evidence.out_of_sample_evidence),
@@ -507,6 +743,8 @@ mod tests {
         assert!(!outcome.holds());
     }
 
+    /// A panel carrying a study but no usable engine still refuses honestly
+    /// rather than claiming a pass.
     #[test]
     fn a_panel_says_why_it_cannot_be_checked_instead_of_reporting_success() {
         let record = Record::Panel(Box::new(crate::PanelEvidence {
@@ -542,6 +780,7 @@ mod tests {
             },
             breadth: None,
             book: None,
+            study: None,
             failures: Vec::new(),
             verdict: crate::Verdict::Inconclusive,
             reasons: Vec::new(),
@@ -551,6 +790,143 @@ mod tests {
             panic!("a panel keeps no curve to check against");
         };
         assert!(why.contains("panel"), "{why}");
+    }
+
+    #[test]
+    fn a_panel_recorded_before_its_study_was_kept_says_so_rather_than_passing() {
+        // Every panel already on disk is one of these. The record pinned the
+        // dataset, the winning parameters and every outcome, and not the
+        // template, the instruments, the grid or the split — so there is
+        // nothing to run again, and a clean bill would be a lie about work
+        // that was never done.
+        let record = panel_record();
+        let outcome = replay(&Canned::returning(&[100.0], 0), &record, Some("v1"));
+        let Replay::NotReplayable { why } = outcome else {
+            panic!("a panel with no study cannot be checked");
+        };
+        assert!(why.contains("before the study"), "{why}");
+        assert!(!Replay::NotReplayable { why }.holds());
+    }
+
+    #[test]
+    fn a_panel_whose_data_changed_is_reported_before_the_expensive_part() {
+        // Replaying a panel costs the whole grid on every instrument. Finding
+        // out afterwards that the data moved would be paying for an answer
+        // that was never going to mean anything.
+        let mut evidence = panel_evidence();
+        evidence.study = Some(panel_study());
+        let record = Record::Panel(Box::new(evidence));
+
+        let outcome = replay(&Canned::returning(&[100.0], 0), &record, Some("v2"));
+        assert!(
+            matches!(outcome, Replay::DataChanged { .. }),
+            "{outcome:?}"
+        );
+    }
+
+    /// A panel with nothing in it, for the paths that never reach a run.
+    fn panel_evidence() -> crate::PanelEvidence {
+        crate::PanelEvidence {
+            hypothesis: HypothesisId("h".to_owned()),
+            dataset: DatasetRef {
+                id: "bars".to_owned(),
+                version: "v1".to_owned(),
+            },
+            in_sample: DateRange::new(at(1).date(), at(4).date()).expect("ordered"),
+            out_of_sample: DateRange::new(at(5).date(), at(9).date()).expect("ordered"),
+            selected_params: std::collections::BTreeMap::new(),
+            selection: crate::Selection {
+                trials: 1,
+                best_sharpe: 1.0,
+                expected_best_under_null: None,
+                survived_deflation: true,
+                scored: Vec::new(),
+            },
+            per_instrument: Vec::new(),
+            pooled: crate::PooledOutcome {
+                instruments: 0,
+                total_trades: 0,
+                mean_excess_return: 0.0,
+                beat_benchmark: 0,
+                mean_max_drawdown: 0.0,
+                worst_max_drawdown: 0.0,
+            },
+            breadth: None,
+            book: None,
+            study: None,
+            failures: Vec::new(),
+            verdict: crate::Verdict::Inconclusive,
+            reasons: Vec::new(),
+        }
+    }
+
+    fn panel_record() -> Record {
+        Record::Panel(Box::new(panel_evidence()))
+    }
+
+    fn panel_study() -> crate::PanelStudy {
+        let Record::Study(study) = study(&[100.0, 110.0], 4) else {
+            unreachable!("study() builds a study");
+        };
+        crate::PanelStudy::new(
+            study.selected.clone(),
+            vec!["AAPL.NASDAQ".to_owned()],
+            crate::ParameterGrid::new(),
+        )
+    }
+
+    #[test]
+    fn a_walk_forward_recorded_before_its_grid_was_kept_says_so() {
+        // The record pinned the template and the cadence and not the search,
+        // which is everything except the one thing that decides what each
+        // fold chose.
+        let record = Record::WalkForward(Box::new(walk_evidence(None)));
+        let outcome = replay(&Canned::returning(&[100.0], 0), &record, Some("v1"));
+        let Replay::NotReplayable { why } = outcome else {
+            panic!("no grid, no procedure");
+        };
+        assert!(why.contains("before the grid"), "{why}");
+    }
+
+    #[test]
+    fn a_walk_forward_with_its_grid_gets_as_far_as_running() {
+        // With the grid present it is no longer refused for being incomplete.
+        // The canned engine cannot actually produce folds, so this asserts the
+        // record stopped being the obstacle rather than that the run succeeded.
+        let record = Record::WalkForward(Box::new(walk_evidence(Some(
+            crate::ParameterGrid::new(),
+        ))));
+        let outcome = replay(&Canned::returning(&[100.0, 110.0], 4), &record, Some("v1"));
+        assert!(
+            !matches!(&outcome, Replay::NotReplayable { why } if why.contains("before the grid")),
+            "{outcome:?}"
+        );
+    }
+
+    fn walk_evidence(grid: Option<crate::ParameterGrid>) -> crate::WalkForwardEvidence {
+        let Record::Study(study) = study(&[100.0, 110.0], 4) else {
+            unreachable!("study() builds a study");
+        };
+        crate::WalkForwardEvidence {
+            hypothesis: HypothesisId("h".to_owned()),
+            template: study.selected.clone(),
+            in_sample_days: 365,
+            step_days: 90,
+            anchored: false,
+            grid,
+            folds: Vec::new(),
+            combined: metrics(4),
+            benchmark: metrics(1),
+            excess_return: 0.1,
+            combined_curve: Vec::new(),
+            benchmark_curve: Vec::new(),
+            combined_trades: crate::TradeStats::default(),
+            stability: Vec::new(),
+            folds_surviving_deflation: 0,
+            folds_without_trades: 0,
+            verdict: crate::Verdict::Inconclusive,
+            reasons: Vec::new(),
+        }
     }
 
     #[test]

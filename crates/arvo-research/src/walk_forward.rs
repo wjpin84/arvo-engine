@@ -174,6 +174,16 @@ pub struct WalkForwardEvidence {
     pub in_sample_days: i64,
     pub step_days: i64,
     pub anchored: bool,
+    /// The grid each fold re-selected from.
+    ///
+    /// The template and the cadence were already here; this was the one input
+    /// missing, and without it the procedure cannot be run again. A record
+    /// that pins everything except the search it performed describes a result
+    /// nobody can reproduce.
+    ///
+    /// `None` for a run recorded before this existed.
+    #[serde(default)]
+    pub grid: Option<crate::ParameterGrid>,
     /// Every fold, each a complete study in its own right.
     pub folds: Vec<FamilyEvidence>,
     /// The folds' out-of-sample runs, end to end.
@@ -317,6 +327,7 @@ pub fn run_walk_forward(
         in_sample_days: plan.in_sample_days,
         step_days: plan.step_days,
         anchored: plan.anchored,
+        grid: Some(plan.grid.clone()),
         folds,
         combined,
         benchmark,

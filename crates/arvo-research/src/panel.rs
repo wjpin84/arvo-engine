@@ -135,6 +135,24 @@ pub struct PanelEvidence {
     /// `default` because it is a persisted format.
     #[serde(default)]
     pub book: Option<Metrics>,
+    /// Everything it would take to run this panel again.
+    ///
+    /// `Experiment` states the rule this obeys: the field list *is* the
+    /// reproducibility contract, and if a run's output can change without one
+    /// of these changing, the record is incomplete. A panel is built from
+    /// experiments and did not obey it. The dataset, the winning parameters
+    /// and every outcome were kept; the template, the instrument list, the
+    /// grid and the split fraction were not, so nobody — including
+    /// `replay` — could re-derive the run that produced them.
+    ///
+    /// Stored whole rather than as four fields because the study *is* the
+    /// input. Four fields can be added to three at a time.
+    ///
+    /// `None` for a panel recorded before this existed. Those genuinely
+    /// cannot be replayed, and saying so is the honest answer rather than a
+    /// silent pass.
+    #[serde(default)]
+    pub study: Option<PanelStudy>,
     /// Instrument/configuration combinations that could not be run.
     pub failures: Vec<String>,
     pub verdict: Verdict,
@@ -329,6 +347,7 @@ pub fn run_panel(
         pooled,
         breadth: Some(breadth),
         book,
+        study: Some(study.clone()),
         failures,
         verdict,
         reasons,
