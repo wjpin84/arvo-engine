@@ -1193,6 +1193,11 @@ pub fn App() -> impl IntoView {
     let (panel, set_panel) = signal(None::<PanelView>);
     let (comparison, set_comparison) = signal(None::<ComparisonView>);
     let (portfolios, set_portfolios) = signal(None::<PortfolioLibraryView>);
+    // Kept apart from the library itself. `None` there means "not loaded",
+    // which the dashboard renders as "no holdings imported yet" — a claim
+    // about what the person has done, and one they will have done. A failed
+    // read must not be able to make it.
+    let (portfolio_error, set_portfolio_error) = signal(None::<String>);
     let (open_portfolio, set_open_portfolio) = signal(None::<PortfolioView>);
     // Everything the backend has said unprompted, newest first. Held here
     // rather than in the alerts sidebar because the sidebar is unmounted
@@ -1280,8 +1285,14 @@ pub fn App() -> impl IntoView {
     Effect::new(move |_| {
         spawn_local(async move {
             match call_typed::<PortfolioLibraryView>("list_portfolios", JsValue::UNDEFINED).await {
-                Ok(library) => set_portfolios.set(Some(library)),
-                Err(reason) => web_sys::console::error_1(&reason.into()),
+                Ok(library) => {
+                    set_portfolios.set(Some(library));
+                    set_portfolio_error.set(None);
+                }
+                Err(reason) => {
+                    web_sys::console::error_1(&reason.clone().into());
+                    set_portfolio_error.set(Some(reason));
+                }
             }
         });
     });
@@ -1403,6 +1414,7 @@ pub fn App() -> impl IntoView {
                                 view! {
                                     <Dashboard
                                         portfolios=portfolios
+                                        portfolio_error=portfolio_error
                                         set_open_portfolio=set_open_portfolio
                                         plugins=plugins
                                         feed_held=feed_held

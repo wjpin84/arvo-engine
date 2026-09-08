@@ -144,6 +144,14 @@ pub(crate) fn ProblemList(
 #[component]
 pub(crate) fn Dashboard(
     portfolios: ReadSignal<Option<PortfolioLibraryView>>,
+    /// Why the library could not be read, when it could not.
+    ///
+    /// Separate from `portfolios` because `None` there means "not loaded",
+    /// and the empty state below is a sentence about what the person has
+    /// done. Telling someone they have imported nothing when the read simply
+    /// failed is worse than saying nothing: it is wrong, it is specific, and
+    /// it suggests they repeat work they have already done.
+    portfolio_error: ReadSignal<Option<String>>,
     set_open_portfolio: WriteSignal<Option<PortfolioView>>,
     plugins: ReadSignal<Vec<PluginView>>,
     feed_held: ReadSignal<bool>,
@@ -153,10 +161,22 @@ pub(crate) fn Dashboard(
     // state in the shell that one view uses is state two things can disagree
     // about later.
     let (history, set_history) = signal(Vec::<HistoryEntryView>::new());
+    // Three states, not two. "Nothing has been run yet" is a claim about the
+    // evidence store, and it was being made while the request was still in
+    // flight and again when the request had failed — so a store that could
+    // not be read told someone they had run nothing, which is the one message
+    // most likely to make them re-run work they already have.
+    //
+    // The watchlist keeps the same distinction for the same reason. This is
+    // the pattern, one file over.
+    let (asked, set_asked) = signal(false);
+    let (error, set_error) = signal(None::<String>);
     spawn_local(async move {
-        if let Ok(found) = call_typed::<HistoryView>("list_history", JsValue::UNDEFINED).await {
-            set_history.set(found.entries);
+        match call_typed::<HistoryView>("list_history", JsValue::UNDEFINED).await {
+            Ok(found) => set_history.set(found.entries),
+            Err(reason) => set_error.set(Some(reason)),
         }
+        set_asked.set(true);
     });
 
     view! {
@@ -211,6 +231,14 @@ pub(crate) fn Dashboard(
             <section class="dashboard-section">
                 <h2 class="dashboard-heading">"Portfolio"</h2>
                 {move || {
+                    if let Some(reason) = portfolio_error.get() {
+                        return view! {
+                            <p class="research-flag">
+                                {format!("Could not read your portfolios: {reason}")}
+                            </p>
+                        }
+                            .into_any();
+                    }
                     let library = portfolios.get();
                     let Some((value, unrealized, holdings)) = totals(library.as_ref()) else {
                         return view! {
@@ -284,10 +312,23 @@ pub(crate) fn Dashboard(
             <section class="dashboard-section">
                 <h2 class="dashboard-heading">"Recent findings"</h2>
                 {move || {
+                    if let Some(reason) = error.get() {
+                        // Named, because the alternative reads as an answer.
+                        return view! {
+                            <p class="research-flag">
+                                {format!("Could not read the findings store: {reason}")}
+                            </p>
+                        }
+                            .into_any();
+                    }
                     let entries = history.get();
                     if entries.is_empty() {
-                        return view! { <p class="sidebar-empty">"Nothing has been run yet"</p> }
-                            .into_any();
+                        let message = if asked.get() {
+                            "Nothing has been run yet"
+                        } else {
+                            "Looking for findings\u{2026}"
+                        };
+                        return view! { <p class="sidebar-empty">{message}</p> }.into_any();
                     }
                     view! {
                         <ul class="dashboard-list">
