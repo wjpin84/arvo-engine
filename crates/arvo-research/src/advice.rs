@@ -133,6 +133,29 @@ pub fn recommend(found: &FamilyEvidence) -> Vec<Recommendation> {
 
     // ---- blocking: the result cannot be read -----------------------------
 
+    // First, and above the trade-count bar, because this is a different kind
+    // of objection. Everything else here says the evidence is too thin to
+    // conclude from; this says the evidence contradicts itself, and no amount
+    // of extra data fixes a result whose own two halves disagree.
+    for discrepancy in crate::reconcile_parts(
+        &found.out_of_sample_evidence.experiment,
+        &evaluation.strategy_curve,
+        &evaluation.strategy_ledger,
+    ) {
+        out.push(Recommendation::new(
+            Severity::Blocking,
+            "The engine disagrees with itself about this run.",
+            "Do not read any number here. Two figures for the same fact came out              differently, so at least one of them is wrong and nothing downstream              can be trusted until it is known which.",
+            format!(
+                "{}: expected {:.2}, got {:.2} — {}",
+                discrepancy.invariant,
+                discrepancy.expected,
+                discrepancy.actual,
+                discrepancy.detail,
+            ),
+        ));
+    }
+
     if evaluation.strategy.trades < criteria.min_trades {
         out.push(Recommendation::new(
             Severity::Blocking,
@@ -1220,6 +1243,47 @@ mod tests {
         study.selected = experiment;
         study.out_of_sample_evidence.evaluation.strategy_ledger = ledger;
         study
+    }
+
+    #[test]
+    fn a_run_whose_curve_contradicts_its_ledger_blocks_before_anything_else() {
+        let day = |d: u32| {
+            chrono::NaiveDate::from_ymd_opt(2024, 1, d)
+                .expect("valid")
+                .and_time(chrono::NaiveTime::MIN)
+        };
+        // The category the gap analysis had no room for: not "too little
+        // evidence" but "the evidence contradicts itself". More data does not
+        // fix it, so it outranks every other objection.
+        let mut study = book_study(&["AAPL.NASDAQ"]);
+        study.out_of_sample_evidence.experiment.alongside.clear();
+        let ledger = &mut study.out_of_sample_evidence.evaluation.strategy_ledger;
+        ledger[0].pnl = 10.0;
+        ledger[0].commission = 0.0;
+        study.out_of_sample_evidence.evaluation.strategy_curve = vec![
+            crate::EquityPoint {
+                at: day(1),
+                equity: 100_000.0,
+            },
+            crate::EquityPoint {
+                at: day(2),
+                // Nowhere near the 10.0 the ledger realised.
+                equity: 190_000.0,
+            },
+        ];
+
+        let out = recommend(&study);
+        assert_eq!(
+            out.first().map(|item| item.severity),
+            Some(Severity::Blocking),
+            "{}",
+            findings(&out)
+        );
+        assert!(
+            out.iter().any(|item| item.finding.contains("disagrees with itself")),
+            "{}",
+            findings(&out)
+        );
     }
 
     #[test]

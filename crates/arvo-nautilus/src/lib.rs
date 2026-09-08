@@ -1769,6 +1769,71 @@ mod tests {
         NautilusSimulation::new(library)
     }
 
+    /// Every reconciliation invariant, against real engine output.
+    ///
+    /// The unit tests in `arvo_research::reconcile` prove the checks catch
+    /// what they claim to. This proves they do not fire on a correct run —
+    /// which is the harder and more important half, and the half this codebase
+    /// has got wrong before: the data-quality outlier check reported 159
+    /// findings in 5,000 bars of a clean fixture and had to be rewritten.
+    ///
+    /// Run across every strategy and both cost shapes, because a fee invariant
+    /// that holds only for zero costs is not an invariant.
+    #[test]
+    fn a_real_run_reconciles_with_itself() {
+        let bars = sawtooth(200);
+        let costs = [
+            CostModel::proportional(0.0, 0.0),
+            CostModel::proportional(2.0, 5.0),
+            CostModel {
+                commission_bps: 1.5,
+                slippage_bps: 3.0,
+                per_fill: 0.65,
+                per_unit_sold: 0.000_166,
+                sell_notional_bps: 0.278,
+            },
+        ];
+
+        for (name, params) in [
+            (SMA_CROSS, params(10.0, 30.0)),
+            (BUY_AND_HOLD, BTreeMap::from([("trade_size".to_owned(), 100.0)])),
+        ] {
+            for cost in &costs {
+                let mut experiment = experiment_named(name, params.clone(), &bars);
+                experiment.costs = *cost;
+
+                let result = provider(bars.clone())
+                    .run(&experiment)
+                    .expect("the backtest should run");
+
+                let found = arvo_research::reconcile(&experiment, &result);
+                assert!(
+                    found.is_empty(),
+                    "{name} at {}bps commission disagreed with itself: {found:#?}",
+                    cost.commission_bps,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_book_reconciles_with_itself_too() {
+        // Several instruments settling against one account is where a fee or
+        // a curve invariant would most plausibly break, because the ledger now
+        // holds trades from more than one price series.
+        let bars = sawtooth(200);
+        let mut experiment = experiment(params(10.0, 30.0), &bars);
+        experiment.costs = CostModel::proportional(2.0, 5.0);
+        experiment.alongside = vec!["MSFT.NASDAQ".to_owned()];
+
+        let result = book_provider(&["AAPL.NASDAQ", "MSFT.NASDAQ"], &bars)
+            .run(&experiment)
+            .expect("the book should run");
+
+        let found = arvo_research::reconcile(&experiment, &result);
+        assert!(found.is_empty(), "{found:#?}");
+    }
+
     #[test]
     fn a_book_trades_every_member_and_the_ledger_says_which() {
         let bars = sawtooth(200);
