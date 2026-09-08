@@ -660,6 +660,7 @@ mod tests {
             sharpe: Some(1.0),
             sortino: Some(1.2),
             calmar: Some(0.9),
+            psr: None,
             trades: 40,
         }
     }

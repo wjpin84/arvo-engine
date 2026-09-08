@@ -67,6 +67,25 @@ pub struct Metrics {
     ///
     /// `None` when the curve never fell.
     pub calmar: Option<f64>,
+    /// Probability that the true Sharpe is above zero, given how many returns
+    /// produced it and what shape they were.
+    ///
+    /// [`Self::sharpe`] is a point estimate and says nothing about its own
+    /// standard error: 1.2 from forty returns and 1.2 from four thousand print
+    /// identically and are not the same finding. This is the second number,
+    /// and it falls with a short sample, with negative skew, and with fat
+    /// tails — the three shapes that flatter a Sharpe most.
+    ///
+    /// Complements deflation rather than repeating it. `expected_best_under_null`
+    /// asks whether the best of N configurations is a search artefact and needs
+    /// the whole search; this asks whether one curve's Sharpe is a small-sample
+    /// artefact and needs only the curve, so it runs everywhere — including on
+    /// benchmarks and on single studies with no grid behind them.
+    ///
+    /// `default` because this is a persisted format: a finding recorded before
+    /// this existed loads as one that does not know its own confidence.
+    #[serde(default)]
+    pub psr: Option<f64>,
     pub trades: u32,
 }
 
@@ -132,6 +151,12 @@ impl Metrics {
 
         let max_drawdown = max_drawdown(curve);
         Some(Self {
+            // Against zero: the question a verdict turns on is whether there
+            // is any edge at all, not whether it beats some other number
+            // somebody chose. From the returns rather than from `sharpe` above,
+            // which is annualised — see `crate::psr` for what feeding it in
+            // would do.
+            psr: crate::probabilistic_sharpe(&returns, periods_per_year, 0.0),
             total_return,
             cagr,
             max_drawdown,
@@ -544,6 +569,7 @@ mod tests {
             sharpe: Some(1.0),
             sortino: Some(1.2),
             calmar: Some(0.9),
+            psr: None,
             trades,
         }
     }

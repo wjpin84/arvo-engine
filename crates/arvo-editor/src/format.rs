@@ -36,6 +36,15 @@ pub(crate) fn short_hash(hash: &str) -> String {
     hash.chars().take(12).collect()
 }
 
+/// A probability, as a percentage.
+///
+/// An absent one is a dash rather than 0%: a curve that never moved has no
+/// confidence to report, and a zero would read as "measured, and it is
+/// certainly not real".
+pub(crate) fn probability(value: Option<f64>) -> String {
+    value.map_or_else(|| "\u{2014}".to_owned(), |v| format!("{:.0}%", v * 100.0))
+}
+
 pub(crate) fn ratio(value: Option<f64>) -> String {
     value.map_or_else(|| "—".to_owned(), |v| format!("{v:.2}"))
 }

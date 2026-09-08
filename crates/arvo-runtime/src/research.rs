@@ -235,6 +235,7 @@ MetricsView {
         sharpe: metrics.sharpe,
         sortino: metrics.sortino,
         calmar: metrics.calmar,
+        psr: metrics.psr,
         trades: metrics.trades,
     }
 }

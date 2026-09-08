@@ -6,6 +6,9 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+# Only for `erf`, which the Probabilistic Sharpe Ratio needs and std has not.
+# Already in the build as a transitive dependency, so this adds no download.
+libm = "0.2"
 # For BarInterval only: the resolution an experiment ran at is part of its
 # record, and one crate has to own that vocabulary.
 arvo-data.workspace = true

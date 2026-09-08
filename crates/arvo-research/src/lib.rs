@@ -31,6 +31,7 @@ pub mod evaluation;
 pub mod family;
 pub mod memory;
 pub mod panel;
+pub mod psr;
 pub mod reconcile;
 pub mod replay;
 pub mod trade;
@@ -50,6 +51,7 @@ pub use family::{
 pub use memory::{
     EvidenceStore, Loaded, MemoryError, Record, StoredRecord, Summary, Unreadable, SCHEMA,
 };
+pub use psr::{period_returns, probabilistic_sharpe};
 pub use reconcile::{reconcile, reconcile_parts, Discrepancy};
 pub use replay::{replay, Divergence, Replay};
 pub use panel::{run_panel, InstrumentOutcome, PanelEvidence, PanelStudy, PooledOutcome};

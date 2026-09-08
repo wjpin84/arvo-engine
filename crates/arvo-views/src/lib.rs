@@ -68,6 +68,12 @@ pub struct MetricsView {
     pub sharpe: Option<f64>,
     pub sortino: Option<f64>,
     pub calmar: Option<f64>,
+    /// Probability the true Sharpe is above zero, given the sample.
+    ///
+    /// The second number a Sharpe needs. 1.2 from forty returns and 1.2 from
+    /// four thousand print identically and are not the same finding.
+    #[serde(default)]
+    pub psr: Option<f64>,
     pub trades: u32,
 }
 

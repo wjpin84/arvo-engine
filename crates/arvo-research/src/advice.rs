@@ -63,6 +63,14 @@ const PANEL_MAJORITY: f64 = 0.5;
 /// however good it looks.
 const FOLD_SELECTION_SHARE: f64 = 0.5;
 
+/// Below this confidence, a positive Sharpe has not been distinguished from
+/// no edge at all.
+///
+/// 0.95, the ordinary 5% bar, and deliberately not softer. The platform's
+/// whole premise is that most results are noise; a threshold chosen to let
+/// more through would be arguing with the premise rather than applying it.
+const PSR_WORTH_BELIEVING: f64 = 0.95;
+
 /// Above this share of the window spent holding, the dividend gap between a
 /// strategy and buy-and-hold is too small to be worth a line.
 ///
@@ -303,6 +311,29 @@ pub fn recommend(found: &FamilyEvidence) -> Vec<Recommendation> {
                 criteria.max_drawdown * 100.0
             ),
         ));
+    }
+
+    if let Some(psr) = evaluation.strategy.psr {
+        // Only where there is a positive Sharpe to be sceptical about. A
+        // negative one has already lost on the return, and saying its
+        // confidence is low would be piling a weak objection on a decided
+        // question.
+        let positive = evaluation.strategy.sharpe.is_some_and(|sharpe| sharpe > 0.0);
+        if positive && psr < PSR_WORTH_BELIEVING {
+            out.push(Recommendation::new(
+                Severity::Warning,
+                "The Sharpe ratio is not distinguishable from no edge at all.",
+                "Lengthen the window or loosen the entry so more returns are observed, \
+                 and do not compare this Sharpe against another until it is. A point \
+                 estimate says nothing about its own error, and this one is small enough, \
+                 short enough or skewed enough that zero is still plausible.",
+                format!(
+                    "{:.0}% confidence the true Sharpe is above zero, against a {:.0}% bar",
+                    psr * 100.0,
+                    PSR_WORTH_BELIEVING * 100.0,
+                ),
+            ));
+        }
     }
 
     if let Some(exposure) = time_in_market(found) {
@@ -1062,6 +1093,7 @@ mod tests {
             sharpe: Some(1.0),
             sortino: Some(1.2),
             calmar: Some(0.9),
+            psr: None,
             trades: 60,
         });
 
@@ -1085,6 +1117,7 @@ mod tests {
             sharpe: Some(1.0),
             sortino: Some(1.2),
             calmar: Some(0.9),
+            psr: None,
             trades: 60,
         });
 
@@ -1128,6 +1161,7 @@ mod tests {
             sharpe: Some(1.0),
             sortino: Some(1.2),
             calmar: Some(0.9),
+            psr: None,
             trades: 40,
         }
     }
@@ -1502,6 +1536,71 @@ mod tests {
         let out = recommend(&study);
         assert!(
             !out.iter().any(|item| item.finding.contains("flattered by dividends")),
+            "{}",
+            findings(&out)
+        );
+    }
+
+    #[test]
+    fn a_sharpe_that_could_still_be_zero_is_flagged() {
+        // The objection deflation cannot make: this run had no grid behind it
+        // at all, and the Sharpe is still an estimate with a standard error.
+        let mut study = book_study(&["AAPL.NASDAQ"]);
+        study.out_of_sample_evidence.experiment.alongside.clear();
+        study.out_of_sample_evidence.evaluation.strategy.sharpe = Some(1.2);
+        study.out_of_sample_evidence.evaluation.strategy.psr = Some(0.62);
+
+        let out = recommend(&study);
+        let item = out
+            .iter()
+            .find(|item| item.finding.contains("not distinguishable"))
+            .unwrap_or_else(|| panic!("{}", findings(&out)));
+        assert_eq!(item.severity, Severity::Warning);
+        assert!(item.evidence.contains("62%"), "{}", item.evidence);
+    }
+
+    #[test]
+    fn a_well_evidenced_sharpe_is_left_alone() {
+        let mut study = book_study(&["AAPL.NASDAQ"]);
+        study.out_of_sample_evidence.experiment.alongside.clear();
+        study.out_of_sample_evidence.evaluation.strategy.sharpe = Some(1.2);
+        study.out_of_sample_evidence.evaluation.strategy.psr = Some(0.99);
+
+        let out = recommend(&study);
+        assert!(
+            !out.iter().any(|item| item.finding.contains("not distinguishable")),
+            "{}",
+            findings(&out)
+        );
+    }
+
+    #[test]
+    fn a_losing_sharpe_is_not_also_told_it_is_uncertain() {
+        // It has already lost on the return. Piling a weak objection onto a
+        // decided question is how a list of recommendations stops being read.
+        let mut study = book_study(&["AAPL.NASDAQ"]);
+        study.out_of_sample_evidence.experiment.alongside.clear();
+        study.out_of_sample_evidence.evaluation.strategy.sharpe = Some(-0.4);
+        study.out_of_sample_evidence.evaluation.strategy.psr = Some(0.10);
+
+        let out = recommend(&study);
+        assert!(
+            !out.iter().any(|item| item.finding.contains("not distinguishable")),
+            "{}",
+            findings(&out)
+        );
+    }
+
+    #[test]
+    fn a_finding_recorded_before_psr_existed_makes_no_claim() {
+        let mut study = book_study(&["AAPL.NASDAQ"]);
+        study.out_of_sample_evidence.experiment.alongside.clear();
+        study.out_of_sample_evidence.evaluation.strategy.sharpe = Some(1.2);
+        assert!(study.out_of_sample_evidence.evaluation.strategy.psr.is_none());
+
+        let out = recommend(&study);
+        assert!(
+            !out.iter().any(|item| item.finding.contains("not distinguishable")),
             "{}",
             findings(&out)
         );

@@ -11,7 +11,7 @@ use crate::chart::{
     DataQuality, EquityChart, MetricCard, MonthlyReturns, ParameterSurface, PriceChart,
     UnderwaterChart,
 };
-use crate::format::{money, percent, ratio, short_hash, verdict_class};
+use crate::format::{money, percent, probability, ratio, short_hash, verdict_class};
 use crate::trades::TradesTable;
 use crate::views::*;
 
@@ -239,6 +239,13 @@ pub(crate) fn StudyReport(study: StudyView) -> impl IntoView {
                         <td>"Volatility"</td>
                         <td>{percent(study.strategy.volatility)}</td>
                         <td>{percent(study.benchmark.volatility)}</td>
+                    </tr>
+                    <tr>
+                        <td title="Probability the true Sharpe is above zero, given how many returns produced it and what shape they were">
+                            "Sharpe is real"
+                        </td>
+                        <td>{probability(study.strategy.psr)}</td>
+                        <td>{probability(study.benchmark.psr)}</td>
                     </tr>
                     <tr>
                         <td>"Sharpe"</td>
