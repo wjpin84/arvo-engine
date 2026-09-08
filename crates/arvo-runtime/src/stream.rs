@@ -92,6 +92,51 @@ enum StreamError {
     Closed,
 }
 
+/// Whether the window currently believes prices are flowing.
+///
+/// Two flags rather than one, because "the socket is up" and "prices are
+/// arriving" are different facts and only the second is what the window is
+/// being told about. A connection that opens and immediately closes is up
+/// repeatedly and delivers nothing; the heartbeat above exists because an open
+/// socket can go quiet, which is the same observation from the other side.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Health {
+    /// The window has been told prices stopped and not yet told otherwise.
+    told_stalled: bool,
+    /// A price has arrived at some point. Until one has, a failing socket is
+    /// a log line rather than something to interrupt anyone for: nothing on
+    /// screen has gone stale because nothing was ever live.
+    ever_delivered: bool,
+}
+
+impl Health {
+    /// A price arrived. Returns whether the window should be told prices are
+    /// back.
+    ///
+    /// Announced here rather than on connect, which is the whole point. A
+    /// socket that opens and dies without delivering would otherwise raise
+    /// "resumed" on every attempt and "interrupted" on none of them, because
+    /// the stall is gated on having delivered something and this session never
+    /// did. The window would keep its last message — "resumed" — and sit
+    /// on frozen prices indefinitely.
+    const fn on_tick(&mut self) -> bool {
+        self.ever_delivered = true;
+        let announce = self.told_stalled;
+        self.told_stalled = false;
+        announce
+    }
+
+    /// The socket failed. Returns whether the window should be told.
+    const fn on_drop(&mut self) -> bool {
+        if self.ever_delivered && !self.told_stalled {
+            self.told_stalled = true;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 /// The handle the rest of the app holds.
 ///
 /// One method, because there is one thing to say: this is the set of symbols
@@ -127,14 +172,7 @@ pub fn start(app: AppHandle) -> Stream {
 
 /// Connect, serve, reconnect, forever.
 async fn run(app: AppHandle, mut symbols: watch::Receiver<Vec<String>>) {
-    // Whether the window has been told prices stopped. Without it, a feed
-    // that is simply unreachable raises a notification every three seconds.
-    let mut stalled = false;
-    // Whether the session that just died had ever produced a price. A socket
-    // that never worked is worth a log line; one that was working and stopped
-    // is worth interrupting someone for, because the number on screen has
-    // quietly become a lie.
-    let mut delivered = false;
+    let mut health = Health::default();
 
     loop {
         // No symbols yet: wait to be told, rather than holding a socket open
@@ -148,14 +186,13 @@ async fn run(app: AppHandle, mut symbols: watch::Receiver<Vec<String>>) {
             continue;
         }
 
-        match session(&app, &mut symbols, &mut stalled, &mut delivered).await {
+        match session(&app, &mut symbols, &mut health).await {
             // The sender went away: the app is shutting down.
             Ok(()) => return,
             Err(err) => {
                 tracing::warn!(error = %err, "price stream dropped; reconnecting");
-                if delivered && !stalled {
+                if health.on_drop() {
                     events::emit(&app, events::stream_stalled(&err.to_string()));
-                    stalled = true;
                 }
                 tokio::time::sleep(BACKOFF).await;
             }
@@ -167,15 +204,9 @@ async fn run(app: AppHandle, mut symbols: watch::Receiver<Vec<String>>) {
 async fn session(
     app: &AppHandle,
     symbols: &mut watch::Receiver<Vec<String>>,
-    stalled: &mut bool,
-    delivered: &mut bool,
+    health: &mut Health,
 ) -> Result<(), StreamError> {
     let (mut socket, _) = tokio_tungstenite::connect_async(ENDPOINT).await?;
-    if *stalled {
-        events::emit(app, events::stream_live());
-        *stalled = false;
-    }
-    *delivered = false;
 
     let wanted = symbols.borrow_and_update().clone();
     subscribe(&mut socket, &wanted).await?;
@@ -201,7 +232,9 @@ async fn session(
             message = socket.next() => {
                 let message = message.ok_or(StreamError::Closed)??;
                 if let Some(tick) = tick_of(&message) {
-                    *delivered = true;
+                    if health.on_tick() {
+                        events::emit(app, events::stream_live());
+                    }
                     // Not fatal: a window that has not finished loading is no
                     // reason to tear down a working socket.
                     if let Err(err) = app.emit(QUOTE_CHANNEL, &tick) {
@@ -268,6 +301,58 @@ mod tests {
         use base64::Engine as _;
         let encoded = base64::engine::general_purpose::STANDARD.encode(data.encode_to_vec());
         Message::text(serde_json::json!({ "message": encoded }).to_string())
+    }
+
+    #[test]
+    fn a_socket_that_reconnects_without_delivering_does_not_claim_prices_are_back() {
+        // The bug this shape exists to prevent. Announcing on connect rather
+        // than on a price means a socket that opens and dies repeatedly says
+        // "resumed" every time and "interrupted" never again, because the
+        // stall is gated on having delivered something and those sessions
+        // never do. The window keeps its last message and sits on frozen
+        // prices.
+        let mut health = Health::default();
+
+        // A working session, then a failure the window is told about.
+        assert!(!health.on_tick(), "nothing to resume from yet");
+        assert!(health.on_drop(), "a stream that was working and stopped");
+
+        // Now the flapping: connect, no ticks, die. Repeatedly.
+        for _ in 0..5 {
+            assert!(
+                !health.on_drop(),
+                "already told, and still nothing has arrived"
+            );
+        }
+        assert!(health.told_stalled, "the window must still believe it stalled");
+
+        // Only an actual price clears it.
+        assert!(health.on_tick(), "a real price is what resumes");
+        assert!(!health.told_stalled);
+    }
+
+    #[test]
+    fn a_stream_that_never_worked_is_not_worth_interrupting_anyone_for() {
+        // Nothing on screen has gone stale, because nothing was ever live.
+        let mut health = Health::default();
+        for _ in 0..3 {
+            assert!(!health.on_drop());
+        }
+    }
+
+    #[test]
+    fn one_interruption_is_announced_once() {
+        let mut health = Health::default();
+        health.on_tick();
+        assert!(health.on_drop());
+        assert!(!health.on_drop(), "a retry loop must not notify every attempt");
+    }
+
+    #[test]
+    fn a_price_arriving_while_nothing_is_wrong_announces_nothing() {
+        let mut health = Health::default();
+        assert!(!health.on_tick());
+        assert!(!health.on_tick());
     }
 
     #[test]
