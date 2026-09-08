@@ -364,6 +364,58 @@ pub fn run_walk_forward(
     })
 }
 
+/// Whether folds cleared the no-skill bar more often than chance would manage.
+///
+/// # Why counting one is not enough
+///
+/// This gate used to be `surviving == 0` — refuse only when *no* fold
+/// selected above its bar. That was a real test while
+/// `expected_best_under_null` was miscalibrated and almost nothing ever
+/// survived. Once the bar was corrected, each fold clears it about half the
+/// time under a null of no skill, because a correctly estimated expected
+/// maximum is a value the observed maximum falls above half the time. With
+/// eight folds, "at least one survived" then happens 99.6% of the time to a
+/// procedure with no ability whatsoever.
+///
+/// A bare majority is barely better: half of F is the median of the null, so
+/// requiring more than half is a coin flip wearing a threshold's clothes.
+///
+/// So this is the actual test. Under the null the number of surviving folds is
+/// binomial with p = 0.5, and this asks whether the count observed sits in the
+/// top 5% of that distribution. It demands a clear majority — seven of
+/// eight, nine of ten — which is what "this procedure selects" has to mean
+/// if it is to mean anything.
+///
+/// A three-fold run can never pass: `P(3 of 3) = 0.125`, above the threshold.
+/// That is the honest answer rather than a limitation. Three folds cannot
+/// demonstrate a process.
+pub(crate) fn selection_beat_chance(surviving: usize, folds: usize) -> bool {
+    /// The false-positive rate this is willing to accept from the fold counts
+    /// alone. The ordinary 5%.
+    const ALPHA: f64 = 0.05;
+
+    if folds == 0 {
+        return false;
+    }
+    // P(X >= surviving) for X ~ Binomial(folds, 0.5), which is the share of
+    // the 2^folds equally likely outcomes with at least this many successes.
+    let mut ways = 0.0_f64;
+    let mut term = 1.0_f64;
+    for k in 0..=folds {
+        if k >= surviving {
+            ways += term;
+        }
+        // C(n, k+1) from C(n, k), which keeps this exact for the fold counts
+        // a walk-forward produces and avoids a factorial that would not be.
+        #[expect(clippy::cast_precision_loss, reason = "fold counts are small")]
+        {
+            term = term * (folds - k) as f64 / (k + 1) as f64;
+        }
+    }
+    let total = 2.0_f64.powi(i32::try_from(folds).unwrap_or(i32::MAX));
+    ways / total <= ALPHA
+}
+
 #[allow(clippy::too_many_arguments, reason = "one verdict, stated in one place")]
 fn judge(
     folds: &[FamilyEvidence],
@@ -410,10 +462,11 @@ fn judge(
         return Verdict::Inconclusive;
     }
 
-    if surviving == 0 {
+    if !selection_beat_chance(surviving, folds.len()) {
         reasons.push(format!(
-            "no fold's winner beat what a no-skill search of that size would produce; the \
-             procedure selected noise in all {} of them",
+            "{surviving} of {} folds selected a winner above the no-skill bar, which a \
+             procedure with no ability to select would manage about half the time; that is \
+             not enough of them to say this one selects",
             folds.len()
         ));
         return Verdict::NotSupported;
@@ -708,6 +761,57 @@ mod tests {
             folds.iter().all(|(_, oos)| oos.days() == 30),
             "every judged period is a whole step"
         );
+    }
+
+    #[test]
+    fn two_folds_in_eight_is_what_chance_produces_not_what_selection_looks_like() {
+        // The run that exposed this. A rule on a series generated as noise
+        // came back `Supported` with two of eight folds selecting above their
+        // bar, because the gate only refused when *none* did.
+        assert!(!selection_beat_chance(2, 8));
+        assert!(!selection_beat_chance(4, 8), "half is the median of the null");
+        assert!(!selection_beat_chance(5, 8), "a bare majority is still a coin flip");
+        assert!(selection_beat_chance(7, 8));
+        assert!(selection_beat_chance(8, 8));
+    }
+
+    #[test]
+    fn at_least_one_surviving_fold_is_almost_free_and_no_longer_enough() {
+        // What the old gate asked. A procedure with no ability at all clears
+        // it 99.6% of the time at eight folds.
+        assert!(!selection_beat_chance(1, 8));
+    }
+
+    #[test]
+    fn three_folds_can_never_demonstrate_a_process() {
+        // Even selecting in all three, the chance of that under the null is
+        // one in eight. The honest answer is that three folds cannot show it,
+        // rather than a threshold bent until they can.
+        assert!(!selection_beat_chance(3, 3));
+        assert!(selection_beat_chance(5, 5), "five in five is one in thirty-two");
+    }
+
+    #[test]
+    fn the_gate_lets_through_about_one_no_skill_procedure_in_twenty() {
+        // The property that makes it a test rather than a threshold: run the
+        // null distribution and count how often it passes.
+        for folds in [5_usize, 8, 10, 12, 20] {
+            // Exact, by summing the binomial mass over every count that would
+            // pass rather than sampling it.
+            let mut passing = 0.0_f64;
+            let mut term = 1.0_f64;
+            for k in 0..=folds {
+                if selection_beat_chance(k, folds) {
+                    passing += term;
+                }
+                term = term * (folds - k) as f64 / (k + 1) as f64;
+            }
+            let rate = passing / 2.0_f64.powi(i32::try_from(folds).expect("small"));
+            assert!(
+                rate <= 0.05,
+                "{folds} folds let {rate:.3} of no-skill procedures through"
+            );
+        }
     }
 
     #[test]

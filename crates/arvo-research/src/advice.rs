@@ -55,14 +55,6 @@ const LONG_TERM_DAYS: f64 = 365.0;
 /// from one member carrying five, and the mean cannot tell those apart.
 const PANEL_MAJORITY: f64 = 0.5;
 
-/// Below this share of folds whose selection survived deflation, the
-/// *procedure* has not been shown to select.
-///
-/// A walk-forward tests a process, not a configuration. If the search picked
-/// noise in most folds, the combined curve is what noise happened to do,
-/// however good it looks.
-const FOLD_SELECTION_SHARE: f64 = 0.5;
-
 /// Below this confidence, a positive Sharpe has not been distinguished from
 /// no edge at all.
 ///
@@ -607,9 +599,10 @@ pub fn recommend_walk_forward(found: &WalkForwardEvidence) -> Vec<Recommendation
         return out;
     }
 
-    #[expect(clippy::cast_precision_loss, reason = "fold counts are small")]
-    let selecting = found.folds_surviving_deflation as f64 / folds as f64;
-    if selecting < FOLD_SELECTION_SHARE {
+    // The same test the verdict applies, called rather than restated. Two
+    // thresholds for one question is how a report ends up recommending against
+    // a result it also calls supported, which is exactly what happened here.
+    if !crate::walk_forward::selection_beat_chance(found.folds_surviving_deflation, folds) {
         // The finding the combined curve cannot show: a procedure whose
         // selections are noise still produces a curve, and the curve looks
         // exactly the same either way.
@@ -1184,7 +1177,7 @@ mod tests {
             benchmark_curve: Vec::new(),
             combined_trades: TradeStats::default(),
             stability: Vec::new(),
-            folds_surviving_deflation: 4,
+            folds_surviving_deflation: 5,
             grid: None,
             criteria: None,
             folds_without_trades: 0,
@@ -1220,9 +1213,11 @@ mod tests {
         }
     }
 
-    /// Four folds, because the interesting walk-forward rules are ratios.
+    /// Five folds, because the gate is a binomial tail: all of four is one in
+    /// sixteen under the null and does not clear 5%, all of five is one in
+    /// thirty-two and does.
     fn with_folds(mut walk: WalkForwardEvidence) -> WalkForwardEvidence {
-        walk.folds = (0..4)
+        walk.folds = (0..5)
             .map(|_| crate::FamilyEvidence {
                 hypothesis: crate::HypothesisId("h".to_owned()),
                 in_sample: experiment().window,
