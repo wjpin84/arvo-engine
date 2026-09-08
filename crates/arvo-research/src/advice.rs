@@ -602,7 +602,7 @@ pub fn recommend_walk_forward(found: &WalkForwardEvidence) -> Vec<Recommendation
     // The same test the verdict applies, called rather than restated. Two
     // thresholds for one question is how a report ends up recommending against
     // a result it also calls supported, which is exactly what happened here.
-    if !crate::walk_forward::selection_beat_chance(found.folds_surviving_deflation, folds) {
+    if !crate::walk_forward::selection_beat_chance(&found.folds) {
         // The finding the combined curve cannot show: a procedure whose
         // selections are noise still produces a curve, and the curve looks
         // exactly the same either way.
@@ -1217,6 +1217,9 @@ mod tests {
     /// sixteen under the null and does not clear 5%, all of five is one in
     /// thirty-two and does.
     fn with_folds(mut walk: WalkForwardEvidence) -> WalkForwardEvidence {
+        // Winners well clear of their own no-skill bars, which is what the
+        // selection test reads. `folds_surviving_deflation` is carried beside
+        // it for the reasons that quote it, and the two are set to agree.
         walk.folds = (0..5)
             .map(|_| crate::FamilyEvidence {
                 hypothesis: crate::HypothesisId("h".to_owned()),
@@ -1225,7 +1228,7 @@ mod tests {
                 selection: crate::Selection {
                     trials: 9,
                     best_sharpe: 1.5,
-                    expected_best_under_null: Some(0.5),
+                    expected_best_under_null: Some(1.0),
                     survived_deflation: true,
                     scored: Vec::new(),
                 },
@@ -1261,8 +1264,17 @@ mod tests {
     fn a_procedure_that_selects_noise_in_most_folds_blocks_the_combined_return() {
         // The finding the combined curve cannot show: a procedure whose
         // selections are noise still draws a curve, and it looks the same.
+        //
+        // Expressed as margins rather than a count, because that is what the
+        // test reads now. Each fold's winner landed near its own no-skill bar,
+        // some a little above and some a little below, which is what a search
+        // with nothing to find produces.
         let mut walk = with_folds(clean_walk());
         walk.folds_surviving_deflation = 1;
+        for (index, fold) in walk.folds.iter_mut().enumerate() {
+            fold.selection.expected_best_under_null = Some(1.0);
+            fold.selection.best_sharpe = if index % 2 == 0 { 1.02 } else { 0.97 };
+        }
 
         let out = recommend_walk_forward(&walk);
         let item = out

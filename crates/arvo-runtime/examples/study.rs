@@ -182,6 +182,25 @@ fn report_walk_forward(found: &arvo_research::WalkForwardEvidence) {
         found.folds.len(),
         found.folds_surviving_deflation
     );
+
+    // The count is the readable summary; the margins are what the verdict
+    // actually turns on. A reader who only sees "5 of 7" cannot tell a
+    // procedure that cleared its bars comfortably from one that scraped over
+    // five and fell well short of two, and those are opposite findings.
+    let margins: Vec<f64> = found
+        .folds
+        .iter()
+        .filter_map(|fold| {
+            let bar = fold.selection.expected_best_under_null?;
+            Some(fold.selection.best_sharpe - bar)
+        })
+        .collect();
+    if !margins.is_empty() {
+        let mean = margins.iter().sum::<f64>() / margins.len() as f64;
+        let shown: Vec<String> = margins.iter().map(|m| format!("{m:+.3}")).collect();
+        println!("  margins over the no-skill bar: {}", shown.join(" "));
+        println!("  mean margin {mean:+.4}");
+    }
     if found.folds_without_trades > 0 {
         println!(
             "  {} folds never opened a position at all",

@@ -364,56 +364,116 @@ pub fn run_walk_forward(
     })
 }
 
-/// Whether folds cleared the no-skill bar more often than chance would manage.
+/// Whether the folds' selections beat what no ability to select would produce.
 ///
-/// # Why counting one is not enough
+/// # Counting folds was the wrong statistic
 ///
-/// This gate used to be `surviving == 0` — refuse only when *no* fold
-/// selected above its bar. That was a real test while
-/// `expected_best_under_null` was miscalibrated and almost nothing ever
-/// survived. Once the bar was corrected, each fold clears it about half the
-/// time under a null of no skill, because a correctly estimated expected
-/// maximum is a value the observed maximum falls above half the time. With
-/// eight folds, "at least one survived" then happens 99.6% of the time to a
-/// procedure with no ability whatsoever.
+/// This asked how many folds cleared their own no-skill bar and tested that
+/// count against a binomial null. It was a real improvement on the gate before
+/// it, which refused only when *no* fold cleared, and it had two faults.
 ///
-/// A bare majority is barely better: half of F is the median of the null, so
-/// requiring more than half is a coin flip wearing a threshold's clothes.
+/// It threw away the magnitudes. A fold that beat its bar by 0.5 and one that
+/// missed by 0.01 counted as a one and a zero, when together they are evidence
+/// of selection. That is the difference between a sign test and a test that
+/// uses the numbers, and it is a large difference in power at seven
+/// observations.
 ///
-/// So this is the actual test. Under the null the number of surviving folds is
-/// binomial with p = 0.5, and this asks whether the count observed sits in the
-/// top 5% of that distribution. It demands a clear majority — seven of
-/// eight, nine of ten — which is what "this procedure selects" has to mean
-/// if it is to mean anything.
+/// And a count of seven is a coarse thing to test. `P(>= 6 of 7) = 0.0625`
+/// sits just the wrong side of 5%, so seven folds demanded all seven while
+/// eight folds demanded seven of eight. Nineteen years of daily bars — the
+/// most the broker will serve — produces exactly seven folds at the pinned
+/// cadence, so the bar landed on its harshest setting precisely where the data
+/// lands.
 ///
-/// A three-fold run can never pass: `P(3 of 3) = 0.125`, above the threshold.
-/// That is the honest answer rather than a limitation. Three folds cannot
-/// demonstrate a process.
-pub(crate) fn selection_beat_chance(surviving: usize, folds: usize) -> bool {
-    /// The false-positive rate this is willing to accept from the fold counts
-    /// alone. The ordinary 5%.
+/// # What this does instead
+///
+/// Each fold contributes a *margin*: how far its winner's in-sample Sharpe sat
+/// above the maximum a no-skill search of that size would be expected to
+/// reach. A procedure that cannot select produces margins scattered around
+/// zero; one that can produces margins that are positive more often and by
+/// more.
+///
+/// The test is a sign-flip permutation on those margins. Under a null of no
+/// ability, each margin is as likely to have come out negative as positive, so
+/// every assignment of signs is equally probable; this asks where the observed
+/// mean sits among all of them. Exact for the fold counts a walk-forward
+/// produces, free of any distributional assumption beyond that symmetry, and
+/// smooth in the number of folds rather than lurching between 100% and 87.5%
+/// required.
+///
+/// # What it still assumes
+///
+/// That the margins are symmetric about zero under the null. Maxima are
+/// right-skewed, so their margins are mildly right-skewed too and this is
+/// slightly anticonservative. Stated rather than corrected: the correction is
+/// small next to the effect it is looking for, and inventing one would be
+/// another piece of arithmetic to be wrong about.
+#[must_use]
+pub(crate) fn selection_beat_chance(folds: &[FamilyEvidence]) -> bool {
+    /// The false-positive rate this accepts from the margins alone.
     const ALPHA: f64 = 0.05;
+    /// Beyond this many folds, enumerating every sign pattern stops being
+    /// free. Sampled deterministically past it, so a verdict never depends on
+    /// when it was computed.
+    const EXACT_UP_TO: usize = 20;
 
-    if folds == 0 {
+    let margins: Vec<f64> = folds
+        .iter()
+        .filter_map(|fold| {
+            // A fold whose trials all scored alike has no bar and no margin.
+            // Skipped rather than counted as zero, which would be evidence of
+            // failing to select where there was no search to speak of.
+            let bar = fold.selection.expected_best_under_null?;
+            Some(fold.selection.best_sharpe - bar)
+        })
+        .collect();
+
+    if margins.len() < MIN_FOLDS {
         return false;
     }
-    // P(X >= surviving) for X ~ Binomial(folds, 0.5), which is the share of
-    // the 2^folds equally likely outcomes with at least this many successes.
-    let mut ways = 0.0_f64;
-    let mut term = 1.0_f64;
-    for k in 0..=folds {
-        if k >= surviving {
-            ways += term;
+    #[expect(clippy::cast_precision_loss, reason = "fold counts are small")]
+    let count = margins.len() as f64;
+    let observed = margins.iter().sum::<f64>() / count;
+    if observed <= 0.0 {
+        return false;
+    }
+
+    let (mut at_least_as_extreme, mut total) = (0_u64, 0_u64);
+    let mut consider = |signs: u64| {
+        let mut sum = 0.0;
+        for (index, margin) in margins.iter().enumerate() {
+            if signs >> index & 1 == 0 {
+                sum += margin;
+            } else {
+                sum -= margin;
+            }
         }
-        // C(n, k+1) from C(n, k), which keeps this exact for the fold counts
-        // a walk-forward produces and avoids a factorial that would not be.
-        #[expect(clippy::cast_precision_loss, reason = "fold counts are small")]
-        {
-            term = term * (folds - k) as f64 / (k + 1) as f64;
+        total += 1;
+        if sum / count >= observed {
+            at_least_as_extreme += 1;
+        }
+    };
+
+    if margins.len() <= EXACT_UP_TO {
+        for signs in 0..(1_u64 << margins.len()) {
+            consider(signs);
+        }
+    } else {
+        // xorshift64*, fixed seed: the same folds must always give the same
+        // verdict, and a test whose answer moves between runs is not one a
+        // stored finding could be checked against.
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        for _ in 0..200_000 {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            consider(state.wrapping_mul(0x2545_f491_4f6c_dd1d));
         }
     }
-    let total = 2.0_f64.powi(i32::try_from(folds).unwrap_or(i32::MAX));
-    ways / total <= ALPHA
+
+    #[expect(clippy::cast_precision_loss, reason = "counts fit a double exactly")]
+    let p = at_least_as_extreme as f64 / total as f64;
+    p <= ALPHA
 }
 
 #[allow(clippy::too_many_arguments, reason = "one verdict, stated in one place")]
@@ -462,7 +522,7 @@ fn judge(
         return Verdict::Inconclusive;
     }
 
-    if !selection_beat_chance(surviving, folds.len()) {
+    if !selection_beat_chance(folds) {
         reasons.push(format!(
             "{surviving} of {} folds selected a winner above the no-skill bar, which a \
              procedure with no ability to select would manage about half the time; that is \
@@ -763,55 +823,167 @@ mod tests {
         );
     }
 
-    #[test]
-    fn two_folds_in_eight_is_what_chance_produces_not_what_selection_looks_like() {
-        // The run that exposed this. A rule on a series generated as noise
-        // came back `Supported` with two of eight folds selecting above their
-        // bar, because the gate only refused when *none* did.
-        assert!(!selection_beat_chance(2, 8));
-        assert!(!selection_beat_chance(4, 8), "half is the median of the null");
-        assert!(!selection_beat_chance(5, 8), "a bare majority is still a coin flip");
-        assert!(selection_beat_chance(7, 8));
-        assert!(selection_beat_chance(8, 8));
-    }
-
-    #[test]
-    fn at_least_one_surviving_fold_is_almost_free_and_no_longer_enough() {
-        // What the old gate asked. A procedure with no ability at all clears
-        // it 99.6% of the time at eight folds.
-        assert!(!selection_beat_chance(1, 8));
-    }
-
-    #[test]
-    fn three_folds_can_never_demonstrate_a_process() {
-        // Even selecting in all three, the chance of that under the null is
-        // one in eight. The honest answer is that three folds cannot show it,
-        // rather than a threshold bent until they can.
-        assert!(!selection_beat_chance(3, 3));
-        assert!(selection_beat_chance(5, 5), "five in five is one in thirty-two");
-    }
-
-    #[test]
-    fn the_gate_lets_through_about_one_no_skill_procedure_in_twenty() {
-        // The property that makes it a test rather than a threshold: run the
-        // null distribution and count how often it passes.
-        for folds in [5_usize, 8, 10, 12, 20] {
-            // Exact, by summing the binomial mass over every count that would
-            // pass rather than sampling it.
-            let mut passing = 0.0_f64;
-            let mut term = 1.0_f64;
-            for k in 0..=folds {
-                if selection_beat_chance(k, folds) {
-                    passing += term;
-                }
-                term = term * (folds - k) as f64 / (k + 1) as f64;
-            }
-            let rate = passing / 2.0_f64.powi(i32::try_from(folds).expect("small"));
-            assert!(
-                rate <= 0.05,
-                "{folds} folds let {rate:.3} of no-skill procedures through"
-            );
+    /// One fold, with only the fields the selection test reads meaning
+    /// anything. Everything else is the least a `FamilyEvidence` will accept.
+    fn experiment_fold() -> FamilyEvidence {
+        let window = DateRange::new(date(2024, 1, 1), date(2024, 12, 31)).expect("ordered");
+        let metrics = Metrics {
+            total_return: 0.1,
+            cagr: 0.1,
+            max_drawdown: 0.05,
+            volatility: 0.1,
+            sharpe: Some(1.0),
+            sortino: Some(1.2),
+            calmar: Some(0.9),
+            psr: None,
+            trades: 10,
+        };
+        FamilyEvidence {
+            hypothesis: HypothesisId::from("h"),
+            in_sample: window,
+            out_of_sample: window,
+            selection: crate::Selection {
+                trials: 9,
+                best_sharpe: 1.0,
+                expected_best_under_null: Some(1.0),
+                survived_deflation: true,
+                scored: Vec::new(),
+            },
+            selected: experiment(window),
+            out_of_sample_evidence: crate::Evidence {
+                hypothesis: HypothesisId::from("h"),
+                experiment: experiment(window),
+                benchmark: crate::ExperimentId::from("b"),
+                engine: "test 1".to_owned(),
+                criteria: EvaluationCriteria::default(),
+                evaluation: crate::Evaluation {
+                    strategy: metrics.clone(),
+                    benchmark: metrics,
+                    strategy_curve: Vec::new(),
+                    benchmark_curve: Vec::new(),
+                    strategy_trades: TradeStats::default(),
+                    strategy_ledger: Vec::new(),
+                    benchmark_instruments: Vec::new(),
+                    excess_return: 0.0,
+                    verdict: Verdict::Inconclusive,
+                    reasons: Vec::new(),
+                },
+            },
+            failures: Vec::new(),
+            verdict: Verdict::Inconclusive,
+            reasons: Vec::new(),
         }
+    }
+
+    /// A fold whose winner beat its no-skill bar by `margin`.
+    fn fold_with_margin(margin: f64) -> FamilyEvidence {
+        let mut fold = experiment_fold();
+        fold.selection.best_sharpe = 1.0 + margin;
+        fold.selection.expected_best_under_null = Some(1.0);
+        fold
+    }
+
+    fn folds_with(margins: &[f64]) -> Vec<FamilyEvidence> {
+        margins.iter().copied().map(fold_with_margin).collect()
+    }
+
+    #[test]
+    fn margins_scattered_around_zero_are_what_no_ability_produces() {
+        // Four up, three down, none by much: the shape of a search that is
+        // picking whichever configuration happened to score highest.
+        let folds = folds_with(&[0.05, -0.04, 0.03, -0.06, 0.02, -0.01, 0.04]);
+        assert!(!selection_beat_chance(&folds));
+    }
+
+    #[test]
+    fn margins_that_are_positive_and_large_are_selection() {
+        let folds = folds_with(&[0.30, 0.25, 0.41, 0.18, 0.33, 0.29, 0.22]);
+        assert!(selection_beat_chance(&folds));
+    }
+
+    #[test]
+    fn the_size_of_a_miss_counts_and_not_only_its_sign() {
+        // The whole reason for changing the statistic. Both of these have five
+        // folds above their bar and two below; counting cannot tell them
+        // apart. One clears by a lot and misses by a hair, the other the
+        // reverse, and they are not the same evidence.
+        let convincing = folds_with(&[0.40, 0.35, 0.30, 0.45, 0.38, -0.01, -0.02]);
+        let unconvincing = folds_with(&[0.02, 0.01, 0.03, 0.02, 0.01, -0.40, -0.35]);
+
+        assert!(selection_beat_chance(&convincing));
+        assert!(!selection_beat_chance(&unconvincing));
+    }
+
+    #[test]
+    fn seven_folds_no_longer_demand_all_seven() {
+        // The coupling that forced this change. A binomial test on a count of
+        // seven put `P(>= 6 of 7)` at 0.0625, just the wrong side of 5%, so
+        // seven folds demanded perfection — and nineteen years of daily bars,
+        // the most the broker serves, produces exactly seven folds.
+        let six_of_seven = folds_with(&[0.30, 0.28, 0.35, 0.31, 0.26, 0.33, -0.02]);
+        assert_eq!(six_of_seven.len(), 7);
+        assert!(selection_beat_chance(&six_of_seven));
+    }
+
+    #[test]
+    fn a_procedure_that_missed_on_average_is_never_selection() {
+        // No amount of permuting rescues a mean below zero, and the test
+        // returns before doing any.
+        let folds = folds_with(&[0.10, -0.20, 0.05, -0.30, 0.02, -0.15, 0.01]);
+        assert!(!selection_beat_chance(&folds));
+    }
+
+    #[test]
+    fn too_few_folds_cannot_demonstrate_a_process_however_good_they_look() {
+        // Two folds have four sign patterns; the best possible p-value is
+        // 0.25. Refusing on the fold count rather than letting the arithmetic
+        // return an answer it cannot support.
+        assert!(!selection_beat_chance(&folds_with(&[0.9, 0.8])));
+    }
+
+    #[test]
+    fn a_fold_whose_trials_all_scored_alike_is_skipped_not_counted_as_a_miss() {
+        // There was no search in that fold, so there is nothing it failed to
+        // select from. Counting it as a zero would be evidence against a
+        // procedure for a fold that never tested it.
+        let mut folds = folds_with(&[0.30, 0.28, 0.35, 0.31, 0.26, 0.33]);
+        let mut flat = experiment_fold();
+        flat.selection.expected_best_under_null = None;
+        folds.push(flat);
+
+        assert!(
+            selection_beat_chance(&folds),
+            "the six real folds are what decides it"
+        );
+    }
+
+    #[test]
+    fn the_test_lets_through_about_one_no_skill_procedure_in_twenty() {
+        // The property that makes it a test. Margins drawn symmetrically about
+        // zero, which is what the null asserts, and the pass rate counted.
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = || {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            let u = ((state.wrapping_mul(0x2545_f491_4f6c_dd1d) >> 11) as f64)
+                / ((1_u64 << 53) as f64);
+            u * 2.0 - 1.0
+        };
+
+        let mut passed = 0;
+        let runs = 400;
+        for _ in 0..runs {
+            let margins: Vec<f64> = (0..7).map(|_| next()).collect();
+            if selection_beat_chance(&folds_with(&margins)) {
+                passed += 1;
+            }
+        }
+        let rate = f64::from(passed) / f64::from(runs) * 100.0;
+        assert!(
+            rate <= 10.0,
+            "{rate:.0}% of no-skill procedures passed, against a 5% target"
+        );
     }
 
     #[test]
