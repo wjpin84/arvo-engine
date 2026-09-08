@@ -134,6 +134,36 @@ fn delete_from(plugin_id: &str, from: usize) -> Result<(), SecretsError> {
 /// Returns an error if the platform keychain cannot be opened or written.
 pub fn store_token(plugin_id: &str, token: &str) -> Result<(), SecretsError> {
     let pieces = split(token);
+
+    // A write that fails halfway leaves a secret nobody can detect is wrong.
+    // `get_token` reads until the first gap, so pieces from a previous longer
+    // token are spliced onto the end of the new prefix and handed back as a
+    // whole token — `Ok(Some(garbage))`, not an error. With nothing
+    // underneath it the result is a truncated token instead, which reads the
+    // same way.
+    //
+    // For an OAuth pair that means the app believes it is signed in while
+    // every call fails on an opaque authorization error, and the only fix is
+    // signing out, which nobody knows to try.
+    //
+    // So a failed write leaves nothing behind. Absence is a state the rest of
+    // this module already handles honestly and the person recovers from by
+    // signing in; corruption is neither.
+    if let Err(err) = write_pieces(plugin_id, &pieces) {
+        // Best effort, and the original failure is what gets reported: the
+        // keychain being unwritable is why the cleanup would fail too, and
+        // reporting the second one would name a consequence instead of a
+        // cause.
+        let _ = delete_token(plugin_id);
+        return Err(err);
+    }
+
+    // Anything a longer previous token left behind.
+    delete_from(plugin_id, pieces.len())
+}
+
+/// Writes every piece, in order.
+fn write_pieces(plugin_id: &str, pieces: &[String]) -> Result<(), SecretsError> {
     for (index, piece) in pieces.iter().enumerate() {
         entry(plugin_id, index)?
             .set_password(piece)
@@ -142,8 +172,7 @@ pub fn store_token(plugin_id: &str, token: &str) -> Result<(), SecretsError> {
                 source,
             })?;
     }
-    // Anything a longer previous token left behind.
-    delete_from(plugin_id, pieces.len())
+    Ok(())
 }
 
 /// A token that was never stored is `Ok(None)`, not an error — same
@@ -307,6 +336,58 @@ mod tests {
             }
             assert_eq!(pieces.concat(), original, "reassembly must be exact");
         }
+    }
+
+    /// Demonstrates what a half-finished write leaves behind, which is why
+    /// `store_token` wipes on failure rather than reporting and stopping.
+    ///
+    /// The failure itself cannot be injected here without a seam through the
+    /// platform keychain, and adding one to fake an error the OS raises would
+    /// be testing the fake. So this builds the state a partial write produces
+    /// and shows what `get_token` does with it: returns it, as a whole token,
+    /// with no error and nothing to distinguish it from a real one.
+    #[test]
+    fn a_spliced_secret_reads_back_as_a_whole_one_which_is_why_it_must_not_exist() {
+        let _guard = exclusive();
+        let plugin_id = "test-plugin-secrets-spliced";
+        let _ = delete_token(plugin_id);
+
+        // A long token, stored properly.
+        let old: String = (0..4000).map(|_| 'o').collect();
+        store_token(plugin_id, &old).unwrap();
+        let was = stored_pieces(plugin_id);
+        assert!(was > 2, "the fixture needs several pieces, got {was}");
+
+        // Now the shape a write that died partway through leaves: the first
+        // piece replaced, the rest still the old token's.
+        entry(plugin_id, 0).unwrap().set_password("NEW").unwrap();
+
+        let read = get_token(plugin_id).unwrap().expect("reads as present");
+        assert!(read.starts_with("NEW"), "the new prefix survived");
+        assert!(read.ends_with('o'), "and the old tail is still attached");
+        assert_ne!(read, old, "this is not the old token");
+        assert_eq!(read, format!("NEW{}", &old[1200..]), "it is a splice of both");
+
+        delete_token(plugin_id).unwrap();
+        assert_eq!(stored_pieces(plugin_id), 0);
+    }
+
+    #[test]
+    fn a_token_replaced_by_a_shorter_one_is_the_shorter_one_exactly() {
+        // The success path of the same hazard, and the reason `delete_from`
+        // runs after every write rather than only when one is expected to
+        // shrink.
+        let _guard = exclusive();
+        let plugin_id = "test-plugin-secrets-replace";
+        let _ = delete_token(plugin_id);
+
+        let long: String = (0..5000).map(|_| 'a').collect();
+        store_token(plugin_id, &long).unwrap();
+        store_token(plugin_id, "short").unwrap();
+
+        assert_eq!(get_token(plugin_id).unwrap().as_deref(), Some("short"));
+        assert_eq!(stored_pieces(plugin_id), 1, "no tail left behind");
+        delete_token(plugin_id).unwrap();
     }
 
     #[test]
