@@ -154,7 +154,10 @@ pub(crate) fn StudyReport(study: StudyView) -> impl IntoView {
                             {format!(
                                 "One account across {} instruments. A position any of them \
                                  takes is capital the others cannot have, so these numbers \
-                                 are not what running them separately would give.",
+                                 are not what running them separately would give. The \
+                                 benchmark is buy-and-hold of these same instruments out of \
+                                 the same account — not an equal-weight index of them, which \
+                                 would be a different and easier thing to beat.",
                                 all.len(),
                             )}
                         </p>

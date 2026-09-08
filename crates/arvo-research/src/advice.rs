@@ -190,6 +190,24 @@ pub fn recommend(found: &FamilyEvidence) -> Vec<Recommendation> {
         ));
     }
 
+    // The benchmark starves the same way the strategy does, out of the same
+    // account. When it holds fewer members than the book names, the comparison
+    // stays fair — both sides are short of capital identically — but it stops
+    // being a comparison about the instruments in the title.
+    let benchmark_short = benchmark_held_fewer(found);
+    if let Some((held, asked)) = benchmark_short {
+        out.push(Recommendation::new(
+            Severity::Warning,
+            "The benchmark could not hold the whole book either.",
+            "Read the excess return as being about the instruments both sides \
+             actually held, not the ones named above. Buy-and-hold of this book \
+             pays for the same account, so it is starved by the same shortage — \
+             which keeps the comparison fair and makes it narrower than its \
+             title.",
+            format!("buy-and-hold held {held} of {asked} instruments"),
+        ));
+    }
+
     let silent = never_traded(found);
     if !silent.is_empty() {
         // Found by running two identical instruments against an account with
@@ -615,6 +633,27 @@ pub fn recommend_walk_forward(found: &WalkForwardEvidence) -> Vec<Recommendation
 
     out.sort_by_key(|item| item.severity);
     out
+}
+
+/// How many instruments the benchmark held, when that is fewer than the book
+/// asked for.
+///
+/// `None` for a single-instrument study, for a benchmark that held everything,
+/// and for a finding recorded before the benchmark's instruments were kept —
+/// an empty list there means "not recorded", not "held nothing", and reading
+/// it the other way would accuse every stored book of a shortage it may not
+/// have had.
+fn benchmark_held_fewer(found: &FamilyEvidence) -> Option<(usize, usize)> {
+    let asked = found.out_of_sample_evidence.experiment.instruments().len();
+    if asked < 2 {
+        return None;
+    }
+    let held = found
+        .out_of_sample_evidence
+        .evaluation
+        .benchmark_instruments
+        .len();
+    (held > 0 && held < asked).then_some((held, asked))
 }
 
 /// Instruments the run held but never opened a position in.
@@ -1109,6 +1148,7 @@ mod tests {
                         benchmark_curve: Vec::new(),
                         strategy_trades: TradeStats::default(),
                         strategy_ledger: Vec::new(),
+                        benchmark_instruments: Vec::new(),
                         excess_return: 0.2,
                         verdict: Verdict::Supported,
                         reasons: Vec::new(),
@@ -1281,6 +1321,61 @@ mod tests {
         );
         assert!(
             out.iter().any(|item| item.finding.contains("disagrees with itself")),
+            "{}",
+            findings(&out)
+        );
+    }
+
+    #[test]
+    fn a_benchmark_that_could_not_hold_the_whole_book_is_reported() {
+        // Both sides starve out of the same account, which keeps the
+        // comparison fair and makes it about fewer instruments than the title
+        // claims. Measured against the engine: three instruments and room for
+        // one left the strategy holding one and buy-and-hold holding one, with
+        // an excess return that reads as a statement about three.
+        let mut study = book_study(&["AAPL.NASDAQ", "MSFT.NASDAQ"]);
+        study.out_of_sample_evidence.evaluation.benchmark_instruments =
+            vec!["AAPL.NASDAQ".to_owned()];
+
+        let out = recommend(&study);
+        let item = out
+            .iter()
+            .find(|item| item.finding.contains("benchmark could not hold"))
+            .unwrap_or_else(|| panic!("{}", findings(&out)));
+        assert_eq!(item.severity, Severity::Warning);
+        assert!(item.evidence.contains("1 of 2"), "{}", item.evidence);
+    }
+
+    #[test]
+    fn a_benchmark_that_held_everything_is_not_reported() {
+        let mut study = book_study(&["AAPL.NASDAQ", "MSFT.NASDAQ"]);
+        study.out_of_sample_evidence.evaluation.benchmark_instruments =
+            vec!["AAPL.NASDAQ".to_owned(), "MSFT.NASDAQ".to_owned()];
+
+        let out = recommend(&study);
+        assert!(
+            !out.iter().any(|item| item.finding.contains("benchmark could not hold")),
+            "{}",
+            findings(&out)
+        );
+    }
+
+    #[test]
+    fn a_finding_recorded_before_benchmark_instruments_were_kept_makes_no_accusation() {
+        // An empty list means "not recorded", not "held nothing". Reading it
+        // the other way accuses every stored book of a shortage.
+        let study = book_study(&["AAPL.NASDAQ", "MSFT.NASDAQ"]);
+        assert!(
+            study
+                .out_of_sample_evidence
+                .evaluation
+                .benchmark_instruments
+                .is_empty(),
+            "the fixture stands in for an older record"
+        );
+        let out = recommend(&study);
+        assert!(
+            !out.iter().any(|item| item.finding.contains("benchmark could not hold")),
             "{}",
             findings(&out)
         );

@@ -312,6 +312,25 @@ pub struct Evaluation {
     /// it: the alternative is re-running the backtest to look at it.
     #[serde(default)]
     pub strategy_ledger: Vec<crate::Trade>,
+    /// Which instruments the *benchmark* actually held.
+    ///
+    /// Only interesting for a book, and then it is essential. A book's
+    /// benchmark is buy-and-hold of the same instruments out of the same
+    /// account, so it contends for capital exactly as the strategy does — and
+    /// when the account cannot fund every member, the benchmark holds fewer
+    /// than the book names.
+    ///
+    /// That keeps the comparison *fair*, since both sides are starved
+    /// identically. It also makes it narrower than its title: measured on
+    /// three instruments with room for one, both sides hold one, and the
+    /// excess return is a statement about that one wearing a three-instrument
+    /// name. Recorded rather than assumed, because buy-and-hold buys
+    /// everything on the first bar while a rule enters when it signals — there
+    /// is no guarantee the two starve the same way.
+    ///
+    /// `default` because this is a persisted format.
+    #[serde(default)]
+    pub benchmark_instruments: Vec<String>,
     /// Strategy return minus benchmark return. The number that matters:
     /// absolute return mostly measures whether the market went up.
     pub excess_return: f64,
@@ -321,6 +340,17 @@ pub struct Evaluation {
 }
 
 impl Evaluation {
+    /// Records which instruments the benchmark run actually traded.
+    ///
+    /// A builder rather than a constructor argument: every existing caller
+    /// means "one instrument, and it is the experiment's", which is what an
+    /// empty list already says.
+    #[must_use]
+    pub fn with_benchmark_instruments(mut self, instruments: Vec<String>) -> Self {
+        self.benchmark_instruments = instruments;
+        self
+    }
+
     /// Attaches the strategy run's trade ledger statistics.
     ///
     /// Separate from [`Self::new`] so scoring stays a function of the two
@@ -379,6 +409,7 @@ impl Evaluation {
             benchmark_curve,
             strategy_trades: crate::TradeStats::default(),
             strategy_ledger: Vec::new(),
+            benchmark_instruments: Vec::new(),
             excess_return,
             verdict,
             reasons,
@@ -449,7 +480,8 @@ pub fn evaluate_against_benchmark(
         benchmark_result.equity_curve,
         criteria,
     )
-    .with_trades(strategy_result.ledger.clone());
+    .with_trades(strategy_result.ledger.clone())
+    .with_benchmark_instruments(held(&benchmark_result.ledger));
 
     Ok(Evidence {
         hypothesis: experiment.hypothesis.clone(),
@@ -463,7 +495,29 @@ pub fn evaluate_against_benchmark(
 
 /// Derives the buy-and-hold run an experiment is scored against.
 #[must_use]
+/// The distinct instruments a ledger actually traded, in order.
+///
+/// An unnamed instrument is a ledger from before trades carried one; those
+/// runs were single-instrument, so there is nothing a list could add.
+fn held(ledger: &[crate::Trade]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for trade in ledger {
+        if !trade.instrument.is_empty() && !out.contains(&trade.instrument) {
+            out.push(trade.instrument.clone());
+        }
+    }
+    out
+}
+
 pub fn benchmark_for(experiment: &Experiment) -> Experiment {
+    // `..experiment.clone()` carries `alongside`, so a book is benchmarked
+    // against buy-and-hold of *the same book out of the same account* — not
+    // against an equal-weight index of its members, which is what a reader may
+    // assume and is a different and easier thing to beat.
+    //
+    // It is the right benchmark: it pays the same costs, holds the same names
+    // over the same window, and contends for the same capital. It also starves
+    // when the account is too small, exactly as the strategy does.
     Experiment {
         id: ExperimentId(format!("{}-benchmark", experiment.id)),
         strategy: StrategySpec {

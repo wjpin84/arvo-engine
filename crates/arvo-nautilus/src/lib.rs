@@ -1835,6 +1835,48 @@ mod tests {
     }
 
     #[test]
+    fn a_books_benchmark_starves_out_of_the_same_account_as_the_strategy() {
+        // A book is scored against buy-and-hold of the *same book out of the
+        // same account*, not against an equal-weight index of its members. So
+        // when the account cannot fund every member, both sides hold fewer
+        // than the book names — which keeps the comparison fair and makes it
+        // narrower than its title. Both halves are asserted here, because
+        // stating the fairness without the narrowness is the misleading half.
+        let bars = sawtooth(200);
+        let names = ["AAPL.NASDAQ", "MSFT.NASDAQ", "NVDA.NASDAQ"];
+        let simulation = book_provider(&names, &bars);
+
+        let held = |result: &arvo_research::SimulationResult| {
+            let mut seen: Vec<&str> = result
+                .ledger
+                .iter()
+                .map(|trade| trade.instrument.as_str())
+                .collect();
+            seen.sort_unstable();
+            seen.dedup();
+            seen.len()
+        };
+
+        let mut roomy = experiment(params(10.0, 30.0), &bars);
+        roomy.alongside = names[1..].iter().map(|n| (*n).to_owned()).collect();
+        let roomy_bench = arvo_research::evaluation::benchmark_for(&roomy);
+        assert_eq!(
+            held(&simulation.run(&roomy_bench).expect("runs")),
+            3,
+            "with room for all three, buy-and-hold holds all three"
+        );
+
+        // A tenth of the capital, and the same three names.
+        let mut cramped = roomy.clone();
+        cramped.starting_cash = 12_000.0;
+        let cramped_bench = arvo_research::evaluation::benchmark_for(&cramped);
+        assert!(
+            held(&simulation.run(&cramped_bench).expect("runs")) < 3,
+            "an account with room for one cannot buy and hold three"
+        );
+    }
+
+    #[test]
     fn a_book_trades_every_member_and_the_ledger_says_which() {
         let bars = sawtooth(200);
         let mut experiment = experiment(params(10.0, 30.0), &bars);
