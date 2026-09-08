@@ -602,6 +602,21 @@ pub(crate) fn ResearchView(
                                         .zip(report.to.as_ref())
                                         .map(|(from, to)| format!(" ({from} → {to})"))}
                                 </p>
+                                // Flagged only for a genuine revision. A
+                                // rescaling is a corporate action doing what
+                                // corporate actions do, and colouring it red
+                                // would teach a reader to ignore the colour.
+                                {report
+                                    .revision
+                                    .clone()
+                                    .map(|revision| {
+                                        let tone = if report.revised {
+                                            "research-flag"
+                                        } else {
+                                            "research-hint"
+                                        };
+                                        view! { <p class=tone>{revision}</p> }
+                                    })}
                                 <DataQuality findings=report.data_findings.clone() />
                             }
                         })

@@ -1418,6 +1418,11 @@ pub async fn fetch_bars(
         interval: report.interval.to_string(),
         bars: report.bars,
         interpolated: report.interpolated,
+        revision: report.revision.as_ref().map(describe_revision),
+        revised: matches!(
+            report.revision,
+            Some(arvo_data::agreement::Agreement::Diverged { .. })
+        ),
         from: report.from.map(|at| at.to_string()),
         to: report.to.map(|at| at.to_string()),
         data_findings: report
@@ -2077,6 +2082,41 @@ pub fn walk_forward_view(
 }
 
 /// Flattens a stored panel for display. Same reasoning as [`study_view`].
+/// What a re-fetch changed, in words.
+///
+/// The distinction that matters is between a *rescaling* and a *revision*. A
+/// rescaling is what a corporate action does to a whole series at once: every
+/// price moves by the same factor, nothing that happened has been contradicted,
+/// and a stored finding is stale only in the sense that its numbers are now
+/// quoted in different units. A revision is a source changing its mind about
+/// individual prices, and a finding drawn from the old ones rested on
+/// something that source no longer stands behind.
+fn describe_revision(agreement: &arvo_data::agreement::Agreement) -> String {
+    use arvo_data::agreement::Agreement;
+    match agreement {
+        Agreement::NoOverlap => {
+            "covers a different period from the copy already held".to_owned()
+        }
+        Agreement::Aligned { compared } => {
+            format!("matches the {compared} bars already held")
+        }
+        Agreement::Rescaled { factor, compared } => format!(
+            "every one of {compared} bars moved by the same factor of {factor:.4} \u{2014} a \
+             corporate action re-adjustment, not a change of mind about any price"
+        ),
+        Agreement::Diverged {
+            disagreeing,
+            compared,
+            worst,
+            at,
+        } => format!(
+            "{disagreeing} of {compared} bars now hold different prices, the worst by \
+             {:.2}% on {at} \u{2014} the source has revised history rather than re-adjusted it",
+            worst * 100.0,
+        ),
+    }
+}
+
 /// Recommendations as the window shows them.
 fn advice(items: Vec<arvo_research::Recommendation>) -> Vec<RecommendationView> {
     items

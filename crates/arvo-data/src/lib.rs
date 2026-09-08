@@ -19,6 +19,7 @@
 //! mirror it. Venue adapters, execution feeds and live streaming remain
 //! Nautilus's, reached through `arvo-nautilus`.
 
+pub mod agreement;
 pub mod interval;
 pub mod quality;
 

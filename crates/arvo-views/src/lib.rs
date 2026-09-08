@@ -677,6 +677,18 @@ pub struct FetchView {
     pub from: Option<String>,
     pub to: Option<String>,
     pub data_findings: Vec<DataFindingView>,
+    /// What changed against the copy already held, when there was one.
+    ///
+    /// A re-fetch that rewrites history stales every finding on the
+    /// instrument, correctly, via the content hash. This says *why* it
+    /// changed — a re-adjustment after a corporate action leaves the
+    /// underlying facts intact, a revision does not, and the two want
+    /// different responses.
+    pub revision: Option<String>,
+    /// True only when the change was a genuine disagreement about prices,
+    /// rather than a rescaling or extra coverage.
+    #[serde(default)]
+    pub revised: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -150,6 +150,19 @@ pub struct FetchReport {
     pub path: PathBuf,
     /// What is wrong with what arrived.
     pub quality: arvo_data::quality::Report,
+    /// How this fetch compares to what was already on disk for the same
+    /// instrument and window.
+    ///
+    /// `None` when there was nothing there to compare against, which is every
+    /// first fetch.
+    ///
+    /// This is the gap that made a re-fetch ambiguous. A vendor that revises
+    /// history changes the content hash, which correctly stales every finding
+    /// on that instrument — and nothing could say whether the change was a
+    /// re-adjustment after a split, which leaves the underlying facts intact,
+    /// or a genuine revision, which does not. Those want different responses
+    /// and looked identical.
+    pub revision: Option<arvo_data::agreement::Agreement>,
 }
 
 /// Fetches one instrument's history and writes it into the library.
@@ -201,7 +214,17 @@ pub async fn fetch(
     // so at the moment it arrives rather than the first time a verdict rests
     // on it.
     let quality = arvo_data::quality::inspect(&bars, interval);
-    let path = CsvBars::new(root).write(instrument, interval, &bars)?;
+
+    // Against what is already held, before it is overwritten. Reading after
+    // the write would compare the new series against itself, which is the
+    // failure this whole comparison exists to avoid.
+    let library = CsvBars::new(root);
+    let revision = arvo_data::BarProvider::bars(&library, instrument, interval, from, to)
+        .ok()
+        .filter(|held| !held.is_empty())
+        .map(|held| arvo_data::agreement::compare(&held, &bars).0);
+
+    let path = library.write(instrument, interval, &bars)?;
     Ok(FetchReport {
         instrument: instrument.to_owned(),
         interval,
@@ -211,6 +234,7 @@ pub async fn fetch(
         to: bars.last().map(|bar| bar.at),
         path,
         quality,
+        revision,
     })
 }
 
