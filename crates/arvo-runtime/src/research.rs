@@ -2395,8 +2395,20 @@ mod comparison_tests {
         // The claim the whole screen exists to make. Each finding already
         // deflates the grid inside it; none of them knows it is one of six a
         // person is about to pick a winner from.
-        let rows: Vec<_> = (0..6)
-            .map(|index| row("MSFT.NASDAQ", 0.3 + f64::from(index) * 0.05))
+        //
+        // The fixture used to be an evenly spaced ladder, 0.30 to 0.55 in
+        // steps of 0.05, and it passed only because the null bar was
+        // miscalibrated. A uniform ladder is not noise-shaped: its maximum
+        // sits 1.34 standard deviations above its mean, where six normal
+        // draws average 1.27. Corrected, that ladder *should* squeak past the
+        // bar, and it does.
+        //
+        // So the fixture is now what it always claimed to be — a winner that
+        // is not meaningfully ahead of the field it was picked from.
+        let sharpes = [0.30, 0.40, 0.45, 0.50, 0.52, 0.55];
+        let rows: Vec<_> = sharpes
+            .iter()
+            .map(|sharpe| row("MSFT.NASDAQ", *sharpe))
             .collect();
         let judged = judge_comparison(&rows, Vec::new());
 
@@ -2404,11 +2416,39 @@ mod comparison_tests {
         let bar = judged.bar.expect("six results is enough to say");
         assert!(
             bar > 0.55,
-            "a spread this tight is what a no-skill search of six produces: bar {bar}"
+            "a winner this close to its field is what a no-skill search of six \
+             produces: bar {bar}"
         );
         assert!(!judged.survived);
         assert!(
             judged.notes.iter().any(|note| note.contains("picking noise")),
+            "{:?}",
+            judged.notes
+        );
+    }
+
+    #[test]
+    fn a_winner_that_is_genuinely_ahead_of_the_field_is_not_called_noise() {
+        // The other half, and the half a bar set too high could never show.
+        // Five results clustered near 0.3 and one at 1.2 is not somebody
+        // getting lucky six times; refusing it would make the screen a thing
+        // that only ever says no, which is as useless as one that only ever
+        // says yes and considerably harder to notice.
+        let sharpes = [0.28, 0.30, 0.31, 0.29, 0.32, 1.20];
+        let rows: Vec<_> = sharpes
+            .iter()
+            .map(|sharpe| row("MSFT.NASDAQ", *sharpe))
+            .collect();
+        let judged = judge_comparison(&rows, Vec::new());
+
+        let bar = judged.bar.expect("six results is enough to say");
+        assert!(
+            judged.survived,
+            "best {:?} against a bar of {bar}",
+            judged.best
+        );
+        assert!(
+            !judged.notes.iter().any(|note| note.contains("picking noise")),
             "{:?}",
             judged.notes
         );

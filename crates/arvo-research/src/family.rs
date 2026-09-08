@@ -176,19 +176,46 @@ pub struct FamilyEvidence {
 /// Expected maximum of `n` independent draws, given the spread of what was
 /// actually observed.
 ///
-/// Uses the asymptotic `sqrt(2 ln n)` approximation for the expected maximum
-/// of `n` standard normals, rescaled by the observed mean and spread.
+/// # The estimator, and the one that was here before
 ///
-/// Two honest caveats, both pushing the same way:
+/// This used `sqrt(2 ln n)`, the asymptotic expected maximum of `n` standard
+/// normals, and justified it with a caveat saying the approximation
+/// "understates for very small n". That is backwards, and the error is not
+/// small at the sizes this platform actually searches:
 ///
-/// * Grid trials are *not* independent — neighbouring parameters produce
-///   nearly the same strategy — so the true expected maximum is lower than
-///   this. The test is therefore harder to pass than it strictly needs to be.
-/// * The approximation understates for very small `n`.
+/// | trials | true E[max] | `sqrt(2 ln n)` | overstates by |
+/// |--------|-------------|----------------|---------------|
+/// | 6      | 1.268       | 1.893          | 49%           |
+/// | 9      | 1.485       | 2.096          | 41%           |
+/// | 100    | 2.508       | 3.035          | 21%           |
 ///
-/// Both make this conservative, which is the right direction for a tool whose
-/// purpose is to avoid believing things. A false negative costs an idea; a
-/// false positive costs money.
+/// `sqrt(2 ln n)` is the leading term of an expansion that converges very
+/// slowly; it is only usable in the thousands. Every grid this platform runs
+/// is six or nine.
+///
+/// The consequence was not subtle. Of the thirteen findings on the machine
+/// this was found on, **all thirteen** failed deflation, and several by a
+/// margin the correction closes: 0.719 against a bar of 0.776, 0.675 against
+/// 0.686. Under a correctly calibrated null a no-skill search clears its own
+/// expected maximum about half the time. Thirteen for thirteen is not a
+/// strict tool, it is a broken one, and it fails in the direction that feels
+/// like rigour — which is why it survived.
+///
+/// So this uses the Bailey and López de Prado estimator instead, the same one
+/// the Deflated Sharpe Ratio is built on. It is within 2.5% of the truth
+/// across every size used here.
+///
+/// # What stays conservative, deliberately
+///
+/// Grid trials are *not* independent: neighbouring parameters produce nearly
+/// the same strategy, so the effective number of trials is smaller than the
+/// count and the true expected maximum is lower still. This does not correct
+/// for that, and the test therefore remains harder to pass than it strictly
+/// needs to be.
+///
+/// That margin is kept on purpose — a false negative costs an idea and a
+/// false positive costs money. The difference is that it is now a stated
+/// margin rather than an arithmetic mistake wearing one's clothes.
 #[must_use]
 pub fn expected_best_under_null(sharpes: &[f64]) -> Option<f64> {
     let n = sharpes.len();
@@ -207,7 +234,46 @@ pub fn expected_best_under_null(sharpes: &[f64]) -> Option<f64> {
         return None;
     }
 
-    Some(mean + spread * (2.0 * count.ln()).sqrt())
+    Some(mean + spread * expected_maximum(count))
+}
+
+/// Expected maximum of `n` independent standard normals.
+///
+/// Bailey and López de Prado's estimator, as used by the Deflated Sharpe
+/// Ratio: a weighted blend of two upper quantiles, with the Euler-Mascheroni
+/// constant as the weight. Accurate to a few percent from `n = 3` upward,
+/// where the asymptotic form is out by half.
+fn expected_maximum(n: f64) -> f64 {
+    /// Euler-Mascheroni.
+    const GAMMA: f64 = 0.577_215_664_901_532_9;
+
+    (1.0 - GAMMA) * inverse_normal_cdf(1.0 - 1.0 / n)
+        + GAMMA * inverse_normal_cdf(1.0 - 1.0 / (n * std::f64::consts::E))
+}
+
+/// The value a standard normal falls below with probability `p`.
+///
+/// By bisection on `libm::erf`, which is already in the build for
+/// [`crate::psr`]. Slower than a rational approximation and correct by
+/// construction: it inverts the same function the rest of the crate uses to
+/// go the other way, so the two cannot disagree, and there is no polynomial
+/// here to have mistyped. It runs twice per family.
+fn inverse_normal_cdf(p: f64) -> f64 {
+    let cdf = |x: f64| 0.5 * (1.0 + libm::erf(x / std::f64::consts::SQRT_2));
+
+    // Wide enough for any `p` a trial count can produce: at n = 1, 1 - 1/n is
+    // 0 and at enormous n it approaches 1, and both ends are clamped by the
+    // bracket rather than running away.
+    let (mut low, mut high) = (-10.0_f64, 10.0_f64);
+    for _ in 0..200 {
+        let mid = f64::midpoint(low, high);
+        if cdf(mid) < p {
+            low = mid;
+        } else {
+            high = mid;
+        }
+    }
+    f64::midpoint(low, high)
 }
 
 /// Runs every configuration in a family and reports what survives.
@@ -487,6 +553,97 @@ mod tests {
             "a split leaving no out-of-sample period is not a split"
         );
         assert!(pair.split(0.0).is_none());
+    }
+
+    /// Expected maximum of `n` standard normals, to three decimals, from
+    /// 200,000 simulated draws each. The numbers this estimator has to hit.
+    const TRUE_EXPECTED_MAXIMUM: &[(f64, f64)] = &[
+        (3.0, 0.846),
+        (5.0, 1.163),
+        (6.0, 1.268),
+        (9.0, 1.485),
+        (12.0, 1.629),
+        (25.0, 1.965),
+        (100.0, 2.508),
+    ];
+
+    #[test]
+    fn the_null_bar_is_calibrated_at_the_sizes_actually_searched() {
+        // The bug this replaced. Every grid this platform runs is six or nine
+        // trials, and the asymptotic form overstated the expected maximum by
+        // half there — so a no-skill search was held to a bar it could not
+        // reach, and thirteen findings in a row were refused for it.
+        for (n, truth) in TRUE_EXPECTED_MAXIMUM {
+            let estimate = expected_maximum(*n);
+            let error = (estimate / truth - 1.0).abs() * 100.0;
+            assert!(
+                error < 5.0,
+                "n={n}: estimated {estimate:.3} against a true {truth:.3} ({error:.1}% out)"
+            );
+        }
+    }
+
+    #[test]
+    fn the_asymptotic_form_this_replaced_is_the_one_that_is_wrong() {
+        // Kept as a test rather than only as prose, so the claim in the doc
+        // above is checkable and stays true.
+        for (n, truth) in TRUE_EXPECTED_MAXIMUM {
+            if *n > 50.0 {
+                continue;
+            }
+            let asymptotic = (2.0 * n.ln()).sqrt();
+            assert!(
+                asymptotic > truth * 1.2,
+                "n={n}: sqrt(2 ln n) is {asymptotic:.3} against a true {truth:.3}, \
+                 which should be at least 20% high"
+            );
+        }
+    }
+
+    #[test]
+    fn a_no_skill_search_clears_its_own_bar_about_half_the_time() {
+        // The property that makes the bar meaningful, and the one thirteen
+        // consecutive refusals said was missing. Draws with no skill at all:
+        // the observed best should land above the estimated expected best
+        // roughly half the time, because that is what an expectation is.
+        //
+        // Deterministic draws rather than a seeded generator, so this cannot
+        // fail on somebody else's machine for a reason that is not the code.
+        let mut cleared = 0;
+        let mut total = 0;
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = || {
+            // xorshift64*, and a Box-Muller pair from it.
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            let u = ((state.wrapping_mul(0x2545_f491_4f6c_dd1d) >> 11) as f64)
+                / ((1_u64 << 53) as f64);
+            u.clamp(1e-12, 1.0 - 1e-12)
+        };
+
+        for _ in 0..2000 {
+            let sharpes: Vec<f64> = (0..9)
+                .map(|_| {
+                    let (u1, u2) = (next(), next());
+                    (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
+                })
+                .collect();
+            let best = sharpes.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            if let Some(bar) = expected_best_under_null(&sharpes) {
+                total += 1;
+                if best > bar {
+                    cleared += 1;
+                }
+            }
+        }
+
+        let share = f64::from(cleared) / f64::from(total) * 100.0;
+        assert!(
+            (30.0..=70.0).contains(&share),
+            "a no-skill search cleared its own bar {share:.0}% of the time; \
+             the old estimator managed 0 of 13 on real runs"
+        );
     }
 
     #[test]
