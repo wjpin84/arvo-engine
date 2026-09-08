@@ -153,6 +153,26 @@ pub struct PanelEvidence {
     /// silent pass.
     #[serde(default)]
     pub study: Option<PanelStudy>,
+    /// The bar this verdict was judged against.
+    ///
+    /// A verdict is a comparison, and half of it was being thrown away. The
+    /// record said `NotSupported` and nothing in it said what the result had
+    /// needed to clear, so the one sentence that matters — *why* — could
+    /// not be re-derived from the finding at all.
+    ///
+    /// It also decays silently. `EvaluationCriteria::default` is thirty
+    /// trades, no negative excess return and a thirty percent drawdown
+    /// ceiling; change any of those and every stored verdict means something
+    /// different from what it says, with nothing to reveal the change. A
+    /// single study already keeps its criteria, and these are built from
+    /// studies.
+    ///
+    /// `Option` rather than `serde(default)` on the bare type, deliberately.
+    /// Defaulting would hand an old record today's bar and let it claim that
+    /// is what it was judged by, which is the exact substitution this exists
+    /// to prevent. `None` means not recorded, and says so.
+    #[serde(default)]
+    pub criteria: Option<EvaluationCriteria>,
     /// Instrument/configuration combinations that could not be run.
     pub failures: Vec<String>,
     pub verdict: Verdict,
@@ -348,6 +368,7 @@ pub fn run_panel(
         breadth: Some(breadth),
         book,
         study: Some(study.clone()),
+        criteria: Some(*criteria),
         failures,
         verdict,
         reasons,
@@ -535,6 +556,99 @@ mod tests {
             survived_deflation: survived,
             scored: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_stored_verdict_can_be_re_derived_from_the_record_that_carries_it() {
+        // The property the criteria field exists for: a finding explains
+        // itself. Everything the re-derivation below touches is read back off
+        // the record rather than from the locals that built it, because the
+        // question is whether the *record* is sufficient, and comparing two
+        // calls on the same variables would answer a different and much
+        // easier one.
+        let outcomes = vec![
+            outcome("A.SIM", 0.10, 0.05, 12),
+            outcome("B.SIM", 0.08, 0.06, 11),
+            outcome("C.SIM", 0.09, 0.04, 10),
+        ];
+        let criteria = EvaluationCriteria::default();
+        let pooled = pool(&outcomes);
+        let breadth = unmeasured();
+        let (verdict, reasons) = judge(&pooled, &selection(true), &criteria, &[], &breadth);
+
+        let day = |d: u32| chrono::NaiveDate::from_ymd_opt(2024, 1, d).expect("valid");
+        let stored = PanelEvidence {
+            hypothesis: HypothesisId::from("h"),
+            dataset: crate::DatasetRef {
+                id: "bars".to_owned(),
+                version: "v1".to_owned(),
+            },
+            in_sample: DateRange::new(day(1), day(4)).expect("ordered"),
+            out_of_sample: DateRange::new(day(5), day(9)).expect("ordered"),
+            selected_params: BTreeMap::new(),
+            selection: selection(true),
+            per_instrument: outcomes,
+            pooled,
+            breadth: Some(breadth),
+            book: None,
+            study: None,
+            criteria: Some(criteria),
+            failures: Vec::new(),
+            verdict,
+            reasons,
+        };
+
+        // Nothing from above: only what a reader opening the file would have.
+        let recorded_criteria = stored
+            .criteria
+            .expect("a panel written by this build records its bar");
+        let recorded_breadth = stored.breadth.clone().expect("and its breadth");
+        let (again, again_reasons) = judge(
+            &stored.pooled,
+            &stored.selection,
+            &recorded_criteria,
+            &stored.failures,
+            &recorded_breadth,
+        );
+
+        assert_eq!(again, stored.verdict, "the record must explain its own verdict");
+        assert_eq!(again_reasons, stored.reasons);
+    }
+
+    #[test]
+    fn the_same_result_under_a_harder_bar_is_a_different_verdict() {
+        // Why defaulting an unrecorded value would be a substitution rather
+        // than a convenience: the identical panel changes answer when the bar
+        // moves, so handing an old record today's bar lets it claim a
+        // judgement nobody made.
+        let outcomes = vec![
+            outcome("A.SIM", 0.10, 0.05, 12),
+            outcome("B.SIM", 0.08, 0.06, 11),
+            outcome("C.SIM", 0.09, 0.04, 10),
+        ];
+        let pooled = pool(&outcomes);
+
+        let (lenient, _) = judge(
+            &pooled,
+            &selection(true),
+            &EvaluationCriteria::default(),
+            &[],
+            &unmeasured(),
+        );
+        let (strict, _) = judge(
+            &pooled,
+            &selection(true),
+            &EvaluationCriteria {
+                min_trades: 500,
+                ..EvaluationCriteria::default()
+            },
+            &[],
+            &unmeasured(),
+        );
+
+        assert_eq!(lenient, Verdict::Supported);
+        assert_eq!(strict, Verdict::Inconclusive);
+        assert_ne!(lenient, strict, "the bar is half of the verdict");
     }
 
     #[test]

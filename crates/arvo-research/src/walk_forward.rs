@@ -184,6 +184,26 @@ pub struct WalkForwardEvidence {
     /// `None` for a run recorded before this existed.
     #[serde(default)]
     pub grid: Option<crate::ParameterGrid>,
+    /// The bar this verdict was judged against.
+    ///
+    /// A verdict is a comparison, and half of it was being thrown away. The
+    /// record said `NotSupported` and nothing in it said what the result had
+    /// needed to clear, so the one sentence that matters — *why* — could
+    /// not be re-derived from the finding at all.
+    ///
+    /// It also decays silently. `EvaluationCriteria::default` is thirty
+    /// trades, no negative excess return and a thirty percent drawdown
+    /// ceiling; change any of those and every stored verdict means something
+    /// different from what it says, with nothing to reveal the change. A
+    /// single study already keeps its criteria, and these are built from
+    /// studies.
+    ///
+    /// `Option` rather than `serde(default)` on the bare type, deliberately.
+    /// Defaulting would hand an old record today's bar and let it claim that
+    /// is what it was judged by, which is the exact substitution this exists
+    /// to prevent. `None` means not recorded, and says so.
+    #[serde(default)]
+    pub criteria: Option<EvaluationCriteria>,
     /// Every fold, each a complete study in its own right.
     pub folds: Vec<FamilyEvidence>,
     /// The folds' out-of-sample runs, end to end.
@@ -328,6 +348,7 @@ pub fn run_walk_forward(
         step_days: plan.step_days,
         anchored: plan.anchored,
         grid: Some(plan.grid.clone()),
+        criteria: Some(*criteria),
         folds,
         combined,
         benchmark,
