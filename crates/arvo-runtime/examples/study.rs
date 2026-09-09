@@ -416,7 +416,7 @@ fn run_ranked(
         &instruments[0],
         plan,
         window,
-        &hasher.finalize().to_hex().to_string(),
+        hasher.finalize().to_hex().as_str(),
     );
     family.template.alongside = instruments[1..].to_vec();
 
