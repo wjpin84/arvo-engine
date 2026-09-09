@@ -45,9 +45,31 @@ use nautilus_model::{
 };
 use nautilus_trading::strategy::{Strategy, StrategyCore};
 
-use super::{indicator::Momentum, Position, Risk, EXIT_SIGNAL};
+use super::{
+    indicator::{Atr, Momentum},
+    Position, Risk, EXIT_SIGNAL, EXIT_STOP,
+};
 
 /// Holds the best few of a set, by return over a lookback.
+///
+/// # The stop is the record's, not this rule's
+///
+/// The ranking is the exit: an instrument that falls out of the top few is
+/// sold whatever it is doing. That made a stop look redundant, so the first
+/// version of this passed no ATR at all.
+///
+/// It was wrong, and not in the harmless direction. `Position::plan` refuses
+/// to size at all when a stop is configured and no ATR is supplied — the
+/// deliberate refusal that stops a rule trading unprotected while its
+/// indicator warms up. Every configuration in the search declared a stop, so
+/// every one of them bought nothing, produced a flat curve, and was reported
+/// as six failures of the idea rather than one failure of this file.
+///
+/// The risk model is pinned in the experiment record and the record is the
+/// claim about what ran. A rule that quietly ignored the stop would make the
+/// record a lie; a rule that refuses because of it makes every run mean
+/// nothing. So it honours it: sized against the stop distance, closed when a
+/// bar trades through it.
 pub(crate) struct CrossSectionalMomentum {
     core: StrategyCore,
     bar_types: Vec<nautilus_model::data::BarType>,
@@ -59,12 +81,26 @@ pub(crate) struct CrossSectionalMomentum {
     /// fail its own replay check.
     scores: BTreeMap<InstrumentId, Momentum>,
     positions: BTreeMap<InstrumentId, Position>,
-    /// The most recent score and close per instrument, as of the timestamp
-    /// being filled in.
-    latest: HashMap<InstrumentId, (f64, f64)>,
+    atrs: BTreeMap<InstrumentId, Atr>,
+    /// The most recent score, close and ATR per instrument, as of the
+    /// timestamp being filled in.
+    ///
+    /// The ATR travels with the close rather than being read at rebalance
+    /// time, so the distance a position is sized against is the one measured
+    /// at the instant it was ranked.
+    latest: HashMap<InstrumentId, Reading>,
     /// The timestamp currently arriving. The rebalance fires when this changes.
     filling: Option<UnixNanos>,
     hold_top: usize,
+}
+
+/// One instrument's state as of a completed timestamp.
+#[derive(Clone, Copy)]
+struct Reading {
+    score: f64,
+    close: f64,
+    /// `None` until the ATR has warmed. Sizing refuses rather than guesses.
+    atr: Option<f64>,
 }
 
 impl CrossSectionalMomentum {
@@ -91,10 +127,12 @@ impl CrossSectionalMomentum {
 
         let mut scores = BTreeMap::new();
         let mut positions = BTreeMap::new();
+        let mut atrs = BTreeMap::new();
         for bar_type in &bar_types {
             let id = bar_type.instrument_id();
             scores.insert(id, Momentum::new(lookback));
             positions.insert(id, Position::new(shared, trade_size));
+            atrs.insert(id, Atr::new(risk.atr_period));
         }
 
         Self {
@@ -102,6 +140,7 @@ impl CrossSectionalMomentum {
             bar_types,
             scores,
             positions,
+            atrs,
             latest: HashMap::new(),
             filling: None,
             hold_top,
@@ -116,7 +155,7 @@ impl CrossSectionalMomentum {
         let mut ranked: Vec<(InstrumentId, f64)> = self
             .latest
             .iter()
-            .map(|(id, (score, _))| (*id, *score))
+            .map(|(id, reading)| (*id, reading.score))
             .collect();
         // By score, then by instrument, so a tie resolves the same way twice.
         ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
@@ -155,17 +194,19 @@ impl CrossSectionalMomentum {
             if self.positions.get(&id).is_some_and(Position::is_open) {
                 continue;
             }
-            let Some((_, close)) = self.latest.get(&id).copied() else {
+            let Some(reading) = self.latest.get(&id).copied() else {
                 continue;
             };
             let Some(position) = self.positions.get_mut(&id) else {
                 continue;
             };
-            // No ATR here: this rule's exit is the ranking, not a stop, and a
-            // stop distance would be a second exit nobody asked for.
-            let Some((size, _)) = position.plan(close, None) else {
+            // Sized against the stop distance the record asked for, and
+            // refused outright when that distance is not measurable yet. See
+            // the type note: passing `None` here bought nothing, ever.
+            let Some((size, stop)) = position.plan(reading.close, reading.atr) else {
                 continue;
             };
+            position.stop = stop;
             position.hold(size);
             self.send(id, OrderSide::Buy, size, None)?;
         }
@@ -179,6 +220,12 @@ impl CrossSectionalMomentum {
     /// diverge whenever an order is rejected or partly filled, and selling the
     /// intended size would leave a remainder or flip short.
     fn close(&mut self, id: InstrumentId) -> anyhow::Result<()> {
+        self.close_tagged(id, EXIT_SIGNAL)
+    }
+
+    /// As [`Self::close`], saying why, so a stop-out is distinguishable from a
+    /// sale in the ledger.
+    fn close_tagged(&mut self, id: InstrumentId, reason: &'static str) -> anyhow::Result<()> {
         let intended = self.positions.get_mut(&id).and_then(Position::release);
         let actual = self.portfolio().net_position(&id);
         let size = match f64::try_from(actual).ok().filter(|held| *held > 0.0) {
@@ -188,7 +235,7 @@ impl CrossSectionalMomentum {
         let Some(size) = size else {
             return Ok(());
         };
-        self.send(id, OrderSide::Sell, size, Some(EXIT_SIGNAL))
+        self.send(id, OrderSide::Sell, size, Some(reason))
     }
 
     /// ponytail: the order mechanics `super::Managed` already has, taking an
@@ -255,9 +302,29 @@ impl DataActor for CrossSectionalMomentum {
         self.filling = Some(bar.ts_event);
 
         let id = bar.bar_type.instrument_id();
-        let close = bar.close.as_f64();
+        let (high, low, close) = (bar.high.as_f64(), bar.low.as_f64(), bar.close.as_f64());
+        let atr = self
+            .atrs
+            .get_mut(&id)
+            .and_then(|atr| atr.update(high, low, close));
         if let Some(score) = self.scores.get_mut(&id).and_then(|m| m.update(close)) {
-            self.latest.insert(id, (score, close));
+            self.latest.insert(id, Reading { score, close, atr });
+        }
+
+        // Against this bar's low, on this bar, for the reason
+        // `Position::stopped_out` gives: a position that traded through its
+        // stop mid-bar did not survive to the close.
+        //
+        // A stopped-out instrument that is still top-ranked is bought again at
+        // the next rebalance. That is what the ranking means — the stop
+        // bounds one trade, it does not express an opinion about the name —
+        // and a cooldown would be a third rule nobody specified.
+        if self
+            .positions
+            .get(&id)
+            .is_some_and(|position| position.is_open() && position.stopped_out(low))
+        {
+            self.close_tagged(id, EXIT_STOP)?;
         }
         Ok(())
     }

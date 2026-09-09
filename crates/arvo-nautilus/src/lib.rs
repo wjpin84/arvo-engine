@@ -1077,6 +1077,60 @@ mod tests {
     }
 
     #[test]
+    fn a_ranking_rule_trades_under_the_risk_model_the_record_pins() {
+        // Every other test here builds its experiment from `RiskModel::default`,
+        // which configures no stop. The runtime's template configures one, and
+        // `Position::plan` refuses to size at all when a stop is asked for and
+        // no ATR is supplied. The ranking rule passed no ATR, so under the only
+        // risk model it was ever actually run with it bought nothing — six
+        // configurations that each looked like a failed idea rather than one
+        // unfed indicator.
+        //
+        // So this fixes the risk model rather than the assertion: the property
+        // is that the rule trades under the model the record pins, not under
+        // the one the tests found convenient.
+        let mut library = InMemoryBars::new();
+        for (name, drift) in [
+            ("A.SIM", 0.004),
+            ("B.SIM", 0.003),
+            ("C.SIM", 0.002),
+            ("D.SIM", -0.002),
+        ] {
+            library = library.with_instrument(name, drifting(200, drift));
+        }
+
+        let bars = drifting(200, 0.004);
+        let mut experiment =
+            experiment_named(CROSS_SECTIONAL, cross_sectional_params(20.0, 2.0), &bars);
+        experiment.instrument = "A.SIM".to_owned();
+        experiment.alongside = vec!["B.SIM".to_owned(), "C.SIM".to_owned(), "D.SIM".to_owned()];
+        experiment.risk = arvo_research::RiskModel {
+            stop_atr_multiple: Some(2.0),
+            atr_period: 14,
+            risk_per_trade: Some(0.01),
+            ..arvo_research::RiskModel::default()
+        };
+
+        let result = NautilusSimulation::new(library)
+            .run(&experiment)
+            .expect("runs");
+
+        assert!(
+            !result.ledger.is_empty(),
+            "a configured stop must size the position, not silence the rule"
+        );
+        let traded: std::collections::BTreeSet<&str> = result
+            .ledger
+            .iter()
+            .map(|trade| trade.instrument.as_str())
+            .collect();
+        assert!(
+            !traded.contains("D.SIM"),
+            "the ranking still governs what is bought: {traded:?}"
+        );
+    }
+
+    #[test]
     fn a_ranking_rule_holds_no_more_than_it_was_told_to() {
         // Four instruments, hold the top two. Concurrency is read from the
         // ledger's own open and close times rather than from anything the
