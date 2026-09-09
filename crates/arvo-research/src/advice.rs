@@ -472,6 +472,21 @@ pub fn recommend_panel(
 
     // ---- warning: readable, but resting on something fragile -------------
 
+    if pooled.distinct > 0 && pooled.distinct < pooled.instruments {
+        out.push(Recommendation::new(
+            Severity::Warning,
+            "This panel holds the same security more than once.",
+            "Read every pooled figure as covering the distinct securities rather \
+             than the rows. Two copies of one stock are not two pieces of \
+             evidence about anything, however they were filed, and the easiest \
+             way to have one is to fetch the same ticker from two sources.",
+            format!(
+                "{} rows covering {} securities",
+                pooled.instruments, pooled.distinct
+            ),
+        ));
+    }
+
     if let Some(breadth) = &found.breadth {
         if let (Some(effective), Some(overstatement)) =
             (breadth.effective, breadth.overstatement())
@@ -1014,6 +1029,8 @@ mod tests {
                 total_trades: 60,
                 mean_excess_return: 0.1,
                 beat_benchmark: 4,
+            distinct: 4,
+            distinct_beat: 4,
                 mean_max_drawdown: 0.1,
                 worst_max_drawdown: 0.12,
             },
@@ -1033,6 +1050,47 @@ mod tests {
             .map(|item| format!("{}: {}", item.severity.label(), item.finding))
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn a_panel_holding_one_security_twice_is_told_so() {
+        // The easiest way to have one, and the way this was found: fetch the
+        // same ticker from two sources and run a panel over the pair. It read
+        // "beat benchmark on 4 of 6" for what was two of three.
+        let mut panel = clean_panel();
+        panel.pooled.instruments = 6;
+        panel.pooled.distinct = 3;
+
+        let out = recommend_panel(&panel, &EvaluationCriteria::default());
+        let item = out
+            .iter()
+            .find(|item| item.finding.contains("same security more than once"))
+            .unwrap_or_else(|| panic!("{}", findings(&out)));
+        assert_eq!(item.severity, Severity::Warning);
+        assert!(item.evidence.contains("6 rows covering 3"), "{}", item.evidence);
+    }
+
+    #[test]
+    fn a_panel_of_distinct_securities_is_not_warned() {
+        let out = recommend_panel(&clean_panel(), &EvaluationCriteria::default());
+        assert!(
+            !out.iter().any(|item| item.finding.contains("same security")),
+            "{}",
+            findings(&out)
+        );
+    }
+
+    #[test]
+    fn a_panel_recorded_before_distinct_was_measured_makes_no_accusation() {
+        // Zero means not measured, not "no distinct securities".
+        let mut panel = clean_panel();
+        panel.pooled.distinct = 0;
+        let out = recommend_panel(&panel, &EvaluationCriteria::default());
+        assert!(
+            !out.iter().any(|item| item.finding.contains("same security")),
+            "{}",
+            findings(&out)
+        );
     }
 
     #[test]

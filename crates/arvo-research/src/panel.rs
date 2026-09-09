@@ -89,7 +89,46 @@ pub struct PooledOutcome {
     /// How many instruments beat their own benchmark. Consistency and
     /// magnitude are different claims, and this is the one a single-instrument
     /// result cannot make.
+    ///
+    /// Read against [`Self::distinct`], not [`Self::instruments`]. The two
+    /// differ when a panel holds one security more than once.
     pub beat_benchmark: usize,
+    /// Distinct securities among [`Self::instruments`].
+    ///
+    /// A panel pools its members as separate evidence, and two vendors' copies
+    /// of the same stock are not separate evidence about anything. Fetching
+    /// `PG` from both sources and running a panel over the pair reported "beat
+    /// benchmark on 4 of 6" for what was two of three — four independent
+    /// confirmations where there were two.
+    ///
+    /// `breadth` already corrects the *certainty* of the pooled average from
+    /// correlation. It cannot correct a count, and a count is what consistency
+    /// is, so this is the count's own version of the same fix.
+    ///
+    /// Same security means same ticker: an instrument id is `SYMBOL.VENUE` by
+    /// convention, and `PG.YF` and `PG.RH` are one company however they were
+    /// filed. `0` for a panel recorded before this was measured, which reads
+    /// as unknown rather than as "no distinct securities".
+    #[serde(default)]
+    pub distinct: usize,
+    /// Distinct securities where *every* copy beat its own benchmark.
+    ///
+    /// The numerator [`Self::distinct`] is the denominator for. Comparing
+    /// [`Self::beat_benchmark`] against `distinct` would be worse than the
+    /// original bug: duplicating a winner raises the row count while the
+    /// security count stands still, so the ratio improves and double-counting
+    /// starts *helping* a panel clear its consistency bar.
+    ///
+    /// "Every copy" rather than "any copy" because a security whose two
+    /// vendors disagree about whether it beat is not a confirmation of
+    /// anything. That case is real: on this machine the mean fold margin for
+    /// PG and JNJ came out with opposite signs from two sources, so at these
+    /// effect sizes the disagreement between vendors is the size of the effect.
+    ///
+    /// `0` for a panel recorded before this was measured, which reads as
+    /// unknown rather than as nothing beating.
+    #[serde(default)]
+    pub distinct_beat: usize,
     /// Mean of the per-instrument drawdowns. Understates a combined position's
     /// drawdown, because correlation is not modelled — see the module docs.
     pub mean_max_drawdown: f64,
@@ -375,6 +414,26 @@ pub fn run_panel(
     })
 }
 
+/// How many distinct securities a set of outcomes covers.
+///
+/// By ticker, because an instrument id is `SYMBOL.VENUE` and the venue says
+/// where a copy came from rather than what it is. An id with no venue at all
+/// counts as itself.
+fn distinct_securities(
+    outcomes: &[InstrumentOutcome],
+) -> std::collections::BTreeMap<&str, Vec<f64>> {
+    let mut by_ticker: std::collections::BTreeMap<&str, Vec<f64>> =
+        std::collections::BTreeMap::new();
+    for outcome in outcomes {
+        let ticker = outcome
+            .instrument
+            .rsplit_once('.')
+            .map_or(outcome.instrument.as_str(), |(ticker, _)| ticker);
+        by_ticker.entry(ticker).or_default().push(outcome.excess_return);
+    }
+    by_ticker
+}
+
 fn pool(outcomes: &[InstrumentOutcome]) -> PooledOutcome {
     let count = outcomes.len() as f64;
     PooledOutcome {
@@ -385,6 +444,11 @@ fn pool(outcomes: &[InstrumentOutcome]) -> PooledOutcome {
             .fold(0_u32, u32::saturating_add),
         mean_excess_return: outcomes.iter().map(|o| o.excess_return).sum::<f64>() / count,
         beat_benchmark: outcomes.iter().filter(|o| o.excess_return > 0.0).count(),
+        distinct: distinct_securities(outcomes).len(),
+        distinct_beat: distinct_securities(outcomes)
+            .into_iter()
+            .filter(|(_, results)| results.iter().all(|excess| *excess > 0.0))
+            .count(),
         mean_max_drawdown: outcomes
             .iter()
             .map(|o| o.strategy.max_drawdown)
@@ -429,6 +493,19 @@ fn judge(
         }
     }
 
+    // Against distinct securities rather than rows. A panel holding one stock
+    // twice would otherwise clear a consistency bar on the strength of
+    // counting it twice, which is the arithmetic equivalent of asking the same
+    // person the same question and calling it a second opinion.
+    //
+    // `distinct` is zero on a panel recorded before it was measured; falling
+    // back to the row count keeps those judged the way they were.
+    let (winners, independent) = if pooled.distinct == 0 {
+        (pooled.beat_benchmark, pooled.instruments)
+    } else {
+        (pooled.distinct_beat, pooled.distinct)
+    };
+
     let verdict = if !selection.survived_deflation {
         reasons.push(format!(
             "best pooled in-sample Sharpe {:.3} across {} configurations did not beat the {:.3} a \
@@ -462,10 +539,9 @@ fn judge(
         Verdict::NotSupported
     } else {
         reasons.push(format!(
-            "beat buy-and-hold by {:.4} on average, on {} of {} instruments, over {} trades",
+            "beat buy-and-hold by {:.4} on average, on {winners} of {independent} securities, \
+             over {} trades",
             pooled.mean_excess_return,
-            pooled.beat_benchmark,
-            pooled.instruments,
             pooled.total_trades
         ));
         Verdict::Supported
@@ -474,10 +550,10 @@ fn judge(
     // Majority-of-one is a real caveat even when the numbers clear the bar: a
     // mean carried by a single instrument is not the cross-sectional evidence
     // a panel was run to get.
-    if pooled.instruments > 1 && pooled.beat_benchmark * 2 <= pooled.instruments {
+    if independent > 1 && winners * 2 <= independent {
         reasons.push(format!(
             "the average is not consistent — only {} of {} instruments beat their benchmark",
-            pooled.beat_benchmark, pooled.instruments
+            winners, independent
         ));
     }
     if !failures.is_empty() {
@@ -649,6 +725,121 @@ mod tests {
         assert_eq!(lenient, Verdict::Supported);
         assert_eq!(strict, Verdict::Inconclusive);
         assert_ne!(lenient, strict, "the bar is half of the verdict");
+    }
+
+    #[test]
+    fn two_vendors_copies_of_one_stock_are_one_security() {
+        // An instrument id is `SYMBOL.VENUE`; the venue says where a copy came
+        // from, not what it is.
+        let outcomes = vec![
+            outcome("PG.YF", 0.02, 0.05, 34),
+            outcome("PG.RH", 0.02, 0.05, 34),
+            outcome("AAPL.YF", 0.02, 0.05, 30),
+            outcome("AAPL.RH", 0.02, 0.05, 30),
+            outcome("JNJ.YF", -0.01, 0.05, 31),
+            outcome("JNJ.RH", -0.01, 0.05, 31),
+        ];
+        let pooled = pool(&outcomes);
+        assert_eq!(pooled.instruments, 6, "six rows ran");
+        assert_eq!(pooled.distinct, 3, "of three companies");
+    }
+
+    #[test]
+    fn consistency_is_judged_on_securities_rather_than_rows() {
+        // Four of six looks like a majority and is two of three. Counting the
+        // same stock twice to clear a consistency bar is the arithmetic
+        // equivalent of asking one person twice and calling it a second
+        // opinion.
+        let outcomes = vec![
+            outcome("PG.YF", 0.02, 0.05, 34),
+            outcome("PG.RH", 0.02, 0.05, 34),
+            outcome("AAPL.YF", 0.02, 0.05, 30),
+            outcome("AAPL.RH", 0.02, 0.05, 30),
+            outcome("JNJ.YF", -0.01, 0.05, 31),
+            outcome("JNJ.RH", -0.01, 0.05, 31),
+        ];
+        let pooled = pool(&outcomes);
+        assert_eq!(pooled.beat_benchmark, 4);
+
+        let (_, reasons) = judge(
+            &pooled,
+            &selection(true),
+            &EvaluationCriteria::default(),
+            &[],
+            &unmeasured(),
+        );
+        // Four of six clears `4 * 2 > 6`; four of three clears it too, so the
+        // gate does not fire either way here. What must not happen is the
+        // message claiming six.
+        assert!(
+            !reasons.iter().any(|reason| reason.contains("of 6 instruments")),
+            "a reason must not count rows as instruments: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn a_duplicated_winner_does_not_vote_twice() {
+        // Two rows of one winner and two distinct losers. Counting rows makes
+        // that "2 of 4 beat", a near-majority; counting securities makes it
+        // one of three, which is what happened.
+        //
+        // Getting this wrong is worse than leaving it alone, and the first
+        // attempt did: comparing the *row* count of winners against the
+        // *security* count of instruments means duplicating a winner improves
+        // the ratio, so double-counting starts helping a panel clear its own
+        // consistency bar.
+        let outcomes = vec![
+            outcome("PG.YF", 0.05, 0.05, 34),
+            outcome("PG.RH", 0.05, 0.05, 34),
+            outcome("AAPL.RH", -0.02, 0.05, 30),
+            outcome("JNJ.RH", -0.02, 0.05, 31),
+        ];
+        let pooled = pool(&outcomes);
+        assert_eq!(pooled.beat_benchmark, 2, "two rows beat");
+        assert_eq!(pooled.distinct, 3, "of three securities");
+        assert_eq!(pooled.distinct_beat, 1, "one of which beat");
+
+        let (_, reasons) = judge(
+            &pooled,
+            &selection(true),
+            &EvaluationCriteria::default(),
+            &[],
+            &unmeasured(),
+        );
+        assert!(
+            reasons.iter().any(|reason| reason.contains("1 of 3")),
+            "consistency is counted in securities: {reasons:?}"
+        );
+        assert!(
+            !reasons.iter().any(|reason| reason.contains("2 of 4")),
+            "and never in rows: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn a_security_whose_two_sources_disagree_is_not_a_confirmation() {
+        // The case that made this worth measuring: on real data the mean fold
+        // margin for two of these names came out with opposite signs from two
+        // vendors. A security whose copies disagree about whether it beat has
+        // confirmed nothing, so it is not counted as having beaten.
+        let outcomes = vec![
+            outcome("PG.YF", 0.05, 0.05, 34),
+            outcome("PG.RH", -0.01, 0.05, 34),
+            outcome("AAPL.RH", 0.04, 0.05, 30),
+        ];
+        let pooled = pool(&outcomes);
+        assert_eq!(pooled.beat_benchmark, 2, "two rows beat");
+        assert_eq!(pooled.distinct, 2);
+        assert_eq!(
+            pooled.distinct_beat, 1,
+            "only AAPL; PG's sources contradict each other"
+        );
+    }
+
+    #[test]
+    fn an_instrument_with_no_venue_counts_as_itself() {
+        let outcomes = vec![outcome("AAPL", 0.02, 0.05, 10), outcome("MSFT", 0.02, 0.05, 10)];
+        assert_eq!(pool(&outcomes).distinct, 2);
     }
 
     #[test]
