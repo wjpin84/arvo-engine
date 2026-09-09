@@ -79,6 +79,9 @@ const OPENING_RANGE: &str = "opening_range";
 const VOLATILITY_BREAKOUT: &str = "volatility_breakout";
 const VWAP_REVERSION: &str = "vwap_reversion";
 const MOMENTUM_BREAKOUT: &str = "momentum_breakout";
+/// The one rule here that ranks instruments against each other rather than
+/// judging each on its own.
+const CROSS_SECTIONAL: &str = "cross_sectional_momentum";
 
 /// Every strategy this engine can run, for a caller that wants to offer a
 /// choice rather than hardcode one.
@@ -88,8 +91,17 @@ pub const STRATEGIES: &[&str] = &[
     VOLATILITY_BREAKOUT,
     VWAP_REVERSION,
     MOMENTUM_BREAKOUT,
+    CROSS_SECTIONAL,
     BUY_AND_HOLD,
 ];
+
+/// Strategies that rank instruments against each other, and therefore need
+/// more than one to say anything at all.
+///
+/// A single-instrument run of one of these is not a weak result, it is a
+/// meaningless one: the ranking has a field of one and holds it whatever it
+/// did. Refused rather than run.
+pub const CROSS_SECTIONAL_STRATEGIES: &[&str] = &[CROSS_SECTIONAL];
 
 /// The strategies defined against a trading *session*, which therefore mean
 /// nothing on daily bars.
@@ -250,6 +262,11 @@ enum Plan {
         exit_period: usize,
         trade_size: f64,
     },
+    CrossSectionalMomentum {
+        lookback: usize,
+        hold_top: usize,
+        trade_size: f64,
+    },
     BuyAndHold {
         trade_size: f64,
     },
@@ -356,6 +373,15 @@ impl Plan {
                     trade_size: trade_size()?,
                 })
             }
+            CROSS_SECTIONAL => {
+                let lookback = period("lookback")?;
+                let hold_top = period("hold_top")?;
+                Ok(Self::CrossSectionalMomentum {
+                    lookback,
+                    hold_top,
+                    trade_size: trade_size()?,
+                })
+            }
             BUY_AND_HOLD => Ok(Self::BuyAndHold {
                 trade_size: trade_size()?,
             }),
@@ -375,6 +401,10 @@ impl Plan {
             // something, which is the gate this rule's entry waits on.
             Self::VwapReversion { .. } => 5,
             Self::MomentumBreakout { entry_period, .. } => *entry_period,
+            // The lookback the ranking is computed over. Until every
+            // instrument has one, the field is partial and the ranking is a
+            // statement about whichever happened to warm up first.
+            Self::CrossSectionalMomentum { lookback, .. } => *lookback,
             // One to buy on, and at least one more for the position to have
             // done anything.
             Self::BuyAndHold { .. } => 1,
@@ -388,6 +418,7 @@ impl Plan {
             | Self::VolatilityBreakout { trade_size, .. }
             | Self::VwapReversion { trade_size, .. }
             | Self::MomentumBreakout { trade_size, .. }
+            | Self::CrossSectionalMomentum { trade_size, .. }
             | Self::BuyAndHold { trade_size } => *trade_size,
         }
     }
@@ -539,6 +570,33 @@ fn run_backtest(
         max_concurrent_positions: experiment.risk.max_concurrent_positions,
     };
 
+    // A ranking rule is one decision-maker over the whole set, not one per
+    // instrument: it has to see every score before it can say which is best.
+    // So it is added once, subscribed to all of them, and the per-instrument
+    // loop below is skipped entirely.
+    if let Plan::CrossSectionalMomentum {
+        lookback, hold_top, ..
+    } = *plan
+    {
+        let core = StrategyCore::new(StrategyConfig {
+            strategy_id: None,
+            order_id_tag: Some("001".to_owned()),
+            oms_type: Some(OmsType::Netting),
+            ..StrategyConfig::default()
+        });
+        engine
+            .add_strategy(strategy::CrossSectionalMomentum::new(
+                core,
+                bar_types.clone(),
+                trade_size,
+                lookback,
+                hold_top,
+                risk,
+            ))
+            .map_err(|err| rejected("adding the strategy", &err))?;
+        return finish(engine, experiment, book);
+    }
+
     // One strategy instance per instrument, all settling against the one
     // account added above. This is what makes capital contention real: when two
     // members want in at the same time, the second is filled out of whatever
@@ -629,10 +687,32 @@ fn run_backtest(
             Plan::BuyAndHold { .. } => {
                 engine.add_strategy(strategy::BuyAndHold::new(core, bar_type, trade_size))
             }
+            Plan::CrossSectionalMomentum { .. } => {
+                // Added once for the whole set above, and returned before
+                // reaching here. The compiler cannot see that, so this says
+                // it rather than pretending the case is possible.
+                return Err(SimulationError::Rejected(
+                    "a ranking rule is added once across every instrument, not once per                      instrument"
+                        .to_owned(),
+                ));
+            }
         }
         .map_err(|err| rejected("adding the strategy", &err))?;
     }
 
+    finish(engine, experiment, book)
+}
+
+/// Runs the engine and reads the result back.
+///
+/// Shared by the two ways strategies get added — one per instrument, or one
+/// across all of them — so a ranking rule and an ordinary one cannot come to
+/// differ in how their results are collected.
+fn finish(
+    mut engine: BacktestEngine,
+    experiment: &Experiment,
+    book: &[(InstrumentId, String, Vec<arvo_data::Bar>)],
+) -> Result<SimulationResult, SimulationError> {
     // The window is already expressed by the data: bars were filtered to it on
     // the way in, so bounding the run again would only add a way to disagree
     // with itself.
@@ -925,6 +1005,138 @@ mod tests {
         NautilusSimulation::new(InMemoryBars::new().with_instrument("AAPL.NASDAQ", bars))
     }
 
+    /// A price path that compounds at `drift` per bar, so a set of them has a
+    /// ranking known in advance.
+    fn drifting(days: usize, drift: f64) -> Vec<arvo_data::Bar> {
+        let mut start = date(2024, 1, 1);
+        let mut bars = Vec::with_capacity(days);
+        for index in 0..days {
+            let close = 100.0 * (1.0 + drift).powi(i32::try_from(index).expect("small"));
+            bars.push(arvo_data::Bar {
+                at: start.and_time(NaiveTime::MIN),
+                open: close,
+                high: close,
+                low: close,
+                close,
+                volume: 10_000.0,
+            });
+            start = start.succ_opt().expect("date stays in range");
+        }
+        bars
+    }
+
+    fn cross_sectional_params(lookback: f64, hold_top: f64) -> BTreeMap<String, f64> {
+        BTreeMap::from([
+            ("lookback".to_owned(), lookback),
+            ("hold_top".to_owned(), hold_top),
+            ("trade_size".to_owned(), 10.0),
+        ])
+    }
+
+    #[test]
+    fn a_ranking_rule_holds_the_risers_and_not_the_fallers() {
+        // The property no other rule here can express. Three instruments that
+        // rise and one that falls, over a window where the ranking never
+        // changes: the faller must never be bought, and the risers must be.
+        let mut library = InMemoryBars::new();
+        library = library.with_instrument("FAST.SIM", drifting(200, 0.004));
+        library = library.with_instrument("MID.SIM", drifting(200, 0.002));
+        library = library.with_instrument("SLOW.SIM", drifting(200, 0.001));
+        library = library.with_instrument("DOWN.SIM", drifting(200, -0.002));
+
+        let bars = drifting(200, 0.004);
+        let mut experiment = experiment_named(
+            CROSS_SECTIONAL,
+            cross_sectional_params(20.0, 2.0),
+            &bars,
+        );
+        experiment.instrument = "FAST.SIM".to_owned();
+        experiment.alongside = vec![
+            "MID.SIM".to_owned(),
+            "SLOW.SIM".to_owned(),
+            "DOWN.SIM".to_owned(),
+        ];
+
+        let result = NautilusSimulation::new(library)
+            .run(&experiment)
+            .expect("the ranking rule should run");
+
+        let traded: std::collections::BTreeSet<&str> = result
+            .ledger
+            .iter()
+            .map(|trade| trade.instrument.as_str())
+            .collect();
+        assert!(
+            !traded.contains("DOWN.SIM"),
+            "a falling instrument is never in the top two: {traded:?}"
+        );
+        assert!(
+            traded.contains("FAST.SIM"),
+            "the fastest riser must be held: {traded:?}"
+        );
+    }
+
+    #[test]
+    fn a_ranking_rule_holds_no_more_than_it_was_told_to() {
+        // Four instruments, hold the top two. Concurrency is read from the
+        // ledger's own open and close times rather than from anything the
+        // strategy reported, so it is what the account did.
+        let mut library = InMemoryBars::new();
+        for (name, drift) in [
+            ("A.SIM", 0.004),
+            ("B.SIM", 0.003),
+            ("C.SIM", 0.002),
+            ("D.SIM", 0.001),
+        ] {
+            library = library.with_instrument(name, drifting(200, drift));
+        }
+
+        let bars = drifting(200, 0.004);
+        let mut experiment =
+            experiment_named(CROSS_SECTIONAL, cross_sectional_params(20.0, 2.0), &bars);
+        experiment.instrument = "A.SIM".to_owned();
+        experiment.alongside = vec!["B.SIM".to_owned(), "C.SIM".to_owned(), "D.SIM".to_owned()];
+
+        let result = NautilusSimulation::new(library)
+            .run(&experiment)
+            .expect("runs");
+
+        let mut edges: Vec<(chrono::NaiveDateTime, i32)> = Vec::new();
+        for trade in &result.ledger {
+            edges.push((trade.opened, 1));
+            if let Some(closed) = trade.closed {
+                edges.push((closed, -1));
+            }
+        }
+        edges.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+        let (mut live, mut peak) = (0, 0);
+        for (_, delta) in edges {
+            live += delta;
+            peak = peak.max(live);
+        }
+        assert!(peak <= 2, "told to hold two, held {peak} at once");
+    }
+
+    #[test]
+    fn a_ranking_rule_over_one_instrument_is_a_field_of_one() {
+        // Not a weak result, a meaningless one: the ranking holds whatever it
+        // has whatever it did. Worth knowing that it runs rather than breaks,
+        // and worth the caller refusing it — see `CROSS_SECTIONAL_STRATEGIES`.
+        let bars = drifting(200, 0.004);
+        let experiment =
+            experiment_named(CROSS_SECTIONAL, cross_sectional_params(20.0, 2.0), &bars);
+        let result = NautilusSimulation::new(
+            InMemoryBars::new().with_instrument("AAPL.NASDAQ", bars.clone()),
+        )
+        .run(&experiment)
+        .expect("it runs");
+        assert!(
+            result.trades <= 1,
+            "one riser, held throughout: {} trades",
+            result.trades
+        );
+    }
+
     #[test]
     fn an_experiment_runs_end_to_end_through_nautilus() {
         let bars = sawtooth(200);
@@ -987,6 +1199,8 @@ mod tests {
                     ("entry_deviations".to_owned(), 2.0),
                     ("entry_period".to_owned(), 20.0),
                     ("exit_period".to_owned(), 10.0),
+                    ("lookback".to_owned(), 60.0),
+                    ("hold_top".to_owned(), 3.0),
                 ]),
             };
             assert!(

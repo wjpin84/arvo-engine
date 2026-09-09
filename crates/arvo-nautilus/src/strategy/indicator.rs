@@ -46,6 +46,47 @@ impl Sma {
     }
 }
 
+/// Return over a fixed lookback: what this instrument did, as one number.
+///
+/// The measure a cross-sectional rule ranks on. Deliberately the plainest one
+/// there is — price now against price `period` bars ago — because the
+/// question that rule asks is whether *ranking* adds anything, and a clever
+/// measure would confound the answer with itself.
+///
+/// A fraction rather than a ratio, so instruments at different prices are
+/// comparable, which is the whole point of ranking them.
+pub(crate) struct Momentum {
+    pub(crate) period: usize,
+    window: VecDeque<f64>,
+}
+
+impl Momentum {
+    pub(crate) fn new(period: usize) -> Self {
+        Self {
+            period,
+            // One more than the period: the return spans `period` intervals
+            // and therefore needs `period + 1` observations.
+            window: VecDeque::with_capacity(period + 1),
+            }
+    }
+
+    /// Feeds a close in, returning the return over the lookback once there is
+    /// one to compute.
+    pub(crate) fn update(&mut self, close: f64) -> Option<f64> {
+        self.window.push_back(close);
+        if self.window.len() > self.period + 1 {
+            self.window.pop_front();
+        }
+        if self.window.len() <= self.period {
+            return None;
+        }
+        let oldest = *self.window.front()?;
+        // A series that reached zero has no meaningful return over it, and a
+        // division here would produce an infinity that sorts above everything.
+        (oldest > 0.0).then(|| close / oldest - 1.0)
+    }
+}
+
 /// Average true range: how far this instrument actually moves in a bar.
 ///
 /// True range is the widest of the bar's own span and the two gaps to the
@@ -242,6 +283,41 @@ fn date_of(at: UnixNanos) -> Option<NaiveDate> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn momentum_is_withheld_until_the_lookback_is_covered() {
+        // A return over five bars needs six observations, and reporting one
+        // early would rank an instrument on a shorter window than its peers.
+        let mut momentum = Momentum::new(5);
+        for close in [100.0, 101.0, 102.0, 103.0, 104.0] {
+            assert_eq!(momentum.update(close), None);
+        }
+        assert!(momentum.update(110.0).is_some());
+    }
+
+    #[test]
+    fn momentum_is_a_fraction_so_instruments_at_different_prices_compare() {
+        // The whole point of ranking. A ten-dollar stock that doubled and a
+        // thousand-dollar stock that doubled rank equally.
+        let mut cheap = Momentum::new(2);
+        let mut dear = Momentum::new(2);
+        for (a, b) in [(10.0, 1000.0), (10.0, 1000.0), (20.0, 2000.0)] {
+            let (x, y) = (cheap.update(a), dear.update(b));
+            if let (Some(x), Some(y)) = (x, y) {
+                assert!((x - y).abs() < 1e-12, "{x} vs {y}");
+                assert!((x - 1.0).abs() < 1e-12, "both doubled");
+            }
+        }
+    }
+
+    #[test]
+    fn a_series_through_zero_reports_nothing_rather_than_an_infinity() {
+        // An infinity sorts above every real instrument, so a rule ranking on
+        // it would hold whichever series was most broken.
+        let mut momentum = Momentum::new(1);
+        assert_eq!(momentum.update(0.0), None);
+        assert_eq!(momentum.update(50.0), None, "no return over a zero base");
+    }
 
     #[test]
     fn an_average_is_withheld_until_its_window_is_full() {

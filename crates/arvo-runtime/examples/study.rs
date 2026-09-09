@@ -37,6 +37,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // rather than a flag on the same output.
     let rolling = requested.iter().any(|arg| arg == "--walk-forward");
     requested.retain(|arg| arg != "--walk-forward");
+
+    // `--since YYYY-MM-DD` trims every instrument to the same starting date.
+    //
+    // Comparing two sources' copies of one stock is meaningless while one has
+    // six more years than the other: the extra history changes the fold count,
+    // which changes the selection, which changes everything downstream. Two
+    // answers that differ then say nothing about whether the *data* differs.
+    let since: Option<chrono::NaiveDate> = match requested.iter().position(|arg| arg == "--since") {
+        Some(at) => {
+            let value = requested
+                .get(at + 1)
+                .ok_or("--since wants a date like 2006-09-13")?
+                .clone();
+            requested.drain(at..=at + 1);
+            Some(value.parse()?)
+        }
+        None => None,
+    };
     let instruments = if requested.is_empty() {
         bars.instruments()?
     } else {
@@ -59,6 +77,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("  no bars");
             continue;
         };
+        // Later of the two, so `--since` narrows and never invents coverage an
+        // instrument does not have.
+        let from = since.map_or(from, |floor| from.max(floor));
+        if from >= to {
+            println!("  no bars after {from}");
+            continue;
+        }
         let window = DateRange::new(from, to)?;
         println!("  {} .. {} ({} days)", from, to, window.days());
 

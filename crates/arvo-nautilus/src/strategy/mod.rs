@@ -38,6 +38,7 @@
 //! of the boundary. `arvo-research` names it by string in `StrategySpec` and
 //! never sees the type.
 
+mod cross_sectional;
 mod indicator;
 mod rules;
 
@@ -45,6 +46,7 @@ use nautilus_common::actor::DataActorNative;
 use nautilus_model::{enums::OrderSide, identifiers::InstrumentId, types::Quantity};
 use nautilus_trading::strategy::{Strategy, StrategyNative};
 
+pub(crate) use cross_sectional::CrossSectionalMomentum;
 pub(crate) use rules::{
     BuyAndHold, MomentumBreakout, OpeningRange, SmaCross, VolatilityBreakout, VwapReversion,
 };
@@ -120,6 +122,26 @@ impl Position {
             peak_equity: None,
             halted: false,
         }
+    }
+
+    /// Records what was just bought.
+    ///
+    /// Named rather than assigned in place, because the two callers that do it
+    /// are in different modules now and a field poked from two directions is a
+    /// field that acquires a third meaning.
+    pub(crate) const fn hold(&mut self, size: Quantity) {
+        self.held = Some(size);
+    }
+
+    /// Gives up what was held, and the levels that went with it.
+    ///
+    /// The levels go together with the size deliberately: a stop left behind
+    /// after the position it protected is gone will fire against the next one,
+    /// at a price chosen for a trade that already ended.
+    pub(crate) const fn release(&mut self) -> Option<Quantity> {
+        self.stop = None;
+        self.target = None;
+        self.held.take()
     }
 
     /// Whether the account's drawdown limit has been reached.
@@ -250,7 +272,7 @@ pub(crate) trait Managed: Strategy + StrategyNative + DataActorNative {
             let position = self.position_mut();
             position.stop = stop;
             position.target = target;
-            position.held = Some(size);
+            position.hold(size);
         }
         self.send(OrderSide::Buy, size, None)?;
         Ok(true)
@@ -294,12 +316,7 @@ pub(crate) trait Managed: Strategy + StrategyNative + DataActorNative {
     /// remainder that outlives its stop or flip short without ever deciding
     /// to. Its own record is the fallback, for a venue that reports nothing.
     fn close(&mut self, reason: &'static str) -> anyhow::Result<()> {
-        let intended = {
-            let position = self.position_mut();
-            position.stop = None;
-            position.target = None;
-            position.held.take()
-        };
+        let intended = self.position_mut().release();
 
         let instrument = self.instrument();
         let actual = self.portfolio().net_position(&instrument);

@@ -121,9 +121,21 @@ pub struct PooledOutcome {
     ///
     /// "Every copy" rather than "any copy" because a security whose two
     /// vendors disagree about whether it beat is not a confirmation of
-    /// anything. That case is real: on this machine the mean fold margin for
-    /// PG and JNJ came out with opposite signs from two sources, so at these
-    /// effect sizes the disagreement between vendors is the size of the effect.
+    /// anything.
+    ///
+    /// An earlier version of this note claimed that case was demonstrated on
+    /// real data DASH that PG and JNJ produced opposite-signed fold margins
+    /// from two sources. That was measured across different windows, and a
+    /// controlled re-run over one window disagrees: the two vendors gave the
+    /// same sign on all three instruments tested, the same fold counts, and
+    /// stitched returns matching to two decimals. The sign flip was six extra
+    /// years of history, not the data.
+    ///
+    /// The rule stands anyway, on the weaker and true claim: the margins do
+    /// not match either. PG came out -0.0175 against -0.0108 on the same
+    /// window, which is the same conclusion reached with meaningfully
+    /// different confidence, and a disagreement about direction remains the
+    /// case this is here for whether or not it has been seen yet.
     ///
     /// `0` for a panel recorded before this was measured, which reads as
     /// unknown rather than as nothing beating.
@@ -818,10 +830,12 @@ mod tests {
 
     #[test]
     fn a_security_whose_two_sources_disagree_is_not_a_confirmation() {
-        // The case that made this worth measuring: on real data the mean fold
-        // margin for two of these names came out with opposite signs from two
-        // vendors. A security whose copies disagree about whether it beat has
-        // confirmed nothing, so it is not counted as having beaten.
+        // A security whose copies disagree about whether it beat has confirmed
+        // nothing, so it is not counted as having beaten.
+        //
+        // Not yet seen on real data: a controlled comparison over one window
+        // had two vendors agreeing on sign for every instrument tested. They
+        // disagreed on magnitude, which is the near miss this guards against.
         let outcomes = vec![
             outcome("PG.YF", 0.05, 0.05, 34),
             outcome("PG.RH", -0.01, 0.05, 34),
