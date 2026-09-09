@@ -123,6 +123,18 @@ const PLANS: &[StrategyPlan] = &[
         intraday: false,
     },
     StrategyPlan {
+        name: "cross_sectional_momentum",
+        label: "Cross-sectional momentum",
+        premise: "Hold the few that rose most, and nothing else. Ranks the set \
+                  rather than judging each on its own.",
+        fixed: &[("trade_size", TRADE_SIZE)],
+        axes: &[
+            ("lookback", &[20.0, 60.0, 120.0]),
+            ("hold_top", &[2.0, 3.0]),
+        ],
+        intraday: false,
+    },
+    StrategyPlan {
         name: "opening_range",
         label: "Opening range breakout",
         premise: "The session's first bars set a range; trade the break, once a day.",
@@ -156,6 +168,17 @@ const INTRADAY: arvo_data::BarInterval =
 const STRATEGY: &str = "sma_cross";
 
 impl StrategyPlan {
+    /// Whether this rule needs more than one instrument to mean anything.
+    ///
+    /// Asked of the engine rather than restated here. A second list of which
+    /// rules rank is a second thing to forget to update, and the failure would
+    /// be a ranking rule quietly run over a field of one — which produces a
+    /// curve, a verdict, and no information.
+    #[must_use]
+    pub fn ranks_a_set(&self) -> bool {
+        arvo_nautilus::CROSS_SECTIONAL_STRATEGIES.contains(&self.name)
+    }
+
     /// Looks a strategy up by the name the record stores.
     #[must_use]
     pub fn find(name: &str) -> Option<&'static Self> {
@@ -716,6 +739,15 @@ pub async fn run_study(
     let name = strategy.unwrap_or_else(|| STRATEGY.to_owned());
     let plan = StrategyPlan::find(&name)
         .ok_or_else(|| CommandError::Failed(format!("no strategy called {name:?}")))?;
+    if plan.ranks_a_set() {
+        // It would run. It would produce a curve, a verdict and no
+        // information: a ranking with a field of one holds that one whatever
+        // it did, so the result describes the instrument and not the rule.
+        return Err(CommandError::Failed(format!(
+            "{} ranks instruments against each other and needs more than one; run it as a book",
+            plan.label
+        )));
+    }
     let interval = plan.interval();
 
     let simulation = service.simulation.clone();
@@ -811,6 +843,17 @@ pub async fn run_book(
     let name = strategy.unwrap_or_else(|| STRATEGY.to_owned());
     let plan = StrategyPlan::find(&name)
         .ok_or_else(|| CommandError::Failed(format!("no strategy called {name:?}")))?;
+
+    // A ranking rule holding the top few of two is holding one of them, which
+    // is a coin toss the rest of the machinery would dutifully evaluate.
+    if plan.ranks_a_set() && instruments.len() < MIN_RANKED {
+        return Err(CommandError::Failed(format!(
+            "{} ranks instruments against each other; {MIN_RANKED} is the fewest a ranking \
+             says anything about, and this has {}",
+            plan.label,
+            instruments.len()
+        )));
+    }
     let interval = plan.interval();
 
     // The window every member can be held over, and one hash covering all of
@@ -1237,7 +1280,7 @@ fn watchlist_symbols(held: &BTreeSet<String>, library: Vec<String>) -> Vec<Strin
 
     // By bare ticker, not by instrument id. The rows, the subscription and the
     // arriving tick all key on the ticker, so `AAPL.SCHWAB` from a statement
-    // and `AAPL.RH` from a fetch are two ids and one row DASH and keeping both
+    // and `AAPL.RH` from a fetch are two ids and one row — and keeping both
     // renders AAPL twice, moving in lockstep, one of them flagged as held.
     let mut seen = std::collections::HashSet::new();
     chosen.retain(|id| seen.insert(symbol_only(id)));
@@ -1256,7 +1299,7 @@ fn watchlist_symbols(held: &BTreeSet<String>, library: Vec<String>) -> Vec<Strin
 /// `DRIFT.SIM` into `DRIFT`, and both the quote call and the socket will
 /// happily answer for a listed ticker of that name. A synthetic fixture would
 /// then display a real market price, moving, under the name of a series that
-/// was generated. That is the worst shape a wrong number can take DASH it is
+/// was generated. That is the worst shape a wrong number can take — it is
 /// not implausible, it is not flagged, and it is exactly as convincing as a
 /// right one.
 ///
@@ -2326,6 +2369,13 @@ fn template_for(
 ///
 /// These are a claim, not a setting: a walk-forward run at a different cadence
 /// is a different experiment, and the pair is part of what the record pins.
+/// The fewest instruments a ranking rule is allowed to rank.
+///
+/// Four, holding two or three, so the choice is a choice. Ranking two and
+/// holding the better one is a coin toss dressed as a selection, and the
+/// evaluation machinery would score it as diligently as anything else.
+const MIN_RANKED: usize = 4;
+
 const IN_SAMPLE_DAYS: i64 = 365 * 3;
 const STEP_DAYS: i64 = 365 * 2;
 

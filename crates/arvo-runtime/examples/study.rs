@@ -71,6 +71,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     run_panel_over(&bars, &simulation, &instruments, &criteria)?;
 
+    // A ranking rule's whole content is the comparison between instruments,
+    // so running it once per instrument would report N findings about a rule
+    // that was never asked its question. The runtime refuses that outright;
+    // here it takes the other path instead.
+    if plan_ranks(strategy) {
+        return run_ranked(&bars, &simulation, &instruments, strategy, &criteria);
+    }
+
     for instrument in instruments {
         println!("\n=== {instrument} ===");
         let Some((from, to)) = bars.coverage(&instrument, arvo_data::BarInterval::DAILY)? else {
@@ -360,5 +368,88 @@ fn run_panel_over(
             }
         }
     }
+    Ok(())
+}
+
+/// Whether this strategy ranks instruments against each other.
+fn plan_ranks(strategy: &str) -> bool {
+    arvo_runtime_lib::research::StrategyPlan::find(strategy)
+        .is_some_and(arvo_runtime_lib::research::StrategyPlan::ranks_a_set)
+}
+
+/// Runs a ranking rule over the whole set as one book.
+///
+/// The window is the intersection of every member's coverage and the dataset
+/// hash covers all of them, for the reasons `run_book` gives: a rule cannot
+/// rank an instrument over a period it has no prices for, and a hash naming
+/// one member would call the run stale when that member changed and fresh
+/// when any other did.
+fn run_ranked(
+    bars: &CsvBars,
+    simulation: &NautilusSimulation<CsvBars>,
+    instruments: &[String],
+    strategy: &str,
+    criteria: &EvaluationCriteria,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let plan =
+        arvo_runtime_lib::research::StrategyPlan::find(strategy).ok_or("no such strategy")?;
+    let (mut from, mut to) = (chrono::NaiveDate::MIN, chrono::NaiveDate::MAX);
+    let mut hasher = blake3::Hasher::new();
+    for instrument in instruments {
+        let Some((first, last)) = bars.coverage(instrument, arvo_data::BarInterval::DAILY)?
+        else {
+            continue;
+        };
+        if let Some(print) = bars.fingerprint(instrument, arvo_data::BarInterval::DAILY)? {
+            hasher.update(instrument.as_bytes());
+            hasher.update(print.as_bytes());
+        }
+        from = from.max(first);
+        to = to.min(last);
+    }
+
+    let window = DateRange::new(from, to)?;
+    println!("\n=== RANKED: {} instruments ===", instruments.len());
+    println!("  {from} .. {to}");
+
+    let mut family = arvo_runtime_lib::research::study_for(
+        &instruments[0],
+        plan,
+        window,
+        &hasher.finalize().to_hex().to_string(),
+    );
+    family.template.alongside = instruments[1..].to_vec();
+
+    let found = arvo_research::run_family(simulation, &family, criteria)?;
+    println!("  verdict: {:?}", found.verdict);
+    println!(
+        "  chose {:?}",
+        found
+            .selected
+            .strategy
+            .params
+            .iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect::<Vec<_>>()
+    );
+    for reason in &found.reasons {
+        println!("  - {reason}");
+    }
+
+    let evaluation = &found.out_of_sample_evidence.evaluation;
+    println!(
+        "  out-of-sample: strategy {:+.2}% ({} trades), buy-and-hold {:+.2}%",
+        evaluation.strategy.total_return * 100.0,
+        evaluation.strategy.trades,
+        evaluation.benchmark.total_return * 100.0,
+    );
+    let mut held: Vec<&str> = evaluation
+        .strategy_ledger
+        .iter()
+        .map(|trade| trade.instrument.as_str())
+        .collect();
+    held.sort_unstable();
+    held.dedup();
+    println!("  held at some point: {}", held.join(" "));
     Ok(())
 }
