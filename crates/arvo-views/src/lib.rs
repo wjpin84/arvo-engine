@@ -198,7 +198,17 @@ pub struct StudyView {
     // The out-of-sample comparison itself.
     pub strategy: MetricsView,
     pub benchmark: MetricsView,
+    /// Uncorrected. [`Self::dividend_gap`] sits beside it rather than being
+    /// folded in: a number silently adjusted by something the reader cannot see
+    /// is what this platform exists to stop.
     pub excess_return: f64,
+    /// How much of that margin is the dividend bias rather than skill.
+    ///
+    /// `None` means it was never measured — no distribution series is held for
+    /// these instruments. The bias is real either way; only its size is
+    /// unknown, and `recommendations` says so.
+    #[serde(default)]
+    pub dividend_gap: Option<DividendGapView>,
 
     /// The two curves behind the numbers. A table says a strategy returned
     /// less than the market; a chart says whether it did so steadily or lost
@@ -648,6 +658,33 @@ pub struct ComparisonView {
     pub survived_deflation: bool,
     /// What is worth saying about the comparison itself.
     pub notes: Vec<String>,
+}
+
+/// The dividend bias, measured.
+///
+/// Prices are split-adjusted but not total-return adjusted, so no dividend is
+/// paid to anything in a backtest. Both sides forgo them — but the benchmark
+/// held through every ex-date and a rule in the market some of the time did
+/// not, so the margin between them is overstated in the strategy's favour.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct DividendGapView {
+    /// Distributions that went ex inside the window.
+    ///
+    /// Zero is a real answer and a good one: these instruments pay nothing, so
+    /// the margin needs no correction.
+    pub events: usize,
+    pub strategy_income: f64,
+    pub benchmark_income: f64,
+    /// The gap as a fraction of starting capital, in the same units as the
+    /// excess return it comes off.
+    pub overstatement: f64,
+    /// The excess return with the gap taken out.
+    pub corrected_excess: f64,
+    /// False when some instrument the run held has no distribution series, in
+    /// which case the figure is a floor rather than the answer.
+    pub complete: bool,
+    pub covered: usize,
+    pub instruments: usize,
 }
 
 /// One instrument the broker knows about.

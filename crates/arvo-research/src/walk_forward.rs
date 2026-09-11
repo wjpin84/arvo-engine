@@ -863,6 +863,7 @@ mod tests {
                     benchmark_curve: Vec::new(),
                     strategy_trades: TradeStats::default(),
                     strategy_ledger: Vec::new(),
+                dividend_gap: None,
                     benchmark_instruments: Vec::new(),
                     excess_return: 0.0,
                     verdict: Verdict::Inconclusive,

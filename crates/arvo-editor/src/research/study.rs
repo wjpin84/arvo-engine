@@ -178,8 +178,24 @@ pub(crate) fn StudyReport(study: StudyView) -> impl IntoView {
                 <MetricCard
                     label="Excess return"
                     value=percent(study.excess_return)
-                    tone=study.excess_return
-                    note="vs buy and hold".to_owned()
+                    // Toned on the *corrected* figure where there is one. A
+                    // margin that is green until you read the caveat under it
+                    // is a margin most people will read as green.
+                    tone=study
+                        .dividend_gap
+                        .map_or(study.excess_return, |gap| gap.corrected_excess)
+                    note=study
+                        .dividend_gap
+                        .filter(|gap| gap.events > 0)
+                        .map_or_else(
+                            || "vs buy and hold".to_owned(),
+                            |gap| {
+                                format!(
+                                    "vs buy and hold · {} after dividends",
+                                    percent(gap.corrected_excess),
+                                )
+                            },
+                        )
                 />
                 <MetricCard
                     label="Strategy"
@@ -271,6 +287,54 @@ pub(crate) fn StudyReport(study: StudyView) -> impl IntoView {
                         <td>"Excess return"</td>
                         <td colspan="2">{percent(study.excess_return)}</td>
                     </tr>
+                    // Split out rather than folded into the row above. Both
+                    // sides forgo every dividend — prices are split-adjusted
+                    // and not total-return adjusted — but the benchmark held
+                    // through every ex-date and this rule held through only
+                    // some, so the margin is overstated in the rule's favour.
+                    // Measured, not estimated, whenever a distribution series
+                    // is held for these instruments.
+                    {study
+                        .dividend_gap
+                        .filter(|gap| gap.events > 0)
+                        .map(|gap| {
+                            view! {
+                                <tr>
+                                    <td>"Dividends the benchmark collected and this did not"</td>
+                                    <td colspan="2" class="research-flag">
+                                        {format!(
+                                            "-{} ({:.2} vs {:.2} on {} payment{})",
+                                            percent(gap.overstatement),
+                                            gap.benchmark_income,
+                                            gap.strategy_income,
+                                            gap.events,
+                                            if gap.events == 1 { "" } else { "s" },
+                                        )}
+                                    </td>
+                                </tr>
+                                <tr class="research-excess">
+                                    <td>"Excess return after dividends"</td>
+                                    <td colspan="2">{percent(gap.corrected_excess)}</td>
+                                </tr>
+                                // A partial sum presented as the answer is a
+                                // precise understated number, which is worse
+                                // than none because it invites belief.
+                                {(!gap.complete)
+                                    .then(|| {
+                                        view! {
+                                            <tr>
+                                                <td colspan="3" class="research-hint">
+                                                    {format!(
+                                                        "A floor: {} of {} instruments hold no                                                          dividend series, so their bias is                                                          unknown rather than zero.",
+                                                        gap.instruments - gap.covered,
+                                                        gap.instruments,
+                                                    )}
+                                                </td>
+                                            </tr>
+                                        }
+                                    })}
+                            }
+                        })}
                 </tbody>
             </table>
 

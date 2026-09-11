@@ -27,6 +27,7 @@
 pub mod advice;
 pub mod book;
 pub mod breadth;
+pub mod dividend;
 pub mod evaluation;
 pub mod family;
 pub mod memory;
@@ -42,6 +43,7 @@ pub use advice::{
 };
 pub use book::combine;
 pub use breadth::Breadth;
+pub use dividend::{measure_dividend_gap, DividendGap};
 pub use evaluation::{
     evaluate_against_benchmark, Evaluation, EvaluationCriteria, Evidence, Metrics, Verdict,
 };
@@ -642,6 +644,33 @@ pub trait SimulationProvider: Send + Sync {
     /// cannot honour the experiment as specified. Never partially succeeds:
     /// a result that came back is a result that ran to the end of the window.
     fn run(&self, experiment: &Experiment) -> Result<SimulationResult, SimulationError>;
+
+    /// Cash distributions for the experiment's instruments over its window,
+    /// keyed by instrument.
+    ///
+    /// # Why the engine is asked for this
+    ///
+    /// It is not really the engine's business — distributions are data, and the
+    /// engine is Nautilus. But this trait is the only seam `arvo-research` has
+    /// to the data behind a run: it deliberately depends on no concrete
+    /// provider, and everything else it knows about an experiment's bars it
+    /// learns by asking here. Threading a second data handle through
+    /// `run_family`, `run_panel` and `run_walk_forward` to reach one report line
+    /// would be a wider change for the same answer.
+    ///
+    /// A missing key means no distribution series exists for that instrument —
+    /// unknown, not zero. An empty map therefore means nothing is known at all,
+    /// and [`crate::DividendGap`] is not recorded. See [`crate::dividend`] for
+    /// why that distinction is the whole point.
+    ///
+    /// Defaulted to empty so every test double and in-memory fixture is
+    /// unaffected: they have no such series, and saying so is what empty means.
+    fn dividends(
+        &self,
+        _experiment: &Experiment,
+    ) -> std::collections::HashMap<String, Vec<arvo_data::Dividend>> {
+        std::collections::HashMap::new()
+    }
 }
 
 #[cfg(test)]

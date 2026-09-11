@@ -57,7 +57,8 @@ use arvo_research::{
 // and `tests/chart_alignment.rs` reaches them through it.
 pub use arvo_views::{
     BookView, BreadthView, CandlePoint, ComparisonRowView, ComparisonView, CurvePoint,
-    DataFindingView, DataLibraryView, DivergenceView, FetchView, FoldView, HistoryEntryView,
+    DataFindingView, DataLibraryView, DivergenceView, DividendGapView, FetchView, FoldView,
+    HistoryEntryView,
     HistoryView, InstrumentView, MatchView, MemberView, MetricsView, MonthlyReturnView, NamedCurveView,
     InstrumentChartView, OutcomeView, PanelView, QuoteView, RecommendationView, RecordView, ReplayView, StabilityView,
     SourceComparisonView, SourceView, StrategyView, StudyView, SurfaceCell, SurfaceView,

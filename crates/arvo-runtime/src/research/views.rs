@@ -449,6 +449,10 @@ pub fn study_view(
         strategy: metrics_view(&evaluation.strategy),
         benchmark: metrics_view(&evaluation.benchmark),
         excess_return: evaluation.excess_return,
+        dividend_gap: dividend_gap_view(
+            evaluation.dividend_gap.as_ref(),
+            evaluation.excess_return,
+        ),
         strategy_curve: curve_points(&evaluation.strategy_curve),
         benchmark_curve: curve_points(&evaluation.benchmark_curve),
         price: candles(
@@ -649,6 +653,28 @@ pub fn walk_forward_view(
 }
 
 /// Recommendations as the window shows them.
+/// The measured dividend bias, as the window sees it.
+///
+/// The corrected margin is computed here rather than left to the front end:
+/// the arithmetic is `excess - overstatement` and it must be the same
+/// subtraction the recommendation text did, not a second one that can drift
+/// from it.
+pub(crate) fn dividend_gap_view(
+    gap: Option<&arvo_research::DividendGap>,
+    excess_return: f64,
+) -> Option<DividendGapView> {
+    gap.map(|gap| DividendGapView {
+        events: gap.events,
+        strategy_income: gap.strategy_income,
+        benchmark_income: gap.benchmark_income,
+        overstatement: gap.overstatement,
+        corrected_excess: gap.corrected_excess(excess_return),
+        complete: gap.complete(),
+        covered: gap.covered,
+        instruments: gap.instruments,
+    })
+}
+
 pub(crate) fn advice(items: Vec<arvo_research::Recommendation>) -> Vec<RecommendationView> {
     items
         .into_iter()

@@ -356,8 +356,28 @@ pub struct Evaluation {
     /// `default` because this is a persisted format.
     #[serde(default)]
     pub benchmark_instruments: Vec<String>,
+    /// How much of the excess return is the dividend bias rather than skill.
+    ///
+    /// `None` when no distribution series was available for any instrument the
+    /// run held — the bias is real and its size is unknown, which is what
+    /// `arvo_research::advice` said in words before this could be measured.
+    /// `Some` with `events: 0` is the opposite and far better news: the series
+    /// was there and the instruments pay nothing, so the excess return needs no
+    /// correction at all.
+    ///
+    /// `default` because this is a persisted format: a finding recorded before
+    /// distributions were fetched still loads, as one whose bias was never
+    /// measured — which is the honest description of it.
+    #[serde(default)]
+    pub dividend_gap: Option<crate::DividendGap>,
     /// Strategy return minus benchmark return. The number that matters:
     /// absolute return mostly measures whether the market went up.
+    ///
+    /// Uncorrected, deliberately. [`Self::dividend_gap`] sits beside it rather
+    /// than being folded into it, because a number silently adjusted by
+    /// something a reader cannot see is exactly what this platform exists to
+    /// stop — and because the correction is only as good as the coverage
+    /// recorded with it.
     pub excess_return: f64,
     pub verdict: Verdict,
     /// Why the verdict came out that way, in the order the checks ran.
@@ -373,6 +393,18 @@ impl Evaluation {
     #[must_use]
     pub fn with_benchmark_instruments(mut self, instruments: Vec<String>) -> Self {
         self.benchmark_instruments = instruments;
+        self
+    }
+
+    /// Attaches the measured dividend bias.
+    ///
+    /// A builder for the same reason [`Self::with_trades`] is: scoring must
+    /// stay a function of the two curves and the criteria, so the verdict never
+    /// starts depending on whether a distribution series happened to be on
+    /// disk. The gap changes how a result is *read*, not whether it passed.
+    #[must_use]
+    pub fn with_dividend_gap(mut self, gap: Option<crate::DividendGap>) -> Self {
+        self.dividend_gap = gap;
         self
     }
 
@@ -434,6 +466,9 @@ impl Evaluation {
             benchmark_curve,
             strategy_trades: crate::TradeStats::default(),
             strategy_ledger: Vec::new(),
+            // Attached by `with_dividend_gap` when a series exists. `new` stays
+            // a function of the curves and the criteria alone.
+            dividend_gap: None,
             benchmark_instruments: Vec::new(),
             excess_return,
             verdict,
@@ -497,6 +532,22 @@ pub fn evaluate_against_benchmark(
         })
     };
 
+    // Measured here because this is the only place both ledgers exist: the
+    // benchmark's was previously read for its instrument names and thrown away,
+    // and it is what says how many shares buy-and-hold held across each
+    // ex-date. Nothing downstream can reconstruct it.
+    let dividends = provider.dividends(experiment);
+    let dividend_gap = (!dividends.is_empty()).then(|| {
+        crate::measure_dividend_gap(
+            experiment.window,
+            experiment.starting_cash,
+            &experiment.instruments(),
+            &strategy_result.ledger,
+            &benchmark_result.ledger,
+            &dividends,
+        )
+    });
+
     let engine = strategy_result.engine.clone();
     let evaluation = Evaluation::new(
         metrics(&strategy_result, "strategy")?,
@@ -506,6 +557,7 @@ pub fn evaluate_against_benchmark(
         criteria,
     )
     .with_trades(strategy_result.ledger.clone())
+    .with_dividend_gap(dividend_gap)
     .with_benchmark_instruments(held(&benchmark_result.ledger));
 
     Ok(Evidence {
