@@ -126,6 +126,16 @@ impl Recommendation {
     }
 }
 
+/// A fraction of the window, phrased the way a person would say it.
+fn share(fraction: f64) -> String {
+    match fraction {
+        f if f >= 0.66 => "most".to_owned(),
+        f if f >= 0.4 => "about half".to_owned(),
+        f if f >= 0.2 => "a third".to_owned(),
+        f => format!("{:.0}%", f * 100.0),
+    }
+}
+
 /// Everything worth saying about a finding, most stopping first.
 ///
 /// Derived on read rather than stored: these are a function of the evidence
@@ -417,6 +427,43 @@ pub fn recommend(found: &FamilyEvidence) -> Vec<Recommendation> {
                     ));
                 }
             }
+        }
+    }
+
+    // What kind of market produced this, when the answer is not one kind.
+    // A rule judged across a trend and a range gets one number describing
+    // neither, and the verdict above is that number.
+    if let Some(breakdown) =
+        crate::regime::attribute(&evaluation.strategy_curve, &evaluation.benchmark_curve)
+    {
+        if let Some((best, worst)) = breakdown.split() {
+            let action = format!(
+                "Read the verdict as an average of two different answers, not as one. This rule \
+                 beat its benchmark by {:+.1}% while the market was {} and lost {:.1}% to it \
+                 while {} — so whichever verdict it received describes a blend the market never \
+                 produced in one piece.\n\nThis is a caveat, not a filter. Trading only the \
+                 regime it worked in means knowing the regime *before* the bar, and these labels \
+                 were computed after the run; selecting on them would be look-ahead of the most \
+                 flattering kind.",
+                best.excess_return * 100.0,
+                best.regime.label(),
+                worst.excess_return.abs() * 100.0,
+                worst.regime.label(),
+            );
+            out.push(Recommendation::new(
+                Severity::Warning,
+                "The result is two different results averaged together.",
+                &action,
+                format!(
+                    "{} of the window was {} ({:+.1}% excess) and {} was {} ({:+.1}% excess)",
+                    share(best.share),
+                    best.regime.label(),
+                    best.excess_return * 100.0,
+                    share(worst.share),
+                    worst.regime.label(),
+                    worst.excess_return * 100.0,
+                ),
+            ));
         }
     }
 
@@ -1616,6 +1663,95 @@ mod tests {
         );
     }
 
+
+
+    /// A study whose window trends for its first half and ranges for its
+    /// second, with a rule that beats the benchmark in one and loses in the
+    /// other.
+    fn two_regimes() -> FamilyEvidence {
+        let mut study = book_study(&["AAPL.NASDAQ"]);
+        study.out_of_sample_evidence.experiment.alongside.clear();
+
+        let mut benchmark = Vec::new();
+        let mut strategy = Vec::new();
+        let (mut market, mut equity) = (100.0, 100.0);
+        for index in 0..120 {
+            if index < 60 {
+                market += 1.0; // goes somewhere
+                equity += 2.0; // and this outruns it
+            } else {
+                market += if index % 2 == 0 { 3.0 } else { -3.0 }; // arrives nowhere
+                equity -= 0.4; // and this bleeds
+            }
+            let at = chrono::NaiveDate::from_ymd_opt(2026, 1, 1)
+                .expect("valid")
+                .and_time(chrono::NaiveTime::MIN)
+                + chrono::Duration::days(index);
+            benchmark.push(crate::EquityPoint { at, equity: market });
+            strategy.push(crate::EquityPoint { at, equity });
+        }
+
+        let evaluation = &mut study.out_of_sample_evidence.evaluation;
+        evaluation.strategy_curve = strategy;
+        evaluation.benchmark_curve = benchmark;
+        study
+    }
+
+    #[test]
+    fn a_result_earned_in_one_regime_and_lost_in_another_says_so() {
+        // The finding this exists for: a rule judged across a trend and a range
+        // gets one number describing neither, and the verdict above it is that
+        // number.
+        let out = recommend(&two_regimes());
+        let item = out
+            .iter()
+            .find(|item| item.finding.contains("two different results"))
+            .unwrap_or_else(|| panic!("{}", findings(&out)));
+
+        assert_eq!(item.severity, Severity::Warning);
+        assert!(
+            item.evidence.contains("trending up") && item.evidence.contains("ranging"),
+            "it should name both regimes: {}",
+            item.evidence
+        );
+    }
+
+    #[test]
+    fn the_regime_split_is_a_caveat_and_never_a_filter() {
+        // The property that keeps this from becoming a look-ahead machine.
+        // These labels are computed after the run; selecting on them would be
+        // the most flattering bias available, and the action text has to say so
+        // rather than leaving a reader to infer it.
+        let out = recommend(&two_regimes());
+        let item = out
+            .iter()
+            .find(|item| item.finding.contains("two different results"))
+            .unwrap_or_else(|| panic!("{}", findings(&out)));
+
+        assert!(
+            item.action.contains("caveat, not a filter"),
+            "{}",
+            item.action
+        );
+        assert!(
+            item.action.contains("look-ahead"),
+            "it must name what selecting on these would be: {}",
+            item.action
+        );
+    }
+
+    #[test]
+    fn a_result_that_behaved_the_same_way_throughout_is_not_split() {
+        // Silence is the right answer. A line on every result saying "this
+        // behaved consistently" is a line that teaches a reader to skip the
+        // section the day it does not.
+        let out = recommend(&book_study(&["AAPL.NASDAQ"]));
+        assert!(
+            !out.iter().any(|item| item.finding.contains("two different results")),
+            "{}",
+            findings(&out)
+        );
+    }
 
     /// A study with a measured gap of `overstatement`, against `excess`.
     fn measured(excess: f64, gap: crate::DividendGap) -> FamilyEvidence {
