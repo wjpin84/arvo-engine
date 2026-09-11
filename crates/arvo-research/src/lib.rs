@@ -60,8 +60,9 @@ pub use psr::{period_returns, probabilistic_sharpe};
 pub use reconcile::{reconcile, reconcile_parts, Discrepancy};
 pub use replay::{replay, Divergence, Replay};
 pub use risk::{
-    decide, AccountState, CorrelationCap, Correlations, Decision, Position, Proposal, Rejection,
-    RiskGate,
+    day_trades_in_window, decide, AccountState, CorrelationCap, Correlations, DayTradingRule,
+    Decision, Position, Proposal, Rejection, RiskGate, PDT_DAY_TRADES, PDT_EQUITY_FLOOR,
+    PDT_WINDOW_DAYS,
 };
 pub use panel::{run_panel, InstrumentOutcome, PanelEvidence, PanelStudy, PooledOutcome};
 pub use trade::{Direction, ExitReason, Trade, TradeStats};
@@ -331,6 +332,17 @@ pub struct RiskModel {
     /// note that a cap with no source refuses rather than passes.
     #[serde(default)]
     pub correlation_cap: Option<crate::risk::CorrelationCap>,
+    /// Which day-trading constraint the account is subject to.
+    ///
+    /// A backtest that ignores this is backtesting a system nobody can open: a
+    /// day-trading rule on a small margin account gets three round trips per
+    /// five business days in reality and unlimited ones in a simulation that
+    /// does not model the rule.
+    ///
+    /// `default` is unconstrained, which is what every finding recorded before
+    /// this existed actually ran under.
+    #[serde(default)]
+    pub day_trading: crate::risk::DayTradingRule,
 }
 
 impl Default for RiskModel {
@@ -357,6 +369,10 @@ impl Default for RiskModel {
             // truncate sessions in every stored finding.
             max_daily_loss: None,
             correlation_cap: None,
+            // Unconstrained, and named rather than implied: modelling the
+            // pattern-day-trader rule changes how many trades a run can make,
+            // so switching it on silently would change every stored result.
+            day_trading: crate::risk::DayTradingRule::Unconstrained,
         }
     }
 }
