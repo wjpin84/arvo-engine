@@ -309,8 +309,13 @@ fn replay_walk_forward(
             what: "the procedure produced a different number of folds".to_owned(),
             at: None,
             when: None,
-            recorded: found.folds.len() as f64,
-            replayed: evidence.folds.len() as f64,
+            // Recorded is the record's, replayed is the re-run's. These were
+            // the wrong way round, so a divergence report named both numbers
+            // backwards — the one branch out of three that had it inverted,
+            // which is exactly the kind of thing only a test that reaches the
+            // branch would find.
+            recorded: evidence.folds.len() as f64,
+            replayed: found.folds.len() as f64,
             relative: 1.0,
         });
     }
@@ -500,10 +505,16 @@ mod tests {
 
     const ENGINE: &str = "test 1";
 
+    /// A day offset from the start of the fixture window.
+    ///
+    /// Offset arithmetic rather than a day-of-month, so a fixture longer than
+    /// January does not panic on an invalid date. `at(1)` is still 1 January,
+    /// which is what every test written against the old form assumed.
     fn at(day: u32) -> chrono::NaiveDateTime {
-        chrono::NaiveDate::from_ymd_opt(2024, 1, day)
+        chrono::NaiveDate::from_ymd_opt(2024, 1, 1)
             .expect("valid")
             .and_time(chrono::NaiveTime::MIN)
+            + chrono::Duration::days(i64::from(day) - 1)
     }
 
     fn curve(values: &[f64]) -> Vec<EquityPoint> {
@@ -935,6 +946,198 @@ mod tests {
             verdict: crate::Verdict::Inconclusive,
             reasons: Vec::new(),
         }
+    }
+
+
+    /// A curve long enough for `Metrics::from_curve` to evaluate.
+    ///
+    /// Two points is enough to compare against a record and not enough to
+    /// *produce* one — the panel and walk-forward procedures both score every
+    /// run, and scoring needs a series.
+    fn long_enough() -> Vec<f64> {
+        (0..40).map(|i| 100.0 + f64::from(i) * 0.5).collect()
+    }
+
+    /// A panel study small enough to run twice in a test and real enough that
+    /// `run_panel` accepts it.
+    fn runnable_panel_study() -> crate::PanelStudy {
+        let Record::Study(recorded) = study(&[100.0, 110.0], 4) else {
+            unreachable!("study() builds a study");
+        };
+        crate::PanelStudy::new(
+            recorded.selected.clone(),
+            vec!["AAPL.NASDAQ".to_owned(), "MSFT.NASDAQ".to_owned()],
+            crate::ParameterGrid::new().axis("fast", vec![5.0, 10.0]),
+        )
+    }
+
+    /// Evidence produced by *actually running* the procedure.
+    ///
+    /// A hand-built fixture would agree with itself by construction and prove
+    /// nothing about the comparison. This runs the real thing and then replays
+    /// it, which is the only arrangement where `Reproduced` means what it says.
+    fn ran_panel(provider: &Canned) -> Record {
+        let evidence = crate::run_panel(
+            provider,
+            &runnable_panel_study(),
+            &crate::EvaluationCriteria::default(),
+        )
+        .expect("the canned provider runs every trial");
+        Record::Panel(Box::new(evidence))
+    }
+
+    #[test]
+    fn a_panel_that_still_concludes_the_same_thing_is_reproduced() {
+        // The path that carries the whole value of panel replay, and the one
+        // nothing reached: every test before this one checked a refusal.
+        let provider = Canned::returning(&long_enough(), 4);
+        let record = ran_panel(&provider);
+        let Record::Panel(evidence) = &record else {
+            unreachable!("ran_panel builds a panel");
+        };
+        let version = evidence.dataset.version.clone();
+
+        let outcome = replay(&provider, &record, Some(&version));
+        assert!(
+            outcome.holds(),
+            "the same procedure over the same answers must reproduce, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn a_panel_that_trades_a_different_number_of_times_has_diverged() {
+        // Trades first, because a different count means different runs and
+        // every pooled average after it would be an average of something else.
+        let recorded_with = Canned::returning(&long_enough(), 4);
+        let record = ran_panel(&recorded_with);
+        let Record::Panel(evidence) = &record else {
+            unreachable!("ran_panel builds a panel");
+        };
+        let version = evidence.dataset.version.clone();
+
+        let now_trades_less = Canned::returning(&long_enough(), 2);
+        let Replay::Diverged(divergence) = replay(&now_trades_less, &record, Some(&version)) else {
+            panic!("a different trade count is a broken contract");
+        };
+        assert!(
+            divergence.what.contains("traded a different number"),
+            "{}",
+            divergence.what
+        );
+        assert!(
+            divergence.recorded > divergence.replayed,
+            "recorded {} should be the record's larger count, replayed {}",
+            divergence.recorded,
+            divergence.replayed
+        );
+    }
+
+    /// A walk-forward whose procedure can be performed twice.
+    fn runnable_walk(grid: crate::ParameterGrid) -> crate::WalkForward {
+        let Record::Study(recorded) = study(&[100.0, 110.0], 4) else {
+            unreachable!("study() builds a study");
+        };
+        let mut template = recorded.selected.clone();
+        // Long enough to roll into several folds at the cadence below.
+        template.window =
+            DateRange::new(at(1).date(), at(1).date() + chrono::Duration::days(2_000))
+                .expect("ordered");
+        crate::WalkForward {
+            hypothesis: template.hypothesis.clone(),
+            template,
+            grid,
+            in_sample_days: 365,
+            step_days: 365,
+            anchored: false,
+        }
+    }
+
+    /// The same shape of run ending somewhere else.
+    fn moved() -> Vec<f64> {
+        (0..40).map(|i| 100.0 + f64::from(i) * 0.9).collect()
+    }
+
+    fn ran_walk_forward(provider: &Canned) -> Record {
+        let plan = runnable_walk(crate::ParameterGrid::new().axis("fast", vec![5.0, 10.0]));
+        let evidence =
+            crate::run_walk_forward(provider, &plan, &crate::EvaluationCriteria::default())
+                .expect("the canned provider runs every fold");
+        Record::WalkForward(Box::new(evidence))
+    }
+
+    #[test]
+    fn a_walk_forward_that_still_concludes_the_same_thing_is_reproduced() {
+        let provider = Canned::returning(&long_enough(), 4);
+        let record = ran_walk_forward(&provider);
+        let Record::WalkForward(evidence) = &record else {
+            unreachable!("ran_walk_forward builds one");
+        };
+        let version = evidence.template.dataset.version.clone();
+
+        let outcome = replay(&provider, &record, Some(&version));
+        assert!(
+            outcome.holds(),
+            "the same procedure over the same answers must reproduce, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn a_walk_forward_whose_combined_record_moved_has_diverged() {
+        let recorded_with = Canned::returning(&long_enough(), 4);
+        let record = ran_walk_forward(&recorded_with);
+        let Record::WalkForward(evidence) = &record else {
+            unreachable!("ran_walk_forward builds one");
+        };
+        let version = evidence.template.dataset.version.clone();
+
+        // Same shape of run, different answer: the contract breaking.
+        let now_ends_elsewhere = Canned::returning(&moved(), 4);
+        let Replay::Diverged(divergence) = replay(&now_ends_elsewhere, &record, Some(&version))
+        else {
+            panic!("a different combined record is a broken contract");
+        };
+        assert!(
+            divergence.recorded != divergence.replayed,
+            "the two figures must actually differ: {divergence:?}"
+        );
+    }
+
+    #[test]
+    fn a_fold_count_divergence_names_the_record_as_recorded() {
+        // The bug this pins: `recorded` and `replayed` were the wrong way
+        // round in this one branch of three, so the report named both numbers
+        // backwards. Only a test that reaches the branch can see it.
+        let provider = Canned::returning(&long_enough(), 4);
+        let record = ran_walk_forward(&provider);
+        let Record::WalkForward(evidence) = &record else {
+            unreachable!("ran_walk_forward builds one");
+        };
+        let recorded_folds = evidence.folds.len();
+        let version = evidence.template.dataset.version.clone();
+
+        // Re-run the same record against a plan that rolls differently, by
+        // shortening the window the replay will use. Still long enough to
+        // clear the three-fold minimum — below that the procedure is refused
+        // outright and the answer would be `Failed`, not a divergence.
+        let mut shortened = evidence.as_ref().clone();
+        shortened.template.window =
+            DateRange::new(at(1).date(), at(1).date() + chrono::Duration::days(1_600))
+                .expect("ordered");
+        let record = Record::WalkForward(Box::new(shortened));
+
+        let Replay::Diverged(divergence) = replay(&provider, &record, Some(&version)) else {
+            panic!("a different fold count is a broken contract");
+        };
+        assert!(
+            divergence.what.contains("number of folds"),
+            "{}",
+            divergence.what
+        );
+        assert!(
+            (divergence.recorded - recorded_folds as f64).abs() < 0.5,
+            "recorded should be the record's {recorded_folds} folds, got {}",
+            divergence.recorded
+        );
     }
 
     #[test]
