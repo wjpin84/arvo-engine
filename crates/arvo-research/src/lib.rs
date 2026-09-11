@@ -27,6 +27,7 @@
 pub mod advice;
 pub mod book;
 pub mod breadth;
+pub mod correlation;
 pub mod dividend;
 pub mod evaluation;
 pub mod family;
@@ -44,6 +45,7 @@ pub use advice::{
 };
 pub use book::combine;
 pub use breadth::Breadth;
+pub use correlation::RollingCorrelations;
 pub use dividend::{measure_dividend_gap, DividendGap};
 pub use evaluation::{
     evaluate_against_benchmark, Evaluation, EvaluationCriteria, Evidence, Metrics, Verdict,

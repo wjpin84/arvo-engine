@@ -46,7 +46,7 @@ use nautilus_common::actor::DataActorNative;
 use std::collections::BTreeMap;
 
 use nautilus_core::UnixNanos;
-use nautilus_model::{enums::OrderSide, identifiers::InstrumentId, types::Quantity};
+use nautilus_model::{data::Bar, enums::OrderSide, identifiers::InstrumentId, types::Quantity};
 use nautilus_trading::strategy::{Strategy, StrategyNative};
 
 pub(crate) use cross_sectional::CrossSectionalMomentum;
@@ -115,6 +115,12 @@ pub(crate) struct Position {
     /// position that outlives the signal that opened it and keeps losing after
     /// the stop was supposed to have ended it.
     held: Option<Quantity>,
+    /// Pairwise correlation over the bars this run has already seen.
+    ///
+    /// Shared: a book's members are separate strategy instances over one
+    /// account, and a correlation cap has to see all of them. An `Arc` rather
+    /// than a field on `Risk`, because `Risk` is `Copy` and a handle is not.
+    correlations: std::sync::Arc<arvo_research::RollingCorrelations>,
     /// The instant of the most recent bar, which is this run's "now".
     ///
     /// Recorded because [`arvo_research::decide`] is given a clock rather than
@@ -132,10 +138,15 @@ pub(crate) struct Position {
 }
 
 impl Position {
-    pub(crate) const fn new(risk: Risk, default_size: Quantity) -> Self {
+    pub(crate) fn new(
+        risk: Risk,
+        default_size: Quantity,
+        correlations: std::sync::Arc<arvo_research::RollingCorrelations>,
+    ) -> Self {
         Self {
             risk,
             default_size,
+            correlations,
             stop: None,
             target: None,
             held: None,
@@ -310,6 +321,7 @@ pub(crate) fn decide_entry(
     positions: &BTreeMap<String, arvo_research::Position>,
     realised_today: f64,
     halted: bool,
+    correlations: Option<&dyn arvo_research::Correlations>,
 ) -> arvo_research::Decision {
     let proposal = arvo_research::Proposal {
         instrument: instrument.to_owned(),
@@ -338,12 +350,7 @@ pub(crate) fn decide_entry(
         now,
         // Never stale. See `signalled_at` above.
         i64::MAX,
-        // ponytail: no correlation source in the engine yet, so a configured
-        // `correlation_cap` refuses every entry and a backtest reports zero
-        // trades. Loud rather than silent, which is the right failure — but it
-        // needs a rolling, no-look-ahead correlation fed from the bars each
-        // strategy already sees before the cap is usable in a backtest.
-        None,
+        correlations,
     )
 }
 
@@ -416,7 +423,31 @@ pub(crate) trait Managed: Strategy + StrategyNative + DataActorNative {
             &positions,
             realised_today,
             self.position().is_halted(),
+            Some(self.position().correlations.as_ref()),
         ))
+    }
+
+    /// Records what this bar says, before any decision is taken on it.
+    ///
+    /// Called first by every rule, on every bar. Two things depend on it and
+    /// both fail silently when it is missed: the run's clock, which every risk
+    /// decision needs, and the correlation estimate, which answers *unknown*
+    /// for a pair it has not been fed — so a configured correlation cap would
+    /// refuse every entry rather than quietly allowing them.
+    ///
+    /// Separate from [`Self::halt_if_drawn_down`] because observing is not
+    /// halting, and one function doing both would have a name that lies about
+    /// half of what it does.
+    fn observe_bar(&mut self, bar: &Bar) {
+        let at = nanos_to_instant(bar.ts_event);
+        self.position_mut().last_bar_at = at;
+
+        if let Some(at) = at {
+            let instrument = self.instrument().to_string();
+            self.position()
+                .correlations
+                .observe(&instrument, at, bar.close.as_f64());
+        }
     }
 
     /// Closes whatever is held. Does nothing when flat.
@@ -487,12 +518,7 @@ pub(crate) trait Managed: Strategy + StrategyNative + DataActorNative {
     /// one that disagreed with the account would be this one.
     ///
     /// Returns whether the halt fired on this bar.
-    fn halt_if_drawn_down(&mut self, at: UnixNanos) -> anyhow::Result<bool> {
-        // Recorded first and unconditionally: it is this run's clock, and every
-        // risk decision below and after needs it even on a bar where no limit
-        // is configured.
-        self.position_mut().last_bar_at = nanos_to_instant(at);
-
+    fn halt_if_drawn_down(&mut self) -> anyhow::Result<bool> {
         if self.position().risk.model.max_drawdown.is_none() || self.position().is_halted() {
             return Ok(false);
         }
@@ -584,7 +610,7 @@ mod tests {
     }
 
     fn position(risk: Risk) -> Position {
-        Position::new(risk, quantity(100.0))
+        Position::new(risk, quantity(100.0), std::sync::Arc::default())
     }
 
     /// A risk model with nothing switched on, and a $100k account.
@@ -630,6 +656,7 @@ mod tests {
             &BTreeMap::new(),
             0.0,
             false,
+            None,
         )
     }
 
@@ -738,6 +765,7 @@ mod tests {
             // $2,100 lost against a $2,000 limit on $100k.
             -2_100.0,
             false,
+            None,
         );
         assert!(matches!(
             refused,
@@ -779,6 +807,7 @@ mod tests {
             &held,
             0.0,
             false,
+            None,
         );
         assert!(matches!(
             refused,
@@ -805,6 +834,7 @@ mod tests {
             &BTreeMap::new(),
             0.0,
             false,
+            None,
         );
         assert!(matches!(
             accepted,

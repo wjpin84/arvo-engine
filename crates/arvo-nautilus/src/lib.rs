@@ -596,6 +596,15 @@ fn run_backtest(
         starting_cash: experiment.starting_cash,
     };
 
+    // One estimate for the whole run, shared by every strategy instance. A book's
+    // members know nothing of each other, so a per-instrument tracker would only
+    // ever see one series and could not correlate anything with anything.
+    //
+    // Fed from bars as the engine delivers them, never computed over the window
+    // up front — that would refuse a trade in March on the strength of how two
+    // instruments moved in November.
+    let correlations = std::sync::Arc::new(arvo_research::RollingCorrelations::default());
+
     // A ranking rule is one decision-maker over the whole set, not one per
     // instrument: it has to see every score before it can say which is best.
     // So it is added once, subscribed to all of them, and the per-instrument
@@ -618,6 +627,7 @@ fn run_backtest(
                 lookback,
                 hold_top,
                 risk,
+                correlations.clone(),
             ))
             .map_err(|err| rejected("adding the strategy", &err))?;
         return finish(engine, experiment, book);
@@ -664,6 +674,7 @@ fn run_backtest(
                 fast_period,
                 slow_period,
                 risk,
+                correlations.clone(),
             )),
             Plan::OpeningRange {
                 range_bars,
@@ -676,6 +687,7 @@ fn run_backtest(
                 range_bars,
                 target_range_multiple,
                 risk,
+                correlations.clone(),
             )),
             Plan::VolatilityBreakout {
                 entry_atr_multiple,
@@ -688,6 +700,7 @@ fn run_backtest(
                 entry_atr_multiple,
                 atr_period,
                 risk,
+                correlations.clone(),
             )),
             Plan::VwapReversion {
                 entry_deviations, ..
@@ -697,6 +710,7 @@ fn run_backtest(
                 trade_size,
                 entry_deviations,
                 risk,
+                correlations.clone(),
             )),
             Plan::MomentumBreakout {
                 entry_period,
@@ -709,9 +723,16 @@ fn run_backtest(
                 entry_period,
                 exit_period,
                 risk,
+                correlations.clone(),
             )),
             Plan::BuyAndHold { .. } => {
-                engine.add_strategy(strategy::BuyAndHold::new(core, bar_type, trade_size, experiment.starting_cash))
+                engine.add_strategy(strategy::BuyAndHold::new(
+                    core,
+                    bar_type,
+                    trade_size,
+                    experiment.starting_cash,
+                    correlations.clone(),
+                ))
             }
             Plan::CrossSectionalMomentum { .. } => {
                 // Added once for the whole set above, and returned before
@@ -2392,6 +2413,127 @@ mod tests {
         let again = provider(bars).run(&explicit).expect("runs");
 
         assert_eq!(result.trades, again.trades);
+    }
+
+
+    /// The correlation cap, end to end through a real backtest.
+    ///
+    /// Every layer of this has unit tests that would still pass with the
+    /// layers unconnected: `RollingCorrelations` correlates a fixture nobody
+    /// feeds it, `decide` refuses on a `None` nobody produces, and the engine
+    /// passes a source no strategy ever observes into. This is the only test
+    /// that fails when the wiring is missing — and the failure it guards
+    /// against is *silent*, because an unwired cap refuses every entry and a
+    /// backtest reporting zero trades looks like a rule that found no signal.
+    mod correlation_cap {
+        use super::*;
+
+        fn capped(bars: &[arvo_data::Bar], cap: Option<arvo_research::CorrelationCap>) -> Experiment {
+            let mut experiment = experiment(params(10.0, 30.0), bars);
+            experiment.alongside = vec!["MSFT.NASDAQ".to_owned()];
+            experiment.risk.correlation_cap = cap;
+            experiment
+        }
+
+        /// Two members fed the identical series: perfectly correlated, so one
+        /// bet wearing two names.
+        fn identical_book(bars: &[arvo_data::Bar]) -> NautilusSimulation<InMemoryBars> {
+            book_provider(&["AAPL.NASDAQ", "MSFT.NASDAQ"], bars)
+        }
+
+        fn concurrent_peak(ledger: &[arvo_research::Trade]) -> usize {
+            // How many were open at once, at the worst moment.
+            let mut events: Vec<(chrono::NaiveDateTime, i32)> = Vec::new();
+            for trade in ledger {
+                events.push((trade.opened, 1));
+                if let Some(closed) = trade.closed {
+                    events.push((closed, -1));
+                }
+            }
+            events.sort_by_key(|(at, delta)| (*at, *delta));
+            let (mut open, mut peak) = (0, 0);
+            for (_, delta) in events {
+                open += delta;
+                peak = peak.max(open);
+            }
+            usize::try_from(peak).unwrap_or_default()
+        }
+
+        #[test]
+        fn a_cap_binds_rather_than_refusing_everything() {
+            // The bug this closes: the cap shipped with nothing able to
+            // evaluate it, and a cap with no source refuses every entry — so
+            // configuring one made a backtest report zero trades with no error
+            // anywhere.
+            let bars = sawtooth(400);
+            let simulation = identical_book(&bars);
+
+            let uncapped = simulation
+                .run(&capped(&bars, None))
+                .expect("the uncapped book should run");
+            assert!(
+                concurrent_peak(&uncapped.ledger) >= 2,
+                "the control must actually hold both at once, or the cap below \
+                 proves nothing"
+            );
+
+            let one_bet = simulation
+                .run(&capped(
+                    &bars,
+                    Some(arvo_research::CorrelationCap {
+                        above: 0.8,
+                        max_positions: 1,
+                    }),
+                ))
+                .expect("the capped book should run");
+
+            assert!(
+                !one_bet.ledger.is_empty(),
+                "a configured cap must not refuse every entry — that is the \
+                 failure this test exists for"
+            );
+            assert_eq!(
+                concurrent_peak(&one_bet.ledger),
+                1,
+                "two members on identical bars are one bet, so only one may be \
+                 held at a time"
+            );
+        }
+
+        #[test]
+        fn a_cap_with_room_for_the_cluster_permits_it() {
+            // The other half, and the one that says the cap is *evaluating*
+            // rather than blanket-refusing: the same perfectly correlated pair,
+            // with room for two, must trade exactly as though no cap were set.
+            //
+            // Note the threshold is compared with `>=`, so identical series
+            // correlating at exactly 1.0 trip a cap of 1.0. There is no "cap
+            // nothing can reach" to test with this fixture — `RiskModel::check`
+            // rejects a threshold above 1.0 precisely because it could never
+            // bind.
+            let bars = sawtooth(400);
+            let simulation = identical_book(&bars);
+
+            let uncapped = simulation
+                .run(&capped(&bars, None))
+                .expect("uncapped runs");
+            let roomy = simulation
+                .run(&capped(
+                    &bars,
+                    Some(arvo_research::CorrelationCap {
+                        above: 0.8,
+                        max_positions: 2,
+                    }),
+                ))
+                .expect("a cap with room runs");
+
+            assert_eq!(
+                roomy.ledger.len(),
+                uncapped.ledger.len(),
+                "a cluster inside its limit should change nothing"
+            );
+            assert!(concurrent_peak(&roomy.ledger) >= 2, "and both may be held");
+        }
     }
 
     #[test]

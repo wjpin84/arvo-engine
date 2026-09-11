@@ -55,12 +55,13 @@ impl SmaCross {
         fast_period: usize,
         slow_period: usize,
         risk: Risk,
+        correlations: std::sync::Arc<arvo_research::RollingCorrelations>,
     ) -> Self {
         Self {
             core,
             bar_type,
             instrument_id: bar_type.instrument_id(),
-            position: Position::new(risk, trade_size),
+            position: Position::new(risk, trade_size, correlations),
             atr: Atr::new(risk.model.atr_period),
             fast: Sma::new(fast_period),
             slow: Sma::new(slow_period),
@@ -86,7 +87,8 @@ impl DataActor for SmaCross {
         let (high, low, close) = (bar.high.as_f64(), bar.low.as_f64(), bar.close.as_f64());
         let atr = self.atr.update(high, low, close);
 
-        if self.exit_on_levels(high, low)?.is_some() || self.halt_if_drawn_down(bar.ts_event)? {
+        self.observe_bar(bar);
+        if self.exit_on_levels(high, low)?.is_some() || self.halt_if_drawn_down()? {
             // Reset the crossover memory too: after a stop the next entry
             // should need a fresh signal, not the stale one that is still
             // technically in force.
@@ -125,6 +127,7 @@ impl BuyAndHold {
         bar_type: BarType,
         trade_size: Quantity,
         starting_cash: f64,
+        correlations: std::sync::Arc<arvo_research::RollingCorrelations>,
     ) -> Self {
         Self {
             core,
@@ -146,6 +149,7 @@ impl BuyAndHold {
                     starting_cash,
                 },
                 trade_size,
+                correlations,
             ),
             entered: false,
         }
@@ -227,12 +231,13 @@ impl OpeningRange {
         range_bars: usize,
         target_range_multiple: f64,
         risk: Risk,
+        correlations: std::sync::Arc<arvo_research::RollingCorrelations>,
     ) -> Self {
         Self {
             core,
             bar_type,
             instrument_id: bar_type.instrument_id(),
-            position: Position::new(risk, trade_size),
+            position: Position::new(risk, trade_size, correlations),
             atr: Atr::new(risk.model.atr_period),
             session: Session::default(),
             range_bars,
@@ -275,7 +280,8 @@ impl DataActor for OpeningRange {
 
         // Risk before signal, always: a rule that has spent its drawdown
         // budget should not be reading its entry condition at all.
-        if self.exit_on_levels(high, low)?.is_some() || self.halt_if_drawn_down(bar.ts_event)? {
+        self.observe_bar(bar);
+        if self.exit_on_levels(high, low)?.is_some() || self.halt_if_drawn_down()? {
             return Ok(());
         }
         if self.position.is_halted() {
@@ -341,12 +347,13 @@ impl VolatilityBreakout {
         entry_atr_multiple: f64,
         atr_period: usize,
         risk: Risk,
+        correlations: std::sync::Arc<arvo_research::RollingCorrelations>,
     ) -> Self {
         Self {
             core,
             bar_type,
             instrument_id: bar_type.instrument_id(),
-            position: Position::new(risk, trade_size),
+            position: Position::new(risk, trade_size, correlations),
             atr: Atr::new(atr_period),
             entry_atr_multiple,
             previous_close: None,
@@ -374,7 +381,8 @@ impl DataActor for VolatilityBreakout {
 
         // Risk before signal, always: a rule that has spent its drawdown
         // budget should not be reading its entry condition at all.
-        if self.exit_on_levels(high, low)?.is_some() || self.halt_if_drawn_down(bar.ts_event)? {
+        self.observe_bar(bar);
+        if self.exit_on_levels(high, low)?.is_some() || self.halt_if_drawn_down()? {
             return Ok(());
         }
         if self.position.is_halted() {
@@ -438,12 +446,13 @@ impl VwapReversion {
         trade_size: Quantity,
         entry_deviations: f64,
         risk: Risk,
+        correlations: std::sync::Arc<arvo_research::RollingCorrelations>,
     ) -> Self {
         Self {
             core,
             bar_type,
             instrument_id: bar_type.instrument_id(),
-            position: Position::new(risk, trade_size),
+            position: Position::new(risk, trade_size, correlations),
             atr: Atr::new(risk.model.atr_period),
             session: Session::default(),
             vwap: SessionVwap::default(),
@@ -481,7 +490,8 @@ impl DataActor for VwapReversion {
 
         // Risk before signal, always: a rule that has spent its drawdown
         // budget should not be reading its entry condition at all.
-        if self.exit_on_levels(high, low)?.is_some() || self.halt_if_drawn_down(bar.ts_event)? {
+        self.observe_bar(bar);
+        if self.exit_on_levels(high, low)?.is_some() || self.halt_if_drawn_down()? {
             return Ok(());
         }
         if self.position.is_halted() {
@@ -542,12 +552,13 @@ impl MomentumBreakout {
         entry_period: usize,
         exit_period: usize,
         risk: Risk,
+        correlations: std::sync::Arc<arvo_research::RollingCorrelations>,
     ) -> Self {
         Self {
             core,
             bar_type,
             instrument_id: bar_type.instrument_id(),
-            position: Position::new(risk, trade_size),
+            position: Position::new(risk, trade_size, correlations),
             atr: Atr::new(risk.model.atr_period),
             entry: Donchian::new(entry_period),
             exit: Donchian::new(exit_period),
@@ -582,7 +593,8 @@ impl DataActor for MomentumBreakout {
 
         // Risk before signal, always: a rule that has spent its drawdown
         // budget should not be reading its entry condition at all.
-        if self.exit_on_levels(high, low)?.is_some() || self.halt_if_drawn_down(bar.ts_event)? {
+        self.observe_bar(bar);
+        if self.exit_on_levels(high, low)?.is_some() || self.halt_if_drawn_down()? {
             return Ok(());
         }
         if self.position.is_halted() {
