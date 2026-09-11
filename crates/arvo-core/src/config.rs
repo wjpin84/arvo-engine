@@ -2,14 +2,16 @@ use serde::Deserialize;
 use std::fmt;
 use std::path::Path;
 
-/// Exactly one of `address` (gRPC subprocess tier) or `path` (WASM tier)
-/// must be set — that shape, not a separate field, is what a plugin's
-/// entry declares about which execution tier it uses. Enforced by `load`.
+/// A plugin is a process speaking gRPC at `address`.
+///
+/// There used to be a second, optional `path` for an in-process WASM tier, and
+/// the pair had to be exactly-one-of. Both the field and the validation went
+/// with the tier: a required field enforces the same rule with no code, and
+/// serde reports a missing one better than a hand-written check did.
 #[derive(Debug, Deserialize, Clone)]
 pub struct PluginConfigEntry {
     pub id: String,
-    pub address: Option<String>,
-    pub path: Option<String>,
+    pub address: String,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -28,10 +30,6 @@ pub enum ConfigError {
         path: String,
         source: toml::de::Error,
     },
-    InvalidPluginEntry {
-        id: String,
-        reason: String,
-    },
 }
 
 impl fmt::Display for ConfigError {
@@ -39,9 +37,6 @@ impl fmt::Display for ConfigError {
         match self {
             ConfigError::Io { path, source } => write!(f, "failed to read {path}: {source}"),
             ConfigError::Parse { path, source } => write!(f, "failed to parse {path}: {source}"),
-            ConfigError::InvalidPluginEntry { id, reason } => {
-                write!(f, "invalid plugin entry {id:?}: {reason}")
-            }
         }
     }
 }
@@ -65,27 +60,10 @@ pub fn load(path: &Path) -> Result<PluginsConfig, ConfigError> {
         }
     };
 
-    let config: PluginsConfig = toml::from_str(&contents).map_err(|source| ConfigError::Parse {
+    toml::from_str(&contents).map_err(|source| ConfigError::Parse {
         path: path.display().to_string(),
         source,
-    })?;
-
-    for entry in &config.plugin {
-        let reason = match (&entry.address, &entry.path) {
-            (Some(_), None) | (None, Some(_)) => continue,
-            (Some(_), Some(_)) => {
-                "both address and path set; a plugin is exactly one of \
-                gRPC (address) or WASM (path)"
-            }
-            (None, None) => "neither address nor path set",
-        };
-        return Err(ConfigError::InvalidPluginEntry {
-            id: entry.id.clone(),
-            reason: reason.into(),
-        });
-    }
-
-    Ok(config)
+    })
 }
 
 #[cfg(test)]
@@ -116,10 +94,7 @@ mod tests {
         let config = load(file.path()).unwrap();
         assert_eq!(config.plugin.len(), 2);
         assert_eq!(config.plugin[0].id, "stub");
-        assert_eq!(
-            config.plugin[1].address.as_deref(),
-            Some("http://127.0.0.1:50052")
-        );
+        assert_eq!(config.plugin[1].address, "http://127.0.0.1:50052");
     }
 
     #[test]
@@ -136,52 +111,9 @@ mod tests {
     }
 
     #[test]
-    fn parses_mixed_address_and_path_entries() {
-        let file = write_temp(
-            r#"
-            [[plugin]]
-            id = "stub"
-            address = "http://127.0.0.1:50051"
-
-            [[plugin]]
-            id = "wasm-stub"
-            path = "../target/wasm32-unknown-unknown/debug/arvo_plugin_wasm_stub.wasm"
-            "#,
-        );
-
-        let config = load(file.path()).unwrap();
-        assert_eq!(config.plugin.len(), 2);
-
-        assert_eq!(
-            config.plugin[0].address.as_deref(),
-            Some("http://127.0.0.1:50051")
-        );
-        assert_eq!(config.plugin[0].path, None);
-
-        assert_eq!(config.plugin[1].address, None);
-        assert!(config.plugin[1].path.is_some());
-    }
-
-    #[test]
-    fn entry_with_both_address_and_path_errors() {
-        let file = write_temp(
-            r#"
-            [[plugin]]
-            id = "ambiguous"
-            address = "http://127.0.0.1:50051"
-            path = "some/plugin.wasm"
-            "#,
-        );
-
-        let result = load(file.path());
-        assert!(matches!(
-            result,
-            Err(ConfigError::InvalidPluginEntry { id, .. }) if id == "ambiguous"
-        ));
-    }
-
-    #[test]
-    fn entry_with_neither_address_nor_path_errors() {
+    fn an_entry_with_no_address_is_a_parse_error_rather_than_a_silent_skip() {
+        // Used to be a hand-written InvalidPluginEntry check. serde enforces
+        // it now that `address` is required, and says which field is missing.
         let file = write_temp(
             r#"
             [[plugin]]
@@ -189,10 +121,6 @@ mod tests {
             "#,
         );
 
-        let result = load(file.path());
-        assert!(matches!(
-            result,
-            Err(ConfigError::InvalidPluginEntry { id, .. }) if id == "empty"
-        ));
+        assert!(matches!(load(file.path()), Err(ConfigError::Parse { .. })));
     }
 }

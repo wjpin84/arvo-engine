@@ -13,7 +13,6 @@ members = [
     "crates/arvo-editor",
     "crates/arvo-runtime",
     "plugins/stub",
-    "plugins/wasm-stub",
 ]
 
 # Single source of truth for versions shared across crates, so a bump happens

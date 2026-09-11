@@ -775,7 +775,7 @@ pub struct PortfolioLibraryView {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginView {
     pub id: String,
-    pub address: Option<String>,
+    pub address: String,
     pub status: PluginStatusView,
 }
 

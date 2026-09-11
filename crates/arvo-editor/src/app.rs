@@ -286,9 +286,7 @@ fn ExtensionsView(
                                     format!("Unreachable — {reason}")
                                 }
                             };
-                            // ponytail: path-based (WASM) entries have no address yet —
-                            // see plugin-execution-tiers ticket 04.
-                            let location = plugin.address.as_deref().unwrap_or("wasm");
+                            let location = plugin.address.clone();
                             view! {
                                 <li>
                                     <span class="extension-kind">"Plugin"</span>
