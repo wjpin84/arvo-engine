@@ -82,6 +82,9 @@ pub(crate) struct CrossSectionalMomentum {
     scores: BTreeMap<InstrumentId, Momentum>,
     positions: BTreeMap<InstrumentId, Position>,
     atrs: BTreeMap<InstrumentId, Atr>,
+    /// Pairwise correlation over the bars this run has already seen, shared
+    /// with every other strategy in the run. See `super::Position`.
+    correlations: std::sync::Arc<arvo_research::RollingCorrelations>,
     /// The most recent score, close and ATR per instrument, as of the
     /// timestamp being filled in.
     ///
@@ -111,6 +114,7 @@ impl CrossSectionalMomentum {
         lookback: usize,
         hold_top: usize,
         risk: Risk,
+        correlations: std::sync::Arc<arvo_research::RollingCorrelations>,
     ) -> Self {
         // At least one, or the rule holds nothing and reports it as a finding
         // about momentum rather than about its own configuration.
@@ -139,7 +143,7 @@ impl CrossSectionalMomentum {
         for bar_type in &bar_types {
             let id = bar_type.instrument_id();
             scores.insert(id, Momentum::new(lookback));
-            positions.insert(id, Position::new(shared, trade_size));
+            positions.insert(id, Position::new(shared, trade_size, correlations.clone()));
             atrs.insert(id, Atr::new(risk.model.atr_period));
         }
 
@@ -149,6 +153,7 @@ impl CrossSectionalMomentum {
             scores,
             positions,
             atrs,
+            correlations,
             latest: HashMap::new(),
             filling: None,
             hold_top,
@@ -240,6 +245,7 @@ impl CrossSectionalMomentum {
                 &positions,
                 realised_today,
                 false,
+                Some(self.correlations.as_ref()),
             );
             let arvo_research::Decision::Accept { quantity } = decision else {
                 continue;
@@ -341,6 +347,17 @@ impl DataActor for CrossSectionalMomentum {
             self.rebalance()?;
         }
         self.filling = Some(bar.ts_event);
+
+        // The ranking rule is the one place a correlation estimate has every
+        // member's bars in hand, so feeding it here is what makes a cap over a
+        // book evaluable at all.
+        if let Some(at) = super::nanos_to_instant(bar.ts_event) {
+            self.correlations.observe(
+                &bar.bar_type.instrument_id().to_string(),
+                at,
+                bar.close.as_f64(),
+            );
+        }
 
         let id = bar.bar_type.instrument_id();
         let (high, low, close) = (bar.high.as_f64(), bar.low.as_f64(), bar.close.as_f64());
