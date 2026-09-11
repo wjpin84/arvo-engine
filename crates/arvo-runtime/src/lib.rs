@@ -9,13 +9,12 @@
 
 pub mod commands;
 pub mod events;
-pub mod feed;
 pub mod portfolio;
 pub mod research;
 pub mod scheduler;
 pub mod session;
+pub mod source;
 pub mod stream;
-pub mod yahoo;
 
 use arvo_core::config;
 use arvo_plugin_host::registry;
@@ -179,23 +178,25 @@ pub fn run() {
             commands::refresh_plugins,
             commands::load_session,
             commands::save_session,
-            research::list_instruments,
-            research::run_study,
-            research::run_walk_forward,
-            research::export_trades,
-            research::list_strategies,
-            research::feed_connected,
-            research::connect_feed,
-            research::disconnect_feed,
-            research::fetch_bars,
-            research::search_instruments,
-            research::watchlist,
-            research::compare_records,
-            research::run_panel,
-            research::list_history,
-            research::open_record,
-            research::replay_record,
-            research::run_book,
+            research::data::list_instruments,
+            research::data::list_sources,
+            research::data::feed_connected,
+            research::data::connect_feed,
+            research::data::disconnect_feed,
+            research::data::fetch_bars,
+            research::data::compare_sources,
+            research::data::search_instruments,
+            research::data::watchlist,
+            research::study::run_study,
+            research::study::run_walk_forward,
+            research::study::run_panel,
+            research::study::run_book,
+            research::study::list_strategies,
+            research::history::list_history,
+            research::history::open_record,
+            research::history::replay_record,
+            research::history::compare_records,
+            research::history::export_trades,
             portfolio::list_portfolios
         ])
         .run(tauri::generate_context!())

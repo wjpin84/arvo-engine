@@ -29,7 +29,7 @@
 //! **A tick never becomes a bar.** The data library is fetched files with a
 //! content hash, and that hash is what makes a stored verdict checkable. A
 //! price that arrived over a socket has no place in it, and nothing here can
-//! write there — see [`crate::feed`] for the full argument.
+//! write there — see [`crate::source`] for the full argument.
 //!
 //! ponytail: no tick history, no candle aggregation, no reconnect jitter.
 //! Add them when something other than a watchlist row reads this.

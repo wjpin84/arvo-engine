@@ -83,6 +83,14 @@ pub(crate) fn ResearchView(
 
     let (symbol, set_symbol) = signal(String::new());
     let (fetched, set_fetched) = signal(None::<FetchView>);
+    // Which vendors exist, asked of the backend rather than hardcoded here —
+    // a menu that drifts from the backend offers sources it will then refuse.
+    let (sources, set_sources) = signal(Vec::<SourceView>::new());
+    let (source, set_source) = signal(String::new());
+    // What a second vendor says about the same instrument. Its own signal
+    // beside the fetch report rather than part of it: a cross-check writes
+    // nothing, so it is a question asked about the library, not a change to it.
+    let (crosscheck, set_crosscheck) = signal(None::<SourceComparisonView>);
     // What the broker knows by that name. The box used to require typing
     // `MSFT.NASDAQ` — both the ticker and a venue convention that is Arvo's
     // rather than the market's.
@@ -106,6 +114,14 @@ pub(crate) fn ResearchView(
         match call_typed::<DataLibraryView>("list_instruments", JsValue::UNDEFINED).await {
             Ok(value) => set_library.set(Some(value)),
             Err(reason) => set_error.set(Some(reason)),
+        }
+    });
+    spawn_local(async move {
+        if let Ok(found) = call_typed::<Vec<SourceView>>("list_sources", JsValue::UNDEFINED).await {
+            if let Some(first) = found.first() {
+                set_source.set(first.id.clone());
+            }
+            set_sources.set(found);
         }
     });
     spawn_local(async move {
@@ -167,8 +183,11 @@ pub(crate) fn ResearchView(
         set_searching.set(true);
         set_error.set(None);
         spawn_local(async move {
-            let args = serde_wasm_bindgen::to_value(&serde_json::json!({ "query": query }))
-                .unwrap_or(JsValue::UNDEFINED);
+            let args = serde_wasm_bindgen::to_value(&serde_json::json!({
+                "query": query,
+                "source": source.get_untracked(),
+            }))
+            .unwrap_or(JsValue::UNDEFINED);
             match call_typed::<Vec<MatchView>>("search_instruments", args).await {
                 Ok(found) => set_matches.set(found),
                 Err(reason) => set_error.set(Some(reason)),
@@ -192,14 +211,20 @@ pub(crate) fn ResearchView(
                 .find(|plan| plan.name == chosen.get_untracked())
                 .map_or_else(|| "1day".to_owned(), |plan| plan.interval.clone())
         });
+        let chosen_source = source.get_untracked();
         set_running.set(Some(format!("Fetching {instrument} at {interval}")));
         set_error.set(None);
         set_fetched.set(None);
+        // A cross-check describes the bars as they were when it ran. Leaving it
+        // on screen beside a fresh fetch would be showing a verdict about a
+        // different series.
+        set_crosscheck.set(None);
         set_matches.set(Vec::new());
         spawn_local(async move {
             let args = serde_wasm_bindgen::to_value(&serde_json::json!({
                 "instrument": instrument,
                 "interval": interval,
+                "source": chosen_source,
             }))
             .unwrap_or(JsValue::UNDEFINED);
             match call_typed::<FetchView>("fetch_bars", args).await {
@@ -207,6 +232,75 @@ pub(crate) fn ResearchView(
                     set_fetched.set(Some(report));
                     refresh_library();
                 }
+                Err(reason) => set_error.set(Some(reason)),
+            }
+            set_running.set(None);
+        });
+    };
+
+    // The check every other data check in this platform cannot do. `quality`
+    // inspects a series against its own shape, which catches what is impossible
+    // and never what is merely wrong — a close off by forty cents is a
+    // perfectly well-formed bar. The only independent version of a price is
+    // somebody else's.
+    // Whether the *selected* source can fetch right now. Not the same question
+    // as `connected`, which is about the broker session specifically: Yahoo
+    // needs no credential, and gating its fetch box behind a Robinhood sign-in
+    // would hide a source that was ready the whole time.
+    let source_ready = move || {
+        let chosen = source.get();
+        sources.with(|all| {
+            // `true` while the list is still loading: the box appears and the
+            // backend refuses if it must, which beats a panel that is blank for
+            // a moment on every open.
+            all.iter()
+                .find(|entry| entry.id == chosen)
+                .is_none_or(|entry| !entry.needs_sign_in || connected.get())
+        })
+    };
+
+    let cross_check = move |_| {
+        let instrument = symbol.get_untracked().trim().to_uppercase();
+        if instrument.is_empty() {
+            set_error.set(Some("Name an instrument to cross-check".to_owned()));
+            return;
+        }
+        let interval = strategies.with_untracked(|found| {
+            found
+                .iter()
+                .find(|plan| plan.name == chosen.get_untracked())
+                .map_or_else(|| "1day".to_owned(), |plan| plan.interval.clone())
+        });
+        // The chosen source against every other one. With two vendors that is
+        // one comparison; the loop is here so a third needs no change.
+        let others: Vec<String> = sources.with_untracked(|all| {
+            all.iter()
+                .map(|entry| entry.id.clone())
+                .filter(|id| *id != source.get_untracked())
+                .collect()
+        });
+        let Some(second) = others.into_iter().next() else {
+            set_error.set(Some(
+                "Nothing to cross-check against — a series compared against itself agrees by                  construction"
+                    .to_owned(),
+            ));
+            return;
+        };
+
+        let first = source.get_untracked();
+        set_running.set(Some(format!("Cross-checking {instrument}: {first} vs {second}")));
+        set_error.set(None);
+        set_crosscheck.set(None);
+        spawn_local(async move {
+            let args = serde_wasm_bindgen::to_value(&serde_json::json!({
+                "instrument": instrument,
+                "interval": interval,
+                "first": first,
+                "second": second,
+            }))
+            .unwrap_or(JsValue::UNDEFINED);
+            match call_typed::<SourceComparisonView>("compare_sources", args).await {
+                Ok(outcome) => set_crosscheck.set(Some(outcome)),
                 Err(reason) => set_error.set(Some(reason)),
             }
             set_running.set(None);
@@ -455,8 +549,36 @@ pub(crate) fn ResearchView(
             // the bars it ran on, so a study that went to the network mid-run
             // would give a different answer whenever the vendor revised a bar.
             <div class="research-fetch">
+                // Which vendor to pull from. It is a choice rather than a
+                // constant because the second source existed for months and
+                // could not be reached from this window — `fetch_bars` named
+                // one vendor in its body. Each files under its own venue, so
+                // two vendors' copies of one ticker stay two datasets.
+                <label class="research-strategy">
+                    <span>"Source"</span>
+                    <select
+                        prop:value=move || source.get()
+                        disabled=move || running.get().is_some()
+                        on:change:target=move |ev| set_source.set(ev.target().value())
+                    >
+                        {move || {
+                            sources
+                                .get()
+                                .into_iter()
+                                .map(|entry| {
+                                    let label = if entry.needs_sign_in && !entry.connected {
+                                        format!("{} (signed out)", entry.label)
+                                    } else {
+                                        format!("{} · {}", entry.label, entry.venue)
+                                    };
+                                    view! { <option value=entry.id.clone()>{label}</option> }
+                                })
+                                .collect_view()
+                        }}
+                    </select>
+                </label>
                 {move || {
-                    if connected.get() {
+                    if source_ready() {
                         view! {
                             <div>
                                 <div class="research-fetch-row">
@@ -482,6 +604,21 @@ pub(crate) fn ResearchView(
                                     </button>
                                     <button disabled=move || running.get().is_some() on:click=fetch>
                                         "Fetch"
+                                    </button>
+                                    // Writes nothing. Every other data check in
+                                    // this platform inspects a series against
+                                    // its own shape, which catches what is
+                                    // impossible and never what is merely
+                                    // wrong. This is the only one that asks
+                                    // somebody else.
+                                    <button
+                                        title="Ask a second vendor for the same bars and report                                                how far apart they are. Writes nothing."
+                                        disabled=move || {
+                                            running.get().is_some() || sources.get().len() < 2
+                                        }
+                                        on:click=cross_check
+                                    >
+                                        "Cross-check"
                                     </button>
                                 </div>
                                 {move || {
@@ -546,9 +683,20 @@ pub(crate) fn ResearchView(
                                             }
                                         })
                                 }}
-                                <button class="research-linkish" on:click=disconnect>
-                                    "Disconnect Robinhood"
-                                </button>
+                                {move || {
+                                    connected
+                                        .get()
+                                        .then(|| {
+                                            view! {
+                                                <button
+                                                    class="research-linkish"
+                                                    on:click=disconnect
+                                                >
+                                                    "Disconnect Robinhood"
+                                                </button>
+                                            }
+                                        })
+                                }}
                             </div>
                         }
                             .into_any()
@@ -587,14 +735,27 @@ pub(crate) fn ResearchView(
                             } else {
                                 String::new()
                             };
+                            // `None` means the vendor does not serve them;
+                            // `Some(0)` means it looked and this instrument
+                            // paid none. Collapsing the two would report "no
+                            // dividends" for an instrument that pays them,
+                            // which is the direction the excess-return bias
+                            // already leans.
+                            let dividends = match report.dividends {
+                                Some(0) => " · no dividends in this window".to_owned(),
+                                Some(paid) => format!(" · {paid} dividends"),
+                                None => " · this source serves no dividends".to_owned(),
+                            };
                             view! {
                                 <p class="research-hint">
                                     {format!(
-                                        "{}: {} {} bars{}",
+                                        "{} from {}: {} {} bars{}{}",
                                         report.instrument,
+                                        report.source,
                                         report.bars,
                                         report.interval,
                                         invented,
+                                        dividends,
                                     )}
                                     {report
                                         .from
@@ -618,6 +779,48 @@ pub(crate) fn ResearchView(
                                         view! { <p class=tone>{revision}</p> }
                                     })}
                                 <DataQuality findings=report.data_findings.clone() />
+                            }
+                        })
+                }}
+                {move || {
+                    crosscheck
+                        .get()
+                        .map(|outcome| {
+                            // Flagged only for a genuine price disagreement. A
+                            // rescaling is an adjustment difference with
+                            // neither side wrong, and a coverage difference is
+                            // two vendors holding different histories — colouring
+                            // either red would teach a reader to ignore the
+                            // colour, which is the failure mode that gets a
+                            // check switched off.
+                            let tone = if outcome.diverged {
+                                "research-flag"
+                            } else {
+                                "research-hint"
+                            };
+                            view! {
+                                <p class="research-hint">
+                                    {format!(
+                                        "{} at {}: {} bars from {}, {} from {}",
+                                        outcome.symbol,
+                                        outcome.interval,
+                                        outcome.first_bars,
+                                        outcome.first,
+                                        outcome.second_bars,
+                                        outcome.second,
+                                    )}
+                                </p>
+                                <p class=tone>{outcome.summary.clone()}</p>
+                                <p class="research-hint">
+                                    {format!(
+                                        "Coverage: {} shared, {} only in {}, {} only in {}",
+                                        outcome.shared,
+                                        outcome.only_first,
+                                        outcome.first,
+                                        outcome.only_second,
+                                        outcome.second,
+                                    )}
+                                </p>
                             }
                         })
                 }}

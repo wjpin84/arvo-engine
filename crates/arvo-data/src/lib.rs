@@ -46,6 +46,37 @@ pub struct Bar {
     pub volume: f64,
 }
 
+/// One cash distribution, on the day it went ex.
+///
+/// # Why the library holds these at all
+///
+/// Because the absence of them is a live overstatement, not a missing feature.
+/// Every source is asked for split-adjusted prices, which is right — raw prices
+/// make a split look like a crash, and a breakout rule would trade it. But
+/// split-adjusted is not *total-return* adjusted: dividends are absent from the
+/// price series, so nothing receives them. A benchmark holds through every
+/// ex-date and a rule in the market some of the time holds through only some,
+/// which overstates excess return in the strategy's favour on every
+/// dividend-paying instrument.
+///
+/// Held as fetched files beside the bars, and for the same reason as the bars:
+/// a distribution read live at backtest time would break reproducibility
+/// exactly as a live bar would. See `arvo_research::dividend` for the
+/// measurement they make possible.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Dividend {
+    /// The first day the shares trade without entitlement to this payment.
+    ///
+    /// Entitlement is settled at the close *before* this date, so a holder who
+    /// sells on the ex-date still receives it and a buyer on the ex-date does
+    /// not. That asymmetry is the whole of the arithmetic in
+    /// `arvo_research::dividend`.
+    pub ex_date: NaiveDate,
+    /// Per share, in the instrument's currency, on the same split basis as the
+    /// prices it sits beside.
+    pub amount: f64,
+}
+
 /// Why data could not be produced.
 #[derive(Debug, thiserror::Error)]
 pub enum DataError {
@@ -134,6 +165,31 @@ pub trait BarProvider: Send + Sync {
             (Some(first), Some(last)) => Some((first.at.date(), last.at.date())),
             _ => None,
         })
+    }
+
+    /// Cash distributions for `instrument` between `from` and `to`, both
+    /// inclusive, oldest first.
+    ///
+    /// `None` means this source holds no distribution series at all — it has
+    /// never been told about them. `Some(vec![])` means it has one and the
+    /// instrument paid nothing in the window. Those are different facts and
+    /// collapsing them would report *no dividends* for an instrument that pays
+    /// them, which is the direction the excess-return bias already leans.
+    ///
+    /// Defaulted to `None` rather than made required: an in-memory fixture and
+    /// every test double have no such series, and forcing each to say so would
+    /// be ceremony. The one provider that reads a real library overrides it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataError`] if the series exists and cannot be read or parsed.
+    fn dividends(
+        &self,
+        _instrument: &str,
+        _from: NaiveDate,
+        _to: NaiveDate,
+    ) -> Result<Option<Vec<Dividend>>, DataError> {
+        Ok(None)
     }
 
     /// A content hash of every bar this source holds for `instrument`.
@@ -275,6 +331,33 @@ pub struct CsvBars {
     root: PathBuf,
 }
 
+/// Where distribution files live, relative to the library root.
+const DIVIDEND_SUBDIR: &str = "dividends";
+
+/// An instrument name that cannot escape the library root.
+///
+/// Instrument names arrive from config files and UI fields, so this is a trust
+/// boundary: `../../etc/passwd` is rejected here rather than handed to the
+/// filesystem. One definition because two paths are built from these now, and
+/// a guard applied to one of them is not a guard.
+///
+/// # Errors
+///
+/// Returns [`DataError::UnsafeInstrument`] for an empty name, one containing
+/// anything but alphanumerics, `.`, `-` and `_`, or one containing `..`.
+fn safe_name(instrument: &str) -> Result<&str, DataError> {
+    let safe = !instrument.is_empty()
+        && instrument
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+        && !instrument.contains("..");
+    if safe {
+        Ok(instrument)
+    } else {
+        Err(DataError::UnsafeInstrument(instrument.to_owned()))
+    }
+}
+
 impl CsvBars {
     #[must_use]
     pub fn new(root: impl Into<PathBuf>) -> Self {
@@ -338,6 +421,62 @@ impl CsvBars {
         Ok(path)
     }
 
+    /// Writes an instrument's distributions, replacing whatever was there.
+    ///
+    /// Replacing rather than merging, for the same reason [`Self::write`]
+    /// replaces: a file that is partly one fetch and partly another is not a
+    /// dataset anyone can name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataError::Io`] if the directory cannot be created or the file
+    /// cannot be written, and [`DataError::UnsafeInstrument`] for a name that
+    /// could escape the root.
+    pub fn write_dividends(
+        &self,
+        instrument: &str,
+        dividends: &[Dividend],
+    ) -> Result<PathBuf, DataError> {
+        let path = self.dividend_path(instrument)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|source| DataError::Io {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+
+        let mut out = String::with_capacity(dividends.len() * 24 + 16);
+        out.push_str("ex_date,amount
+");
+        for dividend in dividends {
+            out.push_str(&format!("{},{}
+", dividend.ex_date, dividend.amount));
+        }
+
+        std::fs::write(&path, out).map_err(|source| DataError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        Ok(path)
+    }
+
+    /// Where an instrument's distributions live: `dividends/SYMBOL.VENUE.csv`.
+    ///
+    /// # Why a subdirectory rather than `SYMBOL.VENUE.dividends.csv`
+    ///
+    /// The same reason a five-minute file does not sit in the root:
+    /// [`Self::instruments`] lists the root's file *stems*, so a sibling named
+    /// `MSFT.RH.dividends.csv` would be listed as an instrument called
+    /// `MSFT.RH.dividends`. It would then appear in the data library, in the
+    /// watchlist, and in anything that iterates the library — an instrument
+    /// with no bars that nothing put there on purpose.
+    fn dividend_path(&self, instrument: &str) -> Result<PathBuf, DataError> {
+        Ok(self
+            .root
+            .join(DIVIDEND_SUBDIR)
+            .join(format!("{}.csv", safe_name(instrument)?)))
+    }
+
     /// Where a resolution's files live.
     ///
     /// Daily bars sit in the root, so an existing library keeps working and
@@ -360,15 +499,9 @@ impl CsvBars {
     /// trust boundary: `../../etc/passwd` is rejected here rather than handed
     /// to the filesystem.
     fn path_for(&self, instrument: &str, interval: BarInterval) -> Result<PathBuf, DataError> {
-        let safe = !instrument.is_empty()
-            && instrument
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
-            && !instrument.contains("..");
-        if !safe {
-            return Err(DataError::UnsafeInstrument(instrument.to_owned()));
-        }
-        Ok(self.directory(interval).join(format!("{instrument}.csv")))
+        Ok(self
+            .directory(interval)
+            .join(format!("{}.csv", safe_name(instrument)?)))
     }
 }
 
@@ -534,6 +667,188 @@ impl BarProvider for CsvBars {
         // are. Sorting once here is cheaper than every caller remembering.
         bars.sort_by_key(|bar| bar.at);
         Ok(bars)
+    }
+
+    /// Reads `dividends/SYMBOL.VENUE.csv`, if a fetch ever wrote one.
+    ///
+    /// A missing file is `None`, not an error and not an empty list: no source
+    /// has ever supplied a distribution series for this instrument, which is
+    /// different from one supplying a series that is empty over the window.
+    fn dividends(
+        &self,
+        instrument: &str,
+        from: NaiveDate,
+        to: NaiveDate,
+    ) -> Result<Option<Vec<Dividend>>, DataError> {
+        let path = self.dividend_path(instrument)?;
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => return Err(DataError::Io { path, source }),
+        };
+
+        let mut paid = Vec::new();
+        for (index, line) in text.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() || index == 0 && line.starts_with("ex_date") {
+                continue;
+            }
+            let malformed = |reason: &str| DataError::Malformed {
+                path: path.clone(),
+                line: index + 1,
+                reason: reason.to_owned(),
+            };
+            let (date, amount) = line
+                .split_once(',')
+                .ok_or_else(|| malformed("expected ex_date,amount"))?;
+            // Parsed strictly. A distribution silently read as zero is a cash
+            // credit that never happens, which is precisely the error the whole
+            // series exists to remove.
+            let ex_date = NaiveDate::parse_from_str(date.trim(), "%Y-%m-%d")
+                .map_err(|err| malformed(&format!("ex_date {date:?}: {err}")))?;
+            let amount: f64 = amount
+                .trim()
+                .parse()
+                .map_err(|_| malformed(&format!("amount {amount:?} is not a number")))?;
+            if ex_date >= from && ex_date <= to {
+                paid.push(Dividend { ex_date, amount });
+            }
+        }
+
+        paid.sort_by_key(|dividend| dividend.ex_date);
+        Ok(Some(paid))
+    }
+}
+
+#[cfg(test)]
+mod dividend_tests {
+    use super::*;
+
+    fn library() -> (tempfile::TempDir, CsvBars) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bars = CsvBars::new(dir.path());
+        (dir, bars)
+    }
+
+    fn window() -> (NaiveDate, NaiveDate) {
+        (
+            NaiveDate::from_ymd_opt(2024, 1, 1).expect("valid"),
+            NaiveDate::from_ymd_opt(2024, 12, 31).expect("valid"),
+        )
+    }
+
+    fn paid(month: u32, amount: f64) -> Dividend {
+        Dividend {
+            ex_date: NaiveDate::from_ymd_opt(2024, month, 9).expect("valid"),
+            amount,
+        }
+    }
+
+    #[test]
+    fn what_is_written_is_what_is_read() {
+        let (_dir, library) = library();
+        let (from, to) = window();
+        library
+            .write_dividends("MSFT.RH", &[paid(2, 0.75), paid(5, 0.83)])
+            .expect("write");
+
+        let read = library.dividends("MSFT.RH", from, to).expect("read");
+        assert_eq!(read, Some(vec![paid(2, 0.75), paid(5, 0.83)]));
+    }
+
+    #[test]
+    fn no_series_at_all_is_none_and_an_empty_one_is_some_nothing() {
+        // The distinction the whole feature rests on. `None` means no source
+        // ever supplied distributions; `Some(vec![])` means one did and the
+        // instrument paid nothing. Collapsing them reports "no dividends" for
+        // an instrument that pays them.
+        let (_dir, library) = library();
+        let (from, to) = window();
+        assert_eq!(library.dividends("MSFT.RH", from, to).expect("read"), None);
+
+        library.write_dividends("MSFT.RH", &[]).expect("write");
+        assert_eq!(
+            library.dividends("MSFT.RH", from, to).expect("read"),
+            Some(Vec::new())
+        );
+    }
+
+    #[test]
+    fn a_dividend_file_is_not_listed_as_an_instrument() {
+        // It used to be written as `MSFT.RH.dividends.csv` beside the bars,
+        // and `instruments()` lists the root's file stems — so the library
+        // grew a phantom instrument called `MSFT.RH.dividends` that nothing
+        // put there on purpose. Hence the subdirectory.
+        let (_dir, library) = library();
+        library
+            .write("MSFT.RH", BarInterval::DAILY, &[Bar {
+                at: NaiveDate::from_ymd_opt(2024, 1, 2).expect("valid").and_time(NaiveTime::MIN),
+                open: 1.0,
+                high: 1.0,
+                low: 1.0,
+                close: 1.0,
+                volume: 1.0,
+            }])
+            .expect("write bars");
+        library.write_dividends("MSFT.RH", &[paid(2, 0.75)]).expect("write");
+
+        assert_eq!(library.instruments().expect("list"), vec!["MSFT.RH"]);
+    }
+
+    #[test]
+    fn only_distributions_inside_the_window_come_back() {
+        let (_dir, library) = library();
+        library
+            .write_dividends("MSFT.RH", &[paid(2, 0.75), paid(5, 0.83), paid(11, 0.91)])
+            .expect("write");
+
+        let read = library
+            .dividends(
+                "MSFT.RH",
+                NaiveDate::from_ymd_opt(2024, 3, 1).expect("valid"),
+                NaiveDate::from_ymd_opt(2024, 8, 31).expect("valid"),
+            )
+            .expect("read");
+        assert_eq!(read, Some(vec![paid(5, 0.83)]));
+    }
+
+    #[test]
+    fn an_unreadable_amount_is_named_rather_than_credited_as_zero() {
+        // A distribution silently read as zero is a cash credit that never
+        // happens, which is the error this series exists to remove.
+        let (dir, library) = library();
+        let path = dir.path().join(DIVIDEND_SUBDIR);
+        std::fs::create_dir_all(&path).expect("mkdir");
+        std::fs::write(path.join("MSFT.RH.csv"), "ex_date,amount
+2024-02-09,tuppence
+")
+            .expect("write");
+
+        let (from, to) = window();
+        assert!(matches!(
+            library.dividends("MSFT.RH", from, to),
+            Err(DataError::Malformed { .. })
+        ));
+    }
+
+    #[test]
+    fn a_name_that_could_escape_the_root_is_refused_for_dividends_too() {
+        // Two paths are built from an instrument name now, and a guard applied
+        // to only one of them is not a guard.
+        let (_dir, library) = library();
+        assert!(matches!(
+            library.write_dividends("../../etc/passwd", &[]),
+            Err(DataError::UnsafeInstrument(_))
+        ));
+    }
+
+    #[test]
+    fn a_provider_that_knows_nothing_of_dividends_says_so() {
+        // The trait default. An in-memory fixture has no series, and `None` is
+        // the honest answer rather than an empty list.
+        let (from, to) = window();
+        let fixture = InMemoryBars::new();
+        assert_eq!(fixture.dividends("MSFT.RH", from, to).expect("read"), None);
     }
 }
 
