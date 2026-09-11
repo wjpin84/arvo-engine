@@ -587,19 +587,13 @@ fn run_backtest(
     // account rather than a share of it. That is deliberate: a per-member cap
     // of `1/N` would pre-allocate capital and there would be nothing left to
     // contend for. The contention is the measurement.
+    // The model travels whole rather than as resolved currency amounts. The
+    // fractions are divided out at decision time by `arvo_research::decide`,
+    // which is the same function a live gate calls — so the engine and a live
+    // session cannot drift apart on how a limit is applied.
     let risk = strategy::Risk {
-        stop_atr_multiple: experiment.risk.stop_atr_multiple,
-        atr_period: experiment.risk.atr_period,
-        risk_amount: experiment
-            .risk
-            .risk_per_trade
-            .map(|fraction| fraction * experiment.starting_cash),
-        max_position_value: experiment
-            .risk
-            .max_position_fraction
-            .map(|fraction| fraction * experiment.starting_cash),
-        max_drawdown: experiment.risk.max_drawdown,
-        max_concurrent_positions: experiment.risk.max_concurrent_positions,
+        model: experiment.risk,
+        starting_cash: experiment.starting_cash,
     };
 
     // A ranking rule is one decision-maker over the whole set, not one per
@@ -717,7 +711,7 @@ fn run_backtest(
                 risk,
             )),
             Plan::BuyAndHold { .. } => {
-                engine.add_strategy(strategy::BuyAndHold::new(core, bar_type, trade_size))
+                engine.add_strategy(strategy::BuyAndHold::new(core, bar_type, trade_size, experiment.starting_cash))
             }
             Plan::CrossSectionalMomentum { .. } => {
                 // Added once for the whole set above, and returned before
@@ -1588,6 +1582,8 @@ mod tests {
             max_position_fraction: Some(1.0),
             max_drawdown: Some(0.05),
             max_concurrent_positions: None,
+            max_daily_loss: None,
+            correlation_cap: None,
         };
 
         let result = provider(bars.clone()).run(&experiment).expect("runs");
@@ -1640,6 +1636,8 @@ mod tests {
             max_position_fraction: Some(1.0),
             max_drawdown: None,
             max_concurrent_positions: None,
+            max_daily_loss: None,
+            correlation_cap: None,
         };
 
         let result = provider(bars).run(&experiment).expect("runs");
@@ -2147,6 +2145,8 @@ mod tests {
             max_position_fraction: Some(1.0),
             max_drawdown: None,
             max_concurrent_positions: None,
+            max_daily_loss: None,
+            correlation_cap: None,
         };
 
         let result = intraday_provider(bars.clone()).run(&experiment).expect("runs");

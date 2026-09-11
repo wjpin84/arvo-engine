@@ -35,6 +35,7 @@ pub mod panel;
 pub mod psr;
 pub mod reconcile;
 pub mod replay;
+pub mod risk;
 pub mod trade;
 pub mod walk_forward;
 
@@ -56,6 +57,10 @@ pub use memory::{
 pub use psr::{period_returns, probabilistic_sharpe};
 pub use reconcile::{reconcile, reconcile_parts, Discrepancy};
 pub use replay::{replay, Divergence, Replay};
+pub use risk::{
+    decide, AccountState, CorrelationCap, Correlations, Decision, Position, Proposal, Rejection,
+    RiskGate,
+};
 pub use panel::{run_panel, InstrumentOutcome, PanelEvidence, PanelStudy, PooledOutcome};
 pub use trade::{Direction, ExitReason, Trade, TradeStats};
 pub use walk_forward::{run_walk_forward, AxisStability, WalkForward, WalkForwardEvidence};
@@ -295,6 +300,35 @@ pub struct RiskModel {
     /// `None` is no limit, which is every run recorded before this existed.
     #[serde(default)]
     pub max_concurrent_positions: Option<usize>,
+    /// How much of starting capital may be lost in realised losses in one day
+    /// before trading stops until tomorrow, as a fraction.
+    ///
+    /// A different instrument from [`Self::max_drawdown`], and the difference
+    /// is the point. The drawdown halt is a conclusion — the idea is wrong,
+    /// stop funding it, permanently. This is a rule about how bad a single
+    /// session may get, and it lifts overnight. A system with only the halt
+    /// either sets it tight enough to end the account's life on one bad
+    /// morning, or loose enough that a bad morning runs unimpeded.
+    ///
+    /// Realised only. An open position moving against you is what the drawdown
+    /// halt watches; counting it here too would stop trading on a mark that may
+    /// reverse before it is ever booked.
+    ///
+    /// `None` is no limit, which is every run recorded before this existed.
+    #[serde(default)]
+    pub max_daily_loss: Option<f64>,
+    /// How many positions may be held among instruments that move together.
+    ///
+    /// [`Self::max_concurrent_positions`] counts tickers; this counts *bets*.
+    /// Five positions each mildly correlated with the index and almost
+    /// perfectly correlated with each other is one bet wearing five names, and
+    /// a cap on the count alone says nothing about it.
+    ///
+    /// `None` is no cap. Setting one requires something that can supply
+    /// correlations at decision time — see [`crate::risk::Correlations`], and
+    /// note that a cap with no source refuses rather than passes.
+    #[serde(default)]
+    pub correlation_cap: Option<crate::risk::CorrelationCap>,
 }
 
 impl Default for RiskModel {
@@ -316,6 +350,11 @@ impl Default for RiskModel {
             // may occupy, and choosing one here would change every book that
             // has ever run without anyone asking for it.
             max_concurrent_positions: None,
+            // Both of these change what a run does, so neither gets a default
+            // that nobody asked for. An invented daily limit would silently
+            // truncate sessions in every stored finding.
+            max_daily_loss: None,
+            correlation_cap: None,
         }
     }
 }
@@ -363,6 +402,29 @@ impl RiskModel {
                 return Err(
                     "risk_per_trade needs a stop: position size is capital-at-risk divided by \
                      the distance to the exit, and without a stop there is no distance"
+                        .to_owned(),
+                );
+            }
+        }
+        if let Some(limit) = self.max_daily_loss {
+            // Zero stops before the first trade; one or more can never be
+            // reached. Both describe a session nobody meant to ask for.
+            if !limit.is_finite() || limit <= 0.0 || limit >= 1.0 {
+                return Err(format!(
+                    "max_daily_loss must be a fraction between 0 and 1, got {limit}"
+                ));
+            }
+        }
+        if let Some(cap) = self.correlation_cap {
+            if !cap.above.is_finite() || !(0.0..=1.0).contains(&cap.above) {
+                return Err(format!(
+                    "correlation_cap.above must be a correlation between 0 and 1, got {}",
+                    cap.above
+                ));
+            }
+            if cap.max_positions == 0 {
+                return Err(
+                    "correlation_cap.max_positions of 0 refuses every correlated trade;                      remove the cap instead of setting it to zero"
                         .to_owned(),
                 );
             }
