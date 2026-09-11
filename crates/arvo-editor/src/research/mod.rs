@@ -811,6 +811,22 @@ pub(crate) fn ResearchView(
                                     )}
                                 </p>
                                 <p class=tone>{outcome.summary.clone()}</p>
+                                // Flagged above the agreement, not below it:
+                                // when the two sources are on different bases
+                                // the agreement is answering a different
+                                // question, and reading it first would be
+                                // reading a precise answer to the wrong one.
+                                {outcome
+                                    .basis_mismatch
+                                    .clone()
+                                    .map(|why| {
+                                        view! {
+                                            <p class="research-flag">
+                                                "These sources are not directly comparable: "
+                                                {why}
+                                            </p>
+                                        }
+                                    })}
                                 <p class="research-hint">
                                     {format!(
                                         "Coverage: {} shared, {} only in {}, {} only in {}",

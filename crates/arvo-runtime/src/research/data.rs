@@ -621,6 +621,7 @@ pub(crate) fn source_comparison_view(outcome: &source::Comparison) -> SourceComp
         only_second: outcome.coverage.only_second,
         summary,
         diverged,
+        basis_mismatch: outcome.basis_mismatch.clone(),
     }
 }
 

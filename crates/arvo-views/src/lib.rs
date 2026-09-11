@@ -744,6 +744,15 @@ pub struct SourceComparisonView {
     /// is an adjustment difference with neither side wrong, and not for a
     /// coverage difference.
     pub diverged: bool,
+    /// Why the two sources cannot be compared at face value, when they cannot.
+    ///
+    /// Neither axis it reports — how much of the tape a feed covers, and what
+    /// the prices are adjusted for — is visible in the bars, so this comes from
+    /// what each source declares rather than from any check. A thin feed and
+    /// the consolidated tape report the same prices; only the volumes differ,
+    /// and `agreement` deliberately does not compare volume.
+    #[serde(default)]
+    pub basis_mismatch: Option<String>,
 }
 
 /// What a fetch pulled in.
