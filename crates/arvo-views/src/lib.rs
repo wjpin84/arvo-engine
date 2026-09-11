@@ -198,7 +198,17 @@ pub struct StudyView {
     // The out-of-sample comparison itself.
     pub strategy: MetricsView,
     pub benchmark: MetricsView,
+    /// Uncorrected. [`Self::dividend_gap`] sits beside it rather than being
+    /// folded in: a number silently adjusted by something the reader cannot see
+    /// is what this platform exists to stop.
     pub excess_return: f64,
+    /// How much of that margin is the dividend bias rather than skill.
+    ///
+    /// `None` means it was never measured — no distribution series is held for
+    /// these instruments. The bias is real either way; only its size is
+    /// unknown, and `recommendations` says so.
+    #[serde(default)]
+    pub dividend_gap: Option<DividendGapView>,
 
     /// The two curves behind the numbers. A table says a strategy returned
     /// less than the market; a chart says whether it did so steadily or lost
@@ -650,6 +660,33 @@ pub struct ComparisonView {
     pub notes: Vec<String>,
 }
 
+/// The dividend bias, measured.
+///
+/// Prices are split-adjusted but not total-return adjusted, so no dividend is
+/// paid to anything in a backtest. Both sides forgo them — but the benchmark
+/// held through every ex-date and a rule in the market some of the time did
+/// not, so the margin between them is overstated in the strategy's favour.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct DividendGapView {
+    /// Distributions that went ex inside the window.
+    ///
+    /// Zero is a real answer and a good one: these instruments pay nothing, so
+    /// the margin needs no correction.
+    pub events: usize,
+    pub strategy_income: f64,
+    pub benchmark_income: f64,
+    /// The gap as a fraction of starting capital, in the same units as the
+    /// excess return it comes off.
+    pub overstatement: f64,
+    /// The excess return with the gap taken out.
+    pub corrected_excess: f64,
+    /// False when some instrument the run held has no distribution series, in
+    /// which case the figure is a floor rather than the answer.
+    pub complete: bool,
+    pub covered: usize,
+    pub instruments: usize,
+}
+
 /// One instrument the broker knows about.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MatchView {
@@ -664,10 +701,58 @@ pub struct MatchView {
     pub held: bool,
 }
 
+/// One source the app can fetch from.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SourceView {
+    pub id: String,
+    pub label: String,
+    /// The namespace instruments fetched here are filed under. Shown because
+    /// it is half of the instrument id a person will see afterwards.
+    pub venue: String,
+    /// Whether it can fetch right now. Always true for a source needing no
+    /// credential, which is the honest answer rather than a claim about a
+    /// session that does not exist.
+    pub connected: bool,
+    /// Whether signing in is a thing for this source at all, so the window
+    /// does not offer a button for something that cannot be done.
+    pub needs_sign_in: bool,
+}
+
+/// What two sources say about the same instrument over the same window.
+///
+/// The verdict is [`Self::summary`] and the counts are beside it, deliberately:
+/// two vendors disagreeing is the normal case and most of the ways they
+/// disagree are not faults, so a bare count of differing bars is true, useless,
+/// and the kind of thing that gets a check switched off.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SourceComparisonView {
+    pub symbol: String,
+    pub interval: String,
+    pub first: String,
+    pub second: String,
+    pub first_bars: usize,
+    pub second_bars: usize,
+    /// Bar instants present in both.
+    pub shared: usize,
+    /// Bars one has and the other does not. Independent of whether the shared
+    /// ones agree: two sources can cover different sessions and match perfectly
+    /// wherever they overlap.
+    pub only_first: usize,
+    pub only_second: usize,
+    pub summary: String,
+    /// True only for a genuine price disagreement — not for a rescaling, which
+    /// is an adjustment difference with neither side wrong, and not for a
+    /// coverage difference.
+    pub diverged: bool,
+}
+
 /// What a fetch pulled in.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FetchView {
     pub instrument: String,
+    /// Which source answered. Part of the result rather than assumed, now that
+    /// it is a choice: two vendors' copies of one ticker are two datasets.
+    pub source: String,
     pub interval: String,
     pub bars: usize,
     /// Gap-fill bars the server synthesised, which were dropped. Surfaced
@@ -689,6 +774,15 @@ pub struct FetchView {
     /// rather than a rescaling or extra coverage.
     #[serde(default)]
     pub revised: bool,
+    /// Cash distributions stored alongside the bars.
+    ///
+    /// `None` means the source does not serve dividends at all, which is a
+    /// different fact from `Some(0)` — it looked, and the instrument paid none.
+    /// Collapsing the two would report "no dividends" for an instrument that
+    /// pays them, which is the direction the platform's excess-return bias
+    /// already leans.
+    #[serde(default)]
+    pub dividends: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -775,7 +869,7 @@ pub struct PortfolioLibraryView {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginView {
     pub id: String,
-    pub address: Option<String>,
+    pub address: String,
     pub status: PluginStatusView,
 }
 

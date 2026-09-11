@@ -1,0 +1,18 @@
+[package]
+name = "arvo-execution"
+description = "Sending orders to a venue, and measuring what the backtest assumed wrong."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+arvo-research.workspace = true
+# Dyn-compatible async, for the same reason `arvo_runtime::source` needs it:
+# `Executor` is held behind a trait object. Already in the graph via tonic.
+async-trait = "0.1.92"
+chrono.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

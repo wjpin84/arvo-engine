@@ -43,6 +43,9 @@ mod indicator;
 mod rules;
 
 use nautilus_common::actor::DataActorNative;
+use std::collections::BTreeMap;
+
+use nautilus_core::UnixNanos;
 use nautilus_model::{enums::OrderSide, identifiers::InstrumentId, types::Quantity};
 use nautilus_trading::strategy::{Strategy, StrategyNative};
 
@@ -59,21 +62,32 @@ pub(crate) const EXIT_STOP: &str = "arvo:exit=stop";
 pub(crate) const EXIT_SIGNAL: &str = "arvo:exit=signal";
 pub(crate) const EXIT_HALT: &str = "arvo:exit=halt";
 
-/// What a strategy does to protect a position, resolved from the experiment.
+/// What the engine's own rules call themselves when they propose a trade.
+///
+/// The same field a live alert pipeline fills in, so a rejection can say which
+/// path was refused and a fill can be attributed afterwards.
+pub(crate) const PROPOSER: &str = "engine";
+
+/// What a strategy does to protect a position.
+///
+/// # Why this is the experiment's own `RiskModel` and not a copy of it
+///
+/// It used to be six mirrored fields. That made the engine's risk policy a
+/// second implementation of the same rules, and a second implementation is a
+/// second thing that can be wrong — while every stored finding went on claiming
+/// to describe the system that would actually trade.
+///
+/// So the model travels whole, and every limit in it is enforced by
+/// [`arvo_research::decide`], which is the same function a live session calls.
+/// What stays here is the part that genuinely needs bars: turning an ATR into a
+/// stop distance.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Risk {
-    pub(crate) stop_atr_multiple: Option<f64>,
-    pub(crate) atr_period: usize,
-    /// Capital-at-risk per trade, already in currency rather than a fraction.
-    pub(crate) risk_amount: Option<f64>,
-    /// The most one position may be worth, in currency.
-    pub(crate) max_position_value: Option<f64>,
-    /// How far the account may fall below its own peak before the rule stops,
-    /// as a fraction.
-    pub(crate) max_drawdown: Option<f64>,
-    /// The most positions the account may hold at once, across every member of
-    /// a book.
-    pub(crate) max_concurrent_positions: Option<usize>,
+    pub(crate) model: arvo_research::RiskModel,
+    /// Opening balance. Every fractional limit in the model is a fraction of
+    /// this, resolved at decision time rather than up front so the engine and a
+    /// live gate divide the same numbers the same way.
+    pub(crate) starting_cash: f64,
 }
 
 /// The long position a strategy is managing, and the levels around it.
@@ -101,6 +115,12 @@ pub(crate) struct Position {
     /// position that outlives the signal that opened it and keeps losing after
     /// the stop was supposed to have ended it.
     held: Option<Quantity>,
+    /// The instant of the most recent bar, which is this run's "now".
+    ///
+    /// Recorded because [`arvo_research::decide`] is given a clock rather than
+    /// reading one — that is what lets the same function run identically here,
+    /// where time is a bar timestamp, and in a live session where it is not.
+    last_bar_at: Option<chrono::NaiveDateTime>,
     /// The highest account equity seen so far, and whether the drawdown limit
     /// has since been reached.
     ///
@@ -119,6 +139,7 @@ impl Position {
             stop: None,
             target: None,
             held: None,
+            last_bar_at: None,
             peak_equity: None,
             halted: false,
         }
@@ -155,7 +176,7 @@ impl Position {
     /// Records the account's equity and says whether the limit has just been
     /// breached.
     fn observe(&mut self, equity: f64) -> bool {
-        let limit = match self.risk.max_drawdown {
+        let limit = match self.risk.model.max_drawdown {
             Some(limit) if !self.halted => limit,
             _ => return false,
         };
@@ -167,6 +188,10 @@ impl Position {
             return true;
         }
         false
+    }
+
+    pub(crate) const fn risk(&self) -> Risk {
+        self.risk
     }
 
     pub(crate) const fn is_open(&self) -> bool {
@@ -192,53 +217,134 @@ impl Position {
         self.target.is_some_and(|target| high >= target)
     }
 
-    /// How many shares to buy so that a stop-out costs about the stated risk.
+    /// The stop distance this entry would use, or `None` if there is no stop.
     ///
-    /// Rounded down to whole shares, and `None` when that rounds to zero —
-    /// buying a share anyway would silently risk more than the model allows,
-    /// which is the failure this sizing exists to prevent.
-    fn sized(&self, stop_distance: f64, price: f64) -> Option<Quantity> {
-        let risk_amount = self.risk.risk_amount?;
-        if stop_distance <= 0.0 || price <= 0.0 {
-            return None;
+    /// The one part of sizing that genuinely belongs to the engine: it needs an
+    /// ATR, which needs bars, which `arvo_research` does not have. Everything
+    /// downstream of the distance — how many shares that buys, whether the cap
+    /// binds, whether the account may take the trade at all — goes through
+    /// [`arvo_research::decide`].
+    ///
+    /// `Err(())` means a stop was configured and the ATR has not warmed up.
+    /// Entering unprotected would be running a different strategy for the first
+    /// few trades, and those trades are in the record — so it refuses rather
+    /// than falling back.
+    fn stop_distance(&self, atr: Option<f64>) -> Result<Option<f64>, ()> {
+        match self.risk.model.stop_atr_multiple {
+            None => Ok(None),
+            Some(multiple) => atr.map(|atr| Some(atr * multiple)).ok_or(()),
         }
-        let mut shares = (risk_amount / stop_distance).floor();
-
-        // A tighter stop asks for a bigger position, so this is where an
-        // intraday stop of a dollar tries to buy several accounts' worth.
-        // Capping is what turns that into a smaller trade rather than a
-        // rejected order and a silently empty backtest.
-        if let Some(cap) = self.risk.max_position_value {
-            shares = shares.min((cap / price).floor());
-        }
-
-        if shares < 1.0 {
-            return None;
-        }
-        Quantity::new_checked(shares, 0).ok()
     }
+}
 
-    /// Works out the size and stop for an entry, or refuses the trade.
-    ///
-    /// `None` means do not enter, and there are two distinct reasons for it,
-    /// both of which have to refuse rather than fall back:
-    ///
-    /// * a stop was configured but the ATR has not warmed up — entering
-    ///   unprotected would be running a different strategy for the first few
-    ///   trades, and those trades are in the record;
-    /// * no size keeps the loss inside the risk budget — taking the trade
-    ///   anyway breaks the one rule the risk model exists to enforce.
-    fn plan(&self, price: f64, atr: Option<f64>) -> Option<(Quantity, Option<f64>)> {
-        let Some(multiple) = self.risk.stop_atr_multiple else {
-            return Some((self.default_size, None));
-        };
-        let distance = atr? * multiple;
-        let size = match self.risk.risk_amount {
-            None => self.default_size,
-            Some(_) => self.sized(distance, price)?,
-        };
-        Some((size, Some(price - distance)))
+/// A Nautilus timestamp as a civil instant, or `None` if it cannot be one.
+///
+/// `None` rather than a saturating fallback: a nonsensical timestamp that
+/// became `NaiveDateTime::MAX` would silently make every subsequent signal
+/// look stale and every closed position look like it was booked on a different
+/// day. Refusing to decide on a clock that makes no sense is the safe answer.
+fn nanos_to_instant(at: UnixNanos) -> Option<chrono::NaiveDateTime> {
+    i64::try_from(at.as_u64())
+        .ok()
+        .map(|nanos| chrono::DateTime::from_timestamp_nanos(nanos).naive_utc())
+}
+
+fn nanos_to_date(at: UnixNanos) -> Option<chrono::NaiveDate> {
+    nanos_to_instant(at).map(|instant| instant.date())
+}
+
+/// The account as the engine's own cache already has it.
+///
+/// Read rather than tracked. A book's members are separate strategy instances
+/// sharing one account and knowing nothing of each other, so a private tally
+/// would give N accounts of one and cap nothing — and a second running total of
+/// something the engine already holds is a second thing that can be wrong,
+/// which this codebase has paid for once already.
+///
+/// Returns what is open and what was realised on `today`.
+pub(crate) fn account_from_positions(
+    held: impl IntoIterator<Item = nautilus_model::position::Position>,
+    today: chrono::NaiveDate,
+) -> (BTreeMap<String, arvo_research::Position>, f64) {
+    let mut positions = BTreeMap::new();
+    let mut realised_today = 0.0;
+
+    for position in held {
+        if position.is_open() {
+            positions.insert(
+                position.instrument_id.to_string(),
+                arvo_research::Position {
+                    quantity: position.quantity.as_f64(),
+                    entry: position.avg_px_open,
+                },
+            );
+        } else if position
+            .ts_closed
+            .is_some_and(|closed| nanos_to_date(closed) == Some(today))
+        {
+            // Realised *today* on the run's own clock: a backtest's day is the
+            // bar's date, never the machine's.
+            realised_today += position.realized_pnl.map_or(0.0, |money| money.as_f64());
+        }
     }
+    (positions, realised_today)
+}
+
+/// Puts one entry to the same risk policy a live session uses.
+///
+/// # Why the engine asks rather than deciding
+///
+/// Because a stored finding claims to describe the system that will actually
+/// trade, and that claim is false the moment the backtest enforces its own
+/// version of the limits. The position cap, the daily loss limit, the
+/// correlation cap and the sizing are all [`arvo_research::decide`] — the same
+/// function `arvo_execution`'s live gate calls with its own book.
+#[expect(clippy::too_many_arguments, reason = "it is one call, spelled out")]
+pub(crate) fn decide_entry(
+    risk: Risk,
+    default_size: Quantity,
+    instrument: &str,
+    price: f64,
+    stop_distance: Option<f64>,
+    now: chrono::NaiveDateTime,
+    positions: &BTreeMap<String, arvo_research::Position>,
+    realised_today: f64,
+    halted: bool,
+) -> arvo_research::Decision {
+    let proposal = arvo_research::Proposal {
+        instrument: instrument.to_owned(),
+        proposer: PROPOSER.to_owned(),
+        // Signalled at the bar it was read from. A backtest has no network
+        // between the signal and the order, so the staleness check cannot fire
+        // here — which is exactly the gap paper trading exists to measure and a
+        // backtest cannot measure about itself.
+        signalled_at: now,
+        reference_price: price,
+        stop_distance,
+        // What the rule trades absent risk sizing, so the engine's fixed trade
+        // size survives the move to a shared policy.
+        desired_quantity: Some(default_size.as_f64()),
+    };
+
+    arvo_research::decide(
+        &risk.model,
+        &arvo_research::AccountState {
+            positions,
+            realised_today,
+            starting_cash: risk.starting_cash,
+            halted: halted.then_some("the account drawdown limit was reached"),
+        },
+        &proposal,
+        now,
+        // Never stale. See `signalled_at` above.
+        i64::MAX,
+        // ponytail: no correlation source in the engine yet, so a configured
+        // `correlation_cap` refuses every entry and a backtest reports zero
+        // trades. Loud rather than silent, which is the right failure — but it
+        // needs a rolling, no-look-ahead correlation fed from the bars each
+        // strategy already sees before the cap is usable in a backtest.
+        None,
+    )
 }
 
 /// Position management, shared by every rule.
@@ -262,15 +368,27 @@ pub(crate) trait Managed: Strategy + StrategyNative + DataActorNative {
         atr: Option<f64>,
         target: Option<f64>,
     ) -> anyhow::Result<bool> {
-        if self.at_position_limit() {
-            return Ok(false);
-        }
-        let Some((size, stop)) = self.position().plan(price, atr) else {
+        let Ok(stop_distance) = self.position().stop_distance(atr) else {
+            // A stop was asked for and the ATR has not warmed up.
             return Ok(false);
         };
+
+        let Some(decision) = self.ask_risk(price, stop_distance) else {
+            return Ok(false);
+        };
+        let arvo_research::Decision::Accept { quantity } = decision else {
+            // A refusal is a normal outcome, not an error. The reason is
+            // already recorded in the rejection; nothing here needs to
+            // re-derive it.
+            return Ok(false);
+        };
+        let Ok(size) = Quantity::new_checked(quantity, 0) else {
+            return Ok(false);
+        };
+
         {
             let position = self.position_mut();
-            position.stop = stop;
+            position.stop = stop_distance.map(|distance| price - distance);
             position.target = target;
             position.hold(size);
         }
@@ -278,26 +396,27 @@ pub(crate) trait Managed: Strategy + StrategyNative + DataActorNative {
         Ok(true)
     }
 
-    /// Whether the account already holds as many positions as it may.
+    /// This strategy's entry, put to the shared policy.
     ///
-    /// Asked of the engine, not of this strategy. A book's members are
-    /// separate strategy instances sharing one account and knowing nothing of
-    /// each other, so each counting only its own position would give N caps of
-    /// one and cap nothing at all.
-    ///
-    /// A strategy already holding something is not blocked by the limit: it is
-    /// one of the positions being counted, and refusing it here would stop a
-    /// rule managing what it already owns.
-    fn at_position_limit(&self) -> bool {
-        let Some(limit) = self.position().risk.max_concurrent_positions else {
-            return false;
-        };
-        if self.position().is_open() {
-            return false;
-        }
-        self.cache()
-            .positions_open_count(None, None, None, None, None)
-            >= limit
+    /// `None` when there is no bar yet, which is before anything can trade.
+    fn ask_risk(&self, price: f64, stop_distance: Option<f64>) -> Option<arvo_research::Decision> {
+        let now = self.position().last_bar_at?;
+        // Bound, not inlined: `positions` borrows from the cache handle, and a
+        // temporary would be dropped at the end of the expression.
+        let cache = self.cache();
+        let (positions, realised_today) =
+            account_from_positions(cache.positions(None, None, None, None, None), now.date());
+        Some(decide_entry(
+            self.position().risk,
+            self.position().default_size,
+            &self.instrument().to_string(),
+            price,
+            stop_distance,
+            now,
+            &positions,
+            realised_today,
+            self.position().is_halted(),
+        ))
     }
 
     /// Closes whatever is held. Does nothing when flat.
@@ -368,8 +487,13 @@ pub(crate) trait Managed: Strategy + StrategyNative + DataActorNative {
     /// one that disagreed with the account would be this one.
     ///
     /// Returns whether the halt fired on this bar.
-    fn halt_if_drawn_down(&mut self) -> anyhow::Result<bool> {
-        if self.position().risk.max_drawdown.is_none() || self.position().is_halted() {
+    fn halt_if_drawn_down(&mut self, at: UnixNanos) -> anyhow::Result<bool> {
+        // Recorded first and unconditionally: it is this run's clock, and every
+        // risk decision below and after needs it even on a bar where no limit
+        // is configured.
+        self.position_mut().last_bar_at = nanos_to_instant(at);
+
+        if self.position().risk.model.max_drawdown.is_none() || self.position().is_halted() {
             return Ok(false);
         }
         let venue = self.instrument().venue;
@@ -463,75 +587,237 @@ mod tests {
         Position::new(risk, quantity(100.0))
     }
 
+    /// A risk model with nothing switched on, and a $100k account.
     const UNSTOPPED: Risk = Risk {
-        stop_atr_multiple: None,
-        atr_period: 14,
-        risk_amount: None,
-        max_position_value: None,
-        max_drawdown: None,
-        max_concurrent_positions: None,
+        model: arvo_research::RiskModel {
+            stop_atr_multiple: None,
+            atr_period: 14,
+            risk_per_trade: None,
+            max_position_fraction: None,
+            max_drawdown: None,
+            max_concurrent_positions: None,
+            max_daily_loss: None,
+            correlation_cap: None,
+        },
+        starting_cash: 100_000.0,
     };
+
+    fn today() -> chrono::NaiveDateTime {
+        chrono::NaiveDate::from_ymd_opt(2026, 9, 11)
+            .expect("valid")
+            .and_hms_opt(14, 30, 0)
+            .expect("valid")
+    }
+
+    /// What the engine would decide for one entry, through the shared policy.
+    ///
+    /// Deliberately routed through [`decide_entry`] rather than a local sizing
+    /// helper. These used to test the engine's own arithmetic, which is exactly
+    /// the second implementation that has now been removed — testing it here
+    /// again would re-create the thing the shared policy exists to prevent.
+    fn entry(risk: Risk, price: f64, atr: Option<f64>) -> arvo_research::Decision {
+        let position = position(risk);
+        let stop_distance = position
+            .stop_distance(atr)
+            .expect("the caller knows whether the ATR is ready");
+        decide_entry(
+            risk,
+            quantity(100.0),
+            "MSFT.NASDAQ",
+            price,
+            stop_distance,
+            today(),
+            &BTreeMap::new(),
+            0.0,
+            false,
+        )
+    }
 
     #[test]
     fn without_a_stop_the_default_size_is_traded() {
-        let (size, stop) = position(UNSTOPPED).plan(100.0, None).expect("no stop needed");
-        assert_eq!(size, quantity(100.0));
-        assert_eq!(stop, None);
+        assert_eq!(
+            entry(UNSTOPPED, 100.0, None),
+            arvo_research::Decision::Accept { quantity: 100.0 }
+        );
+        assert_eq!(
+            position(UNSTOPPED).stop_distance(None),
+            Ok(None),
+            "and no stop is placed"
+        );
     }
 
     #[test]
     fn a_configured_stop_is_refused_rather_than_skipped_before_the_atr_warms_up() {
-        // Entering unprotected because the indicator is not ready yet would
-        // run a different strategy for the first few trades — and those trades
-        // end up in the evidence.
+        // Entering unprotected because the indicator is not ready yet would run
+        // a different strategy for the first few trades — and those trades end
+        // up in the evidence.
         let risk = Risk {
-            stop_atr_multiple: Some(2.0),
+            model: arvo_research::RiskModel {
+                stop_atr_multiple: Some(2.0),
+                ..UNSTOPPED.model
+            },
             ..UNSTOPPED
         };
-        assert!(position(risk).plan(100.0, None).is_none());
+        assert!(position(risk).stop_distance(None).is_err());
     }
 
     #[test]
     fn risk_sizing_is_capped_by_what_the_account_can_hold() {
-        // The bug this cap exists for: a tight stop asks for a bigger
-        // position, so an intraday stop of a dollar orders several accounts'
-        // worth, every order is rejected, and the backtest reports zero trades
-        // with no error anywhere.
+        // The bug this cap exists for: a tight stop asks for a bigger position,
+        // so an intraday stop of a dollar orders several accounts' worth, every
+        // order is rejected, and the backtest reports zero trades with no error
+        // anywhere.
         let risk = Risk {
-            stop_atr_multiple: Some(1.0),
-            risk_amount: Some(1_000.0),
-            max_position_value: Some(100_000.0),
+            model: arvo_research::RiskModel {
+                stop_atr_multiple: Some(1.0),
+                risk_per_trade: Some(0.01),
+                max_position_fraction: Some(1.0),
+                ..UNSTOPPED.model
+            },
             ..UNSTOPPED
         };
         // A $0.10 stop on a $500 share: unbounded sizing asks for 10,000
-        // shares, which is $5m against a $100k cap.
-        let (size, stop) = position(risk).plan(500.0, Some(0.1)).expect("sized");
-        assert_eq!(size, quantity(200.0), "capped at 100k of a 500 share");
-        assert!((stop.expect("stopped") - 499.9).abs() < 1e-9);
+        // shares, which is $5m against a $100k account.
+        assert_eq!(
+            entry(risk, 500.0, Some(0.1)),
+            arvo_research::Decision::Accept { quantity: 200.0 },
+            "capped at one account's worth of a $500 share"
+        );
+        assert_eq!(
+            position(risk).stop_distance(Some(0.1)),
+            Ok(Some(0.1)),
+            "and the stop sits a tenth below the entry"
+        );
     }
 
     #[test]
     fn a_stop_too_tight_to_size_refuses_the_trade() {
         let risk = Risk {
-            stop_atr_multiple: Some(2.0),
-            risk_amount: Some(10.0),
-            max_position_value: Some(100_000.0),
+            model: arvo_research::RiskModel {
+                stop_atr_multiple: Some(2.0),
+                // $100 of risk on a $100k account.
+                risk_per_trade: Some(0.001),
+                max_position_fraction: Some(1.0),
+                ..UNSTOPPED.model
+            },
             ..UNSTOPPED
         };
-        // $10 of risk against a $50 stop distance is a fifth of a share.
+        // $100 of risk against a $50 stop distance is two shares... but at $500
+        // a share that is within the cap, so widen the stop until it rounds to
+        // nothing: $100 against a $200 distance is half a share.
         assert!(
-            position(risk).plan(500.0, Some(25.0)).is_none(),
+            matches!(
+                entry(risk, 500.0, Some(100.0)),
+                arvo_research::Decision::Reject(arvo_research::Rejection::TooSmall { .. })
+            ),
             "rounding up to one share would breach the risk budget"
         );
     }
 
+    #[test]
+    fn the_daily_loss_limit_binds_in_a_backtest() {
+        // The whole point of routing the engine through the shared policy. This
+        // limit existed on `RiskModel` and no backtest had ever enforced it, so
+        // every stored finding claimed a control it did not run under.
+        let risk = Risk {
+            model: arvo_research::RiskModel {
+                max_daily_loss: Some(0.02),
+                max_position_fraction: Some(1.0),
+                ..UNSTOPPED.model
+            },
+            ..UNSTOPPED
+        };
+        let refused = decide_entry(
+            risk,
+            quantity(100.0),
+            "MSFT.NASDAQ",
+            100.0,
+            None,
+            today(),
+            &BTreeMap::new(),
+            // $2,100 lost against a $2,000 limit on $100k.
+            -2_100.0,
+            false,
+        );
+        assert!(matches!(
+            refused,
+            arvo_research::Decision::Reject(arvo_research::Rejection::DailyLossLimit { .. })
+        ));
+    }
+
+    #[test]
+    fn the_position_cap_counts_every_member_of_a_book() {
+        // Counted from the engine's account rather than per strategy: a book's
+        // members are separate instances sharing one balance, so a private
+        // tally would give N caps of one and cap nothing at all.
+        let risk = Risk {
+            model: arvo_research::RiskModel {
+                max_concurrent_positions: Some(2),
+                max_position_fraction: Some(1.0),
+                ..UNSTOPPED.model
+            },
+            ..UNSTOPPED
+        };
+        let mut held = BTreeMap::new();
+        for id in ["AAPL.NASDAQ", "NVDA.NASDAQ"] {
+            held.insert(
+                id.to_owned(),
+                arvo_research::Position {
+                    quantity: 10.0,
+                    entry: 100.0,
+                },
+            );
+        }
+
+        let refused = decide_entry(
+            risk,
+            quantity(100.0),
+            "MSFT.NASDAQ",
+            100.0,
+            None,
+            today(),
+            &held,
+            0.0,
+            false,
+        );
+        assert!(matches!(
+            refused,
+            arvo_research::Decision::Reject(arvo_research::Rejection::TooManyPositions {
+                held: 2,
+                limit: 2
+            })
+        ));
+    }
+
+    #[test]
+    fn a_backtest_signal_is_never_stale() {
+        // A bar's signal is generated at the bar's own instant and there is no
+        // network in between. The check is still on the same path a live
+        // session runs — which is the point — and the fact that it cannot fire
+        // here is precisely the gap paper trading exists to measure.
+        let accepted = decide_entry(
+            UNSTOPPED,
+            quantity(100.0),
+            "MSFT.NASDAQ",
+            100.0,
+            None,
+            today(),
+            &BTreeMap::new(),
+            0.0,
+            false,
+        );
+        assert!(matches!(
+            accepted,
+            arvo_research::Decision::Accept { .. }
+        ));
+    }
+
     const HALTING: Risk = Risk {
-        stop_atr_multiple: None,
-        atr_period: 14,
-        risk_amount: None,
-        max_position_value: None,
-        max_drawdown: Some(0.10),
-        max_concurrent_positions: None,
+        model: arvo_research::RiskModel {
+            max_drawdown: Some(0.10),
+            ..UNSTOPPED.model
+        },
+        ..UNSTOPPED
     };
 
     #[test]

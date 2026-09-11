@@ -15,6 +15,10 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+# Dyn-compatible async trait methods for `source::Source`, which is handed
+# around as `Box<dyn Source>`. Native async-in-trait is not dyn-compatible.
+# Already in the graph via tonic, so this is a manifest line and no build.
+async-trait = "0.1.92"
 arvo-data.workspace = true
 arvo-nautilus.workspace = true
 arvo-portfolio.workspace = true

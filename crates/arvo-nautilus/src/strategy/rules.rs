@@ -61,7 +61,7 @@ impl SmaCross {
             bar_type,
             instrument_id: bar_type.instrument_id(),
             position: Position::new(risk, trade_size),
-            atr: Atr::new(risk.atr_period),
+            atr: Atr::new(risk.model.atr_period),
             fast: Sma::new(fast_period),
             slow: Sma::new(slow_period),
             previous_fast_above: None,
@@ -86,7 +86,7 @@ impl DataActor for SmaCross {
         let (high, low, close) = (bar.high.as_f64(), bar.low.as_f64(), bar.close.as_f64());
         let atr = self.atr.update(high, low, close);
 
-        if self.exit_on_levels(high, low)?.is_some() || self.halt_if_drawn_down()? {
+        if self.exit_on_levels(high, low)?.is_some() || self.halt_if_drawn_down(bar.ts_event)? {
             // Reset the crossover memory too: after a stop the next entry
             // should need a fresh signal, not the stale one that is still
             // technically in force.
@@ -120,7 +120,12 @@ pub(crate) struct BuyAndHold {
 }
 
 impl BuyAndHold {
-    pub(crate) fn new(core: StrategyCore, bar_type: BarType, trade_size: Quantity) -> Self {
+    pub(crate) fn new(
+        core: StrategyCore,
+        bar_type: BarType,
+        trade_size: Quantity,
+        starting_cash: f64,
+    ) -> Self {
         Self {
             core,
             bar_type,
@@ -129,16 +134,16 @@ impl BuyAndHold {
             // and a stopped benchmark is a strategy.
             position: Position::new(
                 Risk {
-                    stop_atr_multiple: None,
-                    atr_period: 1,
-                    risk_amount: None,
-                    max_position_value: None,
-                    // And no halt. The benchmark is "what the market did";
-                    // one that stopped trading partway through would be a
-                    // strategy, and every excess return measured against it
-                    // would be measured against the wrong thing.
-                    max_drawdown: None,
-                max_concurrent_positions: None,
+                    // No stop, no sizing rule, and — the important one — no
+                    // halt. The benchmark is "what the market did"; one that
+                    // stopped trading partway through would be a strategy, and
+                    // every excess return measured against it would be measured
+                    // against the wrong thing.
+                    model: arvo_research::RiskModel {
+                        atr_period: 1,
+                        ..arvo_research::RiskModel::default()
+                    },
+                    starting_cash,
                 },
                 trade_size,
             ),
@@ -228,7 +233,7 @@ impl OpeningRange {
             bar_type,
             instrument_id: bar_type.instrument_id(),
             position: Position::new(risk, trade_size),
-            atr: Atr::new(risk.atr_period),
+            atr: Atr::new(risk.model.atr_period),
             session: Session::default(),
             range_bars,
             target_range_multiple,
@@ -270,7 +275,7 @@ impl DataActor for OpeningRange {
 
         // Risk before signal, always: a rule that has spent its drawdown
         // budget should not be reading its entry condition at all.
-        if self.exit_on_levels(high, low)?.is_some() || self.halt_if_drawn_down()? {
+        if self.exit_on_levels(high, low)?.is_some() || self.halt_if_drawn_down(bar.ts_event)? {
             return Ok(());
         }
         if self.position.is_halted() {
@@ -369,7 +374,7 @@ impl DataActor for VolatilityBreakout {
 
         // Risk before signal, always: a rule that has spent its drawdown
         // budget should not be reading its entry condition at all.
-        if self.exit_on_levels(high, low)?.is_some() || self.halt_if_drawn_down()? {
+        if self.exit_on_levels(high, low)?.is_some() || self.halt_if_drawn_down(bar.ts_event)? {
             return Ok(());
         }
         if self.position.is_halted() {
@@ -439,7 +444,7 @@ impl VwapReversion {
             bar_type,
             instrument_id: bar_type.instrument_id(),
             position: Position::new(risk, trade_size),
-            atr: Atr::new(risk.atr_period),
+            atr: Atr::new(risk.model.atr_period),
             session: Session::default(),
             vwap: SessionVwap::default(),
             entry_deviations,
@@ -476,7 +481,7 @@ impl DataActor for VwapReversion {
 
         // Risk before signal, always: a rule that has spent its drawdown
         // budget should not be reading its entry condition at all.
-        if self.exit_on_levels(high, low)?.is_some() || self.halt_if_drawn_down()? {
+        if self.exit_on_levels(high, low)?.is_some() || self.halt_if_drawn_down(bar.ts_event)? {
             return Ok(());
         }
         if self.position.is_halted() {
@@ -543,7 +548,7 @@ impl MomentumBreakout {
             bar_type,
             instrument_id: bar_type.instrument_id(),
             position: Position::new(risk, trade_size),
-            atr: Atr::new(risk.atr_period),
+            atr: Atr::new(risk.model.atr_period),
             entry: Donchian::new(entry_period),
             exit: Donchian::new(exit_period),
         }
@@ -577,7 +582,7 @@ impl DataActor for MomentumBreakout {
 
         // Risk before signal, always: a rule that has spent its drawdown
         // budget should not be reading its entry condition at all.
-        if self.exit_on_levels(high, low)?.is_some() || self.halt_if_drawn_down()? {
+        if self.exit_on_levels(high, low)?.is_some() || self.halt_if_drawn_down(bar.ts_event)? {
             return Ok(());
         }
         if self.position.is_halted() {

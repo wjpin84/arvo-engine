@@ -138,6 +138,38 @@ impl<P: BarProvider> SimulationProvider for NautilusSimulation<P> {
         ENGINE
     }
 
+    /// Forwards to the data library, one instrument at a time.
+    ///
+    /// Nothing here touches Nautilus: distributions never reach the engine, and
+    /// no backtest receives a cash credit for one. This exists because
+    /// `arvo-research` reaches its data through this trait and nowhere else —
+    /// see [`SimulationProvider::dividends`].
+    ///
+    /// An instrument with no series is left out of the map entirely rather than
+    /// mapped to an empty list. `arvo_research::dividend` reads a missing key as
+    /// *unknown* and an empty list as *paid nothing*, and those are different
+    /// facts about a result.
+    fn dividends(
+        &self,
+        experiment: &Experiment,
+    ) -> std::collections::HashMap<String, Vec<arvo_data::Dividend>> {
+        experiment
+            .instruments()
+            .into_iter()
+            .filter_map(|instrument| {
+                let paid = self
+                    .bars
+                    .dividends(&instrument, experiment.window.from, experiment.window.to)
+                    // A library that cannot be read is not a reason to fail a
+                    // backtest that already ran. The gap goes unmeasured, which
+                    // `advice` reports as unmeasured.
+                    .ok()
+                    .flatten()?;
+                Some((instrument, paid))
+            })
+            .collect()
+    }
+
     fn run(&self, experiment: &Experiment) -> Result<SimulationResult, SimulationError> {
         let plan = Plan::from_spec(&experiment.strategy, experiment.interval)?;
         experiment
@@ -555,19 +587,13 @@ fn run_backtest(
     // account rather than a share of it. That is deliberate: a per-member cap
     // of `1/N` would pre-allocate capital and there would be nothing left to
     // contend for. The contention is the measurement.
+    // The model travels whole rather than as resolved currency amounts. The
+    // fractions are divided out at decision time by `arvo_research::decide`,
+    // which is the same function a live gate calls — so the engine and a live
+    // session cannot drift apart on how a limit is applied.
     let risk = strategy::Risk {
-        stop_atr_multiple: experiment.risk.stop_atr_multiple,
-        atr_period: experiment.risk.atr_period,
-        risk_amount: experiment
-            .risk
-            .risk_per_trade
-            .map(|fraction| fraction * experiment.starting_cash),
-        max_position_value: experiment
-            .risk
-            .max_position_fraction
-            .map(|fraction| fraction * experiment.starting_cash),
-        max_drawdown: experiment.risk.max_drawdown,
-        max_concurrent_positions: experiment.risk.max_concurrent_positions,
+        model: experiment.risk,
+        starting_cash: experiment.starting_cash,
     };
 
     // A ranking rule is one decision-maker over the whole set, not one per
@@ -685,7 +711,7 @@ fn run_backtest(
                 risk,
             )),
             Plan::BuyAndHold { .. } => {
-                engine.add_strategy(strategy::BuyAndHold::new(core, bar_type, trade_size))
+                engine.add_strategy(strategy::BuyAndHold::new(core, bar_type, trade_size, experiment.starting_cash))
             }
             Plan::CrossSectionalMomentum { .. } => {
                 // Added once for the whole set above, and returned before
@@ -1556,6 +1582,8 @@ mod tests {
             max_position_fraction: Some(1.0),
             max_drawdown: Some(0.05),
             max_concurrent_positions: None,
+            max_daily_loss: None,
+            correlation_cap: None,
         };
 
         let result = provider(bars.clone()).run(&experiment).expect("runs");
@@ -1608,6 +1636,8 @@ mod tests {
             max_position_fraction: Some(1.0),
             max_drawdown: None,
             max_concurrent_positions: None,
+            max_daily_loss: None,
+            correlation_cap: None,
         };
 
         let result = provider(bars).run(&experiment).expect("runs");
@@ -1885,6 +1915,131 @@ mod tests {
         );
     }
 
+
+    /// The whole dividend path, from a file on disk to a measured gap.
+    ///
+    /// Every layer of this has unit tests and they would all still pass with
+    /// the layers unconnected: the library reads a file nobody asks for, the
+    /// engine forwards a call nobody makes, and `Evaluation::dividend_gap` is
+    /// `None` forever while `advice` quietly falls back to the old estimate.
+    /// This is the only test that fails when the wiring is missing.
+    mod dividend_path {
+        use super::*;
+        use arvo_data::CsvBars;
+
+        /// The fixture written to a real library, because that is the only
+        /// provider that reads a distribution series at all.
+        fn library(bars: &[arvo_data::Bar], dividends: &[arvo_data::Dividend]) -> tempfile::TempDir {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let library = CsvBars::new(dir.path());
+            library
+                .write("AAPL.NASDAQ", arvo_data::BarInterval::DAILY, bars)
+                .expect("write bars");
+            library
+                .write_dividends("AAPL.NASDAQ", dividends)
+                .expect("write dividends");
+            dir
+        }
+
+        fn paid(day_of_year: u32, amount: f64) -> arvo_data::Dividend {
+            arvo_data::Dividend {
+                ex_date: date(2024, 1, 1) + chrono::Duration::days(i64::from(day_of_year)),
+                amount,
+            }
+        }
+
+        #[test]
+        fn a_distribution_series_on_disk_reaches_the_evaluation_as_a_measured_gap() {
+            let bars = sawtooth(400);
+            let dir = library(&bars, &[paid(50, 0.50), paid(140, 0.50), paid(230, 0.50)]);
+            let experiment = experiment(params(10.0, 30.0), &bars);
+            let provider = NautilusSimulation::new(CsvBars::new(dir.path()));
+
+            let evidence = arvo_research::evaluate_against_benchmark(
+                &provider,
+                &experiment,
+                &arvo_research::EvaluationCriteria::default(),
+            )
+            .expect("both runs should complete");
+
+            let gap = evidence
+                .evaluation
+                .dividend_gap
+                .expect("a series is on disk, so the gap is measurable");
+
+            assert_eq!(gap.events, 3, "three payments went ex inside the window");
+            assert_eq!(
+                (gap.covered, gap.instruments),
+                (1, 1),
+                "the one instrument this run held has a series"
+            );
+            assert!(gap.complete());
+            assert!(
+                gap.benchmark_income > 0.0,
+                "buy-and-hold was in the market for every ex-date"
+            );
+            assert!(
+                gap.benchmark_income >= gap.strategy_income,
+                "a rule that sits out cannot collect more than one that never does: \
+                 benchmark {} against strategy {}",
+                gap.benchmark_income,
+                gap.strategy_income
+            );
+            assert!(
+                gap.overstatement > 0.0,
+                "this rule is out of the market for part of the window, so it must forgo                  strictly more than buy-and-hold does — a gap of zero here means the                  measurement is not seeing the ledger: benchmark {} against strategy {}",
+                gap.benchmark_income,
+                gap.strategy_income
+            );
+        }
+
+        #[test]
+        fn a_library_with_no_series_leaves_the_gap_unmeasured_rather_than_zero() {
+            // The distinction the whole feature rests on. Zero would claim the
+            // bias has been shown not to exist; `None` says nobody looked.
+            let bars = sawtooth(400);
+            let dir = tempfile::tempdir().expect("tempdir");
+            CsvBars::new(dir.path())
+                .write("AAPL.NASDAQ", arvo_data::BarInterval::DAILY, &bars)
+                .expect("write bars");
+
+            let experiment = experiment(params(10.0, 30.0), &bars);
+            let evidence = arvo_research::evaluate_against_benchmark(
+                &NautilusSimulation::new(CsvBars::new(dir.path())),
+                &experiment,
+                &arvo_research::EvaluationCriteria::default(),
+            )
+            .expect("both runs should complete");
+
+            assert!(evidence.evaluation.dividend_gap.is_none());
+        }
+
+        #[test]
+        fn an_instrument_that_paid_nothing_is_measured_as_no_bias_at_all() {
+            // The good news case, and it must not read as the unmeasured one:
+            // the series is there and these instruments pay nothing, so the
+            // excess return needs no correction.
+            let bars = sawtooth(400);
+            let dir = library(&bars, &[]);
+            let experiment = experiment(params(10.0, 30.0), &bars);
+
+            let evidence = arvo_research::evaluate_against_benchmark(
+                &NautilusSimulation::new(CsvBars::new(dir.path())),
+                &experiment,
+                &arvo_research::EvaluationCriteria::default(),
+            )
+            .expect("both runs should complete");
+
+            let gap = evidence
+                .evaluation
+                .dividend_gap
+                .expect("an empty series is still a series");
+            assert_eq!(gap.events, 0);
+            assert!(gap.overstatement.abs() < 1e-12);
+            assert!(!gap.worth_saying());
+        }
+    }
+
     #[test]
     fn the_research_loop_runs_end_to_end_and_produces_evidence() {
         let bars = sawtooth(400);
@@ -1990,6 +2145,8 @@ mod tests {
             max_position_fraction: Some(1.0),
             max_drawdown: None,
             max_concurrent_positions: None,
+            max_daily_loss: None,
+            correlation_cap: None,
         };
 
         let result = intraday_provider(bars.clone()).run(&experiment).expect("runs");

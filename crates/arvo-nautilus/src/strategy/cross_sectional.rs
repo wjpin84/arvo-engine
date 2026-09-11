@@ -119,9 +119,17 @@ impl CrossSectionalMomentum {
         // Room for all of them at once. See the module note on sizing.
         #[expect(clippy::cast_precision_loss, reason = "holding counts are small")]
         let shared = Risk {
-            max_position_value: risk
-                .max_position_value
-                .map(|cap| cap / hold_top as f64),
+            model: arvo_research::RiskModel {
+                // Room for all of them at once. See the module note on sizing:
+                // a ranking rule holding the top N out of one account must size
+                // each to a fraction of the ceiling, or the first fills and the
+                // rest are rejected for want of cash.
+                max_position_fraction: risk
+                    .model
+                    .max_position_fraction
+                    .map(|fraction| fraction / hold_top as f64),
+                ..risk.model
+            },
             ..risk
         };
 
@@ -132,7 +140,7 @@ impl CrossSectionalMomentum {
             let id = bar_type.instrument_id();
             scores.insert(id, Momentum::new(lookback));
             positions.insert(id, Position::new(shared, trade_size));
-            atrs.insert(id, Atr::new(risk.atr_period));
+            atrs.insert(id, Atr::new(risk.model.atr_period));
         }
 
         Self {
@@ -178,6 +186,17 @@ impl CrossSectionalMomentum {
     fn rebalance(&mut self) -> anyhow::Result<()> {
         let wanted = self.wanted();
 
+        // The account, once, before any of the entries below. Read from the
+        // engine so the limits see every member of the book rather than one
+        // instrument's private tally.
+        let Some(now) = self.filling.and_then(super::nanos_to_instant) else {
+            return Ok(());
+        };
+        let (positions, realised_today) = super::account_from_positions(
+            self.cache().positions(None, None, None, None, None),
+            now.date(),
+        );
+
         let held: Vec<InstrumentId> = self
             .positions
             .iter()
@@ -203,10 +222,32 @@ impl CrossSectionalMomentum {
             // Sized against the stop distance the record asked for, and
             // refused outright when that distance is not measurable yet. See
             // the type note: passing `None` here bought nothing, ever.
-            let Some((size, stop)) = position.plan(reading.close, reading.atr) else {
+            let Ok(stop_distance) = position.stop_distance(reading.atr) else {
                 continue;
             };
-            position.stop = stop;
+            // The same policy a live session runs, over the same account. A
+            // ranking rule holds N positions out of one balance, so the daily
+            // loss limit and the position cap have to see all of them — which
+            // they do, because the account is read from the engine rather than
+            // tallied per instrument.
+            let decision = super::decide_entry(
+                position.risk(),
+                position.default_size(),
+                &id.to_string(),
+                reading.close,
+                stop_distance,
+                now,
+                &positions,
+                realised_today,
+                false,
+            );
+            let arvo_research::Decision::Accept { quantity } = decision else {
+                continue;
+            };
+            let Ok(size) = Quantity::new_checked(quantity, 0) else {
+                continue;
+            };
+            position.stop = stop_distance.map(|distance| reading.close - distance);
             position.hold(size);
             self.send(id, OrderSide::Buy, size, None)?;
         }

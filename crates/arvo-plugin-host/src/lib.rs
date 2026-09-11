@@ -1,11 +1,11 @@
 //! Loads and probes Arvo plugins.
 //!
-//! One registry, two execution tiers — gRPC subprocess ([`registry`]) and
-//! in-process WASM component ([`wasm`]) — so callers never need to know which
-//! tier an entry is on.
+//! One tier: a plugin is a process that speaks gRPC at an address, and
+//! [`registry`] probes it. A second, in-process WASM tier existed until it was
+//! removed — see the note on [`registry::PluginRegistry`] for why a sandbox
+//! that grants no imports cannot host the thing plugins are now for.
 
 pub mod registry;
-pub mod wasm;
 
 /// Generated from `protos/arvo/plugin/v1/plugin.proto`.
 pub mod plugin {

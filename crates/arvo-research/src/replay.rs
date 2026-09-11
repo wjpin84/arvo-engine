@@ -563,6 +563,7 @@ mod tests {
             benchmark_curve: Vec::new(),
             strategy_trades: crate::TradeStats::default(),
             strategy_ledger: Vec::new(),
+            dividend_gap: None,
             benchmark_instruments: Vec::new(),
             excess_return: 0.1,
             verdict: crate::Verdict::Supported,

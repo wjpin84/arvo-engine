@@ -379,7 +379,7 @@ mod tests {
     fn plugin(id: &str, reachable: bool) -> PluginView {
         PluginView {
             id: id.to_owned(),
-            address: None,
+            address: "http://127.0.0.1:50051".to_owned(),
             status: if reachable {
                 PluginStatusView::Reachable {
                     name: id.to_owned(),

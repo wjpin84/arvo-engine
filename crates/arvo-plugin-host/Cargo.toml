@@ -1,6 +1,6 @@
 [package]
 name = "arvo-plugin-host"
-description = "Loads and probes Arvo plugins across both execution tiers: gRPC subprocess and in-process WASM component."
+description = "Loads and probes Arvo plugins: gRPC processes at a configured address."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -12,7 +12,6 @@ prost.workspace = true
 tokio.workspace = true
 tonic.workspace = true
 tonic-prost.workspace = true
-wasmtime = "38.0.4"
 
 [build-dependencies]
 protoc-bin-vendored.workspace = true

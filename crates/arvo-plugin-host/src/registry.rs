@@ -1,9 +1,7 @@
 use crate::plugin::plugin_client::PluginClient;
 use crate::plugin::{GetManifestRequest, Manifest};
-use crate::wasm::WasmHost;
 use arvo_core::config::PluginsConfig;
 use arvo_core::events::{Event, StatusKind};
-use std::path::Path;
 use tokio::sync::{broadcast, RwLock};
 
 #[derive(Debug, Clone)]
@@ -15,19 +13,26 @@ pub enum PluginStatus {
 #[derive(Debug, Clone)]
 pub struct PluginEntry {
     pub id: String,
-    pub address: Option<String>,
-    pub path: Option<String>,
+    pub address: String,
     pub status: PluginStatus,
 }
 
 /// Registered != Reachable — see the entry's `status`. A plugin being
-/// Unreachable is expected (it's an external process, or a WASM file, this
-/// app doesn't control the existence of) and must never block startup or
-/// panic. Two execution tiers (gRPC subprocess, WASM in-process), one
-/// registry — callers never need to know which tier an entry is on.
+/// Unreachable is expected (it's an external process this app doesn't control
+/// the existence of) and must never block startup or panic.
+///
+/// # Why there is only one tier
+///
+/// There was an in-process WASM tier beside this one. It was removed rather
+/// than extended, because its sandbox policy and its purpose had come into
+/// direct conflict: components were instantiated with an empty `Linker` and no
+/// WASI context, so a component importing *anything* failed to instantiate.
+/// That is a sound way to run untrusted arithmetic and a structurally
+/// impossible way to run a data source, which needs a socket and a credential.
+/// A plugin worth having is one that can fetch bars; that is a process, and a
+/// process is this tier.
 pub struct PluginRegistry {
     entries: RwLock<Vec<PluginEntry>>,
-    wasm_host: WasmHost,
     events: broadcast::Sender<Event>,
 }
 
@@ -40,7 +45,6 @@ fn status_kind(status: &PluginStatus) -> StatusKind {
 
 impl PluginRegistry {
     pub async fn connect(config: &PluginsConfig) -> Self {
-        let wasm_host = WasmHost::new();
         let (events, _) = broadcast::channel(16);
 
         // No events published here — there's no prior state for anything to
@@ -48,23 +52,16 @@ impl PluginRegistry {
         // meaningful status change. See ticket 02 of the arvo-core map.
         let mut entries = Vec::with_capacity(config.plugin.len());
         for plugin in &config.plugin {
-            let status = probe(
-                plugin.address.as_deref(),
-                plugin.path.as_deref(),
-                &wasm_host,
-            )
-            .await;
+            let status = probe(&plugin.address).await;
             entries.push(PluginEntry {
                 id: plugin.id.clone(),
                 address: plugin.address.clone(),
-                path: plugin.path.clone(),
                 status,
             });
         }
 
         Self {
             entries: RwLock::new(entries),
-            wasm_host,
             events,
         }
     }
@@ -89,8 +86,7 @@ impl PluginRegistry {
 
         let mut refreshed = Vec::with_capacity(known.len());
         for old in known {
-            let new_status =
-                probe(old.address.as_deref(), old.path.as_deref(), &self.wasm_host).await;
+            let new_status = probe(&old.address).await;
 
             if status_kind(&new_status) != status_kind(&old.status) {
                 let _ = self.events.send(Event::PluginStatusChanged {
@@ -102,7 +98,6 @@ impl PluginRegistry {
             refreshed.push(PluginEntry {
                 id: old.id,
                 address: old.address,
-                path: old.path,
                 status: new_status,
             });
         }
@@ -115,33 +110,7 @@ impl PluginRegistry {
     }
 }
 
-async fn probe(address: Option<&str>, path: Option<&str>, wasm_host: &WasmHost) -> PluginStatus {
-    if let Some(address) = address {
-        return probe_process(address).await;
-    }
-
-    if let Some(path) = path {
-        // ponytail: instantiating our stub-sized components is near-instant
-        // (no I/O, pure computation), so this runs directly on the async
-        // task rather than via spawn_blocking. Revisit if a real plugin's
-        // instantiation is ever slow enough to matter — see the map's
-        // Not-yet-specified on wasmtime lifecycle.
-        return match wasm_host.get_manifest(Path::new(path)) {
-            Ok(manifest) => PluginStatus::Reachable(manifest),
-            // `{:#}` is anyhow's alternate form: the whole cause chain on one
-            // line, not just the outermost message. `Unreachable` holds a
-            // String because it is a display value bound for the UI — but it
-            // should carry every cause, not only the last one.
-            Err(err) => PluginStatus::Unreachable(format!("{err:#}")),
-        };
-    }
-
-    // Unreachable in practice — config::load validates exactly one of
-    // address/path is set — but name the state instead of panicking on it.
-    PluginStatus::Unreachable("plugin entry has neither address nor path".into())
-}
-
-async fn probe_process(address: &str) -> PluginStatus {
+async fn probe(address: &str) -> PluginStatus {
     let mut client = match PluginClient::connect(address.to_string()).await {
         Ok(client) => client,
         Err(err) => return PluginStatus::Unreachable(err.to_string()),
@@ -178,8 +147,7 @@ mod tests {
         let config = PluginsConfig {
             plugin: vec![PluginConfigEntry {
                 id: "stub".into(),
-                address: Some("http://127.0.0.1:50061".into()),
-                path: None,
+                address: "http://127.0.0.1:50061".into(),
             }],
         };
 
@@ -200,56 +168,7 @@ mod tests {
                 id: "nothing-here".into(),
                 // ponytail: port picked to almost certainly have nothing
                 // listening; a flaky collision would fail loudly, not silently.
-                address: Some("http://127.0.0.1:50062".into()),
-                path: None,
-            }],
-        };
-
-        let registry = PluginRegistry::connect(&config).await;
-        let snapshot = registry.snapshot().await;
-
-        assert_eq!(snapshot.len(), 1);
-        assert!(matches!(snapshot[0].status, PluginStatus::Unreachable(_)));
-    }
-
-    fn wasm_stub_path() -> String {
-        // Built by plugin-execution-tiers ticket 02; must be built with
-        // --target wasm32-unknown-unknown (not cargo-component's default
-        // wasm32-wasip1) to get zero WASI imports. Relative to this crate,
-        // since that's where `cargo test` runs from.
-        "../../target/wasm32-unknown-unknown/debug/arvo_plugin_wasm_stub.wasm".to_string()
-    }
-
-    #[tokio::test]
-    async fn reachable_wasm_plugin_returns_its_manifest() {
-        let config = PluginsConfig {
-            plugin: vec![PluginConfigEntry {
-                id: "wasm-stub".into(),
-                address: None,
-                path: Some(wasm_stub_path()),
-            }],
-        };
-
-        let registry = PluginRegistry::connect(&config).await;
-        let snapshot = registry.snapshot().await;
-
-        assert_eq!(snapshot.len(), 1);
-        match &snapshot[0].status {
-            PluginStatus::Reachable(manifest) => assert_eq!(manifest.id, "wasm-stub"),
-            PluginStatus::Unreachable(reason) => panic!(
-                "expected reachable (did you `cargo component build --target \
-                 wasm32-unknown-unknown` in plugins/wasm-stub first?): {reason}"
-            ),
-        }
-    }
-
-    #[tokio::test]
-    async fn missing_wasm_file_is_unreachable_not_an_error() {
-        let config = PluginsConfig {
-            plugin: vec![PluginConfigEntry {
-                id: "ghost".into(),
-                address: None,
-                path: Some("does/not/exist.wasm".into()),
+                address: "http://127.0.0.1:50062".into(),
             }],
         };
 
@@ -271,8 +190,7 @@ mod tests {
         let config = PluginsConfig {
             plugin: vec![PluginConfigEntry {
                 id: "events-stub".into(),
-                address: Some("http://127.0.0.1:50063".into()),
-                path: None,
+                address: "http://127.0.0.1:50063".into(),
             }],
         };
 

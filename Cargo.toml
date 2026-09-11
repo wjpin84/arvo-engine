@@ -11,9 +11,9 @@ members = [
     "crates/arvo-nautilus",
     "crates/arvo-portfolio",
     "crates/arvo-editor",
+    "crates/arvo-execution",
     "crates/arvo-runtime",
     "plugins/stub",
-    "plugins/wasm-stub",
 ]
 
 # Single source of truth for versions shared across crates, so a bump happens
@@ -25,6 +25,7 @@ license = "Apache-2.0"
 
 [workspace.dependencies]
 arvo-core = { path = "crates/arvo-core" }
+arvo-execution = { path = "crates/arvo-execution" }
 arvo-data = { path = "crates/arvo-data" }
 arvo-mcp = { path = "crates/arvo-mcp" }
 arvo-oauth = { path = "crates/arvo-oauth" }

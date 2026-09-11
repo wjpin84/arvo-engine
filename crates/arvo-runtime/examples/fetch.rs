@@ -18,17 +18,23 @@
 //! anything.
 
 use arvo_data::BarInterval;
-use arvo_runtime_lib::feed;
+use arvo_runtime_lib::source;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let root = if args.is_empty() {
-        return Err("usage: fetch <data-dir> [--interval 1day] [--years N] SYMBOL...".into());
+        return Err(
+            "usage: fetch <data-dir> [--source robinhood] [--interval 1day] [--years N]              SYMBOL..."
+                .into(),
+        );
     } else {
         args.remove(0)
     };
 
+    let source = source::by_id(
+        &take_value(&mut args, "--source").unwrap_or_else(|| "robinhood".to_owned()),
+    )?;
     let interval = take_value(&mut args, "--interval")
         .unwrap_or_else(|| "1day".to_owned())
         .parse::<BarInterval>()
@@ -42,11 +48,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("name at least one symbol".into());
     }
 
-    // Checked before the first call rather than discovered on it: "no broker
-    // session" is a different instruction from "that symbol is unknown", and
-    // meeting the first one five symbols in wastes the four that worked.
-    if !feed::is_connected()? {
-        return Err("no broker session stored — sign in from the window first".into());
+    // Checked before the first call rather than discovered on it: "no session"
+    // is a different instruction from "that symbol is unknown", and meeting the
+    // first one five symbols in wastes the four that worked. A source needing
+    // no credential answers `true` here, which is the honest answer to "can
+    // this fetch right now".
+    if !source.connected().await? {
+        return Err(format!(
+            "no {} session stored — sign in from the window first",
+            source.id()
+        )
+        .into());
     }
 
     let to = chrono::Utc::now().date_naive();
@@ -55,16 +67,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let (mut fetched, mut failed) = (0_usize, 0_usize);
     for symbol in &args {
-        // Bare tickers in, `SYMBOL.RH` out: the venue is the fetcher's to
-        // decide, and typing it here is how two spellings of one instrument
-        // end up in the library.
-        let instrument = format!("{symbol}.{}", feed::FETCHED_VENUE);
-        match feed::fetch(root.as_ref(), &instrument, interval, from, to).await {
+        // Bare tickers in, `SYMBOL.VENUE` out: the venue is the source's to
+        // decide, and typing it here is how two spellings of one instrument end
+        // up in the library.
+        match source::ingest(root.as_ref(), source.as_ref(), symbol, interval, from, to).await {
             Ok(report) => {
                 fetched += 1;
-                println!("{instrument}: {} bars", report.bars);
+                println!("{}: {} bars", report.instrument, report.bars);
                 if report.interpolated > 0 {
                     println!("  {} invented bars dropped", report.interpolated);
+                }
+                match report.dividends {
+                    Some(paid) => println!("  {paid} dividends"),
+                    None => println!("  no dividend series from this source"),
                 }
                 for finding in &report.quality.findings {
                     println!("  [{:?}] {}", finding.severity, finding.detail);
@@ -77,7 +92,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 failed += 1;
                 // Named and carried on. One unknown symbol is not a reason to
                 // abandon the four after it.
-                println!("{instrument}: {err}");
+                println!("{symbol}: {err}");
             }
         }
     }
