@@ -43,6 +43,7 @@
 //! an instrument that pays them — which is exactly the bias
 //! `arvo_research::advice` exists to warn about.
 
+pub mod alpaca;
 pub mod robinhood;
 pub mod yahoo;
 
@@ -606,7 +607,15 @@ pub async fn compare(
 /// that this crate does not own — see `arvo_plugin_host`.
 #[must_use]
 pub fn all() -> Vec<Box<dyn Source>> {
-    vec![Box::new(robinhood::Robinhood), Box::new(yahoo::Yahoo)]
+    vec![
+        Box::new(robinhood::Robinhood),
+        Box::new(yahoo::Yahoo),
+        // Both Alpaca feeds, because which one a key is entitled to is not
+        // knowable without asking, and the two are different datasets rather
+        // than one source configured two ways.
+        Box::new(alpaca::Alpaca::iex()),
+        Box::new(alpaca::Alpaca::sip()),
+    ]
 }
 
 /// One source by the id it reports.
