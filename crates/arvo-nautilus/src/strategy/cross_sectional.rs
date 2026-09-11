@@ -197,10 +197,24 @@ impl CrossSectionalMomentum {
         let Some(now) = self.filling.and_then(super::nanos_to_instant) else {
             return Ok(());
         };
-        let (positions, realised_today) = super::account_from_positions(
-            self.cache().positions(None, None, None, None, None),
-            now.date(),
-        );
+        let (positions, realised_today, day_trades_used) =
+            super::account_from_cache(&self.cache(), now.date());
+        let equity = self
+            .bar_types
+            .first()
+            .and_then(|bar_type| {
+                self.portfolio()
+                    .equity(&bar_type.instrument_id().venue, None)
+                    .values()
+                    .next()
+                    .map(nautilus_model::types::Money::as_f64)
+            })
+            .unwrap_or_else(|| {
+                self.positions
+                    .values()
+                    .next()
+                    .map_or(0.0, |position| position.risk().starting_cash)
+            });
 
         let held: Vec<InstrumentId> = self
             .positions
@@ -245,6 +259,10 @@ impl CrossSectionalMomentum {
                 &positions,
                 realised_today,
                 false,
+                // A ranking rule holds out of one account, so the equity and
+                // the day-trade budget are the account's, not any member's.
+                equity,
+                day_trades_used,
                 Some(self.correlations.as_ref()),
             );
             let arvo_research::Decision::Accept { quantity } = decision else {

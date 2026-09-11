@@ -374,6 +374,7 @@ impl<E: Executor> Session<E> {
                         &execution.instrument,
                         execution.quantity,
                         execution.fill_price,
+                        execution.filled_at.date(),
                     );
                 }
                 Side::Sell => {

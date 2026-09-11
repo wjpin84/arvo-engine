@@ -273,12 +273,33 @@ fn nanos_to_date(at: UnixNanos) -> Option<chrono::NaiveDate> {
 /// which this codebase has paid for once already.
 ///
 /// Returns what is open and what was realised on `today`.
+/// Every position the engine knows about, live and finished.
+///
+/// **Both sources.** A cycle that closed leaves the live record reset and empty
+/// behind it, so `positions()` alone does not contain finished round trips —
+/// `ledger::from_cache` has always combined the two for exactly this reason, and
+/// reading only the live half here meant the daily loss limit never saw a
+/// realised loss and the day-trade budget never saw a completed day trade. Both
+/// limits were wired, enforced, and looking at an empty history.
+pub(crate) fn account_from_cache(
+    cache: &nautilus_common::cache::CacheApi<'_>,
+    today: chrono::NaiveDate,
+) -> (BTreeMap<String, arvo_research::Position>, f64, usize) {
+    let mut all = cache.position_snapshots(None, None);
+    all.extend(cache.positions(None, None, None, None, None));
+    account_from_positions(all, today)
+}
+
 pub(crate) fn account_from_positions(
     held: impl IntoIterator<Item = nautilus_model::position::Position>,
     today: chrono::NaiveDate,
-) -> (BTreeMap<String, arvo_research::Position>, f64) {
+) -> (BTreeMap<String, arvo_research::Position>, f64, usize) {
     let mut positions = BTreeMap::new();
     let mut realised_today = 0.0;
+    // Round trips opened and closed on one day, for the pattern-day-trader
+    // count. Gathered here because this is already walking every position the
+    // engine holds, and a second walk would be a second chance to disagree.
+    let mut day_trades: Vec<chrono::NaiveDate> = Vec::new();
 
     for position in held {
         if position.is_open() {
@@ -297,8 +318,27 @@ pub(crate) fn account_from_positions(
             // bar's date, never the machine's.
             realised_today += position.realized_pnl.map_or(0.0, |money| money.as_f64());
         }
+
+        match (
+            nanos_to_date(position.ts_opened),
+            position.ts_closed.and_then(nanos_to_date),
+        ) {
+            // A completed round trip inside one day.
+            (Some(opened), Some(closed)) if opened == closed => day_trades.push(closed),
+            // Still open and opened today: it becomes a day trade the moment it
+            // closes, and closing cannot be refused, so the budget has to have
+            // accounted for it already.
+            (Some(opened), None) if opened == today => day_trades.push(opened),
+            _ => {}
+        }
     }
-    (positions, realised_today)
+
+    let earliest = arvo_research::risk::business_days_before(today, arvo_research::PDT_WINDOW_DAYS);
+    let day_trades_used = day_trades
+        .iter()
+        .filter(|at| **at >= earliest && **at <= today)
+        .count();
+    (positions, realised_today, day_trades_used)
 }
 
 /// Puts one entry to the same risk policy a live session uses.
@@ -321,6 +361,8 @@ pub(crate) fn decide_entry(
     positions: &BTreeMap<String, arvo_research::Position>,
     realised_today: f64,
     halted: bool,
+    equity: f64,
+    day_trades_used: usize,
     correlations: Option<&dyn arvo_research::Correlations>,
 ) -> arvo_research::Decision {
     let proposal = arvo_research::Proposal {
@@ -344,6 +386,8 @@ pub(crate) fn decide_entry(
             positions,
             realised_today,
             starting_cash: risk.starting_cash,
+            equity,
+            day_trades_used,
             halted: halted.then_some("the account drawdown limit was reached"),
         },
         &proposal,
@@ -410,9 +454,18 @@ pub(crate) trait Managed: Strategy + StrategyNative + DataActorNative {
         let now = self.position().last_bar_at?;
         // Bound, not inlined: `positions` borrows from the cache handle, and a
         // temporary would be dropped at the end of the expression.
-        let cache = self.cache();
-        let (positions, realised_today) =
-            account_from_positions(cache.positions(None, None, None, None, None), now.date());
+        let (positions, realised_today, day_trades_used) =
+            account_from_cache(&self.cache(), now.date());
+        // Marked to market, because the pattern-day-trader floor tests what the
+        // account is worth now. Before the first fill there is no account, and
+        // the opening balance is the honest stand-in.
+        let equity = self
+            .portfolio()
+            .equity(&self.instrument().venue, None)
+            .values()
+            .next()
+            .map(nautilus_model::types::Money::as_f64)
+            .unwrap_or(self.position().risk.starting_cash);
         Some(decide_entry(
             self.position().risk,
             self.position().default_size,
@@ -423,6 +476,8 @@ pub(crate) trait Managed: Strategy + StrategyNative + DataActorNative {
             &positions,
             realised_today,
             self.position().is_halted(),
+            equity,
+            day_trades_used,
             Some(self.position().correlations.as_ref()),
         ))
     }
@@ -624,6 +679,7 @@ mod tests {
             max_concurrent_positions: None,
             max_daily_loss: None,
             correlation_cap: None,
+            day_trading: arvo_research::DayTradingRule::Unconstrained,
         },
         starting_cash: 100_000.0,
     };
@@ -656,6 +712,8 @@ mod tests {
             &BTreeMap::new(),
             0.0,
             false,
+            UNSTOPPED.starting_cash,
+            0,
             None,
         )
     }
@@ -765,6 +823,8 @@ mod tests {
             // $2,100 lost against a $2,000 limit on $100k.
             -2_100.0,
             false,
+            UNSTOPPED.starting_cash,
+            0,
             None,
         );
         assert!(matches!(
@@ -807,6 +867,8 @@ mod tests {
             &held,
             0.0,
             false,
+            UNSTOPPED.starting_cash,
+            0,
             None,
         );
         assert!(matches!(
@@ -834,6 +896,8 @@ mod tests {
             &BTreeMap::new(),
             0.0,
             false,
+            UNSTOPPED.starting_cash,
+            0,
             None,
         );
         assert!(matches!(

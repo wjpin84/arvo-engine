@@ -1605,6 +1605,7 @@ mod tests {
             max_concurrent_positions: None,
             max_daily_loss: None,
             correlation_cap: None,
+            day_trading: arvo_research::DayTradingRule::Unconstrained,
         };
 
         let result = provider(bars.clone()).run(&experiment).expect("runs");
@@ -1659,6 +1660,7 @@ mod tests {
             max_concurrent_positions: None,
             max_daily_loss: None,
             correlation_cap: None,
+            day_trading: arvo_research::DayTradingRule::Unconstrained,
         };
 
         let result = provider(bars).run(&experiment).expect("runs");
@@ -2168,6 +2170,7 @@ mod tests {
             max_concurrent_positions: None,
             max_daily_loss: None,
             correlation_cap: None,
+            day_trading: arvo_research::DayTradingRule::Unconstrained,
         };
 
         let result = intraday_provider(bars.clone()).run(&experiment).expect("runs");
@@ -2533,6 +2536,190 @@ mod tests {
                 "a cluster inside its limit should change nothing"
             );
             assert!(concurrent_peak(&roomy.ledger) >= 2, "and both may be held");
+        }
+    }
+
+    /// The pattern-day-trader rule, end to end through a real backtest.
+    ///
+    /// A backtest that ignores it is backtesting an account nobody can open,
+    /// and the failure is silent: the run simply trades more than the law
+    /// allows and reports a return drawn from trades that could not happen.
+    mod pattern_day_trader {
+        use super::*;
+
+        /// Weekday sessions that each rise and then fall back.
+        ///
+        /// `sessions` alternates its direction per day so neither a breakout
+        /// nor a reversion rule gets a one-sided fixture — which means a
+        /// long-only crossover enters on every *other* session and can never
+        /// breach a three-per-five-days budget. This fixture is one-sided on
+        /// purpose: the point is to produce a run that *does* breach, so the
+        /// constrained run beside it proves something.
+        ///
+        /// Weekdays only, because the budget window is counted in business
+        /// days and a Saturday session would pack more trades into a window
+        /// than the rule ever sees.
+        fn daily_round_trips(count: usize, bars_each: usize) -> Vec<arvo_data::Bar> {
+            let mut day = date(2024, 1, 2);
+            let mut bars = Vec::with_capacity(count * bars_each);
+            for _ in 0..count {
+                while matches!(
+                    chrono::Datelike::weekday(&day),
+                    chrono::Weekday::Sat | chrono::Weekday::Sun
+                ) {
+                    day = day.succ_opt().expect("date stays in range");
+                }
+                let open = day.and_hms_opt(13, 30, 0).expect("valid");
+                for index in 0..bars_each {
+                    #[expect(clippy::cast_precision_loss, reason = "short sessions")]
+                    let phase = index as f64 / bars_each as f64;
+                    // Three up-down cycles inside each session, so a fast
+                    // crossover completes several round trips a day. One per
+                    // day would leave a daily loss limit nothing to stop: by
+                    // the time the loss is realised the session is over.
+                    let cycle = (phase * 3.0) % 1.0;
+                    let close = 100.0 + if cycle < 0.5 { cycle } else { 1.0 - cycle } * 20.0;
+                    bars.push(arvo_data::Bar {
+                        at: open + chrono::Duration::minutes(5 * i64::try_from(index).expect("small")),
+                        open: close,
+                        high: close + 0.2,
+                        low: close - 0.2,
+                        close,
+                        volume: 10_000.0,
+                    });
+                }
+                day = day.succ_opt().expect("date stays in range");
+            }
+            bars
+        }
+
+        fn constrained(bars: &[arvo_data::Bar], cash: f64) -> Experiment {
+            // Fast periods on purpose: the rule has to cross often enough to
+            // breach the budget, or the constrained run below proves nothing.
+            let mut experiment = intraday_experiment(SMA_CROSS, params(2.0, 5.0), bars);
+            experiment.starting_cash = cash;
+            experiment.risk.day_trading = arvo_research::DayTradingRule::PatternDayTrader;
+            experiment
+        }
+
+        /// The most day trades in any five-business-day window.
+        ///
+        /// The rule is a *rolling* count, not a total: thirty sessions may hold
+        /// many day trades and still never breach it. Asserting on the total
+        /// would be asserting the wrong rule — which is what the first version
+        /// of this test did, and it failed against correct behaviour.
+        fn worst_window(ledger: &[arvo_research::Trade]) -> usize {
+            let dates: Vec<chrono::NaiveDate> = ledger
+                .iter()
+                .filter_map(|trade| {
+                    trade
+                        .closed
+                        .filter(|closed| closed.date() == trade.opened.date())
+                        .map(|closed| closed.date())
+                })
+                .collect();
+
+            dates
+                .iter()
+                .map(|end| {
+                    let start = arvo_research::risk::business_days_before(
+                        *end,
+                        arvo_research::PDT_WINDOW_DAYS,
+                    );
+                    dates.iter().filter(|at| **at >= start && *at <= end).count()
+                })
+                .max()
+                .unwrap_or_default()
+        }
+
+        #[test]
+        fn a_small_account_is_held_to_its_day_trade_budget() {
+            // Intraday bars, so the rule opens and closes inside a session and
+            // every round trip counts against the budget.
+            // Whole sessions of five-minute bars, so a crossover rule opens
+            // and closes inside a day and every round trip counts.
+            let bars = daily_round_trips(20, 60);
+            let simulation = intraday_provider(bars.clone());
+
+            let unconstrained = simulation
+                .run(&{
+                    let mut plain = constrained(&bars, 2_000.0);
+                    plain.risk.day_trading = arvo_research::DayTradingRule::Unconstrained;
+                    plain
+                })
+                .expect("the unconstrained run works");
+            assert!(
+                worst_window(&unconstrained.ledger) > arvo_research::PDT_DAY_TRADES,
+                "the control must breach the budget or the constraint below                  proves nothing: worst window held {}",
+                worst_window(&unconstrained.ledger)
+            );
+
+            let held = simulation
+                .run(&constrained(&bars, 2_000.0))
+                .expect("the constrained run works");
+            assert!(
+                worst_window(&held.ledger) <= arvo_research::PDT_DAY_TRADES,
+                "a $2,000 margin account may not exceed {} day trades in any                  five-business-day window, and its worst held {}",
+                arvo_research::PDT_DAY_TRADES,
+                worst_window(&held.ledger)
+            );
+        }
+
+        #[test]
+        fn the_daily_loss_limit_binds_in_a_backtest_too() {
+            // Found while wiring the day-trade budget, and the same root cause:
+            // `account_from_positions` read only the live half of the cache, so
+            // a closed position's realised loss was invisible. The limit was
+            // configured, enforced by the gate, and looking at an empty
+            // history — the shape of failure that passes every unit test.
+            let bars = daily_round_trips(20, 60);
+            let simulation = intraday_provider(bars.clone());
+
+            // Costs heavy enough that every round trip loses, on both runs, so
+            // the only difference between them is the limit.
+            let losing = |cash: f64| {
+                let mut experiment = constrained(&bars, cash);
+                experiment.risk.day_trading = arvo_research::DayTradingRule::Unconstrained;
+                experiment.costs.commission_bps = 150.0;
+                experiment.costs.slippage_bps = 150.0;
+                experiment
+            };
+
+            let unconstrained = simulation
+                .run(&losing(100_000.0))
+                .expect("the unconstrained run works");
+
+            let mut limited = losing(100_000.0);
+            // Five basis points of the account — fifty dollars. The fixture's
+            // worst session loses about ninety, so the limit bites; at a tenth
+            // of a percent it did not, and the run was identical, which is the
+            // limit correctly declining to bind rather than a broken one.
+            limited.risk.max_daily_loss = Some(0.0005);
+            let held = simulation.run(&limited).expect("the limited run works");
+
+            assert!(
+                held.ledger.len() < unconstrained.ledger.len(),
+                "a daily loss limit that binds must cost some trades: {} against {}",
+                held.ledger.len(),
+                unconstrained.ledger.len()
+            );
+        }
+
+        #[test]
+        fn an_account_above_the_floor_is_not_constrained() {
+            // Twenty-five thousand is the line, and above it the rule does not
+            // apply at all.
+            // Whole sessions of five-minute bars, so a crossover rule opens
+            // and closes inside a day and every round trip counts.
+            let bars = daily_round_trips(20, 60);
+            let simulation = intraday_provider(bars.clone());
+            let rich = simulation
+                .run(&constrained(&bars, arvo_research::PDT_EQUITY_FLOOR * 2.0))
+                .expect("the run works");
+            assert!(
+                worst_window(&rich.ledger) > arvo_research::PDT_DAY_TRADES,
+                "above the floor the budget does not bind"
+            );
         }
     }
 
