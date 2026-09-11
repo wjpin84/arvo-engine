@@ -50,6 +50,132 @@ use std::path::Path;
 
 use arvo_data::{Bar, BarInterval, CsvBars};
 
+/// How much of the market's trading a source's prices cover.
+///
+/// # Why this cannot be detected from the data
+///
+/// Because the prices agree. A single-venue feed and the consolidated tape
+/// report the same trades at the same prices for anything liquid; what differs
+/// is *volume*, by a factor of thirty or more — and [`arvo_data::agreement`]
+/// deliberately does not compare volume, for a good reason it states itself:
+///
+/// > Consolidated tape and primary-exchange volume differ by a factor of three
+/// > on data whose prices are identical, so a volume check would fire on every
+/// > honest pair and say nothing about whether the prices can be trusted.
+///
+/// So a thin feed passes cross-validation silently. The only thing that knows
+/// is the source, which asked for it — hence a declaration rather than a check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Feed {
+    /// Every venue's prints. Volume is the consolidated tape.
+    Consolidated,
+    /// One venue's prints, named. The prices are real; **volume, VWAP and
+    /// anything else derived from size describe a sample of the market rather
+    /// than the market.**
+    ///
+    /// A rule conditioned on volume, and `vwap_reversion` in particular, is
+    /// reading a different instrument from the one it will trade.
+    SingleVenue(&'static str),
+}
+
+/// What corporate actions a source's prices have been adjusted for.
+///
+/// # Why this is not a detail
+///
+/// Two series on different bases differ by a smooth, compounding factor, which
+/// [`arvo_data::agreement`] correctly classifies as `Rescaled` — neither side
+/// wrong, and not usable together until one is restated. Left undeclared, a
+/// cross-check between a split-adjusted and a total-return source reports that
+/// on every instrument forever, and a check that always fires is a check nobody
+/// reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Adjustment {
+    /// Split-adjusted only. Raw prices make a split look like a crash, which a
+    /// breakout rule would trade — so this is the floor, not a choice.
+    ///
+    /// Dividends are absent from the series and nothing receives them, which is
+    /// the bias `arvo_research::dividend` measures.
+    Split,
+    /// Split- and dividend-adjusted: total return, as though every
+    /// distribution were reinvested at the ex-date close.
+    ///
+    /// This is what a brokerage account with dividend reinvestment actually
+    /// does, and it handles a rule that moves in and out correctly — hold
+    /// through an ex-date and the adjusted return captures the dividend, be
+    /// flat and it does not.
+    ///
+    /// It is *not* what a cash account does, where the dividend arrives as cash
+    /// and sits until something buys with it.
+    TotalReturn,
+}
+
+/// What a source's prices actually are.
+///
+/// Declared by the source rather than inferred, because neither axis is
+/// visible in the bars — see [`Feed`] and [`Adjustment`]. Two sources on
+/// different bases are two datasets, and comparing them without saying so
+/// produces a precise answer to the wrong question.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Basis {
+    pub feed: Feed,
+    pub adjustment: Adjustment,
+}
+
+impl Basis {
+    /// Whether two sources can be compared bar for bar without restatement.
+    #[must_use]
+    pub fn comparable_with(self, other: Self) -> bool {
+        self.adjustment == other.adjustment && self.feed == other.feed
+    }
+
+    /// Why two sources cannot be compared, when they cannot.
+    ///
+    /// `None` when they are on the same basis, which is the case a comparison
+    /// can be read at face value.
+    #[must_use]
+    pub fn mismatch_with(self, other: Self) -> Option<String> {
+        if self.adjustment != other.adjustment {
+            return Some(format!(
+                "one series is {} and the other {}, so they differ by a compounding factor \
+                 that is an adjustment difference rather than a disagreement about price",
+                self.adjustment.label(),
+                other.adjustment.label(),
+            ));
+        }
+        match (self.feed, other.feed) {
+            (Feed::Consolidated, Feed::Consolidated) => None,
+            (Feed::SingleVenue(a), Feed::SingleVenue(b)) if a == b => None,
+            _ => Some(format!(
+                "one series is {} and the other {}; the prices are comparable and the \
+                 volumes are not, so anything conditioned on size — VWAP above all — is \
+                 reading a different market on one side",
+                self.feed.label(),
+                other.feed.label(),
+            )),
+        }
+    }
+}
+
+impl Feed {
+    #[must_use]
+    pub fn label(self) -> String {
+        match self {
+            Self::Consolidated => "the consolidated tape".to_owned(),
+            Self::SingleVenue(venue) => format!("{venue} only"),
+        }
+    }
+}
+
+impl Adjustment {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Split => "split-adjusted",
+            Self::TotalReturn => "total-return adjusted",
+        }
+    }
+}
+
 /// What a source returned for one instrument, before anything is written.
 #[derive(Debug, Clone, Default)]
 pub struct Fetched {
@@ -207,6 +333,13 @@ pub trait Source: Send + Sync {
     /// datasets with two content hashes, and filing them under one name would
     /// let a study silently run on whichever was fetched last.
     fn venue(&self) -> &'static str;
+
+    /// What this source's prices actually are.
+    ///
+    /// No default. A default would be "consolidated, split-adjusted", which is
+    /// a silent wrong answer for precisely the source this exists to catch —
+    /// so a new source has to say, and the compiler makes it.
+    fn basis(&self) -> Basis;
 
     /// Whether a usable credential is held.
     ///
@@ -414,6 +547,11 @@ pub struct Comparison {
     pub second: &'static str,
     pub first_bars: usize,
     pub second_bars: usize,
+    /// Why the two cannot be compared at face value, when they cannot.
+    ///
+    /// `None` means the two are on the same basis and the agreement below says
+    /// what it appears to say.
+    pub basis_mismatch: Option<String>,
     pub agreement: arvo_data::agreement::Agreement,
     pub coverage: arvo_data::agreement::Coverage,
 }
@@ -452,6 +590,9 @@ pub async fn compare(
         second: second.id(),
         first_bars: left.bars.len(),
         second_bars: right.bars.len(),
+        // Read from what the sources declare, never from the bars: neither axis
+        // is visible in them. That is the whole reason this is a declaration.
+        basis_mismatch: first.basis().mismatch_with(second.basis()),
         agreement,
         coverage,
     })
@@ -526,6 +667,7 @@ mod tests {
     struct Canned {
         id: &'static str,
         venue: &'static str,
+        basis: Basis,
         bars: Vec<Bar>,
         dividends: Option<Vec<Dividend>>,
     }
@@ -540,6 +682,9 @@ mod tests {
         }
         fn venue(&self) -> &'static str {
             self.venue
+        }
+        fn basis(&self) -> Basis {
+            self.basis
         }
         async fn bars(
             &self,
@@ -583,10 +728,20 @@ mod tests {
             .collect()
     }
 
+    /// What both shipped sources declare, so a fixture is comparable by
+    /// default and only says otherwise when a test means it to.
+    fn consolidated_split() -> Basis {
+        Basis {
+            feed: Feed::Consolidated,
+            adjustment: Adjustment::Split,
+        }
+    }
+
     fn canned(id: &'static str, venue: &'static str, closes: &[f64]) -> Canned {
         Canned {
             id,
             venue,
+            basis: consolidated_split(),
             bars: series(closes),
             dividends: None,
         }
@@ -746,6 +901,7 @@ mod tests {
         let source = Canned {
             id: "acme",
             venue: "AC",
+            basis: consolidated_split(),
             bars: series(&[1.0, 2.0]),
             dividends: Some(vec![
                 Dividend {
@@ -827,6 +983,131 @@ mod tests {
             outcome.agreement,
             arvo_data::agreement::Agreement::Diverged { .. }
         ));
+    }
+
+
+    fn on(feed: Feed, adjustment: Adjustment) -> Basis {
+        Basis { feed, adjustment }
+    }
+
+    /// A source declaring whatever basis a test needs.
+    fn declaring(id: &'static str, venue: &'static str, basis: Basis) -> Canned {
+        Canned {
+            id,
+            venue,
+            basis,
+            bars: series(&[10.0, 20.0, 30.0]),
+            dividends: None,
+        }
+    }
+
+    #[test]
+    fn the_two_shipped_sources_are_comparable_with_each_other() {
+        // The property that keeps `compare_sources` meaningful. If either
+        // source ever changes basis — asking Yahoo for `adjclose`, or Alpaca
+        // for the free IEX feed — this fails, which is the point: the change
+        // would otherwise make every cross-check report a rescaling forever
+        // and nobody would know why.
+        let broker = robinhood::Robinhood.basis();
+        let second = yahoo::Yahoo.basis();
+        assert!(
+            broker.comparable_with(second),
+            "{broker:?} against {second:?}"
+        );
+        assert_eq!(broker.mismatch_with(second), None);
+    }
+
+    #[tokio::test]
+    async fn two_sources_on_the_same_basis_report_no_mismatch() {
+        let (from, to) = window();
+        let outcome = compare(
+            &declaring("a", "A", on(Feed::Consolidated, Adjustment::Split)),
+            &declaring("b", "B", on(Feed::Consolidated, Adjustment::Split)),
+            "MSFT",
+            BarInterval::DAILY,
+            from,
+            to,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.basis_mismatch, None);
+    }
+
+    #[tokio::test]
+    async fn a_thin_feed_is_named_even_though_the_prices_agree() {
+        // The finding this whole type exists for. The prices are identical, so
+        // `agreement` says Aligned and means it — and one side is a fraction of
+        // the tape, which nothing in the bars can reveal.
+        let (from, to) = window();
+        let outcome = compare(
+            &declaring("broker", "BR", on(Feed::Consolidated, Adjustment::Split)),
+            &declaring("thin", "TH", on(Feed::SingleVenue("IEX"), Adjustment::Split)),
+            "MSFT",
+            BarInterval::DAILY,
+            from,
+            to,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(
+                outcome.agreement,
+                arvo_data::agreement::Agreement::Aligned { .. }
+            ),
+            "the prices genuinely agree, which is exactly the trap"
+        );
+        let why = outcome
+            .basis_mismatch
+            .expect("one side is a single venue and that has to be said");
+        assert!(why.contains("IEX"), "{why}");
+        assert!(
+            why.contains("VWAP"),
+            "it should name what breaks, not just that something does: {why}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_different_adjustment_is_named_as_an_adjustment() {
+        // Two bases differ by a compounding factor, which `agreement` correctly
+        // calls a rescaling — neither side wrong. Undeclared, that fires on
+        // every instrument forever, and a check that always fires is a check
+        // nobody reads.
+        let (from, to) = window();
+        let outcome = compare(
+            &declaring("split", "SP", on(Feed::Consolidated, Adjustment::Split)),
+            &declaring("total", "TR", on(Feed::Consolidated, Adjustment::TotalReturn)),
+            "MSFT",
+            BarInterval::DAILY,
+            from,
+            to,
+        )
+        .await
+        .unwrap();
+
+        let why = outcome.basis_mismatch.expect("different bases");
+        assert!(why.contains("split-adjusted"), "{why}");
+        assert!(why.contains("total-return adjusted"), "{why}");
+    }
+
+    #[test]
+    fn the_adjustment_is_reported_ahead_of_the_feed() {
+        // Both wrong is possible. The adjustment is the one that makes every
+        // bar differ, so it is the one to fix first — reporting the feed
+        // instead would send a reader after the smaller problem.
+        let split_thin = on(Feed::SingleVenue("IEX"), Adjustment::Split);
+        let total_wide = on(Feed::Consolidated, Adjustment::TotalReturn);
+        let why = split_thin.mismatch_with(total_wide).expect("both differ");
+        assert!(why.contains("total-return adjusted"), "{why}");
+    }
+
+    #[test]
+    fn the_same_single_venue_on_both_sides_is_comparable() {
+        // Two sources reading the same thin feed agree about volume as well as
+        // price. The comparison is narrow, and it is not mismatched.
+        let iex = on(Feed::SingleVenue("IEX"), Adjustment::Split);
+        assert!(iex.comparable_with(iex));
+        assert_eq!(iex.mismatch_with(iex), None);
     }
 
     #[test]

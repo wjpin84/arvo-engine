@@ -45,7 +45,7 @@
 
 use arvo_data::{Bar, BarInterval, IntervalUnit};
 
-use super::{Dividend, Fetched, Source, SourceError};
+use super::{Adjustment, Basis, Dividend, Feed, Fetched, Source, SourceError};
 
 /// How this source is named, for the reproducibility record.
 pub const SOURCE_ID: &str = "yahoo";
@@ -77,6 +77,16 @@ impl Source for Yahoo {
 
     fn venue(&self) -> &'static str {
         VENUE
+    }
+
+    fn basis(&self) -> Basis {
+        Basis {
+            feed: Feed::Consolidated,
+            // `open`/`high`/`low`/`close`, not `adjclose` — the same basis the
+            // broker is asked for, which is what makes the two comparable at
+            // all. See the module note.
+            adjustment: Adjustment::Split,
+        }
     }
 
     async fn bars(

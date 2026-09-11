@@ -41,7 +41,7 @@ use std::path::Path;
 use arvo_data::{Bar, BarInterval, IntervalUnit};
 use serde_json::{json, Value};
 
-use super::{Fetched, Match, Quote, Source, SourceError};
+use super::{Adjustment, Basis, Feed, Fetched, Match, Quote, Source, SourceError};
 
 /// Where the token lives in the OS keychain, and how this source is named.
 pub const SOURCE_ID: &str = "robinhood";
@@ -94,6 +94,17 @@ impl Source for Robinhood {
 
     fn venue(&self) -> &'static str {
         VENUE
+    }
+
+    fn basis(&self) -> Basis {
+        Basis {
+            // Robinhood serves the consolidated tape; nothing in the request
+            // narrows it to a venue.
+            feed: Feed::Consolidated,
+            // `adjustment_type: "split"` at the call site, and deliberately not
+            // total return — see the note there.
+            adjustment: Adjustment::Split,
+        }
     }
 
     async fn connected(&self) -> Result<bool, SourceError> {
