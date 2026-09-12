@@ -32,8 +32,10 @@
 //! # Stale orders
 //!
 //! Alpaca queues a market order placed outside regular hours rather than
-//! refusing it, exactly as Robinhood does, and for a day-trading system a
-//! signal from 16:05 filling at 09:30 tomorrow is the worst available outcome.
+//! refusing it — confirmed on a live paper account, where an order placed on a
+//! Saturday came back `accepted` with `expires_at` at Monday's close — and for
+//! a day-trading system a signal from 16:05 filling at 09:30 tomorrow is the
+//! worst available outcome.
 //! The guard is the same one and for the same reason: no market calendar, but
 //! anything unfilled [`DEFAULT_MAX_ORDER_AGE_SECS`] after the *signal* is
 //! cancelled and reported unfilled. That covers after-hours, holidays, halts
@@ -141,11 +143,11 @@ impl Executor for AlpacaExecutor {
 
     async fn submit(&self, order: &Order) -> Result<OrderId, ExecutionError> {
         let body = order_body(order);
-        let response = auth::post(&format!("{}/v2/orders", self.api), &body)
-            .await
-            .map_err(|err| rejected(self.venue, &err))?;
-
-        let id = placed_id(self.venue, &response)?;
+        let id = match auth::post(&format!("{}/v2/orders", self.api), &body).await {
+            Ok(response) => placed_id(self.venue, &response)?,
+            // Refused — but a refusal is not proof the order is absent, so ask.
+            Err(refusal) => self.adopt(&body, &refusal).await?,
+        };
         self.outstanding.watch(&id, order);
         Ok(OrderId(id))
     }
@@ -190,16 +192,61 @@ impl Executor for AlpacaExecutor {
     }
 }
 
+impl AlpacaExecutor {
+    /// The order this failed submit describes, if the venue has it anyway.
+    ///
+    /// # The failure this closes
+    ///
+    /// A derived `client_order_id` stops a retry becoming a second position,
+    /// because Alpaca answers the repeat with `422 client_order_id must be
+    /// unique`. That is only half the protection. Reported as a refusal, the
+    /// retry tells the caller the order failed — while the *first* attempt is
+    /// live at the venue and nothing is watching it. Nothing will cancel it
+    /// when it goes stale and nothing will book it when it fills, which is a
+    /// position the gate does not know the account holds. Two orders is the
+    /// louder failure; this is the worse one.
+    ///
+    /// So the venue is asked rather than the error read: is there an order
+    /// under this key? That question has one right answer whatever the refusal
+    /// said, which is why this does not try to recognise Alpaca's wording for
+    /// a duplicate. A refusal for insufficient buying power finds nothing and
+    /// the original error stands.
+    async fn adopt(
+        &self,
+        body: &Value,
+        refusal: &arvo_data::source::SourceError,
+    ) -> Result<String, ExecutionError> {
+        let Some(key) = body.get("client_order_id").and_then(Value::as_str) else {
+            return Err(rejected(self.venue, refusal));
+        };
+
+        // The refusal is the news, not this lookup's own failure: if the venue
+        // cannot be asked, the caller still needs to hear why the submit was
+        // refused rather than why the question could not be put.
+        let Ok(found) = auth::get(&format!(
+            "{}/v2/orders:by_client_order_id?client_order_id={key}",
+            self.api
+        ))
+        .await
+        else {
+            return Err(rejected(self.venue, refusal));
+        };
+
+        placed_id(self.venue, &found).map_err(|_| rejected(self.venue, refusal))
+    }
+}
+
 /// The body for one order.
 ///
 /// Market, day, market-hours only — because [`Order`] is market-only: a limit
 /// price is a second risk decision and the gate has no opinion about it.
 ///
-/// `client_order_id` is derived from the order rather than generated. Alpaca
-/// refuses a duplicate, which is exactly what should happen to a retry of a
-/// request whose reply was lost: the request having succeeded and the reply
-/// having failed are indistinguishable from here, and a fresh id per attempt is
-/// how one signal becomes two positions.
+/// `client_order_id` is derived from the order rather than generated. A repeat
+/// is answered `422 client_order_id must be unique` — observed, not assumed —
+/// which is exactly what should happen to a retry of a request whose reply was
+/// lost: the request having succeeded and the reply having failed are
+/// indistinguishable from here, and a fresh id per attempt is how one signal
+/// becomes two positions. [`AlpacaExecutor::adopt`] handles the other half.
 fn order_body(order: &Order) -> Value {
     json!({
         "symbol": arvo_data::source::symbol_of(&order.instrument),
@@ -252,8 +299,9 @@ fn placed_id(venue: &str, response: &Value) -> Result<String, ExecutionError> {
 
 /// Every order the venue reported, by id.
 ///
-/// Confirmed against Alpaca's published order schema rather than guessed: a
-/// bare array, `id`, `status`, `filled_avg_price`, `filled_at`.
+/// Confirmed against a live paper account rather than guessed: a bare array,
+/// `id`, `status`, and `filled_avg_price`/`filled_at` present as JSON `null`
+/// until something fills.
 ///
 /// # Why this fails loudly
 ///
@@ -470,9 +518,33 @@ mod tests {
 
     #[test]
     fn a_fill_whose_price_cannot_be_read_stays_open_rather_than_booking_at_zero() {
+        for missing in [
+            json!({ "id": "ord-1", "status": "filled" }),
+            // The shape a live account actually sends: present and null, not
+            // absent. `as_str` reads both the same way, and this pins that.
+            json!({ "id": "ord-1", "status": "filled", "filled_avg_price": null,
+                    "filled_at": null }),
+        ] {
+            let states = order_states("ALPACA-PAPER", &json!([missing])).expect("readable");
+            assert_eq!(states["ord-1"], State::Open, "{missing}");
+        }
+    }
+
+    #[test]
+    fn an_order_queued_for_the_next_open_is_still_ours_to_watch() {
+        // What a market order placed outside regular hours actually reports —
+        // `accepted`, with an `expires_at` at the next close. Reading it as an
+        // ending would abandon an order that fills at Monday's bell.
         let states = order_states(
             "ALPACA-PAPER",
-            &json!([{ "id": "ord-1", "status": "filled" }]),
+            &json!([{
+                "id": "ord-1",
+                "status": "accepted",
+                "filled_qty": "0",
+                "filled_avg_price": null,
+                "filled_at": null,
+                "expires_at": "2026-09-14T20:00:00Z",
+            }]),
         )
         .expect("readable");
         assert_eq!(states["ord-1"], State::Open);
