@@ -49,7 +49,8 @@ use arvo_execution::{Execution, ExecutionError, Executor, Order, OrderId, Side};
 use chrono::NaiveDateTime;
 use serde_json::{json, Value};
 
-use crate::{connect, VENUE};
+use crate::auth::connect;
+use crate::source::VENUE;
 
 /// The MCP tool that places an equity order.
 const PLACE: &str = "place_equity_order";
