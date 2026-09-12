@@ -100,7 +100,7 @@ pub enum DataError {
 
 /// Supplies historical daily bars.
 ///
-/// Synchronous, matching [`arvo_research::SimulationProvider`]: a backtest
+/// Synchronous, matching `arvo_research::SimulationProvider`: a backtest
 /// loads its whole window up front and then runs CPU-bound, so there is no
 /// reactor to keep free. A remote source can still live behind this trait —
 /// it blocks inside `spawn_blocking` like any other batch fetch.
