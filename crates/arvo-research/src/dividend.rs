@@ -2,8 +2,8 @@
 //!
 //! # The bias
 //!
-//! Every source is asked for split-adjusted prices, which is right: raw prices
-//! make a split look like a crash and a breakout rule would trade it. But
+//! Every source shipped today serves split-adjusted prices, which is right: raw
+//! prices make a split look like a crash and a breakout rule would trade it. But
 //! split-adjusted is not *total-return* adjusted. Dividends are absent from the
 //! price series and nothing credits them as cash, so neither side of the
 //! comparison receives them — and the two sides do not forgo the same amount.
@@ -13,6 +13,21 @@
 //! So the reported excess return is overstated, systematically, in the
 //! strategy's favour, on every dividend-paying instrument. It always points the
 //! same way, which is what makes it worth a number rather than a caveat.
+//!
+//! # The same measurement means two different things
+//!
+//! On a total-return dataset ([`Adjustment::TotalReturn`]) that bias is not
+//! there: the distribution is inside the return, so holding through an ex-date
+//! captures it and being flat does not. Who held on each ex-date is still worth
+//! knowing — it says how much of the margin is distribution rather than timing —
+//! but it is a *description* of the excess return rather than a correction to
+//! it, and subtracting it would report less than the account earned.
+//!
+//! So [`DividendGap`] carries the basis it was measured on and
+//! [`DividendGap::corrected_excess`] refuses on the one where subtracting is
+//! wrong. See [ADR-0013].
+//!
+//! [ADR-0013]: https://github.com/wjpin84/arvo-desktop/blob/master/docs/adr/0013-dividends-arrive-as-reinvestment.md
 //!
 //! # Why this is measured rather than estimated
 //!
@@ -37,6 +52,8 @@
 
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 use serde::{Deserialize, Serialize};
+
+use arvo_data::source::Adjustment;
 
 use crate::{DateRange, Direction, Trade};
 
@@ -68,6 +85,11 @@ pub struct DividendGap {
     pub overstatement: f64,
     /// Instruments whose distribution series was available.
     pub covered: usize,
+    /// What the prices this was measured against were adjusted for.
+    ///
+    /// Decides whether the gap is a *correction* or a *description*, which is
+    /// the whole reason it travels here — see [`Self::corrected_excess`].
+    pub adjustment: Adjustment,
     /// Instruments the run held. When this exceeds [`Self::covered`] the figure
     /// is a floor rather than the answer.
     ///
@@ -100,10 +122,42 @@ impl DividendGap {
         self.covered >= self.instruments
     }
 
-    /// The excess return with the gap taken out of it.
+    /// The excess return with the gap taken out of it, where taking it out
+    /// means anything.
+    ///
+    /// # Why this can refuse
+    ///
+    /// On a **split-adjusted** series the distribution is missing from both
+    /// sides, so the gap is money neither side received and subtracting it
+    /// corrects the margin. That is the case this was written for.
+    ///
+    /// On a **total-return** series it is already in the returns: a rule that
+    /// held through an ex-date captured the dividend through the price, and the
+    /// benchmark captured all of them. The excess return therefore *already*
+    /// accounts for the difference, and subtracting the gap again would
+    /// double-count — reporting a margin smaller than the account earned.
+    ///
+    /// So this returns `None` there, and the gap stays worth reporting as a
+    /// *description*: how much of the margin is distribution rather than skill.
+    /// A figure that is silently wrong under a basis nobody checked is exactly
+    /// what [ADR-0011] exists to refuse.
+    ///
+    /// [ADR-0011]: https://github.com/wjpin84/arvo-desktop/blob/master/docs/adr/0011-dividend-gap-beside-not-folded-in.md
     #[must_use]
-    pub fn corrected_excess(&self, excess_return: f64) -> f64 {
-        excess_return - self.overstatement
+    pub fn corrected_excess(&self, excess_return: f64) -> Option<f64> {
+        match self.adjustment {
+            Adjustment::Split => Some(excess_return - self.overstatement),
+            Adjustment::TotalReturn => None,
+        }
+    }
+
+    /// Whether the gap is money that went missing, or money already counted.
+    ///
+    /// The one thing a reader needs to know to tell which of the two numbers in
+    /// front of them this is.
+    #[must_use]
+    pub const fn is_a_correction(&self) -> bool {
+        matches!(self.adjustment, Adjustment::Split)
     }
 }
 
@@ -127,6 +181,7 @@ impl DividendGap {
 pub fn measure_dividend_gap(
     window: DateRange,
     starting_cash: f64,
+    adjustment: Adjustment,
     instruments: &[String],
     strategy_ledger: &[Trade],
     benchmark_ledger: &[Trade],
@@ -161,6 +216,7 @@ pub fn measure_dividend_gap(
         strategy_income,
         benchmark_income,
         overstatement,
+        adjustment,
         covered: instruments
             .iter()
             .filter(|instrument| dividends.contains_key(*instrument))
@@ -280,6 +336,7 @@ mod tests {
         let gap = measure_dividend_gap(
             window(),
             100_000.0,
+            Adjustment::Split,
             &held(),
             &strategy,
             &benchmark(),
@@ -301,6 +358,7 @@ mod tests {
         let gap = measure_dividend_gap(
             window(),
             100_000.0,
+            Adjustment::Split,
             &held(),
             &strategy,
             &benchmark(),
@@ -320,6 +378,7 @@ mod tests {
         let gap = measure_dividend_gap(
             window(),
             100_000.0,
+            Adjustment::Split,
             &held(),
             &strategy,
             &benchmark(),
@@ -339,15 +398,29 @@ mod tests {
         let buyer = vec![trade("MSFT.RH", at(2, 9), Some(at(3, 1)), 100.0)];
         let dividends = paid("MSFT.RH", &[(2, 9, 0.75)]);
 
-        let sold =
-            measure_dividend_gap(window(), 100_000.0, &held(), &seller, &benchmark(), &dividends);
+        let sold = measure_dividend_gap(
+            window(),
+            100_000.0,
+            Adjustment::Split,
+            &held(),
+            &seller,
+            &benchmark(),
+            &dividends,
+        );
         assert!(
             (sold.strategy_income - 75.0).abs() < 1e-9,
             "a seller on the ex-date was the holder of record"
         );
 
-        let bought =
-            measure_dividend_gap(window(), 100_000.0, &held(), &buyer, &benchmark(), &dividends);
+        let bought = measure_dividend_gap(
+            window(),
+            100_000.0,
+            Adjustment::Split,
+            &held(),
+            &buyer,
+            &benchmark(),
+            &dividends,
+        );
         assert!(
             bought.strategy_income.abs() < 1e-9,
             "a buyer on the ex-date bought it without the dividend"
@@ -361,6 +434,7 @@ mod tests {
         let gap = measure_dividend_gap(
             narrow,
             100_000.0,
+            Adjustment::Split,
             &held(),
             &strategy,
             &benchmark(),
@@ -385,6 +459,7 @@ mod tests {
         let gap = measure_dividend_gap(
             window(),
             100_000.0,
+            Adjustment::Split,
             &["MSFT.RH".to_owned(), "KO.RH".to_owned()],
             &strategy,
             &bench,
@@ -409,6 +484,7 @@ mod tests {
         let gap = measure_dividend_gap(
             window(),
             100_000.0,
+            Adjustment::Split,
             &["MSFT.RH".to_owned(), "KO.RH".to_owned()],
             &strategy,
             &bench,
@@ -428,6 +504,7 @@ mod tests {
         let gap = measure_dividend_gap(
             window(),
             100_000.0,
+            Adjustment::Split,
             &held(),
             &strategy,
             &benchmark(),
@@ -445,6 +522,7 @@ mod tests {
         let gap = measure_dividend_gap(
             window(),
             100_000.0,
+            Adjustment::Split,
             &held(),
             &strategy,
             &benchmark(),
@@ -460,6 +538,7 @@ mod tests {
         let gap = measure_dividend_gap(
             window(),
             100_000.0,
+            Adjustment::Split,
             &held(),
             &[short],
             &benchmark(),
@@ -475,10 +554,34 @@ mod tests {
             strategy_income: 0.0,
             benchmark_income: 2_000.0,
             overstatement: 0.02,
+            adjustment: Adjustment::Split,
             covered: 1,
             instruments: 1,
         };
-        assert!((gap.corrected_excess(0.05) - 0.03).abs() < 1e-12);
+        let corrected = gap.corrected_excess(0.05).expect("split-adjusted corrects");
+        assert!((corrected - 0.03).abs() < 1e-12);
+        assert!(gap.is_a_correction());
+        assert!(gap.worth_saying());
+    }
+
+    #[test]
+    fn on_a_total_return_series_the_gap_refuses_to_correct_rather_than_double_counting() {
+        // The dividend is already in the returns there, so the excess return
+        // has it. Subtracting the gap again would report a margin smaller than
+        // the account earned — the reason ADR-0013 made this basis-aware.
+        let gap = DividendGap {
+            events: 4,
+            strategy_income: 0.0,
+            benchmark_income: 2_000.0,
+            overstatement: 0.02,
+            adjustment: Adjustment::TotalReturn,
+            covered: 1,
+            instruments: 1,
+        };
+        assert_eq!(gap.corrected_excess(0.05), None);
+        assert!(!gap.is_a_correction());
+        // Still measured, still worth reporting — as composition rather than
+        // as a correction.
         assert!(gap.worth_saying());
     }
 
@@ -489,6 +592,7 @@ mod tests {
             strategy_income: 10.0,
             benchmark_income: 20.0,
             overstatement: 0.0001,
+            adjustment: Adjustment::Split,
             covered: 1,
             instruments: 1,
         };

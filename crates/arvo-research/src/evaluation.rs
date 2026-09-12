@@ -541,6 +541,10 @@ pub fn evaluate_against_benchmark(
         crate::measure_dividend_gap(
             experiment.window,
             experiment.starting_cash,
+            // From the experiment rather than from the provider: the basis is
+            // part of the dataset's identity and is pinned in the record, so a
+            // replay measures the same thing the original run did.
+            experiment.dataset.adjustment,
             &experiment.instruments(),
             &strategy_result.ledger,
             &benchmark_result.ledger,
@@ -833,6 +837,7 @@ mod tests {
             dataset: DatasetRef {
                 id: "d".to_owned(),
                 version: "1".to_owned(),
+                adjustment: arvo_data::source::Adjustment::Split,
             },
             strategy: StrategySpec {
                 name: "sma_cross".to_owned(),

@@ -1018,6 +1018,7 @@ mod tests {
             dataset: DatasetRef {
                 id: "fixture".to_owned(),
                 version: "1".to_owned(),
+                adjustment: arvo_data::source::Adjustment::Split,
             },
             strategy: StrategySpec {
                 name: SMA_CROSS.to_owned(),
@@ -2013,6 +2014,38 @@ mod tests {
                 "this rule is out of the market for part of the window, so it must forgo                  strictly more than buy-and-hold does — a gap of zero here means the                  measurement is not seeing the ledger: benchmark {} against strategy {}",
                 gap.benchmark_income,
                 gap.strategy_income
+            );
+        }
+
+        #[test]
+        fn the_basis_the_experiment_declares_reaches_the_gap_that_reads_it() {
+            // The gap decides whether it is a correction or a description from
+            // the dataset's adjustment, and the only place that is recorded is
+            // the experiment. A measurement that read `Split` regardless would
+            // pass every other test in this module and subtract dividends from
+            // a margin that already contains them.
+            let bars = sawtooth(400);
+            let dir = library(&bars, &[paid(50, 0.50), paid(140, 0.50)]);
+            let mut experiment = experiment(params(10.0, 30.0), &bars);
+            experiment.dataset.adjustment = arvo_data::source::Adjustment::TotalReturn;
+
+            let evidence = arvo_research::evaluate_against_benchmark(
+                &NautilusSimulation::new(CsvBars::new(dir.path())),
+                &experiment,
+                &arvo_research::EvaluationCriteria::default(),
+            )
+            .expect("both runs should complete");
+
+            let gap = evidence
+                .evaluation
+                .dividend_gap
+                .expect("a series is on disk");
+            assert_eq!(gap.events, 2, "still measured on a total-return series");
+            assert!(!gap.is_a_correction());
+            assert_eq!(
+                gap.corrected_excess(evidence.evaluation.excess_return),
+                None,
+                "the distributions are already in the excess return"
             );
         }
 

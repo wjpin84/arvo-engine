@@ -129,6 +129,24 @@ pub struct DatasetRef {
     /// Immutable once published. Re-running an experiment against a mutated
     /// dataset is a new experiment, not a repeat of the old one.
     pub version: String,
+    /// What corporate actions these prices are adjusted for.
+    ///
+    /// Part of the dataset's *identity*, which is what this type is for: a
+    /// split-adjusted series and a total-return one are two datasets, not one
+    /// dataset with a setting. See [ADR-0013].
+    ///
+    /// It decides whether the dividend gap is a correction or a description —
+    /// on a total-return series the distribution is already in the returns, so
+    /// subtracting the gap would double-count. `dividend::DividendGap` carries
+    /// this through for exactly that reason.
+    ///
+    /// `default` because this is a persisted format, and `Split` because that
+    /// is the only basis any source has ever asked for: every record written
+    /// before this field existed genuinely ran on it.
+    ///
+    /// [ADR-0013]: https://github.com/wjpin84/arvo-desktop/blob/master/docs/adr/0013-dividends-arrive-as-reinvestment.md
+    #[serde(default)]
+    pub adjustment: arvo_data::source::Adjustment,
 }
 
 /// What a fill is assumed to cost.

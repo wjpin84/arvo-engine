@@ -557,6 +557,7 @@ mod tests {
             dataset: DatasetRef {
                 id: "bars".to_owned(),
                 version: "v1".to_owned(),
+                adjustment: arvo_data::source::Adjustment::Split,
             },
             strategy: StrategySpec {
                 name: "sma_cross".to_owned(),
@@ -764,6 +765,7 @@ mod tests {
             dataset: DatasetRef {
                 id: "bars".to_owned(),
                 version: "v1".to_owned(),
+                adjustment: arvo_data::source::Adjustment::Split,
             },
             in_sample: DateRange {
                 from: at(1).date(),
@@ -846,6 +848,7 @@ mod tests {
             dataset: DatasetRef {
                 id: "bars".to_owned(),
                 version: "v1".to_owned(),
+                adjustment: arvo_data::source::Adjustment::Split,
             },
             in_sample: DateRange::new(at(1).date(), at(4).date()).expect("ordered"),
             out_of_sample: DateRange::new(at(5).date(), at(9).date()).expect("ordered"),
