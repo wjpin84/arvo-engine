@@ -43,10 +43,9 @@
 //! [#11]: https://github.com/wjpin84/arvo-desktop/issues/11
 
 use std::collections::BTreeMap;
-use std::sync::Mutex;
 
+use arvo_execution::poll::{reconcile, Outstanding, State};
 use arvo_execution::{Execution, ExecutionError, Executor, Order, OrderId, Side};
-use chrono::NaiveDateTime;
 use serde_json::{json, Value};
 
 use crate::auth::connect;
@@ -68,24 +67,6 @@ const CANCEL: &str = "cancel_equity_order";
 /// worse: the price the decision was made at is receding the whole time.
 pub const DEFAULT_MAX_ORDER_AGE_SECS: i64 = 120;
 
-/// What was sent, kept until the venue says what became of it.
-///
-/// Held rather than re-read from the server because half of it is not the
-/// server's to know: `decision_price` and `decision_at` describe the moment the
-/// *signal* fired, and the whole measurement this platform runs on is the gap
-/// between that moment and the fill. An executor that reconstructed them from
-/// the order record would be measuring the last hop and reporting it as the
-/// latency.
-#[derive(Debug, Clone)]
-struct Sent {
-    instrument: String,
-    side: Side,
-    quantity: f64,
-    decision_price: f64,
-    decision_at: NaiveDateTime,
-    proposer: String,
-}
-
 /// Places orders through Robinhood's MCP server.
 ///
 /// # Errors it does not try to prevent
@@ -104,7 +85,7 @@ pub struct RobinhoodExecutor {
     account: String,
     max_order_age: chrono::Duration,
     /// Acknowledged orders whose outcome is not yet known, by order id.
-    outstanding: Mutex<BTreeMap<String, Sent>>,
+    outstanding: Outstanding,
 }
 
 impl std::fmt::Debug for RobinhoodExecutor {
@@ -125,7 +106,7 @@ impl RobinhoodExecutor {
         Self {
             account: account.into(),
             max_order_age: chrono::Duration::seconds(DEFAULT_MAX_ORDER_AGE_SECS),
-            outstanding: Mutex::new(BTreeMap::new()),
+            outstanding: Outstanding::new(),
         }
     }
 
@@ -139,15 +120,7 @@ impl RobinhoodExecutor {
     /// How many orders are acknowledged and not yet resolved.
     #[must_use]
     pub fn resting(&self) -> usize {
-        self.outstanding.lock().map_or(0, |held| held.len())
-    }
-
-    /// A snapshot of what is outstanding, so the async work holds no lock.
-    fn snapshot(&self) -> BTreeMap<String, Sent> {
-        self.outstanding
-            .lock()
-            .map(|held| held.clone())
-            .unwrap_or_default()
+        self.outstanding.len()
     }
 }
 
@@ -173,24 +146,12 @@ impl Executor for RobinhoodExecutor {
 
         let id = placed_id(&response)?;
 
-        if let Ok(mut held) = self.outstanding.lock() {
-            held.insert(
-                id.clone(),
-                Sent {
-                    instrument: order.instrument.clone(),
-                    side: order.side,
-                    quantity: order.quantity,
-                    decision_price: order.decision_price,
-                    decision_at: order.decision_at,
-                    proposer: order.proposer.clone(),
-                },
-            );
-        }
+        self.outstanding.watch(&id, order);
         Ok(OrderId(id))
     }
 
     async fn drain(&self) -> Result<(Vec<Execution>, usize), ExecutionError> {
-        let watching = self.snapshot();
+        let watching = self.outstanding.snapshot();
         if watching.is_empty() {
             return Ok((Vec::new(), 0));
         }
@@ -242,77 +203,9 @@ impl Executor for RobinhoodExecutor {
             }
         }
 
-        if let Ok(mut held) = self.outstanding.lock() {
-            for id in outcome.resolved {
-                held.remove(&id);
-            }
-        }
+        self.outstanding.forget(&outcome.resolved);
         Ok((outcome.executions, self.resting()))
     }
-}
-
-/// What one poll of the venue concluded.
-#[derive(Debug, Default)]
-struct Outcome {
-    executions: Vec<Execution>,
-    /// Orders to stop watching, because the venue has finished with them.
-    resolved: Vec<String>,
-    /// Orders that have rested too long and should be taken back.
-    stale: Vec<String>,
-}
-
-/// Decides what each outstanding order became, given what the venue reported.
-///
-/// Separated from [`Executor::drain`] because everything interesting about a
-/// poll is here and none of it needs a network: which orders became fills,
-/// which ended without one, and which have sat long enough to be pulled. The
-/// method around it is a connect, a call, and a cancel loop.
-///
-/// `now` is passed rather than read, so the staleness rule is testable at all.
-fn reconcile(
-    watching: &BTreeMap<String, Sent>,
-    reported: &BTreeMap<String, State>,
-    now: NaiveDateTime,
-    max_order_age: chrono::Duration,
-) -> Outcome {
-    let mut outcome = Outcome::default();
-
-    for (id, sent) in watching {
-        match reported.get(id) {
-            Some(State::Filled { price, at }) => {
-                outcome.executions.push(Execution {
-                    order: OrderId(id.clone()),
-                    instrument: sent.instrument.clone(),
-                    side: sent.side,
-                    proposer: sent.proposer.clone(),
-                    quantity: sent.quantity,
-                    decision_price: sent.decision_price,
-                    fill_price: *price,
-                    decision_at: sent.decision_at,
-                    filled_at: *at,
-                });
-                outcome.resolved.push(id.clone());
-            }
-            // Gone without a fill. Dropped rather than resent: the gate sized
-            // this against a price that is now minutes old, and a retry would
-            // be a new decision wearing an old one's timestamp.
-            Some(State::Gone) => outcome.resolved.push(id.clone()),
-            // Aged from the *signal*, not from the submit. The thing going
-            // stale is the price the gate sized against, and that started
-            // ageing the moment the signal fired — counting from the send
-            // would hide every queue in front of it.
-            Some(State::Open) if now - sent.decision_at > max_order_age => {
-                outcome.stale.push(id.clone());
-            }
-            // Still working, still young. Left to work.
-            Some(State::Open) => {}
-            // Acknowledged but not yet listed. Left alone: the server is
-            // eventually consistent, and an order that has not appeared is not
-            // an order that failed.
-            None => {}
-        }
-    }
-    outcome
 }
 
 /// The arguments for one order.
@@ -375,18 +268,6 @@ fn placed_id(response: &Value) -> Result<String, ExecutionError> {
             venue: VENUE.to_owned(),
             reason: format!("the order was acknowledged without an id: {response}"),
         })
-}
-
-/// What became of one order.
-#[derive(Debug, Clone, PartialEq)]
-enum State {
-    /// Still working. Partial fills count as open: a position built out of
-    /// half an order is not the position the gate sized, and booking it as
-    /// complete would tell the gate the account holds more than it does.
-    Open,
-    Filled { price: f64, at: NaiveDateTime },
-    /// Cancelled, rejected, failed or voided — resolved without a fill.
-    Gone,
 }
 
 /// Every order the venue reported, by id.
@@ -452,7 +333,7 @@ fn one_state(order: &Value, state: &str) -> State {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{NaiveDate, NaiveTime};
+    use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 
     fn at(minute: u32, second: u32) -> NaiveDateTime {
         NaiveDate::from_ymd_opt(2026, 9, 9)
@@ -595,105 +476,6 @@ mod tests {
             .expect("readable");
             assert_eq!(states["ord-1"], State::Gone, "{ending}");
         }
-    }
-
-    fn sent() -> BTreeMap<String, Sent> {
-        [(
-            "ord-1".to_owned(),
-            Sent {
-                instrument: "MSFT.RH".to_owned(),
-                side: Side::Buy,
-                quantity: 20.0,
-                decision_price: 100.0,
-                decision_at: at(30, 0),
-                proposer: "technical".to_owned(),
-            },
-        )]
-        .into_iter()
-        .collect()
-    }
-
-    fn max_age() -> chrono::Duration {
-        chrono::Duration::seconds(DEFAULT_MAX_ORDER_AGE_SECS)
-    }
-
-    #[test]
-    fn a_fill_becomes_an_execution_that_remembers_the_decision_it_came_from() {
-        // The point of holding `Sent`: the venue knows the fill and nothing
-        // else. Signal-to-fill is the latency that costs money, and it cannot
-        // be reconstructed from the order record.
-        let reported = [(
-            "ord-1".to_owned(),
-            State::Filled {
-                price: 100.08,
-                at: at(30, 1),
-            },
-        )]
-        .into_iter()
-        .collect();
-
-        let outcome = reconcile(&sent(), &reported, at(30, 2), max_age());
-        assert_eq!(outcome.resolved, ["ord-1"]);
-        assert!(outcome.stale.is_empty());
-
-        let [execution] = &outcome.executions[..] else {
-            panic!("one fill: {:?}", outcome.executions);
-        };
-        assert!((execution.decision_price - 100.0).abs() < 1e-9);
-        assert!((execution.fill_price - 100.08).abs() < 1e-9);
-        assert_eq!(execution.latency_ms(), 1_000);
-        assert!((execution.slippage_bps() - 8.0).abs() < 1e-6);
-        assert_eq!(execution.proposer, "technical");
-    }
-
-    #[test]
-    fn an_order_that_ended_without_filling_is_stopped_being_watched() {
-        // Left outstanding, it would be reported as an unfilled order on every
-        // drain for the rest of the session — and `Divergence` counts those.
-        let reported = [("ord-1".to_owned(), State::Gone)].into_iter().collect();
-        let outcome = reconcile(&sent(), &reported, at(30, 2), max_age());
-
-        assert_eq!(outcome.resolved, ["ord-1"]);
-        assert!(outcome.executions.is_empty(), "gone is not filled");
-        assert!(outcome.stale.is_empty(), "nothing left to cancel");
-    }
-
-    #[test]
-    fn an_order_still_working_is_left_alone_until_it_has_rested_too_long() {
-        let reported: BTreeMap<String, State> =
-            [("ord-1".to_owned(), State::Open)].into_iter().collect();
-
-        let young = reconcile(&sent(), &reported, at(30, 30), max_age());
-        assert!(young.stale.is_empty(), "half a minute is not stale");
-        assert!(young.resolved.is_empty(), "and it is still ours to watch");
-
-        // Two minutes and a second after the *signal*, not after the send.
-        let old = reconcile(&sent(), &reported, at(32, 1), max_age());
-        assert_eq!(old.stale, ["ord-1"]);
-        assert!(
-            old.resolved.is_empty(),
-            "not resolved until the cancel is acknowledged — it may have              filled in the meantime, and forgetting it would lose that fill"
-        );
-    }
-
-    #[test]
-    fn an_order_the_venue_has_not_listed_yet_is_neither_filled_nor_abandoned() {
-        // The server is eventually consistent. Treating an absent order as
-        // gone would drop a real order on the floor moments after placing it.
-        let outcome = reconcile(&sent(), &BTreeMap::new(), at(30, 2), max_age());
-        assert!(outcome.executions.is_empty());
-        assert!(outcome.resolved.is_empty());
-        assert!(outcome.stale.is_empty());
-    }
-
-    #[test]
-    fn nothing_outstanding_is_not_something_to_reconcile() {
-        let reported = [("someone-elses".to_owned(), State::Gone)]
-            .into_iter()
-            .collect();
-        let outcome = reconcile(&BTreeMap::new(), &reported, at(30, 2), max_age());
-        assert!(outcome.executions.is_empty());
-        assert!(outcome.resolved.is_empty());
     }
 
     #[test]

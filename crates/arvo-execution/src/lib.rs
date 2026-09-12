@@ -45,6 +45,7 @@
 //! ticks. It never publishes them.
 
 pub mod paper;
+pub mod poll;
 
 use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};

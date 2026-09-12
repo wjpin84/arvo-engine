@@ -6,7 +6,9 @@
 
 use std::path::Path;
 
-use arvo_data::source::{Adjustment, Basis, Feed, Fetched, Match, Quote, Source, SourceError};
+use arvo_data::source::{
+    Adjustment, Basis, Credential, Feed, Fetched, Match, Quote, Source, SourceError,
+};
 use arvo_data::{BarInterval, IntervalUnit};
 use serde_json::json;
 
@@ -50,6 +52,10 @@ impl Source for Robinhood {
 
     fn venue(&self) -> &'static str {
         VENUE
+    }
+
+    fn credential(&self) -> Credential {
+        Credential::SignIn
     }
 
     fn basis(&self) -> Basis {

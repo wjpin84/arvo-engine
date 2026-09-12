@@ -8,8 +8,15 @@ license.workspace = true
 [dependencies]
 arvo-core.workspace = true
 arvo-data.workspace = true
+arvo-execution.workspace = true
 async-trait = "0.1.92"
 chrono.workspace = true
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 serde.workspace = true
 serde_json = "1"
+# A derived idempotency key, so a retry of a lost reply cannot become a second
+# order. Alpaca calls it `client_order_id`.
+uuid = { version = "1.26", features = ["v5"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
