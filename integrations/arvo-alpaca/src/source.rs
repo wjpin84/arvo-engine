@@ -3,7 +3,7 @@
 //! Two constructors rather than a feed setting, because which feed a bar came
 //! from is part of the *data's* identity — see the crate docs.
 
-use arvo_data::source::{Adjustment, Basis, Feed, Fetched, Source, SourceError};
+use arvo_data::source::{Adjustment, Basis, Credential, Feed, Fetched, Source, SourceError};
 use arvo_data::{BarInterval, Dividend, IntervalUnit};
 use serde_json::Value;
 
@@ -71,6 +71,12 @@ impl Source for Alpaca {
 
     fn venue(&self) -> &'static str {
         self.venue
+    }
+
+    fn credential(&self) -> Credential {
+        // A key pair typed in once, not a flow. Both feeds share one pair:
+        // entitlement is a property of the plan, not of the key.
+        Credential::Keys
     }
 
     fn basis(&self) -> Basis {

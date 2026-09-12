@@ -132,6 +132,22 @@ pub struct Basis {
     pub adjustment: Adjustment,
 }
 
+/// How a source is authorised, if it is.
+///
+/// The distinction a window needs and cannot infer. "Sign in to Yahoo Finance"
+/// is a button for something that cannot be done; a sign-in button for a vendor
+/// that issues key pairs directly is a browser window that will never open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Credential {
+    /// Public data. Nothing to hold, nothing to offer.
+    None,
+    /// An OAuth flow: a browser, a redirect, a token that refreshes itself.
+    SignIn,
+    /// A key pair issued by the vendor and typed in once. No flow, no expiry,
+    /// and nothing to open a browser for.
+    Keys,
+}
+
 impl Basis {
     /// Whether two sources can be compared bar for bar without restatement.
     #[must_use]
@@ -337,6 +353,17 @@ pub trait Source: Send + Sync {
     /// datasets with two content hashes, and filing them under one name would
     /// let a study silently run on whichever was fetched last.
     fn venue(&self) -> &'static str;
+
+    /// What kind of credential this source needs, so a window can offer the
+    /// right thing and not offer the wrong one.
+    ///
+    /// Unlike [`Self::basis`] this has a default, because the two failures are
+    /// not comparable: a source that forgets to declare its basis produces
+    /// numbers that are quietly wrong, while one that forgets this produces a
+    /// missing button and a fetch that fails saying exactly what it needs.
+    fn credential(&self) -> Credential {
+        Credential::None
+    }
 
     /// What this source's prices actually are.
     ///
