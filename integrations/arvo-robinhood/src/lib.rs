@@ -36,6 +36,8 @@
 //! reporting an empty list would be a claim that the instrument paid nothing.
 //! Fetch dividend-sensitive work from `arvo_yfinance`, which does serve them.
 
+pub mod execution;
+
 use std::path::Path;
 
 use arvo_data::{Bar, BarInterval, IntervalUnit};
@@ -52,7 +54,8 @@ pub const VENUE: &str = "RH";
 /// Robinhood's MCP endpoint.
 const ENDPOINT: &str = "https://agent.robinhood.com/mcp/trading";
 
-/// The tools this module calls. All three read; none of them trade.
+/// The tools this module calls. All three read; the ones that trade live in
+/// [`execution`], behind `arvo_execution::Session`.
 const HISTORICALS: &str = "get_equity_historicals";
 const SEARCH: &str = "search";
 const QUOTES: &str = "get_equity_quotes";
@@ -218,7 +221,7 @@ impl Source for Robinhood {
 }
 
 /// An MCP client with a fresh token, already through `initialize`.
-async fn connect() -> Result<arvo_mcp::McpClient, SourceError> {
+pub(crate) async fn connect() -> Result<arvo_mcp::McpClient, SourceError> {
     let token = access_token().await?;
     let client = arvo_mcp::McpClient::new(ENDPOINT, token);
     client.connect().await.map_err(transport)?;
