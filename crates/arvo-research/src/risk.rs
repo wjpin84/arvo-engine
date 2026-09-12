@@ -230,8 +230,9 @@ pub struct Position {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Rejection {
-    /// The account stopped trading and does not resume. See
-    /// [`RiskModel::max_drawdown`].
+    /// The account stopped trading: either it breached
+    /// [`RiskModel::max_drawdown`], or someone pulled the kill switch. Which
+    /// one decides whether it can resume — see [`Halt::manual`].
     Halted { reason: String },
     /// Today's realised losses have reached the limit.
     DailyLossLimit { lost: f64, limit: f64 },
@@ -316,8 +317,27 @@ pub struct RiskGate {
     /// Realised profit and loss booked today. Negative is a loss.
     realised_today: f64,
     today: NaiveDate,
-    halted: Option<String>,
+    halted: Option<Halt>,
     max_signal_age_ms: i64,
+}
+
+/// Why an account stopped trading, and whether it can be started again.
+///
+/// Two halts share one field because [`decide`] must treat them identically —
+/// a stopped account is stopped, whatever stopped it. They differ only in who
+/// may lift them, which is [`RiskGate::release`]'s problem and nothing else's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Halt {
+    pub reason: String,
+    /// Whether a person pulled it, and can therefore put it back.
+    ///
+    /// The drawdown halt is deliberately permanent for the session: a gate that
+    /// stopped trading cannot recover the equity that would let it resume, so
+    /// "halt until recovered" either never resumes or has to keep trading to
+    /// find out. A kill switch is the opposite — someone decided, and someone
+    /// can decide again — and conflating the two would let a person clear a
+    /// drawdown halt by pressing the button that arms and then releases.
+    pub manual: bool,
 }
 
 impl RiskGate {
@@ -349,7 +369,48 @@ impl RiskGate {
     /// Whether the account has stopped trading, and why.
     #[must_use]
     pub fn halted(&self) -> Option<&str> {
-        self.halted.as_deref()
+        self.halted.as_ref().map(|halt| halt.reason.as_str())
+    }
+
+    /// The halt itself, for a caller that needs to know whether it can lift.
+    #[must_use]
+    pub const fn halt(&self) -> Option<&Halt> {
+        self.halted.as_ref()
+    }
+
+    /// Stops the account on a person's instruction — the kill switch.
+    ///
+    /// Refuses every subsequent proposal through the ordinary halt check, so
+    /// there is no second code path to keep in step with the drawdown halt.
+    ///
+    /// **It does not flatten.** Arming and exiting are separate because the
+    /// gate cannot reach a venue; `arvo_execution::Session::kill` does both, in
+    /// that order. Arming first is the point: anything racing in behind the
+    /// button is refused, and the exits do not go through the gate anyway.
+    ///
+    /// An account already halted is left as it was. Arming on top of a drawdown
+    /// halt would otherwise make that halt releasable by pressing one button
+    /// twice.
+    pub fn kill(&mut self, reason: &str) {
+        if self.halted.is_none() {
+            self.halted = Some(Halt {
+                reason: reason.to_owned(),
+                manual: true,
+            });
+        }
+    }
+
+    /// Lifts a kill switch. Returns whether it lifted.
+    ///
+    /// `false` means the account is halted for a reason a person did not choose
+    /// and cannot unchoose — read [`Self::halted`] for it. Returning `false`
+    /// rather than lifting anyway is the whole reason [`Halt::manual`] exists.
+    pub fn release(&mut self) -> bool {
+        if self.halted.as_ref().is_some_and(|halt| halt.manual) {
+            self.halted = None;
+            return true;
+        }
+        false
     }
 
     #[must_use]
@@ -382,7 +443,7 @@ impl RiskGate {
                 starting_cash: self.starting_cash,
                 equity: self.equity,
                 day_trades_used: self.day_trades_used(now.date()),
-                halted: self.halted.as_deref(),
+                halted: self.halted(),
             },
             proposal,
             now,
@@ -460,11 +521,14 @@ impl RiskGate {
                     // would let it resume, so "halt until recovered" would
                     // either never resume or would have to keep trading to
                     // find out — which is not a halt.
-                    self.halted = Some(format!(
-                        "account fell {:.1}% below its peak, against a {:.1}% limit",
-                        depth * 100.0,
-                        limit * 100.0
-                    ));
+                    self.halted = Some(Halt {
+                        reason: format!(
+                            "account fell {:.1}% below its peak, against a {:.1}% limit",
+                            depth * 100.0,
+                            limit * 100.0
+                        ),
+                        manual: false,
+                    });
                 }
             }
         }
@@ -880,6 +944,69 @@ mod tests {
             gate.propose(&third, immediately(&third), None),
             Decision::Reject(Rejection::TooManyPositions { held: 2, limit: 2 })
         );
+    }
+
+    #[test]
+    fn the_kill_switch_refuses_everything_until_it_is_released() {
+        let mut gate = gate(model());
+        let proposal = proposal("MSFT.RH");
+        assert!(matches!(
+            gate.propose(&proposal, immediately(&proposal), None),
+            Decision::Accept { .. }
+        ));
+
+        gate.kill("operator pulled it");
+        assert_eq!(
+            gate.propose(&proposal, immediately(&proposal), None),
+            Decision::Reject(Rejection::Halted {
+                reason: "operator pulled it".to_owned()
+            })
+        );
+
+        assert!(gate.release(), "a manual halt is a person's to lift");
+        assert!(gate.halted().is_none());
+        assert!(matches!(
+            gate.propose(&proposal, immediately(&proposal), None),
+            Decision::Accept { .. }
+        ));
+    }
+
+    #[test]
+    fn releasing_does_not_lift_a_drawdown_halt() {
+        // The drawdown halt is permanent for the session on purpose: a gate
+        // that stopped trading cannot recover the equity that would let it
+        // resume. One release path that lifted both would quietly undo that.
+        let mut gate = gate(RiskModel {
+            max_drawdown: Some(0.10),
+            ..model()
+        });
+        gate.mark(1_700.0);
+        assert!(gate.halted().is_some(), "15% below a 10% limit");
+
+        assert!(!gate.release(), "nobody chose this halt, so nobody can unchoose it");
+        assert!(gate.halted().is_some());
+    }
+
+    #[test]
+    fn arming_on_top_of_a_drawdown_halt_does_not_make_it_releasable() {
+        // The hole this is shaped to close: press the button once to arm, once
+        // more to release, and an account that breached its drawdown limit is
+        // trading again without anything having recovered.
+        let mut gate = gate(RiskModel {
+            max_drawdown: Some(0.10),
+            ..model()
+        });
+        gate.mark(1_700.0);
+        let breach = gate.halted().expect("halted").to_owned();
+
+        gate.kill("operator pulled it");
+        assert_eq!(
+            gate.halted(),
+            Some(breach.as_str()),
+            "the first halt stands and keeps its reason"
+        );
+        assert!(!gate.release());
+        assert!(gate.halted().is_some());
     }
 
     #[test]

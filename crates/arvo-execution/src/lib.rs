@@ -207,6 +207,29 @@ impl Divergence {
     }
 }
 
+/// What a kill switch managed to do.
+///
+/// Not a `Result`: the halt is armed either way, and some exits succeeding
+/// while others fail is the ordinary case rather than an error condition. A
+/// caller that collapses this to success or failure is discarding the half it
+/// most needs.
+#[derive(Debug, Default)]
+pub struct Flatten {
+    /// Exits the venue acknowledged.
+    pub submitted: Vec<OrderId>,
+    /// Positions the venue would not take an exit for. **Still held**, by an
+    /// account that has stopped trading.
+    pub failed: Vec<(String, ExecutionError)>,
+}
+
+impl Flatten {
+    /// Whether every held position got an exit out of the door.
+    #[must_use]
+    pub fn complete(&self) -> bool {
+        self.failed.is_empty()
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ExecutionError {
     #[error("{venue} rejected the order: {reason}")]
@@ -446,6 +469,65 @@ impl<E: Executor> Session<E> {
         self.executor.submit(&order).await.map(Some)
     }
 
+    /// Stops the account and flattens everything it holds. The kill switch.
+    ///
+    /// # The order matters
+    ///
+    /// The halt is armed **before** the first exit is sent, so a proposer that
+    /// fires while the account is being flattened is refused rather than
+    /// opening into the exit. Flattening first would leave exactly that window
+    /// open, and the window is widest precisely when this is being used.
+    ///
+    /// Arming does not block the exits: [`Self::close`] does not go through the
+    /// gate, for the reason recorded there — an exit path that can be refused
+    /// is not an exit path.
+    ///
+    /// # Why this returns rather than failing
+    ///
+    /// A venue that refuses one exit must not stop the other seven. Every
+    /// position is attempted, and what could not be exited is *named* — those
+    /// are still held, by an account that has stopped trading, which is the one
+    /// state a person pressing this needs to be told about. The halt is armed
+    /// either way.
+    ///
+    /// `prices` is the reference price per instrument, used only to measure the
+    /// exit's slippage afterwards. A missing one does not stop the exit: these
+    /// are market orders, and refusing to flatten for want of a quote would be
+    /// the failure this method exists to prevent.
+    pub async fn kill(
+        &mut self,
+        reason: &str,
+        prices: &std::collections::BTreeMap<String, f64>,
+        at: NaiveDateTime,
+    ) -> Flatten {
+        self.gate.kill(reason);
+
+        let held: Vec<String> = self.gate.positions().keys().cloned().collect();
+        let mut flatten = Flatten::default();
+        for instrument in held {
+            // ponytail: an unquoted exit is recorded with no reference price,
+            // so `Execution::slippage_bps` reports zero for it rather than a
+            // number measured against the wrong thing. Feed the map from the
+            // same quotes that drive `mark` and this does not arise.
+            let price = prices.get(&instrument).copied().unwrap_or_default();
+            match self.close(&instrument, price, at).await {
+                Ok(Some(order)) => flatten.submitted.push(order),
+                Ok(None) => {}
+                Err(err) => flatten.failed.push((instrument, err)),
+            }
+        }
+        flatten
+    }
+
+    /// Lifts a kill switch. Returns whether it lifted.
+    ///
+    /// `false` means this session is halted for a reason nobody chose — a
+    /// drawdown breach — and that one does not lift. See
+    /// `arvo_research::risk::Halt::manual`.
+    pub fn rearm(&mut self) -> bool {
+        self.gate.release()
+    }
+
     /// What this session measured that a backtest could not.
     #[must_use]
     pub fn divergence(&self) -> Divergence {
@@ -483,6 +565,60 @@ mod tests {
             decision_at: at(30, 0, 0),
             filled_at: at(30, 0, latency_ms),
         }
+    }
+
+    /// A venue that takes nothing, to exercise the half of a kill switch that
+    /// matters most: what happens when the exits do not go out.
+    struct Refusing;
+
+    #[async_trait::async_trait]
+    impl Executor for Refusing {
+        fn venue(&self) -> &str {
+            "refusing"
+        }
+
+        async fn submit(&self, order: &Order) -> Result<OrderId, ExecutionError> {
+            Err(ExecutionError::Transport {
+                venue: "refusing".to_owned(),
+                detail: format!("no route for {}", order.instrument),
+            })
+        }
+
+        async fn drain(&self) -> Result<(Vec<Execution>, usize), ExecutionError> {
+            Ok((Vec::new(), 0))
+        }
+    }
+
+    #[tokio::test]
+    async fn one_exit_the_venue_refuses_does_not_strand_the_others() {
+        // The failure mode a `?` would have shipped: the first unreachable
+        // instrument aborts the flatten and everything after it stays held, by
+        // an account nobody is watching any more because the button was pressed.
+        use arvo_research::{risk::RiskGate, RiskModel};
+
+        let day = NaiveDate::from_ymd_opt(2026, 9, 9).expect("valid");
+        let mut gate = RiskGate::new(RiskModel::default(), 10_000.0, day);
+        gate.opened("MSFT.RH", 10.0, 100.0, day);
+        gate.opened("AAPL.RH", 20.0, 50.0, day);
+        gate.opened("NVDA.RH", 5.0, 200.0, day);
+        let mut session = Session::new(gate, Refusing);
+
+        let flatten = session
+            .kill("operator pulled it", &Default::default(), at(0, 0, 0))
+            .await;
+
+        assert!(!flatten.complete());
+        assert_eq!(flatten.failed.len(), 3, "every position was attempted");
+        let stranded: Vec<&str> = flatten
+            .failed
+            .iter()
+            .map(|(instrument, _)| instrument.as_str())
+            .collect();
+        assert_eq!(stranded, ["AAPL.RH", "MSFT.RH", "NVDA.RH"]);
+
+        // Armed regardless. The exits failing is the reason to stop trading,
+        // not a reason to carry on.
+        assert!(session.gate().halted().is_some());
     }
 
     #[test]
