@@ -1,9 +1,0 @@
-[package]
-name = "arvo-views"
-description = "The shapes the desktop backend and its window agree on."
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-
-[dependencies]
-serde.workspace = true

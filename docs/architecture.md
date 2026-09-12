@@ -51,24 +51,56 @@ Hence the sequencing rule that orders the roadmap:
   framework, and systematic is the only form the benchmark discipline can
   evaluate.
 
-## Crate map
+## Layout
 
-| Crate | Owns |
+Four groups, one rule each.
+
+```
+crates/        the platform
+engines/       runs a backtest
+integrations/  talks to a vendor
+app/           the desktop application
+```
+
+| | Owns |
 |---|---|
-| `arvo-core` | Secrets, config, events — platform primitives |
-| `arvo-data` | `Bar`, `Dividend`, `BarProvider`, the CSV library, quality and agreement checks |
-| `arvo-research` | Experiments, evaluation, evidence, advice, the risk policy |
-| `arvo-nautilus` | The only crate permitted to name a Nautilus type |
-| `arvo-execution` | Venues, orders, fills, the paper executor, divergence |
-| `arvo-runtime` | The Tauri host, data sources, commands |
-| `arvo-views` | The shapes crossing to the UI, defined once |
-| `arvo-editor` | The Leptos workbench |
-| `arvo-mcp` / `arvo-oauth` | Protocol and authorization, both vendor-agnostic |
-| `arvo-plugin-host` | Out-of-process plugins over gRPC |
+| `crates/arvo-core` | Secrets, config, events — platform primitives |
+| `crates/arvo-data` | `Bar`, `Dividend`, `BarProvider`, the CSV library, quality and agreement checks, and the `Source` trait with its ingest pipeline |
+| `crates/arvo-research` | Experiments, evaluation, evidence, advice, the risk policy |
+| `crates/arvo-portfolio` | Holdings imported from a statement |
+| `crates/arvo-execution` | The `Executor` trait, the paper executor, divergence |
+| `crates/arvo-mcp`, `crates/arvo-oauth` | Protocol and authorization, both vendor-agnostic |
+| `crates/arvo-plugin-host` | Out-of-process plugins over gRPC |
+| `engines/arvo-nautilus` | The only crate permitted to name a Nautilus type |
+| `integrations/arvo-robinhood` | Bars, search and quotes over MCP, with OAuth |
+| `integrations/arvo-yfinance` | A second opinion, and dividends |
+| `integrations/arvo-alpaca` | Bars and corporate actions, on two feeds |
+| `app/arvo-runtime` | The Tauri host, the source registry, commands |
+| `app/arvo-views` | The shapes crossing to the UI, defined once |
+| `app/arvo-editor` | The Leptos workbench |
 
 Crates provide *architecture* (compile-time boundaries). Extensions provide
 *replaceable runtime capabilities*. Not every crate is an extension, and not
 every extension needs a crate.
+
+### Where the traits live
+
+Beside their implementer or their primary consumer, never in a shared types
+crate — see [ADR-0005](adr/0005-providers-are-earned.md), and note that
+`SimulationProvider` sits in `arvo-research` *specifically* so that
+`arvo-nautilus` depends on it and not the reverse.
+
+| Trait | Lives in |
+|---|---|
+| `BarProvider` | `arvo-data`, next to `CsvBars` |
+| `Source` | `arvo-data`, next to the library it fills |
+| `Executor` | `arvo-execution`, next to `PaperExecutor` |
+| `SimulationProvider` | `arvo-research`, to invert the dependency |
+| `Correlations` | `arvo-research`, next to the gate that consumes it |
+
+An integration depends only on `arvo-data` and its own protocol crates —
+never on `app/arvo-runtime`. The registry that knows every vendor is the one
+thing that must, and it lives in the composition root.
 
 ## Data, and what it assumes
 

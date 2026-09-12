@@ -1,0 +1,20 @@
+[package]
+name = "arvo-robinhood"
+description = "Bars, search and quotes from Robinhood's MCP server, as an arvo Source."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+arvo-core.workspace = true
+arvo-data.workspace = true
+arvo-mcp.workspace = true
+arvo-oauth.workspace = true
+async-trait = "0.1.92"
+chrono.workspace = true
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+serde.workspace = true
+serde_json = "1"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
