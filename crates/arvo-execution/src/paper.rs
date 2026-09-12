@@ -311,6 +311,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_kill_switch_flattens_what_is_held_and_refuses_what_comes_after() {
+        let mut session = session();
+        for (instrument, price) in [("MSFT.RH", 100.0), ("AAPL.RH", 50.0)] {
+            session
+                .propose(&proposal(instrument, price, at(0, 0)), at(0, 10), None)
+                .await
+                .expect("venue")
+                .expect("approved");
+            session.executor().on_price(instrument, price, at(0, 100));
+        }
+        session.settle().await.expect("settle");
+        assert_eq!(session.gate().positions().len(), 2);
+
+        let prices = [("MSFT.RH".to_owned(), 99.0), ("AAPL.RH".to_owned(), 49.0)]
+            .into_iter()
+            .collect();
+        let flatten = session.kill("operator pulled it", &prices, at(1, 0)).await;
+
+        assert!(flatten.complete(), "{:?}", flatten.failed);
+        assert_eq!(flatten.submitted.len(), 2, "both positions got an exit");
+        assert_eq!(session.executor().resting(), 2);
+
+        // And the account is shut, not merely emptied. A kill switch that
+        // flattened and then let the next signal straight back in would be a
+        // very expensive way to close two positions.
+        let after = session
+            .propose(&proposal("NVDA.RH", 10.0, at(1, 0)), at(1, 0), None)
+            .await
+            .expect("venue");
+        assert!(after.is_none());
+        assert!(matches!(
+            session.refusals().last(),
+            Some((_, arvo_research::risk::Rejection::Halted { .. }))
+        ));
+
+        assert!(session.rearm(), "a manual halt lifts");
+        assert!(session.gate().halted().is_none());
+    }
+
+    #[tokio::test]
+    async fn flattening_a_flat_account_is_not_an_error() {
+        let mut session = session();
+        let flatten = session
+            .kill("operator pulled it", &Default::default(), at(1, 0))
+            .await;
+
+        assert!(flatten.complete());
+        assert!(flatten.submitted.is_empty());
+        assert!(session.gate().halted().is_some(), "still shut");
+    }
+
+    #[tokio::test]
     async fn a_refused_proposal_never_reaches_the_venue() {
         // The invariant: nothing gets to an executor except through the gate.
         let mut session = session();
