@@ -1,0 +1,15 @@
+[package]
+name = "arvo-alpaca"
+description = "Alpaca bars and corporate actions, on two feeds that are two datasets."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+arvo-core.workspace = true
+arvo-data.workspace = true
+async-trait = "0.1.92"
+chrono.workspace = true
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+serde.workspace = true
+serde_json = "1"

@@ -7,12 +7,15 @@ members = [
     "crates/arvo-plugin-host",
     "crates/arvo-mcp",
     "crates/arvo-oauth",
-    "crates/arvo-views",
-    "crates/arvo-nautilus",
+    "app/arvo-views",
+    "engines/arvo-nautilus",
     "crates/arvo-portfolio",
-    "crates/arvo-editor",
+    "app/arvo-editor",
     "crates/arvo-execution",
-    "crates/arvo-runtime",
+    "integrations/arvo-alpaca",
+    "integrations/arvo-robinhood",
+    "integrations/arvo-yfinance",
+    "app/arvo-runtime",
     "plugins/stub",
 ]
 
@@ -26,11 +29,14 @@ license = "Apache-2.0"
 [workspace.dependencies]
 arvo-core = { path = "crates/arvo-core" }
 arvo-execution = { path = "crates/arvo-execution" }
+arvo-alpaca = { path = "integrations/arvo-alpaca" }
+arvo-robinhood = { path = "integrations/arvo-robinhood" }
+arvo-yfinance = { path = "integrations/arvo-yfinance" }
 arvo-data = { path = "crates/arvo-data" }
 arvo-mcp = { path = "crates/arvo-mcp" }
 arvo-oauth = { path = "crates/arvo-oauth" }
-arvo-views = { path = "crates/arvo-views" }
-arvo-nautilus = { path = "crates/arvo-nautilus" }
+arvo-views = { path = "app/arvo-views" }
+arvo-nautilus = { path = "engines/arvo-nautilus" }
 arvo-portfolio = { path = "crates/arvo-portfolio" }
 arvo-research = { path = "crates/arvo-research" }
 arvo-plugin-host = { path = "crates/arvo-plugin-host" }

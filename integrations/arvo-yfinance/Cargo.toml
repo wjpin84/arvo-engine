@@ -1,0 +1,13 @@
+[package]
+name = "arvo-yfinance"
+description = "A second opinion on the same bars, plus the distributions nothing else here serves."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+arvo-data.workspace = true
+async-trait = "0.1.92"
+chrono.workspace = true
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+serde_json = "1"
