@@ -33,7 +33,7 @@ use std::sync::Mutex;
 
 use chrono::NaiveDateTime;
 
-use crate::{Execution, ExecutionError, Executor, Order, OrderId};
+use crate::{Execution, ExecutionError, Executor, Order, OrderId, VenueState};
 
 /// An order waiting for a price.
 #[derive(Debug, Clone)]
@@ -172,6 +172,42 @@ impl Executor for PaperExecutor {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let completed = std::mem::take(&mut state.completed);
         Ok((completed, state.resting.len()))
+    }
+
+    /// Whatever this executor is currently holding for the session that owns
+    /// it — which is never anything.
+    ///
+    /// Not a stub. A paper executor is created empty and dies with the process,
+    /// so there is no state for a *later* session to inherit, and reporting a
+    /// clear venue is the true answer rather than a convenient one. That is
+    /// also exactly why it cannot stand in for a broker in this respect: the
+    /// hazard `Session::reconcile` exists for is one this venue cannot have.
+    ///
+    /// The resting orders are a subtler case and the answer is still none. They
+    /// belong to *this* session — it placed them and `drain` is watching them —
+    /// so reporting them here would have reconciliation cancel a session's own
+    /// working orders on the way in.
+    async fn at_venue(&self) -> Result<VenueState, ExecutionError> {
+        Ok(VenueState::default())
+    }
+
+    async fn cancel(&self, order: &OrderId) -> Result<(), ExecutionError> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let before = state.resting.len();
+        state.resting.retain(|resting| &resting.id != order);
+        if state.resting.len() == before {
+            // Refused rather than shrugged off: a cancel that reports success
+            // for an order the venue does not have would let a caller believe
+            // it had stopped something it never touched.
+            return Err(ExecutionError::Rejected {
+                venue: self.venue.clone(),
+                reason: format!("{order} is not resting here"),
+            });
+        }
+        Ok(())
     }
 }
 
