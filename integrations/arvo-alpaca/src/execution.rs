@@ -252,6 +252,9 @@ fn placed_id(venue: &str, response: &Value) -> Result<String, ExecutionError> {
 
 /// Every order the venue reported, by id.
 ///
+/// Confirmed against Alpaca's published order schema rather than guessed: a
+/// bare array, `id`, `status`, `filled_avg_price`, `filled_at`.
+///
 /// # Why this fails loudly
 ///
 /// An unreadable response that returned an empty map would report *no fills*,
@@ -301,17 +304,21 @@ fn one_state(order: &Value, status: &str) -> State {
                 _ => State::Open,
             }
         }
-        // Every way an Alpaca order ends without a complete fill.
+        // Alpaca's documented terminal statuses, and only those. An order in
+        // any other state can still change, and the cost of the two mistakes
+        // is not symmetric: stop watching one that later fills and the gate
+        // believes the account is flat while it holds a position nobody sized.
+        // Keep watching one that never fills and it rests until the stale
+        // timeout cancels it, which is a request the venue answers.
         //
-        // `done_for_day` is in here and is the one worth explaining: it means
-        // the venue will do no more with this order today. On a day order that
-        // is over, and leaving it open would have it reported as unfilled on
-        // every drain until the session ends.
-        "canceled" | "cancelled" | "expired" | "rejected" | "replaced" | "done_for_day"
-        | "suspended" => State::Gone,
-        // `partially_filled` lands here with everything else unrecognised.
-        // Half the size the gate approved is not the position it approved, and
-        // an unknown status is a reason to keep watching rather than to guess.
+        // `done_for_day` and `suspended` read like endings and are not on that
+        // list. A day order that is done for the day goes on to `expired` or
+        // `canceled`, and this sees that — or the timeout gets there first.
+        "canceled" | "expired" | "replaced" | "rejected" => State::Gone,
+        // `partially_filled` lands here with everything else. Half the size
+        // the gate approved is not the position it approved, and an
+        // unrecognised status is a reason to keep looking rather than to
+        // guess — Alpaca has sixteen of them and adds to the list.
         _ => State::Open,
     }
 }
@@ -473,17 +480,10 @@ mod tests {
 
     #[test]
     fn every_way_an_order_ends_without_filling_resolves_it() {
-        // Left open, each would rest outstanding forever and be reported as an
-        // unfilled order on every drain for the rest of the session.
-        for ending in [
-            "canceled",
-            "cancelled",
-            "expired",
-            "rejected",
-            "replaced",
-            "done_for_day",
-            "suspended",
-        ] {
+        // Alpaca's documented terminal set, less `filled`. Left open, each
+        // would rest outstanding forever and be reported as an unfilled order
+        // on every drain for the rest of the session.
+        for ending in ["canceled", "expired", "rejected", "replaced"] {
             let states =
                 order_states("ALPACA-PAPER", &json!([{ "id": "ord-1", "status": ending }]))
                     .expect("readable");
@@ -495,7 +495,20 @@ mod tests {
     fn a_status_this_does_not_recognise_is_watched_rather_than_guessed() {
         // Alpaca has sixteen of them and adds to the list. An unknown one is a
         // reason to keep looking, and the stale timeout is the backstop.
-        for working in ["new", "accepted", "pending_new", "calculated", "invented"] {
+        for working in [
+            "new",
+            "accepted",
+            "pending_new",
+            "calculated",
+            "held",
+            // The two that read like endings and are not on Alpaca's terminal
+            // list. Treating them as over stops the watch on an order that can
+            // still fill, and a fill nobody booked is a position the gate does
+            // not know it holds.
+            "done_for_day",
+            "suspended",
+            "invented",
+        ] {
             let states =
                 order_states("ALPACA-PAPER", &json!([{ "id": "ord-1", "status": working }]))
                     .expect("readable");
