@@ -44,7 +44,9 @@
 use std::collections::BTreeMap;
 
 use arvo_execution::poll::{reconcile, Outstanding, State};
-use arvo_execution::{Execution, ExecutionError, Executor, Order, OrderId, Side};
+use arvo_execution::{
+    Execution, ExecutionError, Executor, Holding, Order, OrderId, Side, VenueState,
+};
 use serde_json::{json, Value};
 
 use crate::auth;
@@ -179,10 +181,7 @@ impl Executor for AlpacaExecutor {
             // A cancel that fails leaves the order outstanding on purpose: it
             // may have filled between the read and the request, and forgetting
             // it here would lose a fill the account really took.
-            if auth::delete(&format!("{}/v2/orders/{id}", self.api))
-                .await
-                .is_ok()
-            {
+            if self.cancel(&OrderId(id.clone())).await.is_ok() {
                 outcome.resolved.push(id.clone());
             }
         }
@@ -190,6 +189,93 @@ impl Executor for AlpacaExecutor {
         self.outstanding.forget(&outcome.resolved);
         Ok((outcome.executions, self.resting()))
     }
+
+    async fn at_venue(&self) -> Result<VenueState, ExecutionError> {
+        // Two calls because Alpaca keeps them apart, and both are asked before
+        // either is acted on: a reconciliation that cancelled orders and then
+        // failed to read the positions would leave the account changed and the
+        // gate still ignorant.
+        let held = auth::get(&format!("{}/v2/positions", self.api))
+            .await
+            .map_err(|err| transport(self.venue, &err))?;
+        let working = auth::get(&format!("{}/v2/orders?status=open&limit=500", self.api))
+            .await
+            .map_err(|err| transport(self.venue, &err))?;
+
+        Ok(VenueState {
+            positions: positions(self.venue, &held)?,
+            resting: order_states(self.venue, &working)?
+                .into_keys()
+                .map(OrderId)
+                .collect(),
+        })
+    }
+
+    async fn cancel(&self, order: &OrderId) -> Result<(), ExecutionError> {
+        auth::delete(&format!("{}/v2/orders/{order}", self.api))
+            .await
+            .map_err(|err| rejected(self.venue, &err))
+    }
+}
+
+/// What the venue says the account holds.
+///
+/// Alpaca answers with a bare array, as it does for orders. A short is a
+/// negative `qty`, which is carried through rather than made absolute — see
+/// [`Holding::quantity`].
+fn positions(venue: &str, response: &Value) -> Result<Vec<Holding>, ExecutionError> {
+    let held = response
+        .as_array()
+        .ok_or_else(|| ExecutionError::Transport {
+            venue: venue.to_owned(),
+            detail: format!("expected an array of positions, got {response}"),
+        })?;
+
+    let mut out = Vec::with_capacity(held.len());
+    for position in held {
+        // Every field is required. A position read with a missing size or
+        // price is a position the gate would size against wrongly, and
+        // skipping it silently would report a flatter account than the one
+        // that exists — the single answer reconciliation must never give.
+        let field = |name: &str| -> Result<f64, ExecutionError> {
+            position
+                .get(name)
+                .and_then(Value::as_str)
+                .and_then(|raw| raw.parse::<f64>().ok())
+                .ok_or_else(|| ExecutionError::Transport {
+                    venue: venue.to_owned(),
+                    detail: format!("a position has no readable {name}: {position}"),
+                })
+        };
+        let symbol = position
+            .get("symbol")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ExecutionError::Transport {
+                venue: venue.to_owned(),
+                detail: format!("a position has no symbol: {position}"),
+            })?;
+
+        // Alpaca reports direction two ways — a `side` of `long`/`short`, and
+        // in practice a signed `qty` — and documents only the first. Taking
+        // the magnitude and applying `side` is right whichever way the sign
+        // arrives; trusting `qty` alone would be wrong if it is ever positive
+        // on a short, and negating on `side` would be wrong if it is already
+        // negative. `Holding::quantity` is signed, and getting it backwards
+        // means flattening a short by selling more of it.
+        let size = field("qty")?.abs();
+        let quantity = match position.get("side").and_then(Value::as_str) {
+            Some("short") => -size,
+            Some(_) => size,
+            // No `side` at all: the sign on `qty` is the only thing said.
+            None => field("qty")?,
+        };
+        out.push(Holding {
+            symbol: symbol.to_owned(),
+            quantity,
+            entry: field("avg_entry_price")?,
+        });
+    }
+    Ok(out)
 }
 
 impl AlpacaExecutor {
@@ -561,6 +647,43 @@ mod tests {
                     .expect("readable");
             assert_eq!(states["ord-1"], State::Gone, "{ending}");
         }
+    }
+
+    #[test]
+    fn a_position_is_read_as_the_venue_reports_it_sign_and_all() {
+        let held = positions(
+            "ALPACA-PAPER",
+            &json!([
+                { "symbol": "MSFT", "qty": "20", "avg_entry_price": "412.50", "side": "long" },
+                // A short, both ways Alpaca might say it. Negative either
+                // way, because flattening one means buying and a positive
+                // number would have the exit sell a hundred more.
+                { "symbol": "F", "qty": "-100", "avg_entry_price": "13.95", "side": "short" },
+                { "symbol": "T", "qty": "50", "avg_entry_price": "27.10", "side": "short" },
+                { "symbol": "KO", "qty": "-5", "avg_entry_price": "60.00" },
+            ]),
+        )
+        .expect("readable");
+
+        assert_eq!(held[0].symbol, "MSFT", "bare, with no venue suffix");
+        assert!((held[0].quantity - 20.0).abs() < 1e-9);
+        assert!((held[0].entry - 412.50).abs() < 1e-9);
+        assert!((held[1].quantity + 100.0).abs() < 1e-9, "signed and short");
+        assert!((held[2].quantity + 50.0).abs() < 1e-9, "unsigned but short");
+        assert!((held[3].quantity + 5.0).abs() < 1e-9, "signed, no side given");
+    }
+
+    #[test]
+    fn a_position_missing_a_field_is_named_rather_than_skipped() {
+        // Skipping it would report a flatter account than the one that exists,
+        // which is the single answer reconciliation must never give.
+        let err = positions("ALPACA-PAPER", &json!([{ "symbol": "MSFT", "qty": "20" }]))
+            .expect_err("no entry price");
+        assert!(err.to_string().contains("avg_entry_price"), "{err}");
+
+        let err = positions("ALPACA-PAPER", &json!({ "positions": [] }))
+            .expect_err("an envelope is not the array Alpaca sends");
+        assert!(err.to_string().contains("array of positions"), "{err}");
     }
 
     #[test]

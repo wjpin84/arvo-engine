@@ -208,6 +208,66 @@ impl Divergence {
     }
 }
 
+/// One position the venue says the account holds.
+///
+/// The venue's word, not the gate's. Reconciliation exists because the two can
+/// differ, so a type that could only be built from the gate's own book would
+/// be unable to express the disagreement it is here to find.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Holding {
+    /// The venue's own name for it — a bare ticker, with no venue suffix.
+    ///
+    /// Bare because the executor cannot honestly say more. The gate keys
+    /// positions by Arvo instrument id (`MSFT.RH`), which encodes *which
+    /// library the bars came from* — and a broker reporting `MSFT` has no idea
+    /// where this platform fetched its prices. Joining the two is the caller's
+    /// fact; see [`Session::reconcile`].
+    pub symbol: String,
+    /// Signed: negative is short. A venue reports a short as a negative
+    /// quantity and flattening it means buying, so dropping the sign here
+    /// would have reconciliation exit a short by selling more of it.
+    pub quantity: f64,
+    /// What the account paid, averaged. The gate books entries at fill price
+    /// and this is the venue's equivalent of one.
+    pub entry: f64,
+}
+
+/// What the venue holds and has working, right now.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct VenueState {
+    pub positions: Vec<Holding>,
+    /// Orders resting at the venue, whoever placed them.
+    pub resting: Vec<OrderId>,
+}
+
+impl VenueState {
+    /// Whether the account is flat and quiet, which is the only state a fresh
+    /// session can assume without asking.
+    #[must_use]
+    pub fn is_clear(&self) -> bool {
+        self.positions.is_empty() && self.resting.is_empty()
+    }
+}
+
+/// What a session found at the venue that it did not put there.
+#[derive(Debug, Default)]
+pub struct Reconciliation {
+    /// Positions the gate has been told about. It now sizes against them.
+    pub adopted: Vec<Holding>,
+    /// Orders cancelled because nothing in this session was watching them.
+    pub cancelled: Vec<OrderId>,
+    /// Orders the venue would not take back. Still working, still unwatched.
+    pub stranded: Vec<(OrderId, ExecutionError)>,
+}
+
+impl Reconciliation {
+    /// Whether anything was found. `false` is the ordinary start.
+    #[must_use]
+    pub fn found_anything(&self) -> bool {
+        !self.adopted.is_empty() || !self.cancelled.is_empty() || !self.stranded.is_empty()
+    }
+}
+
 /// What a kill switch managed to do.
 ///
 /// Not a `Result`: the halt is armed either way, and some exits succeeding
@@ -274,6 +334,31 @@ pub trait Executor: Send + Sync {
     ///
     /// Returns [`ExecutionError`] if the venue cannot be reached.
     async fn drain(&self) -> Result<(Vec<Execution>, usize), ExecutionError>;
+
+    /// What the venue holds and has working, asked of the venue.
+    ///
+    /// No default. A default would report a flat, quiet account, which is a
+    /// silent wrong answer for precisely the case this exists to catch — so a
+    /// new venue has to say, and the compiler makes it. The same argument
+    /// `arvo_data::source::Source::basis` makes about a basis.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecutionError`] if the venue cannot be reached.
+    async fn at_venue(&self) -> Result<VenueState, ExecutionError>;
+
+    /// Takes one order back.
+    ///
+    /// Separate from the cancelling [`Self::drain`] already does for its own
+    /// stale orders, because this one is for orders the session never placed
+    /// and therefore has no record of.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecutionError`] if the venue refuses or cannot be reached.
+    /// An order that has already filled or been cancelled is the venue's to
+    /// refuse, and refusing is the right answer.
+    async fn cancel(&self, order: &OrderId) -> Result<(), ExecutionError>;
 }
 
 /// A live or paper trading session: one gate, one venue, many proposers.
@@ -470,6 +555,100 @@ impl<E: Executor> Session<E> {
         self.executor.submit(&order).await.map(Some)
     }
 
+    /// Squares this session against what the venue already has.
+    ///
+    /// Call once, before the first proposal. `venue` is the library suffix
+    /// this session's instruments are filed under — the broker reports bare
+    /// tickers and the gate keys by Arvo instrument id, and only the caller
+    /// knows which library supplied the bars. A gate starts flat and quiet
+    /// because a fresh `RiskGate` has no book — and an account is not
+    /// obliged to agree. A crash mid-session, a restart after a deploy, or an
+    /// order placed by hand all leave the venue holding something this process
+    /// has never heard of, and a gate that starts up believing it is flat
+    /// sizes the next trade against capital that is already committed.
+    ///
+    /// # What it does, and why it is not just "adopt and carry on"
+    ///
+    /// **Positions are adopted.** The gate is told, so sizing, the position
+    /// cap and the correlation cap all see them, and so an exit is sized
+    /// against what is actually held.
+    ///
+    /// **Resting orders are cancelled.** An order placed by a session that no
+    /// longer exists has no owner: nothing will cancel it when it goes stale
+    /// and nothing will book it when it fills. It cannot be adopted either —
+    /// [`poll::Sent`] needs the price and instant the *signal* fired, and the
+    /// venue does not know them. So it is taken back, and a strategy that
+    /// still wants the position may propose it again with a fresh decision
+    /// behind it.
+    ///
+    /// **And then the account is halted.** This is the part worth arguing
+    /// about. Adopting silently would restore the positions and lose
+    /// everything the gate knows *around* them: the day-trade count, today's
+    /// realised loss, the equity peak the drawdown halt measures from. An
+    /// account that hit its daily loss limit, crashed, and restarted would be
+    /// free to trade again — a limit that a restart lifts is not a limit. So
+    /// the session comes up stopped, naming what it found, and a person
+    /// releases it with [`Self::rearm`] once they have looked.
+    ///
+    /// A clear venue halts nothing. The ordinary start is unaffected.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecutionError`] if the venue cannot be asked. A cancel the
+    /// venue refuses is not an error — it is reported in
+    /// [`Reconciliation::stranded`], because an order that would not die is
+    /// exactly what the operator needs to be told about.
+    pub async fn reconcile(
+        &mut self,
+        now: NaiveDateTime,
+        venue: &str,
+    ) -> Result<Reconciliation, ExecutionError> {
+        let state = self.executor.at_venue().await?;
+        let mut found = Reconciliation::default();
+
+        for holding in state.positions {
+            // Booked through the same door a fill uses, so there is one way
+            // the gate learns it holds something.
+            //
+            // ponytail: one venue for the whole session. A session trades one
+            // library's instruments, so the suffix is the same for all of
+            // them; the day a session mixes two libraries this has to become a
+            // lookup from symbol to the id it is filed under — which
+            // `arvo_data::source::existing_venues` already computes, for the
+            // caller to hand in.
+            let instrument = format!("{}.{venue}", holding.symbol);
+            self.gate
+                .opened(&instrument, holding.quantity, holding.entry, now.date());
+            found.adopted.push(holding);
+        }
+
+        for order in state.resting {
+            match self.executor.cancel(&order).await {
+                Ok(()) => found.cancelled.push(order),
+                Err(err) => found.stranded.push((order, err)),
+            }
+        }
+
+        if found.found_anything() {
+            self.gate.kill(&format!(
+                "this session started against an account that already held {} position{}                  and {} resting order{}{}; nothing was proposed until you released it",
+                found.adopted.len(),
+                if found.adopted.len() == 1 { "" } else { "s" },
+                found.cancelled.len() + found.stranded.len(),
+                if found.cancelled.len() + found.stranded.len() == 1 { "" } else { "s" },
+                if found.stranded.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        ", {} of which the venue would not cancel and are still working",
+                        found.stranded.len()
+                    )
+                },
+            ));
+        }
+        Ok(found)
+    }
+
     /// Stops the account and flattens everything it holds. The kill switch.
     ///
     /// # The order matters
@@ -588,6 +767,17 @@ mod tests {
         async fn drain(&self) -> Result<(Vec<Execution>, usize), ExecutionError> {
             Ok((Vec::new(), 0))
         }
+
+        async fn at_venue(&self) -> Result<VenueState, ExecutionError> {
+            Ok(VenueState::default())
+        }
+
+        async fn cancel(&self, _: &OrderId) -> Result<(), ExecutionError> {
+            Err(ExecutionError::Transport {
+                venue: "refusing".to_owned(),
+                detail: "takes nothing back either".to_owned(),
+            })
+        }
     }
 
     #[tokio::test]
@@ -620,6 +810,191 @@ mod tests {
         // Armed regardless. The exits failing is the reason to stop trading,
         // not a reason to carry on.
         assert!(session.gate().halted().is_some());
+    }
+
+    /// A venue that already holds things, to exercise the one case a paper
+    /// executor structurally cannot have.
+    struct Stocked {
+        state: VenueState,
+        /// Orders it will refuse to take back.
+        immovable: Vec<&'static str>,
+    }
+
+    #[async_trait::async_trait]
+    impl Executor for Stocked {
+        fn venue(&self) -> &str {
+            "stocked"
+        }
+
+        async fn submit(&self, _: &Order) -> Result<OrderId, ExecutionError> {
+            Ok(OrderId("new".to_owned()))
+        }
+
+        async fn drain(&self) -> Result<(Vec<Execution>, usize), ExecutionError> {
+            Ok((Vec::new(), 0))
+        }
+
+        async fn at_venue(&self) -> Result<VenueState, ExecutionError> {
+            Ok(self.state.clone())
+        }
+
+        async fn cancel(&self, order: &OrderId) -> Result<(), ExecutionError> {
+            if self.immovable.contains(&order.0.as_str()) {
+                return Err(ExecutionError::Rejected {
+                    venue: "stocked".to_owned(),
+                    reason: "already filling".to_owned(),
+                });
+            }
+            Ok(())
+        }
+    }
+
+    fn day() -> NaiveDate {
+        NaiveDate::from_ymd_opt(2026, 9, 9).expect("valid")
+    }
+
+    fn stocked(state: VenueState, immovable: Vec<&'static str>) -> Session<Stocked> {
+        use arvo_research::{risk::RiskGate, RiskModel};
+        Session::new(
+            RiskGate::new(RiskModel::default(), 10_000.0, day()),
+            Stocked { state, immovable },
+        )
+    }
+
+    fn holding(symbol: &str, quantity: f64) -> Holding {
+        Holding {
+            symbol: symbol.to_owned(),
+            quantity,
+            entry: 100.0,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_clear_venue_is_the_ordinary_start_and_changes_nothing() {
+        // The common path. A reconciliation that halted every session would be
+        // a reconciliation nobody ran.
+        let mut session = stocked(VenueState::default(), Vec::new());
+        let found = session.reconcile(at(0, 0, 0), "RH").await.expect("readable");
+
+        assert!(!found.found_anything());
+        assert!(session.gate().halted().is_none());
+        assert!(session.gate().positions().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_position_the_gate_never_saw_is_adopted_and_then_sized_against() {
+        // The hazard in one test. Before this the gate started flat, so it
+        // would size the next trade against capital already committed.
+        let state = VenueState {
+            positions: vec![holding("MSFT", 20.0)],
+            resting: Vec::new(),
+        };
+        let mut session = stocked(state, Vec::new());
+        let found = session.reconcile(at(0, 0, 0), "RH").await.expect("readable");
+
+        assert_eq!(found.adopted, vec![holding("MSFT", 20.0)]);
+        let held = session
+            .gate()
+            .positions()
+            .get("MSFT.RH")
+            .expect("the gate was told");
+        assert!((held.quantity - 20.0).abs() < 1e-9);
+        assert!((held.entry - 100.0).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn a_short_keeps_its_sign_so_flattening_it_does_not_double_it() {
+        // A venue reports a short as a negative quantity, and flattening one
+        // means buying. Dropping the sign would have the exit sell more.
+        let state = VenueState {
+            positions: vec![holding("MSFT", -20.0)],
+            resting: Vec::new(),
+        };
+        let mut session = stocked(state, Vec::new());
+        session.reconcile(at(0, 0, 0), "RH").await.expect("readable");
+
+        let held = session.gate().positions()["MSFT.RH"];
+        assert!(held.quantity < 0.0, "{held:?}");
+    }
+
+    #[tokio::test]
+    async fn an_order_nobody_is_watching_is_taken_back() {
+        // It cannot be adopted: `poll::Sent` needs the price and instant the
+        // signal fired, and the venue does not know them. So it is cancelled,
+        // and a strategy that still wants the position proposes it again with
+        // a fresh decision behind it.
+        let state = VenueState {
+            positions: Vec::new(),
+            resting: vec![OrderId("ord-1".to_owned()), OrderId("ord-2".to_owned())],
+        };
+        let mut session = stocked(state, Vec::new());
+        let found = session.reconcile(at(0, 0, 0), "RH").await.expect("readable");
+
+        assert_eq!(found.cancelled.len(), 2);
+        assert!(found.stranded.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_order_the_venue_will_not_take_back_is_named_rather_than_forgotten() {
+        // Still working, still unwatched, and the one thing the operator most
+        // needs to be told. Dropping it silently would report a clean start.
+        let state = VenueState {
+            positions: Vec::new(),
+            resting: vec![OrderId("ord-1".to_owned()), OrderId("stuck".to_owned())],
+        };
+        let mut session = stocked(state, vec!["stuck"]);
+        let found = session.reconcile(at(0, 0, 0), "RH").await.expect("readable");
+
+        assert_eq!(found.cancelled, vec![OrderId("ord-1".to_owned())]);
+        assert_eq!(found.stranded.len(), 1);
+        assert_eq!(found.stranded[0].0, OrderId("stuck".to_owned()));
+        assert!(
+            session
+                .gate()
+                .halted()
+                .is_some_and(|why| why.contains("would not cancel")),
+            "{:?}",
+            session.gate().halted()
+        );
+    }
+
+    #[tokio::test]
+    async fn finding_anything_stops_the_account_until_a_person_looks() {
+        // Adopting silently would restore the positions and lose everything
+        // the gate knows around them — the day-trade count, today's realised
+        // loss, the equity peak the drawdown halt measures from. An account
+        // that hit its daily loss limit, crashed and restarted would be free
+        // to trade again, and a limit a restart lifts is not a limit.
+        let state = VenueState {
+            positions: vec![holding("MSFT", 20.0)],
+            resting: Vec::new(),
+        };
+        let mut session = stocked(state, Vec::new());
+        session.reconcile(at(0, 0, 0), "RH").await.expect("readable");
+
+        let why = session.gate().halted().expect("halted").to_owned();
+        assert!(why.contains("1 position"), "{why}");
+
+        let proposal = arvo_research::risk::Proposal {
+            instrument: "AAPL.RH".to_owned(),
+            proposer: "technical".to_owned(),
+            signalled_at: at(0, 0, 0),
+            reference_price: 100.0,
+            stop_distance: Some(2.0),
+            desired_quantity: None,
+        };
+        assert!(
+            session
+                .propose(&proposal, at(0, 0, 0), None)
+                .await
+                .expect("venue")
+                .is_none(),
+            "nothing may be proposed into an account nobody has looked at"
+        );
+
+        // And a person can release it, because this halt is one somebody chose.
+        assert!(session.rearm());
+        assert!(session.gate().halted().is_none());
     }
 
     #[test]

@@ -45,7 +45,9 @@
 use std::collections::BTreeMap;
 
 use arvo_execution::poll::{reconcile, Outstanding, State};
-use arvo_execution::{Execution, ExecutionError, Executor, Order, OrderId, Side};
+use arvo_execution::{
+    Execution, ExecutionError, Executor, Holding, Order, OrderId, Side, VenueState,
+};
 use serde_json::{json, Value};
 
 use crate::auth::connect;
@@ -57,6 +59,8 @@ const PLACE: &str = "place_equity_order";
 const ORDERS: &str = "get_equity_orders";
 /// The MCP tool that takes one back.
 const CANCEL: &str = "cancel_equity_order";
+/// The MCP tool that says what the account holds.
+const POSITIONS: &str = "get_equity_positions";
 
 /// How long an unfilled order may rest before it is cancelled.
 ///
@@ -191,14 +195,7 @@ impl Executor for RobinhoodExecutor {
             // may have filled in the moment between reading and cancelling,
             // and forgetting it here would lose a fill the account really
             // took. The next poll sees it again.
-            if client
-                .call_tool_json(
-                    CANCEL,
-                    json!({ "account_number": self.account, "order_id": id }),
-                )
-                .await
-                .is_ok()
-            {
+            if self.cancel(&OrderId(id.clone())).await.is_ok() {
                 outcome.resolved.push(id.clone());
             }
         }
@@ -206,6 +203,118 @@ impl Executor for RobinhoodExecutor {
         self.outstanding.forget(&outcome.resolved);
         Ok((outcome.executions, self.resting()))
     }
+
+    async fn at_venue(&self) -> Result<VenueState, ExecutionError> {
+        let client = connect().await.map_err(|err| ExecutionError::Transport {
+            venue: VENUE.to_owned(),
+            detail: err.to_string(),
+        })?;
+
+        let held = client
+            .call_tool_json(POSITIONS, json!({ "account_number": self.account }))
+            .await
+            .map_err(|err| ExecutionError::Transport {
+                venue: VENUE.to_owned(),
+                detail: err.to_string(),
+            })?;
+
+        // Every open state Robinhood has, because "resting" means "the venue
+        // may still act on it" and asking for one state would miss the others.
+        let mut resting = Vec::new();
+        for state in ["new", "queued", "confirmed", "unconfirmed", "partially_filled"] {
+            let page = client
+                .call_tool_json(
+                    ORDERS,
+                    json!({ "account_number": self.account, "state": state }),
+                )
+                .await
+                .map_err(|err| ExecutionError::Transport {
+                    venue: VENUE.to_owned(),
+                    detail: err.to_string(),
+                })?;
+            resting.extend(order_states(&page)?.into_keys().map(OrderId));
+        }
+        // One order can be read twice across two polls of adjacent states.
+        // Cancelling it twice is the venue refusing the second, which would be
+        // reported as an order that would not die.
+        resting.sort_by(|a, b| a.0.cmp(&b.0));
+        resting.dedup();
+
+        Ok(VenueState {
+            positions: positions(&held)?,
+            resting,
+        })
+    }
+
+    async fn cancel(&self, order: &OrderId) -> Result<(), ExecutionError> {
+        let client = connect().await.map_err(|err| ExecutionError::Transport {
+            venue: VENUE.to_owned(),
+            detail: err.to_string(),
+        })?;
+        client
+            .call_tool_json(
+                CANCEL,
+                json!({ "account_number": self.account, "order_id": order.0 }),
+            )
+            .await
+            .map(|_| ())
+            .map_err(|err| ExecutionError::Rejected {
+                venue: VENUE.to_owned(),
+                reason: err.to_string(),
+            })
+    }
+}
+
+/// What the venue says the account holds.
+///
+/// Every field is required. A position read with a missing size or price is
+/// one the gate would size against wrongly, and skipping it silently would
+/// report a flatter account than the one that exists — the single answer
+/// reconciliation must never give.
+fn positions(response: &Value) -> Result<Vec<Holding>, ExecutionError> {
+    let held = response
+        .pointer("/data/results")
+        .or_else(|| response.pointer("/data/positions"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| ExecutionError::Transport {
+            venue: VENUE.to_owned(),
+            detail: format!("no data.results or data.positions array in {response}"),
+        })?;
+
+    let mut out = Vec::with_capacity(held.len());
+    for position in held {
+        let number = |name: &str| -> Result<f64, ExecutionError> {
+            position
+                .get(name)
+                .and_then(Value::as_str)
+                .and_then(|raw| raw.parse::<f64>().ok())
+                .ok_or_else(|| ExecutionError::Transport {
+                    venue: VENUE.to_owned(),
+                    detail: format!("a position has no readable {name}: {position}"),
+                })
+        };
+        let symbol = position
+            .get("symbol")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ExecutionError::Transport {
+                venue: VENUE.to_owned(),
+                detail: format!("a position has no symbol: {position}"),
+            })?;
+
+        let quantity = number("quantity")?;
+        // A flat row is not a position. Brokers keep the record after a close
+        // and report zero, and adopting one would have the gate refuse a
+        // proposal in that name as `AlreadyHeld` for the rest of the session.
+        if quantity.abs() < f64::EPSILON {
+            continue;
+        }
+        out.push(Holding {
+            symbol: symbol.to_owned(),
+            quantity,
+            entry: number("average_buy_price")?,
+        });
+    }
+    Ok(out)
 }
 
 /// The arguments for one order.
@@ -476,6 +585,45 @@ mod tests {
             .expect("readable");
             assert_eq!(states["ord-1"], State::Gone, "{ending}");
         }
+    }
+
+    #[test]
+    fn a_position_is_read_as_the_broker_reports_it() {
+        let held = positions(&json!({ "data": { "results": [
+            { "symbol": "MSFT", "quantity": "20.0000", "average_buy_price": "412.5000" },
+        ]}}))
+        .expect("readable");
+
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].symbol, "MSFT", "bare, with no venue suffix");
+        assert!((held[0].quantity - 20.0).abs() < 1e-9);
+        assert!((held[0].entry - 412.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_closed_position_the_broker_still_lists_is_not_adopted() {
+        // Brokers keep the record after a close and report zero. Adopting one
+        // would have the gate refuse every later proposal in that name as
+        // `AlreadyHeld` for the rest of the session.
+        let held = positions(&json!({ "data": { "results": [
+            { "symbol": "MSFT", "quantity": "0.0000", "average_buy_price": "412.5000" },
+            { "symbol": "AAPL", "quantity": "5.0000", "average_buy_price": "190.0000" },
+        ]}}))
+        .expect("readable");
+
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].symbol, "AAPL");
+    }
+
+    #[test]
+    fn a_position_missing_a_field_is_named_rather_than_skipped() {
+        // Skipping it would report a flatter account than the one that exists.
+        let err = positions(&json!({ "data": { "results": [{ "symbol": "MSFT" }] } }))
+            .expect_err("no quantity");
+        assert!(err.to_string().contains("quantity"), "{err}");
+
+        let err = positions(&json!({ "data": {} })).expect_err("no array at all");
+        assert!(err.to_string().contains("data.results"), "{err}");
     }
 
     #[test]
