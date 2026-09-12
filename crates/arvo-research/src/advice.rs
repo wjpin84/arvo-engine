@@ -344,11 +344,6 @@ pub fn recommend(found: &FamilyEvidence) -> Vec<Recommendation> {
     // is real either way, and the difference is whether its size is known.
     match evaluation.dividend_gap {
         Some(gap) if gap.worth_saying() => {
-            let corrected = gap.corrected_excess(evaluation.excess_return);
-            // Whether the correction takes the result back across the line it
-            // was being judged against. That is the version of this finding
-            // that actually changes a decision, so it changes the severity.
-            let survives = corrected > 0.0;
             let coverage = if gap.complete() {
                 String::new()
             } else {
@@ -359,41 +354,68 @@ pub fn recommend(found: &FamilyEvidence) -> Vec<Recommendation> {
                     gap.instruments,
                 )
             };
-            out.push(Recommendation::new(
-                if survives {
-                    Severity::Warning
-                } else {
-                    Severity::Blocking
-                },
-                if survives {
-                    "The excess return is smaller than it reads, by a measured amount."
-                } else {
-                    "The excess return is entirely dividends the benchmark forgoes and this \
-                     rule does not."
-                },
-                &format!(
-                    "Read the margin over buy-and-hold as {:.2}%, not {:.2}%. Prices here are \
-                     split-adjusted but not total-return adjusted, so no dividend is paid to \
-                     anything — and the benchmark held through every ex-date while this rule \
-                     held through only some.{}",
-                    corrected * 100.0,
-                    evaluation.excess_return * 100.0,
-                    if survives {
-                        ""
-                    } else {
-                        " Corrected, this rule did not beat holding, and the verdict above \
-                         was reached on the uncorrected figure."
-                    },
-                ),
-                format!(
-                    "{} distributions in the window: buy-and-hold would have collected {:.2} \
-                     and this rule {:.2}, a gap of {:.2}% of starting capital{coverage}",
-                    gap.events,
-                    gap.benchmark_income,
-                    gap.strategy_income,
-                    gap.overstatement * 100.0,
-                ),
-            ));
+            let evidence = format!(
+                "{} distributions in the window: buy-and-hold would have collected {:.2} \
+                 and this rule {:.2}, a gap of {:.2}% of starting capital{coverage}",
+                gap.events,
+                gap.benchmark_income,
+                gap.strategy_income,
+                gap.overstatement * 100.0,
+            );
+
+            match gap.corrected_excess(evaluation.excess_return) {
+                // Split-adjusted: the distribution is missing from both sides,
+                // so the gap is money neither received and the margin has to be
+                // read smaller than it prints.
+                Some(corrected) => {
+                    // Whether the correction takes the result back across the
+                    // line it was judged against. That is the version of this
+                    // finding that changes a decision, so it changes severity.
+                    let survives = corrected > 0.0;
+                    out.push(Recommendation::new(
+                        if survives {
+                            Severity::Warning
+                        } else {
+                            Severity::Blocking
+                        },
+                        if survives {
+                            "The excess return is smaller than it reads, by a measured amount."
+                        } else {
+                            "The excess return is entirely dividends the benchmark forgoes \
+                             and this rule does not."
+                        },
+                        &format!(
+                            "Read the margin over buy-and-hold as {:.2}%, not {:.2}%. Prices \
+                             here are split-adjusted but not total-return adjusted, so no \
+                             dividend is paid to anything — and the benchmark held through \
+                             every ex-date while this rule held through only some.{}",
+                            corrected * 100.0,
+                            evaluation.excess_return * 100.0,
+                            if survives {
+                                ""
+                            } else {
+                                " Corrected, this rule did not beat holding, and the verdict \
+                                 above was reached on the uncorrected figure."
+                            },
+                        ),
+                        evidence,
+                    ));
+                }
+                // Total-return adjusted: the distribution is already in the
+                // returns, so the margin above is right and subtracting the gap
+                // again would double-count it. What is left to say is what the
+                // margin is *made of*, which is a different and quieter claim.
+                None => out.push(Recommendation::new(
+                    Severity::Note,
+                    "Much of the margin over buy-and-hold is dividends rather than timing.",
+                    "Do not subtract this from the excess return — on a total-return series \
+                     the distributions are already in it, and taking them out again would \
+                     report a margin smaller than the account earned. Read it as \
+                     composition: this much of the edge came from holding through ex-dates \
+                     rather than from choosing when to be in.",
+                    evidence,
+                )),
+            }
         }
         // Measured, and too small to change how anything is read. Deliberately
         // silent: a line saying "this bias is negligible" on every result is a
@@ -1122,6 +1144,7 @@ mod tests {
             dataset: crate::DatasetRef {
                 id: "bars".to_owned(),
                 version: "v1".to_owned(),
+                adjustment: arvo_data::source::Adjustment::Split,
             },
             in_sample: crate::DateRange {
                 from: day(1),
@@ -1375,6 +1398,7 @@ mod tests {
             dataset: crate::DatasetRef {
                 id: "bars".to_owned(),
                 version: "v1".to_owned(),
+                adjustment: arvo_data::source::Adjustment::Split,
             },
             strategy: crate::StrategySpec {
                 name: "sma_cross".to_owned(),
@@ -1769,6 +1793,7 @@ mod tests {
             strategy_income: 120.0,
             benchmark_income: 120.0 + overstatement * 100_000.0,
             overstatement,
+            adjustment: arvo_data::source::Adjustment::Split,
             covered,
             instruments,
         }
@@ -1821,6 +1846,45 @@ mod tests {
     }
 
     #[test]
+    fn on_a_total_return_series_the_gap_describes_the_margin_instead_of_correcting_it() {
+        // Same measurement, different claim. Subtracting here would take the
+        // distributions out of a figure that already contains them and report
+        // a margin smaller than the account earned — so the recommendation must
+        // not quote a corrected number, and must not be Blocking on a rule that
+        // did beat holding.
+        let mut gap = gap(0.03, 1, 1);
+        gap.adjustment = arvo_data::source::Adjustment::TotalReturn;
+        let out = recommend(&measured(0.01, gap));
+
+        let item = out
+            .iter()
+            .find(|item| item.finding.contains("dividends rather than timing"))
+            .unwrap_or_else(|| panic!("{}", findings(&out)));
+
+        assert_eq!(item.severity, Severity::Note);
+        assert!(item.action.contains("Do not subtract"), "{}", item.action);
+        assert!(
+            item.evidence.contains("4 distributions"),
+            "the measurement still stands: {}",
+            item.evidence
+        );
+        assert!(
+            !out.iter().any(|item| {
+                item.finding.contains("entirely dividends")
+                    || item.finding.contains("smaller than it reads")
+            }),
+            "no correction may be offered on this basis: {}",
+            findings(&out)
+        );
+        // And the -2.00% the split-adjusted case reports must appear nowhere.
+        assert!(
+            !out.iter().any(|item| item.action.contains("-2.00%")),
+            "{}",
+            findings(&out)
+        );
+    }
+
+    #[test]
     fn a_measured_gap_too_small_to_matter_is_not_mentioned_at_all() {
         // Deliberately silent. A line saying "this bias is negligible" on every
         // result is a line that teaches a reader to skip the section the day it
@@ -1867,6 +1931,7 @@ mod tests {
                 strategy_income: 0.0,
                 benchmark_income: 0.0,
                 overstatement: 0.0,
+                adjustment: arvo_data::source::Adjustment::Split,
                 covered: 1,
                 instruments: 1,
             },

@@ -92,13 +92,20 @@ pub enum Feed {
 /// cross-check between a split-adjusted and a total-return source reports that
 /// on every instrument forever, and a check that always fires is a check nobody
 /// reads.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Adjustment {
     /// Split-adjusted only. Raw prices make a split look like a crash, which a
     /// breakout rule would trade — so this is the floor, not a choice.
     ///
     /// Dividends are absent from the series and nothing receives them, which is
     /// the bias `arvo_research::dividend` measures.
+    ///
+    /// The default, and not arbitrarily: it is the only basis any source has
+    /// ever asked for, so a record written before the basis was pinned was
+    /// produced on this one. That makes the default a true statement about
+    /// history rather than an assumption about the future.
+    #[default]
     Split,
     /// Split- and dividend-adjusted: total return, as though every
     /// distribution were reinvested at the ex-date close.
@@ -595,7 +602,10 @@ pub async fn compare(
     })
 }
 
-
+/// The ticker out of an Arvo instrument id: `MSFT.NASDAQ` is `MSFT`.
+///
+/// Shared rather than one copy per source, which is what it was. Applied by
+/// [`ingest`] and [`compare`] to whatever they are handed, so a caller may pass
 /// either spelling and a re-fetch of `MSFT.YF` from Robinhood lands on
 /// `MSFT.RH` rather than on `MSFT.YF.RH`.
 #[must_use]

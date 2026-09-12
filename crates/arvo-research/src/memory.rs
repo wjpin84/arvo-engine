@@ -677,6 +677,7 @@ mod tests {
             dataset: DatasetRef {
                 id: instrument.to_owned(),
                 version: dataset_version.to_owned(),
+                adjustment: arvo_data::source::Adjustment::Split,
             },
             strategy: StrategySpec {
                 name: "sma_cross".to_owned(),

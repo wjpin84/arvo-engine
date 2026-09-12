@@ -730,6 +730,7 @@ mod tests {
             dataset: crate::DatasetRef {
                 id: "fixture".to_owned(),
                 version: "1".to_owned(),
+                adjustment: arvo_data::source::Adjustment::Split,
             },
             strategy: crate::StrategySpec {
                 name: "sma_cross".to_owned(),

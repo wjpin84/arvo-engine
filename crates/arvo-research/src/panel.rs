@@ -670,6 +670,7 @@ mod tests {
             dataset: crate::DatasetRef {
                 id: "bars".to_owned(),
                 version: "v1".to_owned(),
+                adjustment: arvo_data::source::Adjustment::Split,
             },
             in_sample: DateRange::new(day(1), day(4)).expect("ordered"),
             out_of_sample: DateRange::new(day(5), day(9)).expect("ordered"),
