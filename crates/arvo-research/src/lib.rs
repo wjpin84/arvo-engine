@@ -25,6 +25,7 @@
 //! anticipating an implementation nobody has asked for.
 
 pub mod advice;
+pub mod agent_search;
 pub mod book;
 pub mod breadth;
 pub mod correlation;
@@ -44,6 +45,7 @@ pub mod walk_forward;
 pub use advice::{
     recommend, recommend_panel, recommend_walk_forward, Recommendation, Severity,
 };
+pub use agent_search::AgentSearch;
 pub use book::combine;
 pub use breadth::Breadth;
 pub use correlation::RollingCorrelations;
@@ -55,7 +57,7 @@ pub use family::{
     run_family, ExperimentFamily, FamilyEvidence, ParameterGrid, ScoredTrial, Selection,
 };
 pub use memory::{
-    EvidenceStore, Loaded, MemoryError, Record, StoredRecord, Summary, Unreadable, SCHEMA,
+    Author, EvidenceStore, Loaded, MemoryError, Record, StoredRecord, Summary, Unreadable, SCHEMA,
 };
 pub use psr::{period_returns, probabilistic_sharpe};
 pub use regime::{Breakdown, Regime, RegimeOutcome};

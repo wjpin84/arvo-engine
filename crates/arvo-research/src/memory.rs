@@ -33,7 +33,10 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    family::FamilyEvidence, panel::PanelEvidence, walk_forward::WalkForwardEvidence,
+    agent_search::AgentSearch,
+    family::{FamilyEvidence, Selection},
+    panel::PanelEvidence,
+    walk_forward::WalkForwardEvidence,
     HypothesisId, Verdict,
 };
 
@@ -99,6 +102,60 @@ impl Record {
             Self::WalkForward(evidence) => &evidence.hypothesis,
         }
     }
+
+    /// Every search over configurations that went into this finding: one for
+    /// a study or a panel, one per fold for a walk-forward.
+    #[must_use]
+    pub fn selections(&self) -> Vec<&Selection> {
+        match self {
+            Self::Study(evidence) => vec![&evidence.selection],
+            Self::Panel(evidence) => vec![&evidence.selection],
+            Self::WalkForward(evidence) => {
+                evidence.folds.iter().map(|fold| &fold.selection).collect()
+            }
+        }
+    }
+
+    /// Marks the finding `NotSupported`, saying why. Never upgrades.
+    pub(crate) fn refuse(&mut self, reason: String) {
+        let (verdict, reasons) = match self {
+            Self::Study(evidence) => (&mut evidence.verdict, &mut evidence.reasons),
+            Self::Panel(evidence) => (&mut evidence.verdict, &mut evidence.reasons),
+            Self::WalkForward(evidence) => (&mut evidence.verdict, &mut evidence.reasons),
+        };
+        *verdict = Verdict::NotSupported;
+        reasons.push(reason);
+    }
+}
+
+/// Who ran a finding.
+///
+/// Recorded on every finding from the first one an agent could write, because
+/// it cannot be recovered afterwards: deflating an agent's finding means
+/// counting everything *that agent* ran, and a store that did not say who ran
+/// what makes every stored agent finding uninterpretable (#25).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "by", rename_all = "snake_case")]
+pub enum Author {
+    /// Someone at the workbench. `default` because every finding recorded
+    /// before this existed was one.
+    #[default]
+    Person,
+    /// An agent, with the bar its whole search held this finding to. The bar
+    /// is kept rather than recomputed: the history it was measured over
+    /// changes as findings are added and deleted.
+    Agent { id: String, search: AgentSearch },
+}
+
+impl Author {
+    /// The agent's id, or `None` for a person.
+    #[must_use]
+    pub fn agent(&self) -> Option<&str> {
+        match self {
+            Self::Person => None,
+            Self::Agent { id, .. } => Some(id),
+        }
+    }
 }
 
 /// The shape this build writes.
@@ -121,6 +178,10 @@ pub struct StoredRecord {
     /// read any more, so it is a useful thing to be able to say.
     #[serde(default)]
     pub schema: u32,
+    /// Who ran it. `default`, so findings written before this read as a
+    /// person's — which they all were.
+    #[serde(default)]
+    pub author: Author,
     pub record: Record,
 }
 
@@ -181,7 +242,34 @@ impl StoredRecord {
             id,
             recorded_at,
             schema: SCHEMA,
+            author: Author::Person,
             record,
+        }
+    }
+
+    /// Builds an agent's record, judged against everything that agent has
+    /// already recorded.
+    ///
+    /// The only way to attribute a finding to an agent, so there is no path
+    /// that stores one without deflating it. `history` is the store as it
+    /// stands — [`EvidenceStore::load`] — and findings by anyone else in it
+    /// are ignored.
+    // ponytail: history is every full finding (~400 KB each); carry trial
+    // counts and scores in `Summary` once an agent's store reaches hundreds.
+    #[must_use]
+    pub fn by_agent(
+        mut record: Record,
+        agent: &str,
+        history: &[Self],
+        recorded_at: DateTime<Utc>,
+    ) -> Self {
+        let search = crate::agent_search::deflate_for_agent(&mut record, agent, history);
+        Self {
+            author: Author::Agent {
+                id: agent.to_owned(),
+                search,
+            },
+            ..Self::new(record, recorded_at)
         }
     }
 
@@ -493,7 +581,7 @@ fn read_record(path: &Path) -> Result<StoredRecord, String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// The index is a cache over the directory, and every test here is about
@@ -690,7 +778,7 @@ mod tests {
         }
     }
 
-    fn study(instrument: &str, dataset_version: &str) -> Record {
+    pub(crate) fn study(instrument: &str, dataset_version: &str) -> Record {
         let selected = experiment(instrument, dataset_version);
         let window = selected.window;
         Record::Study(Box::new(FamilyEvidence {
