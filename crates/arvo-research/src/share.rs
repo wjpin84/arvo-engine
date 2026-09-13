@@ -110,6 +110,16 @@ pub fn export(record: &Record) -> Result<SharedExperiment, ShareError> {
             record.kind()
         )));
     };
+    if !found.selected.alongside.is_empty() {
+        // A book is recorded as a study, and a file with no field for the
+        // other members would quietly turn a question about capital shared
+        // across several instruments into one about a single instrument.
+        return Err(ShareError::Unshareable(
+            "a book cannot be shared yet; the file has no way to name the instruments that \
+             share its account"
+                .to_owned(),
+        ));
+    }
     let selection = &found.selection;
     if selection.scored.is_empty() {
         return Err(ShareError::Unshareable(
@@ -414,6 +424,16 @@ mod tests {
             import(&shared.to_json(), KNOWN),
             Err(ShareError::Invalid(_))
         ));
+    }
+
+    #[test]
+    fn a_book_is_not_shared_as_if_it_were_one_instrument() {
+        let mut record = searched();
+        let Record::Study(found) = &mut record else {
+            unreachable!("a study")
+        };
+        found.selected.alongside = vec!["AAPL.NASDAQ".to_owned()];
+        assert!(matches!(export(&record), Err(ShareError::Unshareable(_))));
     }
 
     #[test]
