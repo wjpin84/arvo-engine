@@ -56,4 +56,7 @@ mod source;
 
 pub use auth::{forget, store, Keys, CREDENTIAL_ID};
 pub use execution::{AlpacaExecutor, DEFAULT_MAX_ORDER_AGE_SECS};
-pub use source::{Alpaca, IEX_SOURCE_ID, IEX_VENUE, SIP_SOURCE_ID, SIP_VENUE};
+pub use source::{
+    Alpaca, IEX_SOURCE_ID, IEX_TOTAL_RETURN_SOURCE_ID, IEX_TOTAL_RETURN_VENUE, IEX_VENUE,
+    SIP_SOURCE_ID, SIP_TOTAL_RETURN_SOURCE_ID, SIP_TOTAL_RETURN_VENUE, SIP_VENUE,
+};
