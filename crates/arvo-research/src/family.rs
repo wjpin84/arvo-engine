@@ -98,6 +98,15 @@ pub struct ExperimentFamily {
     pub grid: ParameterGrid,
     /// Fraction of the window used for selection.
     pub in_sample_fraction: f64,
+    /// Configurations already tried somewhere else to arrive at this family.
+    ///
+    /// Zero for a family designed here. An imported experiment carries the
+    /// search that produced it, and this is where it lands: someone who ran
+    /// fifty configurations and shared the one that survived has handed over
+    /// the maximum of fifty draws, and deflating it against this machine's
+    /// grid alone would count one. See [`crate::share`].
+    #[serde(default)]
+    pub prior_trials: usize,
 }
 
 impl ExperimentFamily {
@@ -109,6 +118,7 @@ impl ExperimentFamily {
             template,
             grid,
             in_sample_fraction: DEFAULT_IN_SAMPLE_FRACTION,
+            prior_trials: 0,
         }
     }
 }
@@ -135,6 +145,13 @@ pub struct Selection {
     pub expected_best_under_null: Option<f64>,
     /// Whether [`Self::best_sharpe`] cleared that bar.
     pub survived_deflation: bool,
+    /// Configurations tried elsewhere before this search, counted into the
+    /// bar above but not into [`Self::trials`], which is what ran here.
+    ///
+    /// Recorded because without it a bar raised by an imported search reads
+    /// as a miscalibrated one. `default`: every earlier finding had none.
+    #[serde(default)]
+    pub prior_trials: usize,
     /// Every configuration that ran, with its in-sample score.
     ///
     /// Kept rather than discarded once the winner is known, and it is the
@@ -329,13 +346,13 @@ pub fn run_family(
             ))
         })?;
 
-    run_split(
+    search(
         provider,
         &family.hypothesis,
         &family.template,
         &family.grid,
-        in_sample,
-        out_of_sample,
+        (in_sample, out_of_sample),
+        family.prior_trials,
         criteria,
     )
 }
@@ -361,6 +378,28 @@ pub fn run_split(
     out_of_sample: DateRange,
     criteria: &EvaluationCriteria,
 ) -> Result<FamilyEvidence, SimulationError> {
+    search(
+        provider,
+        hypothesis,
+        template,
+        grid,
+        (in_sample, out_of_sample),
+        0,
+        criteria,
+    )
+}
+
+/// [`run_split`], deflated against `prior_trials` more configurations than it
+/// runs itself.
+fn search(
+    provider: &dyn SimulationProvider,
+    hypothesis: &HypothesisId,
+    template: &Experiment,
+    grid: &ParameterGrid,
+    (in_sample, out_of_sample): (DateRange, DateRange),
+    prior_trials: usize,
+    criteria: &EvaluationCriteria,
+) -> Result<FamilyEvidence, SimulationError> {
     let combinations = grid.combinations();
     if combinations.is_empty() {
         return Err(SimulationError::Rejected(
@@ -372,6 +411,7 @@ pub fn run_split(
         template: template.clone(),
         grid: grid.clone(),
         in_sample_fraction: 0.0,
+        prior_trials,
     };
 
     let mut scored: Vec<(f64, BTreeMap<String, f64>)> = Vec::with_capacity(combinations.len());
@@ -421,13 +461,14 @@ pub fn run_split(
             ))
         })?;
 
-    let expected = expected_best_under_null(&sharpes);
+    let expected = expected_best_of(&sharpes, sharpes.len() + prior_trials);
     let survived_deflation = expected.is_none_or(|bar| best_sharpe > bar);
     let selection = Selection {
         trials: sharpes.len(),
         best_sharpe,
         expected_best_under_null: expected,
         survived_deflation,
+        prior_trials,
         scored: surface,
     };
 
@@ -438,8 +479,13 @@ pub fn run_split(
     let verdict = if survived_deflation {
         out_of_sample_evidence.evaluation.verdict
     } else {
+        let elsewhere = if prior_trials > 0 {
+            format!(" and {prior_trials} tried before it was shared")
+        } else {
+            String::new()
+        };
         reasons.push(format!(
-            "best in-sample Sharpe {best_sharpe:.3} across {} trials did not beat the {:.3} a \
+            "best in-sample Sharpe {best_sharpe:.3} across {} trials{elsewhere} did not beat the {:.3} a \
              no-skill search of that size would be expected to produce; the winner is selection \
              noise",
             selection.trials,

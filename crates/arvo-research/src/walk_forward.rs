@@ -848,6 +848,7 @@ mod tests {
                 best_sharpe: 1.0,
                 expected_best_under_null: Some(1.0),
                 survived_deflation: true,
+                prior_trials: 0,
                 scored: Vec::new(),
             },
             selected: experiment(window),
