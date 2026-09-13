@@ -218,6 +218,19 @@ pub struct FamilyEvidence {
 /// margin rather than an arithmetic mistake wearing one's clothes.
 #[must_use]
 pub fn expected_best_under_null(sharpes: &[f64]) -> Option<f64> {
+    expected_best_of(sharpes, sharpes.len())
+}
+
+/// The same bar, for a search of `trials` of which only `sharpes` were kept.
+///
+/// A search spanning many findings can count more trials than it has scores
+/// for: a finding recorded before [`Selection::scored`] existed says how many
+/// configurations it tried but not what they scored. Those still widen the
+/// search, so they count towards `n`; the spread is estimated from the scores
+/// that survive. Dropping them instead would shrink the count, which is the
+/// one direction this must never be wrong in.
+#[must_use]
+pub fn expected_best_of(sharpes: &[f64], trials: usize) -> Option<f64> {
     let n = sharpes.len();
     if n < 2 {
         return None;
@@ -234,7 +247,9 @@ pub fn expected_best_under_null(sharpes: &[f64]) -> Option<f64> {
         return None;
     }
 
-    Some(mean + spread * expected_maximum(count))
+    #[expect(clippy::cast_precision_loss, reason = "trial counts are small")]
+    let searched = trials.max(n) as f64;
+    Some(mean + spread * expected_maximum(searched))
 }
 
 /// Expected maximum of `n` independent standard normals.
@@ -617,8 +632,8 @@ mod tests {
             state ^= state >> 12;
             state ^= state << 25;
             state ^= state >> 27;
-            let u = ((state.wrapping_mul(0x2545_f491_4f6c_dd1d) >> 11) as f64)
-                / ((1_u64 << 53) as f64);
+            let u =
+                ((state.wrapping_mul(0x2545_f491_4f6c_dd1d) >> 11) as f64) / ((1_u64 << 53) as f64);
             u.clamp(1e-12, 1.0 - 1e-12)
         };
 
