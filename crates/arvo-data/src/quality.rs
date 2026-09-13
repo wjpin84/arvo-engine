@@ -114,6 +114,7 @@ pub fn inspect(bars: &[Bar], interval: BarInterval) -> Report {
     stalls(bars, &mut findings);
     silent_movement(bars, &mut findings);
     gaps(bars, interval, &mut findings);
+    outside_session(bars, interval, &mut findings);
     splits(bars, &mut findings);
     outliers(bars, &mut findings);
 
@@ -232,6 +233,35 @@ fn gaps(bars: &[Bar], interval: BarInterval, out: &mut Vec<Finding>) {
             });
         }
     }
+}
+
+/// Intraday bars from outside the US regular session.
+///
+/// Not a fault — extended-hours trading is real — but everything downstream
+/// assumes regular hours: the annualisation, the opening range, the session
+/// VWAP. A file fetched before a source filtered them, or from one that never
+/// did, would otherwise be read as if it held none. See [`crate::session`].
+fn outside_session(bars: &[Bar], interval: BarInterval, out: &mut Vec<Finding>) {
+    if !interval.is_intraday() {
+        return;
+    }
+    let mut outside = bars
+        .iter()
+        .filter(|bar| !crate::session::in_regular_session(bar.at));
+    let Some(first) = outside.next() else {
+        return;
+    };
+    let count = 1 + outside.count();
+    out.push(Finding {
+        severity: Severity::Suspect,
+        kind: "outside-session",
+        at: Some(first.at),
+        detail: format!(
+            "{count} of {} bars are outside US regular hours; annualised statistics, opening \
+             ranges and session VWAP all assume they are not there",
+            bars.len()
+        ),
+    });
 }
 
 /// A move that looks like an unadjusted corporate action.
@@ -438,11 +468,42 @@ mod tests {
                 .expect("valid"),
             ..bar(day, 100.0)
         };
-        let overnight = vec![session(2, 19, 55), session(3, 13, 30)];
+        // January, so the open is 14:30 UTC: 13:30 is 08:30 in New York.
+        let overnight = vec![session(2, 20, 55), session(3, 14, 30)];
         assert!(inspect(&overnight, interval).is_clean());
 
-        let mid_session = vec![session(2, 13, 30), session(2, 15, 0)];
+        let mid_session = vec![session(2, 14, 30), session(2, 16, 0)];
         assert!(kinds(&inspect(&mid_session, interval)).contains(&"gap"));
+    }
+
+    #[test]
+    fn extended_hours_bars_are_called_out_once_with_a_count() {
+        // Pre-market prints become an opening range and a 390-minute year
+        // stops being true, and neither shows in the result.
+        let interval = BarInterval::new(5, crate::IntervalUnit::Minute);
+        let at = |hour: u32, minute: u32| Bar {
+            at: chrono::NaiveDate::from_ymd_opt(2024, 7, 1)
+                .expect("valid")
+                .and_hms_opt(hour, minute, 0)
+                .expect("valid"),
+            ..bar(1, 100.0)
+        };
+        let series = vec![at(8, 0), at(8, 5), at(13, 30), at(20, 0)];
+        let report = inspect(&series, interval);
+        let found: Vec<_> = report
+            .findings
+            .iter()
+            .filter(|finding| finding.kind == "outside-session")
+            .collect();
+        assert_eq!(found.len(), 1, "{:?}", report.findings);
+        assert!(found[0].detail.starts_with("3 of 4"), "{}", found[0].detail);
+    }
+
+    #[test]
+    fn daily_bars_are_not_held_to_a_session() {
+        // A daily bar opens at midnight by construction.
+        let series = vec![bar(2, 100.0), bar(3, 101.0)];
+        assert!(!kinds(&inspect(&series, BarInterval::DAILY)).contains(&"outside-session"));
     }
 
     #[test]

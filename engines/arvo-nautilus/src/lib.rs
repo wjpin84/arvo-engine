@@ -946,14 +946,14 @@ mod tests {
     /// rule has something to find: a quiet opening range, then a break, then
     /// a fade back through the session's average.
     ///
-    /// Timestamps are UTC and sit inside US regular hours (13:30–20:00), so a
-    /// session never crosses UTC midnight — which is the assumption
-    /// `strategy::indicator::Session` is built on.
+    /// Timestamps are UTC and sit inside US regular hours — January, so
+    /// 14:30–21:00 — and a session never crosses UTC midnight, which is the
+    /// assumption `strategy::indicator::Session` is built on.
     fn sessions(count: usize, bars_each: usize) -> Vec<arvo_data::Bar> {
         let mut day = date(2024, 1, 2);
         let mut bars = Vec::with_capacity(count * bars_each);
         for session in 0..count {
-            let open = day.and_hms_opt(13, 30, 0).expect("valid");
+            let open = day.and_hms_opt(14, 30, 0).expect("valid");
             // Alternate the direction of the break so neither a breakout rule
             // nor a reversion rule is handed a one-sided fixture.
             let sign = if session % 2 == 0 { 1.0 } else { -1.0 };
