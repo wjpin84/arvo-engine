@@ -790,6 +790,7 @@ pub(crate) mod tests {
                 best_sharpe: 1.0,
                 expected_best_under_null: Some(0.5),
                 survived_deflation: true,
+                prior_trials: 0,
                 scored: Vec::new(),
             },
             out_of_sample_evidence: Evidence {

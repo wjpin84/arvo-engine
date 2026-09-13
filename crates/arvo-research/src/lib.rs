@@ -40,6 +40,7 @@ pub mod regime;
 pub mod reconcile;
 pub mod replay;
 pub mod risk;
+pub mod share;
 pub mod trade;
 pub mod walk_forward;
 

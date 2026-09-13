@@ -336,6 +336,7 @@ pub fn run_panel(
         best_sharpe,
         expected_best_under_null: expected,
         survived_deflation,
+        prior_trials: 0,
         scored: surface,
     };
 
@@ -642,6 +643,7 @@ mod tests {
             best_sharpe: 1.0,
             expected_best_under_null: Some(if survived { 0.5 } else { 2.0 }),
             survived_deflation: survived,
+            prior_trials: 0,
             scored: Vec::new(),
         }
     }
