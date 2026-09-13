@@ -114,6 +114,12 @@ total-return adjusted, so dividends are absent from the series and nothing
 credits them — a bias that always favours the strategy, now measured rather than
 estimated ([ADR-0011](adr/0011-dividend-gap-beside-not-folded-in.md)).
 
+Total-return prices are served too, by separate sources under separate venues
+(`YFTR`, `AIEXTR`, `ASIPTR`): distributions reinvested at the ex-date, which is
+what an account with DRIP does ([ADR-0013](adr/0013-dividends-arrive-as-reinvestment.md)).
+The basis is read from the venue, so a study on one records it and the dividend
+gap describes the margin rather than correcting it.
+
 Still open: one vendor per instrument unless cross-checked by hand, no
 point-in-time index membership, and no delisted archive — so a panel over
 today's names is a panel over survivors.
