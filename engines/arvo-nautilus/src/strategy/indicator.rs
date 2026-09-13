@@ -250,7 +250,8 @@ impl SessionVwap {
 /// Which trading day a bar belongs to.
 ///
 /// A session boundary is a change of UTC date. That holds for US regular
-/// hours, which run 13:30–20:00 UTC and never cross midnight, and it is the
+/// hours, which run 13:30–20:00 UTC in summer and 14:30–21:00 in winter and
+/// never cross midnight, and it is the
 /// only market this crate's instrument conventions describe. A market whose
 /// session spans UTC midnight would need the exchange calendar instead, and
 /// would silently see two sessions where there is one — so the assumption is

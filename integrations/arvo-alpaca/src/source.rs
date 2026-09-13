@@ -139,6 +139,14 @@ impl Source for Alpaca {
 
         bars.sort_by_key(|bar| bar.at);
         bars.dedup_by_key(|bar| bar.at);
+        // Alpaca aggregates pre-market and after-hours trades into its bars
+        // and has no parameter to leave them out — Robinhood is asked for
+        // `bounds=regular` and Yahoo omits them by default. Kept, they would
+        // form the opening range from 04:00 prints and break the 390-minute
+        // day every annualised figure assumes.
+        if interval.is_intraday() {
+            bars.retain(|bar| arvo_data::session::in_regular_session(bar.at));
+        }
         Ok(Fetched {
             bars,
             // Alpaca returns bars it has and omits the rest; nothing is
