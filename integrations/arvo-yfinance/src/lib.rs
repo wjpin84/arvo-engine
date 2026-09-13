@@ -33,12 +33,14 @@
 //! dividend-adjusted, which is the same basis the Robinhood source asks for —
 //! `adjustment_type: "split"`. That is what makes the two comparable at all.
 //!
-//! Yahoo also returns `adjclose`, which *is* dividend-adjusted, and this
-//! deliberately ignores it: mixing the two bases would make one source's series
-//! a rescaling of the other's, and `agreement` would say so on every instrument
-//! forever. It is also why the dividends are fetched as their own series rather
-//! than taken as read from an adjusted price — a cash credit a backtest can
-//! actually receive has to be a cash amount on a date.
+//! Yahoo also returns `adjclose`, which *is* dividend-adjusted. [`Yahoo::new`]
+//! ignores it: mixing the two bases would make one source's series a rescaling
+//! of the other's, and `agreement` would say so on every instrument forever.
+//! [`Yahoo::total_return`] is the same endpoint read on that basis instead — a
+//! second source under its own venue, because a total-return series is a
+//! different dataset (ADR-0013). Dividends are still fetched as their own
+//! series on both: on a total-return dataset the gap describes how much of a
+//! margin was distributions rather than correcting it.
 //!
 //! No key, no account, no session. It is a public endpoint and this only ever
 //! reads.
@@ -58,35 +60,79 @@ pub const SOURCE_ID: &str = "yahoo";
 /// one name would let a study silently run on whichever was fetched last.
 pub const VENUE: &str = "YF";
 
+/// The total-return source's name and venue.
+pub const TOTAL_RETURN_SOURCE_ID: &str = "yahoo-tr";
+pub const TOTAL_RETURN_VENUE: &str = "YFTR";
+
 const ENDPOINT: &str = "https://query1.finance.yahoo.com/v8/finance/chart";
 
 /// Yahoo refuses a request without one, with a 429 that says nothing useful.
 const USER_AGENT: &str = "Mozilla/5.0 (compatible; arvo/0.1)";
 
-/// The Yahoo source.
-pub struct Yahoo;
+/// The Yahoo source, on one adjustment basis or the other.
+pub struct Yahoo {
+    total_return: bool,
+}
+
+impl Yahoo {
+    /// Split-adjusted, the broker's basis.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            total_return: false,
+        }
+    }
+
+    /// Split- and dividend-adjusted, from `adjclose`.
+    #[must_use]
+    pub const fn total_return() -> Self {
+        Self { total_return: true }
+    }
+}
+
+impl Default for Yahoo {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[async_trait::async_trait]
 impl Source for Yahoo {
     fn id(&self) -> &'static str {
-        SOURCE_ID
+        if self.total_return {
+            TOTAL_RETURN_SOURCE_ID
+        } else {
+            SOURCE_ID
+        }
     }
 
     fn label(&self) -> &'static str {
-        "Yahoo Finance"
+        if self.total_return {
+            "Yahoo Finance (total return)"
+        } else {
+            "Yahoo Finance"
+        }
     }
 
     fn venue(&self) -> &'static str {
-        VENUE
+        if self.total_return {
+            TOTAL_RETURN_VENUE
+        } else {
+            VENUE
+        }
     }
 
     fn basis(&self) -> Basis {
         Basis {
             feed: Feed::Consolidated,
-            // `open`/`high`/`low`/`close`, not `adjclose` — the same basis the
-            // broker is asked for, which is what makes the two comparable at
-            // all. See the module note.
-            adjustment: Adjustment::Split,
+            // `open`/`high`/`low`/`close` is the broker's basis, which is what
+            // makes the two comparable; `adjclose` is total return. See the
+            // module note.
+            adjustment: if self.total_return {
+                Adjustment::TotalReturn
+            } else {
+                Adjustment::Split
+            },
         }
     }
 
@@ -97,9 +143,17 @@ impl Source for Yahoo {
         from: chrono::NaiveDate,
         to: chrono::NaiveDate,
     ) -> Result<Fetched, SourceError> {
+        if self.total_return && interval.is_intraday() {
+            // Yahoo computes `adjclose` for daily bars and coarser only.
+            // Refused rather than served split-adjusted under a venue that
+            // declares total return.
+            return Err(SourceError::Unsupported(format!(
+                "Yahoo serves total-return prices daily and coarser, not at {interval}"
+            )));
+        }
         let body = chart(symbol, interval, from, to).await?;
         Ok(Fetched {
-            bars: parse_bars(&body)?,
+            bars: parse_bars(&body, self.total_return)?,
             // Yahoo drops a session it has no print for rather than filling it,
             // so there is nothing invented to count. `parse_bars` drops any
             // half-formed bar for the same reason.
@@ -208,7 +262,12 @@ fn result(body: &serde_json::Value) -> Result<&serde_json::Value, SourceError> {
 /// rather than filled: an invented price is the one thing a breakout rule cannot
 /// tell from a real one, which is the same reason the Robinhood source drops the
 /// interpolated bars its own server synthesises.
-fn parse_bars(body: &serde_json::Value) -> Result<Vec<Bar>, SourceError> {
+///
+/// With `total_return`, every price in a bar is scaled by that bar's
+/// `adjclose / close`. Yahoo adjusts only the close, and a bar whose open, high
+/// and low stayed on the split basis would have its close outside its own
+/// range on every day before a distribution.
+fn parse_bars(body: &serde_json::Value, total_return: bool) -> Result<Vec<Bar>, SourceError> {
     let result = result(body)?;
     let times = result
         .pointer("/timestamp")
@@ -231,6 +290,16 @@ fn parse_bars(body: &serde_json::Value) -> Result<Vec<Bar>, SourceError> {
         column("close")?,
         column("volume")?,
     );
+    let adjusted = if total_return {
+        Some(
+            result
+                .pointer("/indicators/adjclose/0/adjclose")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| malformed("no adjclose column"))?,
+        )
+    } else {
+        None
+    };
 
     let mut bars = Vec::with_capacity(times.len());
     for (index, time) in times.iter().enumerate() {
@@ -254,6 +323,16 @@ fn parse_bars(body: &serde_json::Value) -> Result<Vec<Bar>, SourceError> {
         ) else {
             continue;
         };
+        // The same all-or-none rule for the adjusted close: a bar that cannot
+        // be put on the declared basis is dropped, not left on the other one.
+        let factor = match adjusted {
+            None => 1.0,
+            Some(adjusted) => match value(adjusted) {
+                Some(adjclose) if close > 0.0 => adjclose / close,
+                _ => continue,
+            },
+        };
+        let (open, high, low, close) = (open * factor, high * factor, low * factor, close * factor);
 
         bars.push(Bar {
             // Yahoo stamps a daily bar at the session *open* in exchange time.
@@ -351,9 +430,56 @@ mod tests {
         })
     }
 
+    fn parse_bars_split(body: &serde_json::Value) -> Result<Vec<Bar>, SourceError> {
+        parse_bars(body, false)
+    }
+
+    #[test]
+    fn a_total_return_bar_is_scaled_whole_so_its_close_stays_inside_its_range() {
+        let mut body = reply(&[1_700_000_000, 1_700_086_400], &[Some(100.0), Some(100.0)]);
+        body["chart"]["result"][0]["indicators"]["quote"][0]["high"] =
+            serde_json::json!([101.0, 101.0]);
+        body["chart"]["result"][0]["indicators"]["adjclose"] =
+            serde_json::json!([{ "adjclose": [98.0, 100.0] }]);
+
+        let bars = parse_bars(&body, true).expect("a total-return reply");
+        assert!((bars[0].close - 98.0).abs() < 1e-9);
+        assert!(
+            (bars[0].high - 98.98).abs() < 1e-9,
+            "scaled by 0.98: {}",
+            bars[0].high
+        );
+        assert!(bars[0].close <= bars[0].high);
+        assert!(
+            (bars[1].close - 100.0).abs() < 1e-9,
+            "no distribution since, no factor"
+        );
+
+        let split = parse_bars(&body, false).expect("the same reply, split basis");
+        assert!((split[0].close - 100.0).abs() < 1e-9, "adjclose ignored");
+    }
+
+    #[test]
+    fn a_total_return_reply_without_adjclose_is_refused_not_served_split() {
+        let body = reply(&[1_700_000_000], &[Some(100.0)]);
+        let Err(SourceError::Malformed { detail, .. }) = parse_bars(&body, true) else {
+            panic!("a missing adjclose is a shape problem");
+        };
+        assert!(detail.contains("adjclose"), "{detail}");
+    }
+
+    #[test]
+    fn the_two_yahoo_sources_are_two_datasets() {
+        let (split, total) = (Yahoo::new(), Yahoo::total_return());
+        assert_ne!(split.id(), total.id());
+        assert_ne!(split.venue(), total.venue());
+        assert_eq!(split.basis().adjustment, Adjustment::Split);
+        assert_eq!(total.basis().adjustment, Adjustment::TotalReturn);
+    }
+
     #[test]
     fn reads_a_chart_into_bars() {
-        let bars = parse_bars(&reply(
+        let bars = parse_bars_split(&reply(
             &[1_700_000_000, 1_700_086_400],
             &[Some(1.0), Some(2.0)],
         ))
@@ -368,7 +494,7 @@ mod tests {
         // The one thing a breakout rule cannot tell from a real price is an
         // invented one, which is why the broker source drops its server's
         // synthesised bars too.
-        let bars = parse_bars(&reply(&[1_700_000_000, 1_700_086_400], &[Some(1.0), None]))
+        let bars = parse_bars_split(&reply(&[1_700_000_000, 1_700_086_400], &[Some(1.0), None]))
             .expect("a reply with a hole is still readable");
         assert_eq!(bars.len(), 1, "the null bar is gone, not zeroed");
     }
@@ -382,7 +508,7 @@ mod tests {
             "chart": { "error": { "code": "Not Found" }, "result": null }
         });
         assert!(matches!(
-            parse_bars(&body),
+            parse_bars_split(&body),
             Err(SourceError::Malformed { .. })
         ));
     }
@@ -395,7 +521,7 @@ mod tests {
                 "indicators": { "quote": [{ "open": [1.0] }] }
             }]}
         });
-        let Err(SourceError::Malformed { detail, .. }) = parse_bars(&body) else {
+        let Err(SourceError::Malformed { detail, .. }) = parse_bars_split(&body) else {
             panic!("a missing column is a shape problem");
         };
         assert!(detail.contains("high"), "{detail}");

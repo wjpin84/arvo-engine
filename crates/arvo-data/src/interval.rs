@@ -25,6 +25,10 @@ const TRADING_DAYS: f64 = 252.0;
 /// crypto session is longer, and an extended-hours request covers more. It is
 /// named here rather than buried in a constant so the day it is wrong, it is
 /// findable.
+///
+/// Made true rather than hoped for: every source serves regular hours only,
+/// and [`crate::quality`] flags intraday bars outside them — see
+/// [`crate::session`].
 const SESSION_MINUTES: f64 = 390.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -489,6 +489,29 @@ pub fn recommend(found: &FamilyEvidence) -> Vec<Recommendation> {
         }
     }
 
+    // An intraday rule that made its money in the gaps between sessions. The
+    // verdict reads as a statement about intraday timing and is not one.
+    let intraday = found.out_of_sample_evidence.experiment.interval.is_intraday();
+    if let Some(split) = crate::overnight::split(&evaluation.strategy_curve)
+        .filter(|split| intraday && split.earned_only_overnight())
+    {
+        out.push(Recommendation::new(
+            Severity::Warning,
+            "The profit was made while the market was closed.",
+            "Do not read this as evidence for the intraday signal: within sessions it did not \
+             make money, and everything it earned came from positions it happened to carry \
+             through the close. That is exposure to overnight news and the overnight drift, \
+             which no rule here chose. Flatten at the close and run it again to see what the \
+             signal itself is worth.",
+            format!(
+                "held through {} nights: {:+.2}% between sessions, {:+.2}% within them",
+                split.nights_held,
+                split.overnight * 100.0,
+                split.session * 100.0,
+            ),
+        ));
+    }
+
     // ---- notes -----------------------------------------------------------
 
     let long_enough_to_characterise = trades.closed >= MIN_TRADES_TO_CHARACTERISE;
@@ -1774,6 +1797,52 @@ mod tests {
         let out = recommend(&book_study(&["AAPL.NASDAQ"]));
         assert!(
             !out.iter().any(|item| item.finding.contains("two different results")),
+            "{}",
+            findings(&out)
+        );
+    }
+
+    /// A study at `interval` whose curve lost within both sessions and gained
+    /// across the night between them.
+    fn gapped(interval: arvo_data::BarInterval) -> FamilyEvidence {
+        let mut study = book_study(&["AAPL.NASDAQ"]);
+        study.out_of_sample_evidence.experiment.interval = interval;
+        let point = |day: u32, hour: u32, equity: f64| crate::EquityPoint {
+            at: chrono::NaiveDate::from_ymd_opt(2024, 7, day)
+                .expect("valid")
+                .and_hms_opt(hour, 0, 0)
+                .expect("valid"),
+            equity,
+        };
+        study.out_of_sample_evidence.evaluation.strategy_curve = vec![
+            point(1, 14, 100.0),
+            point(1, 19, 98.0),
+            point(2, 14, 106.0),
+            point(2, 19, 104.0),
+        ];
+        study
+    }
+
+    #[test]
+    fn an_intraday_rule_that_only_made_money_overnight_is_told_so() {
+        let out = recommend(&gapped(arvo_data::BarInterval::new(
+            5,
+            arvo_data::IntervalUnit::Minute,
+        )));
+        let item = out
+            .iter()
+            .find(|item| item.finding.contains("while the market was closed"))
+            .unwrap_or_else(|| panic!("{}", findings(&out)));
+        assert_eq!(item.severity, Severity::Warning);
+        assert!(item.evidence.contains("1 nights"), "{}", item.evidence);
+    }
+
+    #[test]
+    fn a_daily_rule_is_not_accused_of_holding_overnight() {
+        // Every daily bar is a night; holding through them is the rule.
+        let out = recommend(&gapped(arvo_data::BarInterval::DAILY));
+        assert!(
+            !out.iter().any(|item| item.finding.contains("while the market was closed")),
             "{}",
             findings(&out)
         );

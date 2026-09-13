@@ -23,6 +23,7 @@ pub mod source;
 pub mod agreement;
 pub mod interval;
 pub mod quality;
+pub mod session;
 
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 

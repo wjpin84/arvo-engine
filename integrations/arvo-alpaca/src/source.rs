@@ -23,14 +23,24 @@ pub const IEX_VENUE: &str = "AIEX";
 pub const SIP_SOURCE_ID: &str = "alpaca-sip";
 pub const SIP_VENUE: &str = "ASIP";
 
-/// The Alpaca source, on one feed or the other.
+/// Each feed again, total-return adjusted, under venues of their own.
+pub const IEX_TOTAL_RETURN_SOURCE_ID: &str = "alpaca-iex-tr";
+pub const IEX_TOTAL_RETURN_VENUE: &str = "AIEXTR";
+pub const SIP_TOTAL_RETURN_SOURCE_ID: &str = "alpaca-sip-tr";
+pub const SIP_TOTAL_RETURN_VENUE: &str = "ASIPTR";
+
+/// The Alpaca source, on one feed or the other, at one adjustment or the other.
 ///
-/// Which feed is part of the source's identity rather than a setting, because
-/// it is part of the *data's* identity: see the module note on venues.
+/// Both are part of the source's identity rather than settings, because both
+/// are part of the *data's* identity: see the module note on venues, and
+/// ADR-0013 for why a total-return series is a different dataset rather than
+/// the same one with a flag.
 pub struct Alpaca {
     feed: &'static str,
+    adjustment: Adjustment,
     id: &'static str,
     venue: &'static str,
+    label: &'static str,
 }
 
 impl Alpaca {
@@ -39,8 +49,10 @@ impl Alpaca {
     pub const fn iex() -> Self {
         Self {
             feed: "iex",
+            adjustment: Adjustment::Split,
             id: IEX_SOURCE_ID,
             venue: IEX_VENUE,
+            label: "Alpaca (IEX, free)",
         }
     }
 
@@ -49,9 +61,44 @@ impl Alpaca {
     pub const fn sip() -> Self {
         Self {
             feed: "sip",
+            adjustment: Adjustment::Split,
             id: SIP_SOURCE_ID,
             venue: SIP_VENUE,
+            label: "Alpaca (all exchanges)",
         }
+    }
+
+    /// The free plan, with every distribution reinvested at the ex-date.
+    #[must_use]
+    pub const fn iex_total_return() -> Self {
+        Self {
+            feed: "iex",
+            adjustment: Adjustment::TotalReturn,
+            id: IEX_TOTAL_RETURN_SOURCE_ID,
+            venue: IEX_TOTAL_RETURN_VENUE,
+            label: "Alpaca (IEX, free, total return)",
+        }
+    }
+
+    /// The paid plan, with every distribution reinvested at the ex-date.
+    #[must_use]
+    pub const fn sip_total_return() -> Self {
+        Self {
+            feed: "sip",
+            adjustment: Adjustment::TotalReturn,
+            id: SIP_TOTAL_RETURN_SOURCE_ID,
+            venue: SIP_TOTAL_RETURN_VENUE,
+            label: "Alpaca (all exchanges, total return)",
+        }
+    }
+}
+
+/// Alpaca's name for an adjustment basis.
+const fn adjustment_parameter(adjustment: Adjustment) -> &'static str {
+    match adjustment {
+        Adjustment::Split => "split",
+        // Splits, dividends and spin-offs: total return.
+        Adjustment::TotalReturn => "all",
     }
 }
 
@@ -62,11 +109,7 @@ impl Source for Alpaca {
     }
 
     fn label(&self) -> &'static str {
-        if self.feed == "iex" {
-            "Alpaca (IEX, free)"
-        } else {
-            "Alpaca (all exchanges)"
-        }
+        self.label
     }
 
     fn venue(&self) -> &'static str {
@@ -89,10 +132,9 @@ impl Source for Alpaca {
             } else {
                 Feed::Consolidated
             },
-            // `adjustment=split`, matching the other two sources. Alpaca's
-            // default is `raw`, which would make every split read as a crash —
-            // so it is passed explicitly at the call site.
-            adjustment: Adjustment::Split,
+            // Always passed explicitly at the call site: Alpaca's default is
+            // `raw`, which would make every split read as a crash.
+            adjustment: self.adjustment,
         }
     }
 
@@ -117,8 +159,9 @@ impl Source for Alpaca {
         loop {
             let mut url = format!(
                 "{DATA}/v2/stocks/bars?symbols={symbol}&timeframe={}&start={from}&end={to}\
-                 &adjustment=split&feed={}&limit={PAGE}",
+                 &adjustment={}&feed={}&limit={PAGE}",
                 spelling(interval)?,
+                adjustment_parameter(self.adjustment),
                 self.feed,
             );
             if let Some(token) = &page {
@@ -139,6 +182,14 @@ impl Source for Alpaca {
 
         bars.sort_by_key(|bar| bar.at);
         bars.dedup_by_key(|bar| bar.at);
+        // Alpaca aggregates pre-market and after-hours trades into its bars
+        // and has no parameter to leave them out — Robinhood is asked for
+        // `bounds=regular` and Yahoo omits them by default. Kept, they would
+        // form the opening range from 04:00 prints and break the 390-minute
+        // day every annualised figure assumes.
+        if interval.is_intraday() {
+            bars.retain(|bar| arvo_data::session::in_regular_session(bar.at));
+        }
         Ok(Fetched {
             bars,
             // Alpaca returns bars it has and omits the rest; nothing is
@@ -224,6 +275,33 @@ mod tests {
         // study silently run on whichever was fetched last.
         assert_ne!(Alpaca::iex().venue(), Alpaca::sip().venue());
         assert_ne!(Alpaca::iex().id(), Alpaca::sip().id());
+    }
+
+    #[test]
+    fn a_total_return_source_asks_for_it_and_declares_it() {
+        // The request and the declaration are one fact stated twice, and a
+        // file whose basis says one thing while its prices are the other is
+        // the error ADR-0013 exists to stop.
+        for source in [Alpaca::iex_total_return(), Alpaca::sip_total_return()] {
+            assert_eq!(source.basis().adjustment, Adjustment::TotalReturn);
+            assert_eq!(adjustment_parameter(source.adjustment), "all");
+        }
+        for source in [Alpaca::iex(), Alpaca::sip()] {
+            assert_eq!(source.basis().adjustment, Adjustment::Split);
+            assert_eq!(adjustment_parameter(source.adjustment), "split");
+        }
+    }
+
+    #[test]
+    fn a_total_return_series_keeps_its_feed() {
+        assert_eq!(
+            Alpaca::iex_total_return().basis().feed,
+            Alpaca::iex().basis().feed
+        );
+        assert_eq!(
+            Alpaca::sip_total_return().basis().feed,
+            Alpaca::sip().basis().feed
+        );
     }
 
     #[test]
