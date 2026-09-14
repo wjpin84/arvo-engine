@@ -328,14 +328,27 @@ fn splits(bars: &[Bar], out: &mut Vec<Finding>) {
 /// module's own preamble warns about, found by running it on real data rather
 /// than on a test that only ever used one price level.
 ///
+/// # Against bars at the same time of day, and why the second version was wrong
+///
+/// One median for a whole intraday series compares the opening bar with
+/// lunchtime. The open carries the overnight news and the opening auction, and
+/// its range is routinely ten times a midday bar's — so on a year of real
+/// five-minute AAPL from Alpaca, 18 of 22 bars this flagged were the open or
+/// the bar after it. The same crying-wolf failure, in a new shape.
+///
+/// So each bar is measured against the median of bars at the same clock time.
+/// A daily series has one time, midnight, and is measured exactly as before.
+/// Times are UTC, so daylight saving splits the open into two groups (13:30 and
+/// 14:30) of about half a year each; a group too small for a median is not
+/// judged at all, which is the right way for this to be silent.
+///
 /// Real markets do produce genuine outliers; so do bad prints, and the two
 /// look identical from here. That is why it is a suspicion rather than a
 /// fault.
 fn outliers(bars: &[Bar], out: &mut Vec<Finding>) {
-    if bars.len() < 20 {
-        // Too short for a median to describe anything.
-        return;
-    }
+    /// Fewer bars than this in a group is too few for a median to describe.
+    const MIN_GROUP: usize = 20;
+
     let relative = |bar: &Bar| {
         if bar.close > 0.0 {
             (bar.high - bar.low) / bar.close
@@ -344,14 +357,24 @@ fn outliers(bars: &[Bar], out: &mut Vec<Finding>) {
         }
     };
 
-    let mut ranges: Vec<f64> = bars.iter().map(relative).collect();
-    ranges.sort_by(f64::total_cmp);
-    let median = ranges[ranges.len() / 2];
-    if median <= 0.0 {
-        return;
+    let mut by_time: BTreeMap<chrono::NaiveTime, Vec<f64>> = BTreeMap::new();
+    for bar in bars {
+        by_time.entry(bar.at.time()).or_default().push(relative(bar));
     }
+    let medians: BTreeMap<chrono::NaiveTime, f64> = by_time
+        .into_iter()
+        .filter(|(_, ranges)| ranges.len() >= MIN_GROUP)
+        .map(|(time, mut ranges)| {
+            ranges.sort_by(f64::total_cmp);
+            (time, ranges[ranges.len() / 2])
+        })
+        .filter(|(_, median)| *median > 0.0)
+        .collect();
 
     for bar in bars {
+        let Some(&median) = medians.get(&bar.at.time()) else {
+            continue;
+        };
         let range = relative(bar);
         if range > median * OUTLIER {
             out.push(Finding {
@@ -576,6 +599,56 @@ mod tests {
             "a constant relative range is not an outlier at any price level: {:?}",
             report.findings
         );
+    }
+
+    /// Five-minute bars over `days` sessions: a quiet day, with an opening bar
+    /// whose range is `open_range` of price.
+    fn sessions(days: i64, open_range: f64) -> Vec<Bar> {
+        let first = chrono::NaiveDate::from_ymd_opt(2024, 7, 1).expect("valid");
+        (0..days)
+            .flat_map(|day| {
+                (0..78).map(move |slot| {
+                    let at = (first + chrono::Duration::days(day))
+                        .and_hms_opt(13, 30, 0)
+                        .expect("valid")
+                        + chrono::Duration::minutes(5 * slot);
+                    let range = if slot == 0 { open_range } else { 0.001 };
+                    Bar {
+                        at,
+                        open: 100.0,
+                        high: 100.0 * (1.0 + range / 2.0),
+                        low: 100.0 * (1.0 - range / 2.0),
+                        close: 100.0,
+                        volume: 1_000.0,
+                    }
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_ordinary_opening_bar_is_not_an_outlier() {
+        // Found on a real year of Alpaca AAPL: the open's range is routinely
+        // ten times midday's, and one median for the day flagged the open.
+        let interval = BarInterval::new(5, crate::IntervalUnit::Minute);
+        let report = inspect(&sessions(30, 0.015), interval);
+        assert!(
+            !kinds(&report).contains(&"outlier"),
+            "an open fifteen times midday, every day, is the market: {:?}",
+            report.findings.iter().filter(|f| f.kind == "outlier").count()
+        );
+    }
+
+    #[test]
+    fn a_bad_print_at_midday_still_stands_out_against_midday() {
+        let interval = BarInterval::new(5, crate::IntervalUnit::Minute);
+        let mut bars = sessions(30, 0.015);
+        let noon = 30; // day 0, 16:00 UTC
+        bars[noon].high = 105.0;
+        let report = inspect(&bars, interval);
+        let flagged: Vec<_> = report.findings.iter().filter(|f| f.kind == "outlier").collect();
+        assert_eq!(flagged.len(), 1, "{flagged:?}");
+        assert_eq!(flagged[0].at, Some(bars[noon].at));
     }
 
     #[test]
