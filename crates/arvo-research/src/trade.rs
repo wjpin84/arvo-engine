@@ -356,8 +356,7 @@ pub fn equity_curve(
             match trade.closed {
                 Some(closed) if closed <= at => equity += trade.pnl,
                 // Held right now: mark it to the latest close of the
-                // instrument it is in. Long-only, so the sign is the price
-                // move.
+                // instrument it is in. A short gains what the price loses.
                 _ if trade.opened <= at => {
                     // An empty instrument is a ledger from before trades named
                     // one, which only ever happens on a single-instrument run
@@ -369,7 +368,11 @@ pub fn equity_curve(
                         last_close.get(trade.instrument.as_str())
                     };
                     if let Some(close) = close {
-                        equity += trade.quantity * (close - trade.entry);
+                        let sign = match trade.direction {
+                            Direction::Long => 1.0,
+                            Direction::Short => -1.0,
+                        };
+                        equity += sign * trade.quantity * (close - trade.entry);
                     }
                 }
                 _ => {}

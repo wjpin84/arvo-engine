@@ -14,7 +14,7 @@ use arvo_research::{Direction, ExitReason, Trade};
 use nautilus_common::cache::Cache;
 use nautilus_core::UnixNanos;
 use nautilus_model::{
-    enums::PositionSide,
+    enums::OrderSide,
     orders::Order,
     position::Position,
 };
@@ -90,12 +90,12 @@ fn to_trade(cache: &Cache, position: &Position) -> Trade {
         instrument: position.instrument_id.to_string(),
         opened: instant(position.ts_opened),
         closed: position.ts_closed.map(instant),
-        direction: match position.side {
-            PositionSide::Short => Direction::Short,
-            // Flat is only reachable for a position that never held anything,
-            // which cannot produce a fill. Long is the honest reading of a
-            // record that exists at all.
-            PositionSide::Long | PositionSide::Flat => Direction::Long,
+        // From the side that opened it, not the side it is on now: a closed
+        // position is flat, and reading that as long reported every short
+        // ever closed as a long — found the first time anything sold to open.
+        direction: match position.entry {
+            OrderSide::Sell => Direction::Short,
+            _ => Direction::Long,
         },
         quantity,
         entry: position.avg_px_open,

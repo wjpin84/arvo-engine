@@ -28,6 +28,7 @@ pub mod advice;
 pub mod agent_search;
 pub mod book;
 pub mod breadth;
+pub mod collateral;
 pub mod correlation;
 pub mod dividend;
 pub mod evaluation;

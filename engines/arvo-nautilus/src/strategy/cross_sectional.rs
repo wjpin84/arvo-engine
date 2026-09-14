@@ -259,6 +259,7 @@ impl CrossSectionalMomentum {
             // they do, because the account is read from the engine rather than
             // tallied per instrument.
             let decision = super::decide_entry(
+                false,
                 position.risk(),
                 position.default_size(),
                 &id.to_string(),

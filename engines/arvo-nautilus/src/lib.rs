@@ -79,6 +79,10 @@ const ENGINE: &str = "nautilus 0.63.0";
 /// The strategies wired up so far. See [`strategy`] for why these two.
 const SMA_CROSS: &str = "sma_cross";
 const BUY_AND_HOLD: &str = arvo_research::evaluation::BUY_AND_HOLD;
+/// Sell an option to open and hold it to expiry (#84). Not in [`STRATEGIES`]:
+/// it only means anything on an option contract, and nothing that offers the
+/// menu can run one yet.
+pub const SELL_AND_HOLD: &str = "sell_and_hold";
 const OPENING_RANGE: &str = "opening_range";
 const VOLATILITY_BREAKOUT: &str = "volatility_breakout";
 const VWAP_REVERSION: &str = "vwap_reversion";
@@ -407,6 +411,9 @@ enum Plan {
     BuyAndHold {
         trade_size: f64,
     },
+    SellAndHold {
+        trade_size: f64,
+    },
 }
 
 impl Plan {
@@ -522,6 +529,9 @@ impl Plan {
             BUY_AND_HOLD => Ok(Self::BuyAndHold {
                 trade_size: trade_size()?,
             }),
+            SELL_AND_HOLD => Ok(Self::SellAndHold {
+                trade_size: trade_size()?,
+            }),
             _ => Err(SimulationError::UnknownStrategy(spec.name.clone())),
         }
     }
@@ -544,7 +554,7 @@ impl Plan {
             Self::CrossSectionalMomentum { lookback, .. } => *lookback,
             // One to buy on, and at least one more for the position to have
             // done anything.
-            Self::BuyAndHold { .. } => 1,
+            Self::BuyAndHold { .. } | Self::SellAndHold { .. } => 1,
         }
     }
 
@@ -556,7 +566,8 @@ impl Plan {
             | Self::VwapReversion { trade_size, .. }
             | Self::MomentumBreakout { trade_size, .. }
             | Self::CrossSectionalMomentum { trade_size, .. }
-            | Self::BuyAndHold { trade_size } => *trade_size,
+            | Self::BuyAndHold { trade_size }
+            | Self::SellAndHold { trade_size } => *trade_size,
         }
     }
 }
@@ -934,6 +945,13 @@ fn run_backtest(
                     correlations.clone(),
                 ))
             }
+            Plan::SellAndHold { .. } => engine.add_strategy(strategy::SellAndHold::new(
+                core,
+                bar_type,
+                trade_size,
+                risk,
+                correlations.clone(),
+            )),
             Plan::CrossSectionalMomentum { .. } => {
                 // Added once for the whole set above, and returned before
                 // reaching here. The compiler cannot see that, so this says
@@ -1790,6 +1808,17 @@ mod tests {
     /// as the underlying. The contract's own bars stop at its expiration, as a
     /// real contract's do; the underlying's run on to July.
     fn held_through_expiry(contract: &str) -> (SimulationResult, Vec<arvo_data::Bar>, Experiment) {
+        held_as(BUY_AND_HOLD, contract, 100_000.0, 100.0)
+    }
+
+    /// As [`held_through_expiry`], by any hold-to-expiry rule, account size
+    /// and trade size.
+    fn held_as(
+        strategy: &str,
+        contract: &str,
+        starting_cash: f64,
+        trade_size: f64,
+    ) -> (SimulationResult, Vec<arvo_data::Bar>, Experiment) {
         let expires = arvo_data::option::OptionContract::parse(contract)
             .expect("a contract")
             .expiration;
@@ -1798,13 +1827,20 @@ mod tests {
             .into_iter()
             .filter(|bar| bar.at.date() <= expires)
             .collect();
-        let mut held = experiment(BTreeMap::from([("trade_size".to_owned(), 100.0)]), &underlying);
-        held.strategy.name = BUY_AND_HOLD.to_owned();
+        let mut held = experiment(
+            BTreeMap::from([("trade_size".to_owned(), trade_size)]),
+            &underlying,
+        );
+        held.strategy.name = strategy.to_owned();
         held.instrument = contract.to_owned();
         held.underlying = Some(UNDERLYING.to_owned());
-        // A commission, so the reconciliation has settlement fills to get wrong.
+        held.starting_cash = starting_cash;
+        // Commission and both sell-side fees, so the reconciliation has
+        // settlement fills and a short's selling entry to get wrong.
         held.costs = CostModel {
             commission_bps: 2.0,
+            per_unit_sold: 0.001,
+            sell_notional_bps: 0.3,
             ..spread(arvo_research::OptionSpread::MEASURED)
         };
         let result = NautilusSimulation::new(
@@ -1973,6 +2009,68 @@ mod tests {
         assert_eq!(result.ledger.len(), 1, "{:?}", result.ledger);
         assert!((result.ledger[0].pnl - large.ledger[0].pnl).abs() < 1e-9);
         assert_eq!(arvo_research::reconcile::reconcile(&small, &result), Vec::new());
+    }
+
+    #[test]
+    fn a_sold_put_that_expires_worthless_keeps_its_premium() {
+        // Strike 100 against an underlying that ends near 107: out of the money.
+        let (result, _, held) = held_as(SELL_AND_HOLD, "SPY240315P00100000.AOPT", 100_000.0, 100.0);
+        let [short] = result.ledger.as_slice() else {
+            panic!("one short: {:?}", result.ledger);
+        };
+        assert_eq!(short.direction, arvo_research::Direction::Short, "read from the side that opened it");
+        assert_eq!(short.exit_reason, arvo_research::ExitReason::Expired);
+        assert_eq!(short.exit, Some(0.0));
+        assert!((short.pnl - (short.entry * 100.0 - short.commission)).abs() < 1e-6, "{short:?}");
+        assert!(short.pnl > 0.0);
+        assert!((final_equity(&result) - (100_000.0 + short.pnl)).abs() < 0.01);
+        assert_eq!(arvo_research::reconcile::reconcile(&held, &result), Vec::new());
+    }
+
+    #[test]
+    fn a_short_is_marked_against_itself_while_it_is_held() {
+        let contract = "SPY240315P00100000.AOPT";
+        let (result, _, _) = held_as(SELL_AND_HOLD, contract, 100_000.0, 100.0);
+        let short = &result.ledger[0];
+        // Mid-hold: the account is up by what the premium has fallen since the
+        // sale, not down by it.
+        let premiums = premium_path(200);
+        let bar = premiums
+            .iter()
+            .find(|bar| bar.at.date() == date(2024, 2, 1))
+            .expect("a bar");
+        let point = result
+            .equity_curve
+            .iter()
+            .find(|point| point.at == bar.at + chrono::Duration::days(1))
+            .expect("a point");
+        let expected = 100_000.0 - 100.0 * (bar.close - short.entry);
+        assert!((point.equity - expected).abs() < 0.01, "{} vs {expected}", point.equity);
+    }
+
+    #[test]
+    fn an_account_sells_only_the_puts_it_has_the_cash_to_secure() {
+        let contract = "SPY240315P00100000.AOPT";
+        // A 100-strike put reserves $10,000 a contract. Five are asked for.
+        let (enough, _, _) = held_as(SELL_AND_HOLD, contract, 100_000.0, 500.0);
+        assert!((enough.ledger[0].quantity - 500.0).abs() < 1e-9);
+        let (some, _, _) = held_as(SELL_AND_HOLD, contract, 25_000.0, 500.0);
+        assert!((some.ledger[0].quantity - 200.0).abs() < 1e-9, "two contracts' worth of cash");
+        let (none, _, _) = held_as(SELL_AND_HOLD, contract, 9_000.0, 500.0);
+        assert!(none.ledger.is_empty(), "not one contract's worth: {:?}", none.ledger);
+    }
+
+    #[test]
+    fn a_cash_account_does_not_sell_a_naked_call_or_a_stock() {
+        // Nautilus's cash account accepted both; the gate is what refuses them.
+        let (call, _, _) = held_as(SELL_AND_HOLD, "SPY240315C00100000.AOPT", 1e9, 100.0);
+        assert!(call.ledger.is_empty(), "{:?}", call.ledger);
+
+        let bars = sawtooth(60);
+        let mut stock = experiment(BTreeMap::from([("trade_size".to_owned(), 100.0)]), &bars);
+        stock.strategy.name = SELL_AND_HOLD.to_owned();
+        let result = provider(bars).run(&stock).expect("runs");
+        assert!(result.ledger.is_empty(), "{:?}", result.ledger);
     }
 
     #[test]

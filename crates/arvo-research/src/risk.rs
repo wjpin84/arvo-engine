@@ -212,6 +212,12 @@ pub struct Proposal {
     /// sizing applies — and omitting it here would have made the same rule
     /// trade the whole account live and a hundred shares in the backtest.
     pub desired_quantity: Option<f64>,
+    /// Whether this sells to open rather than buys (#84).
+    ///
+    /// Only an option contract may be sold short in a cash account, and only
+    /// with the cash to cover what it can lose at expiry already in hand — see
+    /// [`crate::collateral`].
+    pub opens_short: bool,
 }
 
 /// A position the account is actually holding.
@@ -285,6 +291,15 @@ pub enum Rejection {
     /// second signal as "buy the same amount again" is how one idea silently
     /// becomes three.
     AlreadyHeld { quantity: f64 },
+    /// Selling this to open would leave an expiration net short calls, which
+    /// loses without limit and so cannot be secured by any amount of cash.
+    Uncovered {
+        underlying: String,
+        expiration: NaiveDate,
+    },
+    /// A cash account cannot borrow shares to sell. Only option contracts are
+    /// sold to open, against cash.
+    CannotShort { instrument: String },
 }
 
 /// What the gate decided.
@@ -838,6 +853,10 @@ fn correlation_check(
 /// ponytail: the fill lands at the next bar's price, not the reference, and
 /// slippage rounds up to a whole tick. Flooring to whole shares absorbs both
 /// almost always; a gap past the slack is still refused, and now counted.
+/// The most contracts one proposal may sell, however much cash there is. A
+/// bound on the collateral search, not a trading limit anyone should meet.
+const MAX_CONTRACTS: u32 = 10_000;
+
 fn size(
     model: &RiskModel,
     account: &AccountState<'_>,
@@ -880,10 +899,57 @@ fn size(
         )
     });
     let ceiling = model.max_position_fraction.unwrap_or(1.0);
+
+    // Cash already promised against the options the account is short (#84). A
+    // cash account cannot spend it twice, and the venue's free balance does not
+    // know it is promised: selling a put *adds* its premium to that balance.
+    let held: Vec<(&str, f64)> = account
+        .positions
+        .iter()
+        .map(|(name, position)| (name.as_str(), position.quantity))
+        .collect();
+    let reserve = match crate::collateral::reserved(held.iter().copied()) {
+        Ok(reserve) => reserve,
+        Err(uncovered) => {
+            return Decision::Reject(Rejection::Uncovered {
+                underlying: uncovered.underlying,
+                expiration: uncovered.expiration,
+            })
+        }
+    };
+    let spendable = account.spendable.map(|cash| cash - reserve);
+
+    if proposal.opens_short {
+        if lot <= 1.0 {
+            return Decision::Reject(Rejection::CannotShort {
+                instrument: proposal.instrument.clone(),
+            });
+        }
+        // Sized by the cash its worst case at expiry needs, not by its premium:
+        // selling a $2 put asks for $200 and can cost $64,000.
+        let available = spendable
+            .unwrap_or(starting_cash)
+            .min(starting_cash * ceiling)
+            - per_fill;
+        let wanted = by_risk
+            .or(proposal.desired_quantity)
+            .map_or(MAX_CONTRACTS, |units| (units / lot).floor().clamp(0.0, f64::from(MAX_CONTRACTS)) as u32);
+        return match crate::collateral::sellable(&held, &proposal.instrument, available, wanted) {
+            Err(uncovered) => Decision::Reject(Rejection::Uncovered {
+                underlying: uncovered.underlying,
+                expiration: uncovered.expiration,
+            }),
+            Ok(0) => Decision::Reject(Rejection::TooSmall {
+                affordable: available.max(0.0),
+            }),
+            Ok(contracts) => Decision::Accept {
+                quantity: f64::from(contracts) * lot,
+            },
+        };
+    }
+
     let by_cap = ((starting_cash * ceiling - per_fill) / per_unit).max(0.0);
-    let by_cash = account
-        .spendable
-        .map(|cash| ((cash - per_fill) / per_unit).max(0.0));
+    let by_cash = spendable.map(|cash| ((cash - per_fill) / per_unit).max(0.0));
     let by_cap = by_cash.map_or(by_cap, |by_cash| by_cap.min(by_cash));
 
     // Risk sizing wins where it applies; otherwise what was asked for; and the
@@ -928,6 +994,7 @@ mod tests {
             reference_price: 100.0,
             stop_distance: Some(2.0),
             desired_quantity: None,
+            opens_short: false,
         }
     }
 
@@ -1361,6 +1428,73 @@ mod tests {
             None,
             costs,
         )
+    }
+
+    /// One decision against a $100k account holding `positions`, with $100k
+    /// spendable.
+    fn decided(positions: BTreeMap<String, Position>, proposal: &Proposal) -> Decision {
+        decide(
+            &model(),
+            &AccountState {
+                positions: &positions,
+                realised_today: 0.0,
+                starting_cash: 100_000.0,
+                equity: 100_000.0,
+                day_trades_used: 0,
+                halted: None,
+                spendable: Some(100_000.0),
+            },
+            proposal,
+            proposal.signalled_at,
+            i64::MAX,
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn a_short_put_is_sized_by_its_strike_not_its_premium() {
+        let sale = Proposal {
+            reference_price: 2.0,
+            desired_quantity: Some(500.0),
+            opens_short: true,
+            ..proposal("SPY250912P00300000.AOPT")
+        };
+        // $30,000 a contract against $100k: three, not the 500 units $2 a share
+        // would suggest.
+        assert_eq!(decided(BTreeMap::new(), &sale), Decision::Accept { quantity: 300.0 });
+    }
+
+    #[test]
+    fn cash_promised_to_a_short_put_cannot_buy_anything_else() {
+        let held = BTreeMap::from([(
+            "SPY250912P00640000.AOPT".to_owned(),
+            Position { quantity: -100.0, entry: 2.0 },
+        )]);
+        let greedy = Proposal {
+            desired_quantity: Some(1_000_000.0),
+            ..proposal("MSFT.RH")
+        };
+        // $100k spendable, $64k of it reserved: 360 shares at $100, not 1,000.
+        assert_eq!(decided(held, &greedy), Decision::Accept { quantity: 360.0 });
+    }
+
+    #[test]
+    fn a_cash_account_does_not_short_stock_or_sell_an_uncovered_call() {
+        let stock = Proposal { opens_short: true, ..proposal("MSFT.RH") };
+        assert!(matches!(
+            decided(BTreeMap::new(), &stock),
+            Decision::Reject(Rejection::CannotShort { .. })
+        ));
+        let call = Proposal {
+            reference_price: 2.0,
+            opens_short: true,
+            ..proposal("SPY250912C00700000.AOPT")
+        };
+        assert!(matches!(
+            decided(BTreeMap::new(), &call),
+            Decision::Reject(Rejection::Uncovered { .. })
+        ));
     }
 
     #[test]
