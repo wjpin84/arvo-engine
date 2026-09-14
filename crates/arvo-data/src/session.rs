@@ -36,6 +36,13 @@ pub fn in_regular_session(open: NaiveDateTime) -> bool {
     local >= start && local < end
 }
 
+/// The regular close on `date`, 16:00 New York, as a UTC instant.
+#[must_use]
+pub fn regular_close(date: NaiveDate) -> NaiveDateTime {
+    let offset = if daylight_saving(date) { 4 } else { 5 };
+    date.and_hms_opt(16, 0, 0).expect("valid") + Duration::hours(offset)
+}
+
 /// Whether US Eastern time is on daylight saving on `date`.
 fn daylight_saving(date: NaiveDate) -> bool {
     let year = date.year();
