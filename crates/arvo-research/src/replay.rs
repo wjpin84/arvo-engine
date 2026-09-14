@@ -577,6 +577,7 @@ mod tests {
             strategy_trades: crate::TradeStats::default(),
             strategy_ledger: Vec::new(),
             dividend_gap: None,
+            stress: None,
             refused_orders: crate::Refused::default(),
             benchmark_instruments: Vec::new(),
             excess_return: 0.1,

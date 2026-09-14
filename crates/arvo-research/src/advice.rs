@@ -149,6 +149,7 @@ fn option_tail(
     experiment: &crate::Experiment,
     curve: &[crate::EquityPoint],
     ledger: &[crate::Trade],
+    stress: Option<&crate::stress::Stress>,
 ) -> Vec<Recommendation> {
     // An option run is one whose instrument is a contract, or one that traded
     // contracts while reading something else — a put spread runs on SPY and
@@ -161,6 +162,32 @@ fn option_tail(
         return Vec::new();
     }
     let mut out = Vec::new();
+    if let Some(worst) = stress.and_then(crate::stress::Stress::worst) {
+        let share = worst.loss / experiment.starting_cash;
+        out.push(Recommendation::new(
+            if share >= 0.10 { Severity::Blocking } else { Severity::Warning },
+            "On the market's worst day, one position held here would have lost this.",
+            "Read this before any return. It is a floor: puts are priced at the VIX, not at \
+             the steeper volatility a crash gives them, and the whole day lands at once.",
+            format!(
+                "{} ({}): SPY {:+.1}%, VIX {:.0} -> {} opened {} loses {:.0} ({:.1}% of the \
+                 account){}",
+                worst.day,
+                worst.what,
+                worst.spot_move * 100.0,
+                worst.vix,
+                worst.position,
+                worst.opened,
+                worst.loss,
+                share * 100.0,
+                if worst.credit > 0.0 {
+                    format!(", {:.1}x the credit it took in", worst.loss / worst.credit)
+                } else {
+                    String::new()
+                },
+            ),
+        ));
+    }
     if let Some(tail) = crate::evaluation::tail(curve) {
         out.push(Recommendation::new(
             Severity::Warning,
@@ -300,6 +327,7 @@ pub fn recommend(found: &FamilyEvidence) -> Vec<Recommendation> {
         &found.out_of_sample_evidence.experiment,
         &evaluation.strategy_curve,
         &evaluation.strategy_ledger,
+        evaluation.stress.as_ref(),
     ));
 
     // The benchmark starves the same way the strategy does, out of the same
@@ -925,7 +953,16 @@ pub fn recommend_walk_forward(found: &WalkForwardEvidence) -> Vec<Recommendation
         .iter()
         .flat_map(|fold| fold.out_of_sample_evidence.evaluation.strategy_ledger.iter().cloned())
         .collect();
-    out.extend(option_tail(&found.template, &found.combined_curve, &fold_ledgers));
+    // The worst shock any fold's positions took.
+    let stress = found
+        .folds
+        .iter()
+        .filter_map(|fold| fold.out_of_sample_evidence.evaluation.stress.as_ref())
+        .max_by(|a, b| {
+            let loss = |s: &crate::stress::Stress| s.worst().map_or(f64::NEG_INFINITY, |w| w.loss);
+            loss(a).total_cmp(&loss(b))
+        });
+    out.extend(option_tail(&found.template, &found.combined_curve, &fold_ledgers, stress));
 
     for axis in &found.stability {
         if axis.distinct > 1 && axis.modal_share < MODAL_SHARE_FLOOR {
@@ -1211,17 +1248,37 @@ mod tests {
 
         let mut option = experiment();
         option.instrument = "SPY240621P00500000.AOPT".to_owned();
-        let advice = option_tail(&option, &curve, &[]);
+        let advice = option_tail(&option, &curve, &[], None);
         assert_eq!(advice.len(), 2);
         assert!(advice[0].evidence.contains("worst 1day -15.0%"), "{}", advice[0].evidence);
         assert!(advice[0].evidence.contains("worst month"), "{}", advice[0].evidence);
         assert!(advice[1].finding.contains("no crash"));
 
-        assert!(option_tail(&experiment(), &curve, &[]).is_empty(), "a stock run is unaffected");
+        assert!(option_tail(&experiment(), &curve, &[], None).is_empty(), "a stock run is unaffected");
         // A put spread reads SPY and holds puts: its ledger makes it an option run.
         let mut put = trade(0, 3, -50.0, ExitReason::Signal);
         put.instrument = "SPY240621P00500000.AOPT".to_owned();
-        assert_eq!(option_tail(&experiment(), &curve, &[put]).len(), 2);
+        assert_eq!(option_tail(&experiment(), &curve, &[put.clone()], None).len(), 2);
+
+        // With a replay, the crash leads, and blocks once it would take a tenth
+        // of the account.
+        let stress = crate::stress::Stress {
+            shocks: vec![crate::stress::Shock {
+                day: chrono::NaiveDate::from_ymd_opt(2020, 3, 16).expect("valid"),
+                what: "covid crash".to_owned(),
+                spot_move: -0.1094,
+                vix: 82.69,
+                position: put.instrument.clone(),
+                opened: put.opened,
+                loss: 12_000.0,
+                credit: 300.0,
+            }],
+            unpriced: 0,
+        };
+        let advice = option_tail(&experiment(), &curve, &[put], Some(&stress));
+        assert_eq!(advice.len(), 3);
+        assert_eq!(advice[0].severity, Severity::Blocking);
+        assert!(advice[0].evidence.contains("40.0x the credit"), "{}", advice[0].evidence);
     }
 
     #[test]
@@ -1624,6 +1681,7 @@ mod tests {
                         strategy_trades: TradeStats::default(),
                         strategy_ledger: Vec::new(),
                 dividend_gap: None,
+                stress: None,
                 refused_orders: crate::Refused::default(),
                         benchmark_instruments: Vec::new(),
                         excess_return: 0.2,
