@@ -583,6 +583,17 @@ pub struct Comparison {
     /// `None` means the two are on the same basis and the agreement below says
     /// what it appears to say.
     pub basis_mismatch: Option<String>,
+    /// Whether the two declare different adjustment bases.
+    ///
+    /// Separate from [`Self::basis_mismatch`] because it changes how a
+    /// divergence is read, and a feed difference does not. A total-return
+    /// series departs from a split-adjusted one by a factor that steps at
+    /// every ex-date — not a constant, so [`crate::agreement`] reports
+    /// `Diverged` rather than `Rescaled` — and on real KO that was "6,222 of
+    /// 6,284 bars genuinely disagree". Both vendors were right. A thin feed
+    /// against the tape, by contrast, should still agree on price, so a
+    /// divergence there stays a divergence.
+    pub adjustments_differ: bool,
     pub agreement: crate::agreement::Agreement,
     pub coverage: crate::agreement::Coverage,
 }
@@ -624,6 +635,7 @@ pub async fn compare(
         // Read from what the sources declare, never from the bars: neither axis
         // is visible in them. That is the whole reason this is a declaration.
         basis_mismatch: first.basis().mismatch_with(second.basis()),
+        adjustments_differ: first.basis().adjustment != second.basis().adjustment,
         agreement,
         coverage,
     })
@@ -1069,6 +1081,7 @@ mod tests {
         .await
         .unwrap();
 
+        assert!(outcome.adjustments_differ);
         let why = outcome.basis_mismatch.expect("different bases");
         assert!(why.contains("split-adjusted"), "{why}");
         assert!(why.contains("total-return adjusted"), "{why}");
