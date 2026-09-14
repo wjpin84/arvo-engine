@@ -238,7 +238,7 @@ impl Source for Alpaca {
 /// Alpaca caps minutes at 59 and hours at 23, and serves only a fixed set of
 /// month steps — so an unsupported step is refused rather than rounded, the
 /// same reasoning as the broker's spelling function.
-fn spelling(interval: BarInterval) -> Result<String, SourceError> {
+pub(crate) fn spelling(interval: BarInterval) -> Result<String, SourceError> {
     let step = interval.step;
     match interval.unit {
         IntervalUnit::Minute if (1..=59).contains(&step) => Ok(format!("{step}Min")),
