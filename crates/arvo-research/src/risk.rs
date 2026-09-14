@@ -319,6 +319,9 @@ pub struct RiskGate {
     today: NaiveDate,
     halted: Option<Halt>,
     max_signal_age_ms: i64,
+    /// What a fill costs on top of its price, so an entry is sized all in.
+    /// `None` sizes on price alone.
+    costs: Option<crate::CostModel>,
 }
 
 /// Why an account stopped trading, and whether it can be started again.
@@ -356,7 +359,16 @@ impl RiskGate {
             today,
             halted: None,
             max_signal_age_ms: DEFAULT_MAX_SIGNAL_AGE_MS,
+            costs: None,
         }
+    }
+
+    /// Sizes entries against what a fill is assumed to cost, as the backtest
+    /// that produced the strategy did. See ADR-0015.
+    #[must_use]
+    pub const fn with_costs(mut self, costs: crate::CostModel) -> Self {
+        self.costs = Some(costs);
+        self
     }
 
     /// Overrides the staleness window. See [`DEFAULT_MAX_SIGNAL_AGE_MS`].
@@ -435,6 +447,23 @@ impl RiskGate {
         now: NaiveDateTime,
         correlations: Option<&dyn Correlations>,
     ) -> Decision {
+        self.propose_within(proposal, now, correlations, None)
+    }
+
+    /// As [`Self::propose`], with the cash the account can spend right now.
+    ///
+    /// The book is the gate's; the cash is the venue's. A gate that tracked
+    /// cash itself would be a second running total of something the broker
+    /// already holds — so the caller asks the broker and hands it in, and
+    /// `None` leaves the ceiling off.
+    #[must_use]
+    pub fn propose_within(
+        &self,
+        proposal: &Proposal,
+        now: NaiveDateTime,
+        correlations: Option<&dyn Correlations>,
+        spendable: Option<f64>,
+    ) -> Decision {
         decide(
             &self.model,
             &AccountState {
@@ -444,16 +473,13 @@ impl RiskGate {
                 equity: self.equity,
                 day_trades_used: self.day_trades_used(now.date()),
                 halted: self.halted(),
-                // ponytail: a live session knows its cash only through the
-                // broker, and nothing hands the gate buying power yet. The venue
-                // refuses what cannot be paid for, and `Session` reports it.
-                spendable: None,
+                spendable,
             },
             proposal,
             now,
             self.max_signal_age_ms,
             correlations,
-            None,
+            self.costs.as_ref(),
         )
     }
 

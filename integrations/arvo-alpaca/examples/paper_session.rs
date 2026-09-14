@@ -57,7 +57,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         RiskGate::new(RiskModel::default(), STARTING_CASH, now().date()),
         executor,
     );
-    println!("venue: {} (paper)", session.executor().venue());
+    println!(
+        "venue: {} (paper), buying power {:?}",
+        session.executor().venue(),
+        session.executor().buying_power().await?,
+    );
 
     // 1. Reconcile.
     let found = session.reconcile(now(), VENUE).await?;

@@ -359,6 +359,22 @@ pub trait Executor: Send + Sync {
     /// An order that has already filled or been cancelled is the venue's to
     /// refuse, and refusing is the right answer.
     async fn cancel(&self, order: &OrderId) -> Result<(), ExecutionError>;
+
+    /// What the account can spend on a new position right now, as the venue
+    /// counts it — already net of orders it has working.
+    ///
+    /// `None` when this venue cannot say, which leaves the gate's cash ceiling
+    /// off: entries are sized on the opening balance and the venue refuses
+    /// what cannot be paid for. Defaulted for that reason — unlike
+    /// [`Self::at_venue`], not knowing degrades to the old behaviour rather
+    /// than to a silently wrong answer. See ADR-0015.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecutionError`] if the venue cannot be reached.
+    async fn buying_power(&self) -> Result<Option<f64>, ExecutionError> {
+        Ok(None)
+    }
 }
 
 /// A live or paper trading session: one gate, one venue, many proposers.
@@ -438,7 +454,11 @@ impl<E: Executor> Session<E> {
         now: NaiveDateTime,
         correlations: Option<&dyn arvo_research::risk::Correlations>,
     ) -> Result<Option<OrderId>, ExecutionError> {
-        match self.gate.propose(proposal, now, correlations) {
+        // Asked per proposal, not cached: every fill and every working order
+        // changes it, and a stale figure is the refused order this exists to
+        // prevent.
+        let spendable = self.executor.buying_power().await?;
+        match self.gate.propose_within(proposal, now, correlations, spendable) {
             Decision::Reject(rejection) => {
                 self.refusals.push((proposal.proposer.clone(), rejection));
                 Ok(None)
@@ -810,6 +830,83 @@ mod tests {
         // Armed regardless. The exits failing is the reason to stop trading,
         // not a reason to carry on.
         assert!(session.gate().halted().is_some());
+    }
+
+    /// A venue with a stated amount to spend, remembering what it was sent.
+    struct Funded {
+        cash: Option<f64>,
+        sent: std::sync::Mutex<Vec<f64>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Executor for Funded {
+        fn venue(&self) -> &str {
+            "funded"
+        }
+
+        async fn submit(&self, order: &Order) -> Result<OrderId, ExecutionError> {
+            self.sent.lock().expect("unpoisoned").push(order.quantity);
+            Ok(OrderId("o".to_owned()))
+        }
+
+        async fn drain(&self) -> Result<(Vec<Execution>, usize), ExecutionError> {
+            Ok((Vec::new(), 0))
+        }
+
+        async fn at_venue(&self) -> Result<VenueState, ExecutionError> {
+            Ok(VenueState::default())
+        }
+
+        async fn cancel(&self, _: &OrderId) -> Result<(), ExecutionError> {
+            Ok(())
+        }
+
+        async fn buying_power(&self) -> Result<Option<f64>, ExecutionError> {
+            Ok(self.cash)
+        }
+    }
+
+    async fn sent_for(cash: Option<f64>) -> Vec<f64> {
+        use arvo_research::{
+            risk::{Proposal, RiskGate},
+            CostModel, RiskModel,
+        };
+        let gate = RiskGate::new(RiskModel::default(), 100_000.0, day())
+            .with_costs(CostModel::proportional(1.0, 1.0));
+        let mut session = Session::new(
+            gate,
+            Funded {
+                cash,
+                sent: std::sync::Mutex::default(),
+            },
+        );
+        let signalled = at(30, 0, 0);
+        let proposal = Proposal {
+            instrument: "MSFT.AIEX".to_owned(),
+            proposer: "test".to_owned(),
+            signalled_at: signalled,
+            reference_price: 100.0,
+            stop_distance: None,
+            desired_quantity: Some(5_000.0),
+        };
+        session
+            .propose(&proposal, signalled, None)
+            .await
+            .expect("the venue answered");
+        let sent = session.executor().sent.lock().expect("unpoisoned").clone();
+        sent
+    }
+
+    #[tokio::test]
+    async fn a_live_entry_is_capped_at_what_the_broker_says_it_can_spend() {
+        // ADR-0015's follow-up. The gate sizes off the opening balance, so an
+        // account down to $20,000 kept proposing $100,000 of stock and the
+        // broker refused it. Asked per proposal, the venue's figure caps it.
+        let capped = sent_for(Some(20_000.0)).await;
+        assert_eq!(capped, vec![199.0], "$20,000 all in at $100.02 a share");
+
+        let unknown = sent_for(None).await;
+        assert_eq!(unknown, vec![999.0], "a venue that cannot say leaves the ceiling off, costs still in");
     }
 
     /// A venue that already holds things, to exercise the one case a paper

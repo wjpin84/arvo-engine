@@ -216,6 +216,35 @@ impl Executor for AlpacaExecutor {
             .await
             .map_err(|err| rejected(self.venue, &err))
     }
+
+    async fn buying_power(&self) -> Result<Option<f64>, ExecutionError> {
+        let account = auth::get(&format!("{}/v2/account", self.api))
+            .await
+            .map_err(|err| transport(self.venue, &err))?;
+        buying_power(self.venue, &account).map(Some)
+    }
+}
+
+/// What the account can buy with, from `GET /v2/account`.
+///
+/// `non_marginable_buying_power`, not `buying_power`. The second includes
+/// margin — on a $100,000 paper account it read $399,999.80, four times the
+/// cash — and the backtest the strategy came from is a cash account whose
+/// ceiling is its free cash. A live session sized against margin would take
+/// entries that backtest refused, which is the divergence ADR-0009 exists to
+/// prevent. This is cash, net of working orders.
+///
+/// Required: an account read without it is a shape change, and treating that
+/// as "cannot say" would switch the ceiling off without anyone deciding to.
+fn buying_power(venue: &str, account: &Value) -> Result<f64, ExecutionError> {
+    account
+        .get("non_marginable_buying_power")
+        .and_then(Value::as_str)
+        .and_then(|raw| raw.parse::<f64>().ok())
+        .ok_or_else(|| ExecutionError::Transport {
+            venue: venue.to_owned(),
+            detail: format!("the account has no readable non_marginable_buying_power: {account}"),
+        })
 }
 
 /// What the venue says the account holds.
@@ -480,6 +509,28 @@ mod tests {
         NaiveDate::from_ymd_opt(2026, 9, 9)
             .expect("valid")
             .and_time(NaiveTime::from_hms_opt(14, minute, second).expect("valid"))
+    }
+
+    #[test]
+    fn buying_power_is_read_from_the_account_as_alpaca_reports_it() {
+        // Alpaca sends money as strings, and margin inflates `buying_power` —
+        // the cash figure is the one a cash-account backtest was sized against.
+        let account = json!({
+            "cash": "100000",
+            "buying_power": "399999.8",
+            "non_marginable_buying_power": "99999.95",
+        });
+        assert!((buying_power("ALPACA-PAPER", &account).expect("readable") - 99_999.95).abs() < 1e-9);
+    }
+
+    #[test]
+    fn an_account_without_buying_power_is_an_error_not_an_unlimited_account() {
+        let Err(ExecutionError::Transport { detail, .. }) =
+            buying_power("ALPACA-PAPER", &json!({ "cash": "100000", "buying_power": "400000" }))
+        else {
+            panic!("a missing figure must not switch the ceiling off");
+        };
+        assert!(detail.contains("non_marginable_buying_power"), "{detail}");
     }
 
     fn order() -> Order {
