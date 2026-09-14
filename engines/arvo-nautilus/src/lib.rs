@@ -57,13 +57,13 @@ use nautilus_common::logging::logging_set_bypass;
 use nautilus_execution::models::{fee::FeeModelHandle, fill::FillModelHandle};
 use nautilus_core::UnixNanos;
 use nautilus_model::{
-    data::{Bar, BarSpecification, BarType, Data},
+    data::{Bar, BarSpecification, BarType, Data, IndexPriceUpdate},
     enums::{
         AccountType, AggregationSource, AssetClass, BarAggregation, BookType, OmsType, OptionKind,
         PriceType,
     },
     identifiers::{InstrumentId, Symbol},
-    instruments::{Equity, InstrumentAny, OptionContract},
+    instruments::{Equity, IndexInstrument, InstrumentAny, OptionContract},
     types::{Currency, Money, Price, Quantity},
 };
 use nautilus_trading::strategy::{StrategyConfig, StrategyCore};
@@ -197,22 +197,11 @@ impl<P: BarProvider> SimulationProvider for NautilusSimulation<P> {
             .iter()
             .filter_map(|name| arvo_data::option::OptionContract::parse(name))
             .collect();
-        // A position held through expiry is neither exercised nor assigned nor
-        // expired — it stays open, marked at its last trade, for as long as
-        // the window runs. Settlement is #84; until it exists a window that
-        // outlives a contract is refused rather than valued as if it had not.
-        if let Some(contract) = contracts
-            .iter()
-            .find(|contract| experiment.window.to > contract.expiration)
-        {
-            return Err(SimulationError::Rejected(format!(
-                "{} expires {} and the window runs to {}: settlement at expiry is not \
-                 modelled yet, so end the window on or before the expiration",
-                contract.symbol(),
-                contract.expiration,
-                experiment.window.to
-            )));
-        }
+        let settlement = if contracts.is_empty() {
+            None
+        } else {
+            Some(self.settlement(experiment, &contracts)?)
+        };
         if !contracts.is_empty() {
             if experiment.costs.option_spread.is_none() {
                 return Err(SimulationError::Rejected(
@@ -290,7 +279,78 @@ impl<P: BarProvider> SimulationProvider for NautilusSimulation<P> {
             )));
         }
 
-        run_backtest(experiment, &plan, &book)
+        run_backtest(experiment, &plan, &book, settlement.as_ref())
+    }
+}
+
+/// What an option run settles against at expiry (#84).
+struct Settlement {
+    /// The underlying's symbol, which Nautilus looks up on the option's venue.
+    symbol: String,
+    /// Each contract expiring inside the window, with the underlying's close on
+    /// that contract's expiration date.
+    closes: Vec<(arvo_data::option::OptionContract, f64)>,
+}
+
+impl<P: BarProvider> NautilusSimulation<P> {
+    /// The underlying an option run names, and its close on every expiration
+    /// the window reaches.
+    ///
+    /// Refused rather than run without, because a contract held to expiry
+    /// with nothing to settle against stays open and is marked at its last
+    /// trade for as long as the window runs — found exactly that way, holding
+    /// one for four months after it ceased to exist.
+    fn settlement(
+        &self,
+        experiment: &Experiment,
+        contracts: &[arvo_data::option::OptionContract],
+    ) -> Result<Settlement, SimulationError> {
+        let rejected = |why: String| SimulationError::Rejected(why);
+        let name = experiment.underlying.as_deref().ok_or_else(|| {
+            rejected(
+                "an option run needs `underlying`, the stock series it settles against \
+                 (e.g. SPY.AIEX): without it a contract held to expiry is never settled"
+                    .to_owned(),
+            )
+        })?;
+        let symbol = name.split('.').next().unwrap_or_default();
+        if let Some(contract) = contracts.iter().find(|c| c.underlying != symbol) {
+            return Err(rejected(format!(
+                "{} is an option on {}, and the underlying named is {name}",
+                contract.symbol(),
+                contract.underlying
+            )));
+        }
+        let bars = self
+            .bars
+            .bars(name, experiment.interval, experiment.window.from, experiment.window.to)
+            .map_err(|err| rejected(format!("reading underlying {name}: {err}")))?;
+
+        let mut closes = Vec::new();
+        for contract in contracts
+            .iter()
+            .filter(|c| c.expiration <= experiment.window.to)
+        {
+            // The last bar on the expiration date closes at 16:00 at any
+            // resolution: the daily bar, or the 15:55 five-minute bar.
+            let close = bars
+                .iter()
+                .rev()
+                .find(|bar| bar.at.date() == contract.expiration)
+                .map(|bar| bar.close)
+                .ok_or_else(|| {
+                    rejected(format!(
+                        "{name} has no bar on {}, the day {} settles",
+                        contract.expiration,
+                        contract.symbol()
+                    ))
+                })?;
+            closes.push((contract.clone(), close));
+        }
+        Ok(Settlement {
+            symbol: symbol.to_owned(),
+            closes,
+        })
     }
 }
 
@@ -532,6 +592,7 @@ fn run_backtest(
     experiment: &Experiment,
     plan: &Plan,
     book: &[(InstrumentId, String, Vec<arvo_data::Bar>)],
+    settlement: Option<&Settlement>,
 ) -> Result<SimulationResult, SimulationError> {
     let rejected = |context: &str, err: &dyn std::fmt::Display| {
         SimulationError::Rejected(format!("{context}: {err}"))
@@ -631,6 +692,82 @@ fn run_backtest(
             .map_err(|err| rejected("adding bar data", &err))?;
 
         bar_types.push(bar_type);
+    }
+
+    // The underlying, on the option's venue, because that is where Nautilus's
+    // own settlement looks for it — and registered as an *index*, so that an
+    // in-the-money contract is settled in cash at its intrinsic value and an
+    // out-of-the-money one at nothing.
+    //
+    // # Cash, not shares
+    //
+    // SPY options deliver shares, and Nautilus will deliver them if asked. In a
+    // cash account that is wrong more often than right: sizing pays for the
+    // premium, not the strike, so exercising one in-the-money call a $10k
+    // account holds bought $64,000 of SPY it could never have owned, and every
+    // figure afterwards carried six times the account in stock. A broker sells
+    // such a contract at the close instead. Settling at intrinsic value against
+    // the close is that sale, and it is also what delivery nets to wherever the
+    // shares would be sold again — a spread's two legs, or a 0DTE position.
+    // What it does not model is a strategy that means to keep the shares.
+    //
+    // The one price settlement reads is the underlying's index price, so each
+    // expiration gets exactly one: that day's close, a nanosecond before the
+    // contract's expiry fires. Daily bars are stamped at the end of their day,
+    // after 16:00 — without this, a daily run would settle on the day before.
+    if let Some(settlement) = settlement {
+        let underlying_id = InstrumentId::from(format!("{}.{venue}", settlement.symbol).as_str());
+        let index = IndexInstrument::builder()
+            .instrument_id(underlying_id)
+            .raw_symbol(Symbol::from(settlement.symbol.as_str()))
+            .currency(currency)
+            .price_precision(PRICE_PRECISION)
+            .size_precision(SIZE_PRECISION)
+            .price_increment(
+                Price::new_checked(0.01, PRICE_PRECISION)
+                    .map_err(|err| rejected("underlying tick", &err))?,
+            )
+            .size_increment(Quantity::from(1))
+            .ts_event(UnixNanos::default())
+            .ts_init(UnixNanos::default())
+            .build()
+            .map_err(|err| rejected("building the underlying", &err))?;
+        engine
+            .add_instrument(&InstrumentAny::IndexInstrument(index))
+            .map_err(|err| rejected("adding the underlying", &err))?;
+        let prints = settlement
+            .closes
+            .iter()
+            .map(|(contract, close)| {
+                let at = contract
+                    .expires_at()
+                    .and_utc()
+                    .timestamp_nanos_opt()
+                    .and_then(|ns| u64::try_from(ns - 1).ok())
+                    .ok_or_else(|| {
+                        SimulationError::Rejected(format!(
+                            "{} expiry is not representable",
+                            contract.symbol()
+                        ))
+                    })?;
+                // ponytail: rounded to the cent, so a 657.535 close settles at
+                // 657.54 — up to half a cent a share, $0.50 a contract, either
+                // way. Round against each contract's holder if that matters.
+                let price = Price::new_checked(*close, PRICE_PRECISION)
+                    .map_err(|err| rejected("underlying close", &err))?;
+                Ok(Data::IndexPrice(IndexPriceUpdate::new(
+                    underlying_id,
+                    price,
+                    UnixNanos::from(at),
+                    UnixNanos::from(at),
+                )))
+            })
+            .collect::<Result<Vec<_>, SimulationError>>()?;
+        if !prints.is_empty() {
+            engine
+                .add_data(prints, None, true, true)
+                .map_err(|err| rejected("adding settlement prints", &err))?;
+        }
     }
 
     let trade_size = Quantity::new_checked(plan.trade_size(), SIZE_PRECISION)
@@ -1136,6 +1273,7 @@ mod tests {
             hypothesis: HypothesisId::from("h-1"),
             instrument: "AAPL.NASDAQ".to_owned(),
             alongside: Vec::new(),
+            underlying: None,
             window: DateRange::new(
                 bars.first().expect("fixture is not empty").at.date(),
                 bars.last().expect("fixture is not empty").at.date(),
@@ -1636,9 +1774,47 @@ mod tests {
     ) -> Result<SimulationResult, SimulationError> {
         let mut experiment = experiment(params(5.0, 10.0), bars);
         experiment.instrument = contract.to_owned();
+        experiment.underlying = Some(UNDERLYING.to_owned());
         experiment.costs = costs;
-        NautilusSimulation::new(InMemoryBars::new().with_instrument(contract, bars.to_vec()))
-            .run(&experiment)
+        NautilusSimulation::new(
+            InMemoryBars::new()
+                .with_instrument(contract, bars.to_vec())
+                .with_instrument(UNDERLYING, sawtooth(bars.len())),
+        )
+        .run(&experiment)
+    }
+
+    const UNDERLYING: &str = "SPY.AIEX";
+
+    /// Bought on the first bar and held through expiry, against the sawtooth
+    /// as the underlying. The contract's own bars stop at its expiration, as a
+    /// real contract's do; the underlying's run on to July.
+    fn held_through_expiry(contract: &str) -> (SimulationResult, Vec<arvo_data::Bar>, Experiment) {
+        let expires = arvo_data::option::OptionContract::parse(contract)
+            .expect("a contract")
+            .expiration;
+        let underlying = sawtooth(200);
+        let premiums: Vec<_> = premium_path(200)
+            .into_iter()
+            .filter(|bar| bar.at.date() <= expires)
+            .collect();
+        let mut held = experiment(BTreeMap::from([("trade_size".to_owned(), 100.0)]), &underlying);
+        held.strategy.name = BUY_AND_HOLD.to_owned();
+        held.instrument = contract.to_owned();
+        held.underlying = Some(UNDERLYING.to_owned());
+        // A commission, so the reconciliation has settlement fills to get wrong.
+        held.costs = CostModel {
+            commission_bps: 2.0,
+            ..spread(arvo_research::OptionSpread::MEASURED)
+        };
+        let result = NautilusSimulation::new(
+            InMemoryBars::new()
+                .with_instrument(contract, premiums)
+                .with_instrument(UNDERLYING, underlying.clone()),
+        )
+        .run(&held)
+        .expect("runs");
+        (result, underlying, held)
     }
 
     const LATE_CONTRACT: &str = "SPY241220C00100000.AOPT";
@@ -1730,21 +1906,136 @@ mod tests {
         assert!(final_equity(&measured) < final_equity(&tight));
     }
 
+    fn final_equity(result: &SimulationResult) -> f64 {
+        result.equity_curve.last().expect("non-empty").equity
+    }
+
     #[test]
-    fn a_window_past_a_contracts_expiration_is_refused_until_settlement_exists() {
-        // Found by holding one through: the position stayed open for four
-        // months after the contract ceased to exist, marked at its last trade.
-        let bars = premium_path(200);
-        let err = option_run(
-            "SPY240315C00100000.AOPT",
-            spread(arvo_research::OptionSpread::MEASURED),
-            &bars,
-        )
-        .expect_err("the window runs to July");
+    fn an_in_the_money_call_at_expiry_settles_at_its_intrinsic_value() {
+        let (result, underlying, held) = held_through_expiry("SPY240315C00100000.AOPT");
+        let [option] = result.ledger.as_slice() else {
+            panic!("settled in cash, no shares delivered: {:?}", result.ledger);
+        };
+        let settle = underlying
+            .iter()
+            .find(|bar| bar.at.date() == date(2024, 3, 15))
+            .expect("a bar")
+            .close;
+
+        assert_eq!(option.exit_reason, arvo_research::ExitReason::Expired);
         assert!(
-            matches!(err, SimulationError::Rejected(ref why) if why.contains("2024-03-15")),
-            "{err}"
+            (option.exit.expect("closed") - (settle - 100.0)).abs() < 0.005,
+            "{:?} against the {settle} close",
+            option.exit
         );
+        assert_eq!(
+            option.closed,
+            Some(date(2024, 3, 15).and_hms_opt(20, 0, 0).expect("valid")),
+            "16:00 New York on the expiration date"
+        );
+        assert!((final_equity(&result) - (100_000.0 + option.pnl)).abs() < 0.01);
+        assert_eq!(
+            arvo_research::reconcile::reconcile(&held, &result),
+            Vec::new(),
+            "settlement charges no commission and the checks know it"
+        );
+    }
+
+    #[test]
+    fn a_small_account_is_not_handed_shares_it_could_never_pay_for() {
+        // Found on real data: exercising a SPY 640 call in a $10k cash account
+        // delivered $64,000 of stock. The result is the same premium and the
+        // same intrinsic value at any account size.
+        let contract = "SPY240315C00100000.AOPT";
+        let (large, _, _) = held_through_expiry(contract);
+        let underlying = sawtooth(200);
+        let premiums: Vec<_> = premium_path(200)
+            .into_iter()
+            .filter(|bar| bar.at.date() <= date(2024, 3, 15))
+            .collect();
+        let mut small = experiment(BTreeMap::from([("trade_size".to_owned(), 100.0)]), &underlying);
+        small.strategy.name = BUY_AND_HOLD.to_owned();
+        small.instrument = contract.to_owned();
+        small.underlying = Some(UNDERLYING.to_owned());
+        small.costs = CostModel {
+            commission_bps: 2.0,
+            ..spread(arvo_research::OptionSpread::MEASURED)
+        };
+        small.starting_cash = 1_000.0;
+        let result = NautilusSimulation::new(
+            InMemoryBars::new()
+                .with_instrument(contract, premiums)
+                .with_instrument(UNDERLYING, underlying),
+        )
+        .run(&small)
+        .expect("runs");
+
+        assert_eq!(result.ledger.len(), 1, "{:?}", result.ledger);
+        assert!((result.ledger[0].pnl - large.ledger[0].pnl).abs() < 1e-9);
+        assert_eq!(arvo_research::reconcile::reconcile(&small, &result), Vec::new());
+    }
+
+    #[test]
+    fn an_out_of_the_money_put_at_expiry_is_worth_nothing() {
+        let (result, _, held) = held_through_expiry("SPY240315P00100000.AOPT");
+        let [option] = result.ledger.as_slice() else {
+            panic!("one contract, closed: {:?}", result.ledger);
+        };
+        assert_eq!(option.exit_reason, arvo_research::ExitReason::Expired);
+        assert!((final_equity(&result) - (100_000.0 + option.pnl)).abs() < 0.01);
+        assert_eq!(arvo_research::reconcile::reconcile(&held, &result), Vec::new());
+    }
+
+    #[test]
+    fn a_daily_run_settles_on_the_expiration_days_close_not_the_day_before() {
+        // The sawtooth closes 107.15 on 14 March and 106.70 on the 15th. A call
+        // struck at 106.90 is in the money on the first and not the second; a
+        // daily bar is stamped at the end of its day, after the 16:00 expiry, so
+        // settling on the last bar the engine had seen would pay it 25 cents.
+        let underlying = sawtooth(200);
+        let close = |day: u32| {
+            underlying
+                .iter()
+                .find(|bar| bar.at.date() == date(2024, 3, day))
+                .expect("a bar")
+                .close
+        };
+        assert!(close(14) > 106.9 && close(15) < 106.9, "{} {}", close(14), close(15));
+
+        let (result, _, _) = held_through_expiry("SPY240315C00106900.AOPT");
+        assert_eq!(result.ledger[0].exit_reason, arvo_research::ExitReason::Expired);
+        assert_eq!(result.ledger[0].exit, Some(0.0), "expired worthless: {:?}", result.ledger);
+    }
+
+    #[test]
+    fn an_option_run_cannot_settle_without_its_own_underlying() {
+        let bars = premium_path(200);
+        let contract = "SPY240315C00100000.AOPT";
+        let run = |underlying: Option<&str>, series: Vec<arvo_data::Bar>| {
+            let mut experiment = experiment(params(5.0, 10.0), &bars);
+            experiment.instrument = contract.to_owned();
+            experiment.underlying = underlying.map(ToOwned::to_owned);
+            experiment.costs = spread(arvo_research::OptionSpread::MEASURED);
+            NautilusSimulation::new(
+                InMemoryBars::new()
+                    .with_instrument(contract, bars.clone())
+                    .with_instrument("SPY.AIEX", series.clone())
+                    .with_instrument("QQQ.AIEX", series),
+            )
+            .run(&experiment)
+            .expect_err("refused")
+            .to_string()
+        };
+        let whole = sawtooth(200);
+        let without_expiry: Vec<_> = whole
+            .iter()
+            .copied()
+            .filter(|bar| bar.at.date() != date(2024, 3, 15))
+            .collect();
+
+        assert!(run(None, whole.clone()).contains("underlying"));
+        assert!(run(Some("QQQ.AIEX"), whole).contains("option on SPY"));
+        assert!(run(Some("SPY.AIEX"), without_expiry).contains("no bar on 2024-03-15"));
     }
 
     #[test]

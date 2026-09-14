@@ -134,7 +134,18 @@ fn exit_reason(cache: &Cache, position: &Position) -> ExitReason {
     // Signal is the fallback, including for an order no longer in the cache:
     // the position did close, and calling that a stop on no evidence would
     // inflate the count this field exists to make honest.
-    if tagged(crate::strategy::EXIT_HALT) {
+    // Nautilus tags its settlement orders `EXPIRATION_<venue>_<how>`.
+    let settled = cache
+        .order(&closing)
+        .and_then(|order| {
+            order
+                .tags()
+                .map(|tags| tags.iter().any(|t| t.starts_with("EXPIRATION_")))
+        })
+        .unwrap_or(false);
+    if settled {
+        ExitReason::Expired
+    } else if tagged(crate::strategy::EXIT_HALT) {
         ExitReason::Halted
     } else if tagged(crate::strategy::EXIT_STOP) {
         ExitReason::Stop

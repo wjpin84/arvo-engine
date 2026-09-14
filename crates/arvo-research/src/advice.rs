@@ -1452,6 +1452,7 @@ mod tests {
             hypothesis: crate::HypothesisId("h".to_owned()),
             instrument: "AAPL.NASDAQ".to_owned(),
             alongside: Vec::new(),
+            underlying: None,
             window: crate::DateRange {
                 from: day(1),
                 to: day(9),

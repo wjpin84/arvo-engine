@@ -549,6 +549,7 @@ mod tests {
             hypothesis: HypothesisId("h".to_owned()),
             instrument: "AAPL.NASDAQ".to_owned(),
             alongside: Vec::new(),
+            underlying: None,
             window: DateRange {
                 from: at(1).date(),
                 to: at(9).date(),

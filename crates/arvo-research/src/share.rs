@@ -261,6 +261,7 @@ impl SharedExperiment {
             hypothesis: self.hypothesis.clone(),
             instrument: instrument.to_owned(),
             alongside: Vec::new(),
+            underlying: None,
             window,
             interval: self.interval,
             dataset,
