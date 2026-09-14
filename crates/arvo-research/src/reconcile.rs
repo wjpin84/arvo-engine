@@ -244,17 +244,23 @@ fn fees_match_the_cost_model(experiment: &Experiment, ledger: &[Trade]) -> Optio
     let mut fills = 0.0;
     let mut expected = 0.0;
     for trade in ledger {
+        // Settlement at expiry is not a trade on the venue and charges nothing
+        // (#84), so an expired contract's close is not a fill to price.
+        let settled = trade.exit_reason == crate::ExitReason::Expired;
         let entry_notional = trade.entry * trade.quantity;
         // One fill in, and one out only if it actually closed.
-        let exit_notional = trade.exit.map_or(0.0, |exit| exit * trade.quantity);
-        let sides = if trade.exit.is_some() { 2.0 } else { 1.0 };
+        let exit_notional = match trade.exit {
+            Some(exit) if !settled => exit * trade.quantity,
+            _ => 0.0,
+        };
+        let sides = if trade.exit.is_some() && !settled { 2.0 } else { 1.0 };
         fills += sides;
 
         expected += (entry_notional + exit_notional) * costs.commission_bps / 10_000.0;
         expected += costs.per_fill * sides;
         // Sell-side charges fall on the closing fill of a long, which is the
         // only side this engine sells on.
-        if trade.exit.is_some() {
+        if trade.exit.is_some() && !settled {
             expected += costs.per_unit_sold * trade.quantity;
             expected += exit_notional * costs.sell_notional_bps / 10_000.0;
         }
@@ -353,6 +359,7 @@ mod tests {
             hypothesis: HypothesisId("h".to_owned()),
             instrument: "AAPL.NASDAQ".to_owned(),
             alongside: Vec::new(),
+            underlying: None,
             window: DateRange::new(at(1).date(), at(9).date()).expect("ordered"),
             interval: arvo_data::BarInterval::DAILY,
             dataset: DatasetRef {

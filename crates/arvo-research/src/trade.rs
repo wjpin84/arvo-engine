@@ -47,6 +47,11 @@ pub enum ExitReason {
     /// the trade and the run — and a run that ended early is a different claim
     /// from one that ran its window out.
     Halted,
+    /// The contract reached expiration and was settled rather than traded out
+    /// of (#84): in cash at its intrinsic value against the underlying's close
+    /// on the expiration date, which is nothing when it expired out of the
+    /// money. Charges no commission.
+    Expired,
     /// The run ended with the position still open.
     ///
     /// Not an exit at all, and kept distinct from one: a run that ends while
@@ -154,6 +159,9 @@ pub struct TradeStats {
     /// How the closed trades ended.
     pub signal_exits: u32,
     pub stop_exits: u32,
+    /// Option contracts that reached expiration and were settled (#84).
+    #[serde(default)]
+    pub expired_exits: u32,
     /// Whether the run stopped early because the account's drawdown limit was
     /// reached.
     ///
@@ -184,6 +192,7 @@ impl TradeStats {
             total_commission: ledger.iter().map(|trade| trade.commission).sum(),
             signal_exits: 0,
             stop_exits: 0,
+            expired_exits: 0,
             halted: false,
         };
 
@@ -200,6 +209,7 @@ impl TradeStats {
             match trade.exit_reason {
                 ExitReason::Signal => stats.signal_exits += 1,
                 ExitReason::Stop => stats.stop_exits += 1,
+                ExitReason::Expired => stats.expired_exits += 1,
                 ExitReason::Halted => {
                     stats.stop_exits += 1;
                     stats.halted = true;

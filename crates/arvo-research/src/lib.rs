@@ -671,6 +671,17 @@ pub struct Experiment {
     /// before a run could hold more than one loads as what it was.
     #[serde(default)]
     pub alongside: Vec<String>,
+    /// The stock an option run settles against, as a library series —
+    /// `SPY.AIEX` — when [`Self::instrument`] is an option contract.
+    ///
+    /// Not traded, and not one of [`Self::instruments`]: nothing runs the rule
+    /// on it. Its close on a contract's expiration date is what that contract
+    /// settles at. A contract held to expiry with no underlying cannot be
+    /// settled, so an option run without one is refused.
+    ///
+    /// Skipped when absent, so every record without one serialises unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub underlying: Option<String>,
     pub window: DateRange,
     /// The resolution the rule was evaluated at.
     ///

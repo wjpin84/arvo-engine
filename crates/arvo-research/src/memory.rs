@@ -807,6 +807,7 @@ pub(crate) mod tests {
             hypothesis: HypothesisId::from("h-1"),
             instrument: instrument.to_owned(),
             alongside: Vec::new(),
+            underlying: None,
             window: DateRange::new(day(1), day(31)).expect("ordered"),
             interval: arvo_data::BarInterval::DAILY,
             dataset: DatasetRef {

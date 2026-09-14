@@ -725,6 +725,7 @@ mod tests {
             hypothesis: HypothesisId::from("h"),
             instrument: "AAPL.NASDAQ".to_owned(),
             alongside: Vec::new(),
+            underlying: None,
             window,
             interval: arvo_data::BarInterval::DAILY,
             dataset: crate::DatasetRef {
