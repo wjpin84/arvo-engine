@@ -228,6 +228,15 @@ impl CrossSectionalMomentum {
             }
         }
 
+        // Read once and spent down: every entry in this pass fills on the next
+        // bar, so each one seeing the whole free balance would let the set of
+        // them order more than the account holds. Proceeds from the exits just
+        // sent are not in it yet either, which is when the venue would have
+        // them too.
+        let mut spendable = self
+            .bar_types
+            .first()
+            .and_then(|bar_type| super::spendable(&self.cache(), &bar_type.instrument_id().venue));
         for id in wanted {
             if self.positions.get(&id).is_some_and(Position::is_open) {
                 continue;
@@ -263,6 +272,7 @@ impl CrossSectionalMomentum {
                 // the day-trade budget are the account's, not any member's.
                 equity,
                 day_trades_used,
+                spendable,
                 Some(self.correlations.as_ref()),
             );
             let arvo_research::Decision::Accept { quantity } = decision else {
@@ -271,11 +281,29 @@ impl CrossSectionalMomentum {
             let Ok(size) = Quantity::new_checked(quantity, 0) else {
                 continue;
             };
+            let costs = position.risk().costs;
+            if let Some(cash) = spendable.as_mut() {
+                *cash -= quantity
+                    * reading.close
+                    * (1.0 + costs.slippage_bps / 10_000.0)
+                    * (1.0 + costs.commission_bps / 10_000.0)
+                    + costs.per_fill;
+            }
             position.stop = stop_distance.map(|distance| reading.close - distance);
             position.hold(size);
             self.send(id, OrderSide::Buy, size, None)?;
         }
         Ok(())
+    }
+
+    /// As `super::Managed::refused`, for one member of the set.
+    fn refused(&mut self, id: InstrumentId) {
+        let flat = f64::try_from(self.portfolio().net_position(&id)).is_ok_and(|held| held == 0.0);
+        if flat {
+            if let Some(position) = self.positions.get_mut(&id) {
+                position.release();
+            }
+        }
     }
 
     /// Closes whatever is held in one instrument.
@@ -331,7 +359,14 @@ impl CrossSectionalMomentum {
     }
 }
 
-nautilus_trading::nautilus_strategy!(CrossSectionalMomentum);
+nautilus_trading::nautilus_strategy!(CrossSectionalMomentum, {
+    fn on_order_denied(&mut self, event: nautilus_model::events::OrderDenied) {
+        self.refused(event.instrument_id);
+    }
+    fn on_order_rejected(&mut self, event: nautilus_model::events::OrderRejected) {
+        self.refused(event.instrument_id);
+    }
+});
 
 impl std::fmt::Debug for CrossSectionalMomentum {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

@@ -38,7 +38,7 @@ use std::collections::BTreeMap;
 use chrono::{Datelike, NaiveDate, NaiveDateTime};
 use serde::{Deserialize, Serialize};
 
-use crate::{RiskModel, Trade};
+use crate::{CostModel, RiskModel, Trade};
 
 /// How stale a signal may be before the gate refuses to act on it.
 ///
@@ -444,11 +444,16 @@ impl RiskGate {
                 equity: self.equity,
                 day_trades_used: self.day_trades_used(now.date()),
                 halted: self.halted(),
+                // ponytail: a live session knows its cash only through the
+                // broker, and nothing hands the gate buying power yet. The venue
+                // refuses what cannot be paid for, and `Session` reports it.
+                spendable: None,
             },
             proposal,
             now,
             self.max_signal_age_ms,
             correlations,
+            None,
         )
     }
 
@@ -610,6 +615,16 @@ pub struct AccountState<'a> {
     pub day_trades_used: usize,
     /// Why the account stopped trading, if it has.
     pub halted: Option<&'a str>,
+    /// Cash the account could pay with right now. `None` when the caller
+    /// cannot say, which leaves the cash ceiling unapplied.
+    ///
+    /// Sizing comes off `starting_cash` on purpose — see [`size`] — so without
+    /// this an account that had lost anything kept proposing entries it could
+    /// not pay for. The venue refused them, and on two years of five-minute
+    /// AAPL an opening-range rule took 3 of 72 breakouts. Risk still sizes off
+    /// the opening balance; this only stops a proposal asking for money that
+    /// is not there.
+    pub spendable: Option<f64>,
 }
 
 /// Answers one proposal against a stated account.
@@ -622,6 +637,10 @@ pub struct AccountState<'a> {
 /// a backtest, where "now" is a bar timestamp. A function calling `Utc::now()`
 /// internally would be untestable and would differ between the two places it
 /// has to be the same.
+///
+/// `costs` is what a fill is assumed to cost on top of its price, so an entry
+/// is never sized at a notional the account can reach and its commission and
+/// slippage cannot. `None` sizes on price alone.
 ///
 /// `correlations` may be `None` when no cap is configured. When one *is*
 /// configured and this is `None`, the proposal is refused — see
@@ -638,6 +657,7 @@ pub fn decide(
     now: NaiveDateTime,
     max_signal_age_ms: i64,
     correlations: Option<&dyn Correlations>,
+    costs: Option<&CostModel>,
 ) -> Decision {
     if let Some(reason) = account.halted {
         return Decision::Reject(Rejection::Halted {
@@ -710,7 +730,7 @@ pub fn decide(
         }
     }
 
-    size(model, account.starting_cash, proposal)
+    size(model, account, proposal, costs)
 }
 
 /// Whether this instrument would over-fill a correlated cluster.
@@ -778,7 +798,27 @@ fn correlation_check(
 /// five-minute ATR asks for several times the account. Whether the account can
 /// actually pay is settled at the venue, in a backtest by the engine rejecting
 /// the order and live by the broker doing the same.
-fn size(model: &RiskModel, starting_cash: f64, proposal: &Proposal) -> Decision {
+///
+/// # What it can pay, and what it costs to
+///
+/// That last sentence was the design, and it failed silently: the engine
+/// refused the order, the strategy was never told, and a rule that had lost
+/// money once took almost none of its later signals. So both ceilings are now
+/// in *all-in* terms — price plus the experiment's slippage and commission —
+/// and when the caller knows the account's cash, the entry is also capped at
+/// what that cash can buy. Sizing still comes off the opening balance; only
+/// affordability reads the live figure.
+///
+/// ponytail: the fill lands at the next bar's price, not the reference, and
+/// slippage rounds up to a whole tick. Flooring to whole shares absorbs both
+/// almost always; a gap past the slack is still refused, and now counted.
+fn size(
+    model: &RiskModel,
+    account: &AccountState<'_>,
+    proposal: &Proposal,
+    costs: Option<&CostModel>,
+) -> Decision {
+    let starting_cash = account.starting_cash;
     if proposal.reference_price <= 0.0 {
         return Decision::Reject(Rejection::TooSmall { affordable: 0.0 });
     }
@@ -789,8 +829,21 @@ fn size(model: &RiskModel, starting_cash: f64, proposal: &Proposal) -> Decision 
         (None, _) => None,
     };
 
+    // What one share costs to buy, all in.
+    let (per_unit, per_fill) = costs.map_or((proposal.reference_price, 0.0), |costs| {
+        (
+            proposal.reference_price
+                * (1.0 + costs.slippage_bps / 10_000.0)
+                * (1.0 + costs.commission_bps / 10_000.0),
+            costs.per_fill,
+        )
+    });
     let ceiling = model.max_position_fraction.unwrap_or(1.0);
-    let by_cap = starting_cash * ceiling / proposal.reference_price;
+    let by_cap = ((starting_cash * ceiling - per_fill) / per_unit).max(0.0);
+    let by_cash = account
+        .spendable
+        .map(|cash| ((cash - per_fill) / per_unit).max(0.0));
+    let by_cap = by_cash.map_or(by_cap, |by_cash| by_cap.min(by_cash));
 
     // Risk sizing wins where it applies; otherwise what was asked for; and the
     // cap bounds either. A proposer's desired size is a request, never a
@@ -1195,6 +1248,64 @@ mod tests {
             "sized {quantity} at {} = {}, more than the account",
             scalp.reference_price,
             quantity * scalp.reference_price
+        );
+    }
+
+    /// One decision against a $100k account holding nothing, wanting as much
+    /// of a $100 stock as the cap allows.
+    fn sized(spendable: Option<f64>, costs: Option<&CostModel>) -> f64 {
+        let positions = BTreeMap::new();
+        let greedy = Proposal {
+            desired_quantity: Some(1_000_000.0),
+            reference_price: 100.0,
+            ..proposal("MSFT.RH")
+        };
+        let decision = decide(
+            &model(),
+            &AccountState {
+                positions: &positions,
+                realised_today: 0.0,
+                starting_cash: 100_000.0,
+                equity: 100_000.0,
+                day_trades_used: 0,
+                halted: None,
+                spendable,
+            },
+            &greedy,
+            greedy.signalled_at,
+            i64::MAX,
+            None,
+            costs,
+        );
+        match decision {
+            Decision::Accept { quantity } => quantity,
+            Decision::Reject(why) => panic!("refused: {why:?}"),
+        }
+    }
+
+    #[test]
+    fn the_cap_is_what_the_account_can_pay_all_in_not_on_price_alone() {
+        // 1,000 shares at $100 is the whole account. With slippage and
+        // commission on top it is more than the whole account, and the venue
+        // refused it — so the cap counts them.
+        assert!((sized(None, None) - 1_000.0).abs() < 1e-9, "no costs, as before");
+        let costs = CostModel::proportional(10.0, 10.0);
+        let all_in = sized(None, Some(&costs));
+        assert!((all_in - 998.0).abs() < 1e-9, "{all_in}");
+        assert!(all_in * 100.0 * 1.001 * 1.001 <= 100_000.0);
+    }
+
+    #[test]
+    fn an_account_that_has_spent_money_is_not_sized_as_if_it_had_not() {
+        // Sizing comes off the opening balance on purpose. Without a cash
+        // ceiling an account down to $50k kept ordering $100k of stock, the
+        // venue refused every one, and a rule took 3 of its 72 signals.
+        let costs = CostModel::proportional(1.0, 1.0);
+        let quantity = sized(Some(50_000.0), Some(&costs));
+        assert!((quantity - 499.0).abs() < 1e-9, "{quantity}");
+        assert!(
+            sized(Some(500_000.0), Some(&costs)) <= sized(None, Some(&costs)),
+            "cash beyond the cap buys nothing past the cap"
         );
     }
 

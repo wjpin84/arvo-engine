@@ -866,6 +866,7 @@ mod tests {
                     strategy_trades: TradeStats::default(),
                     strategy_ledger: Vec::new(),
                 dividend_gap: None,
+                refused_orders: crate::Refused::default(),
                     benchmark_instruments: Vec::new(),
                     excess_return: 0.0,
                     verdict: Verdict::Inconclusive,

@@ -401,6 +401,7 @@ mod tests {
                 })
                 .collect(),
             ledger,
+            refused: crate::Refused::default(),
         }
     }
 
