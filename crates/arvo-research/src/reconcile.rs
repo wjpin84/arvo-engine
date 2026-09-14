@@ -465,6 +465,7 @@ mod tests {
             per_fill: 0.50,
             per_unit_sold: 0.01,
             sell_notional_bps: 2.0,
+            option_spread: None,
         };
         // 100 in at 10, out at 11: notional 1000 + 1100.
         let expected = (1_000.0 + 1_100.0) * 10.0 / 10_000.0  // commission

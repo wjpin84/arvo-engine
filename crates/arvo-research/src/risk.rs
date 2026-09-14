@@ -855,12 +855,27 @@ fn size(
         (None, _) => None,
     };
 
-    // What one share costs to buy, all in.
+    // An option is traded in shares of what it delivers, a contract at a time:
+    // units of 100, each priced per share as quoted. Holding the unit at one
+    // share keeps every dollar figure downstream — curve, stops, P&L — the
+    // product of a price and a quantity, with no multiplier to forget.
+    let lot = if arvo_data::option::OptionContract::parse(&proposal.instrument).is_some() {
+        arvo_data::option::MULTIPLIER
+    } else {
+        1.0
+    };
+
+    // What one unit costs to buy, all in. An option pays half its spread
+    // rather than equity basis points.
     let (per_unit, per_fill) = costs.map_or((proposal.reference_price, 0.0), |costs| {
+        let crossed = match costs.option_spread {
+            Some(spread) if lot > 1.0 => {
+                proposal.reference_price + spread.half_spread(proposal.reference_price)
+            }
+            _ => proposal.reference_price * (1.0 + costs.slippage_bps / 10_000.0),
+        };
         (
-            proposal.reference_price
-                * (1.0 + costs.slippage_bps / 10_000.0)
-                * (1.0 + costs.commission_bps / 10_000.0),
+            crossed * (1.0 + costs.commission_bps / 10_000.0),
             costs.per_fill,
         )
     });
@@ -875,8 +890,8 @@ fn size(
     // cap bounds either. A proposer's desired size is a request, never a
     // permission.
     let wanted = by_risk.or(proposal.desired_quantity).unwrap_or(by_cap);
-    let quantity = wanted.min(by_cap).floor();
-    if quantity < 1.0 {
+    let quantity = (wanted.min(by_cap) / lot).floor() * lot;
+    if quantity < lot {
         return Decision::Reject(Rejection::TooSmall { affordable: by_cap });
     }
     Decision::Accept { quantity }
@@ -1319,6 +1334,71 @@ mod tests {
         let all_in = sized(None, Some(&costs));
         assert!((all_in - 998.0).abs() < 1e-9, "{all_in}");
         assert!(all_in * 100.0 * 1.001 * 1.001 <= 100_000.0);
+    }
+
+    /// As [`sized`], for an option contract at `premium` a share.
+    fn sized_option(premium: f64, wanted: f64, costs: Option<&CostModel>) -> Decision {
+        let positions = BTreeMap::new();
+        let proposal = Proposal {
+            desired_quantity: Some(wanted),
+            reference_price: premium,
+            ..proposal("SPY250912P00640000.AOPT")
+        };
+        decide(
+            &model(),
+            &AccountState {
+                positions: &positions,
+                realised_today: 0.0,
+                starting_cash: 10_000.0,
+                equity: 10_000.0,
+                day_trades_used: 0,
+                halted: None,
+                spendable: None,
+            },
+            &proposal,
+            proposal.signalled_at,
+            i64::MAX,
+            None,
+            costs,
+        )
+    }
+
+    #[test]
+    fn an_option_is_sized_in_whole_contracts_and_pays_its_spread() {
+        let costs = CostModel {
+            option_spread: Some(crate::OptionSpread::MEASURED),
+            ..CostModel::proportional(0.0, 0.0)
+        };
+        // $10k at $2.00 a share is 5,000 shares on price alone. Half the spread
+        // is 2% of $2.00 = $0.04, so $2.04 a share all in: 4,901 shares, which
+        // is 49 whole contracts and not 4,901 shares of a contract.
+        assert_eq!(
+            sized_option(2.0, 1e9, Some(&costs)),
+            Decision::Accept { quantity: 4_900.0 }
+        );
+        // Asking for 250 shares is asking for two and a half contracts.
+        assert_eq!(
+            sized_option(2.0, 250.0, Some(&costs)),
+            Decision::Accept { quantity: 200.0 }
+        );
+        // Less than one contract is nothing, not a fraction of one.
+        assert!(matches!(
+            sized_option(2.0, 99.0, Some(&costs)),
+            Decision::Reject(Rejection::TooSmall { .. })
+        ));
+    }
+
+    #[test]
+    fn a_stock_is_still_sized_in_shares() {
+        assert!((sized(None, None) - 1_000.0).abs() < 1e-9);
+        let costs = CostModel {
+            option_spread: Some(crate::OptionSpread::MEASURED),
+            ..CostModel::proportional(0.0, 0.0)
+        };
+        assert!(
+            (sized(None, Some(&costs)) - 1_000.0).abs() < 1e-9,
+            "an option spread on the record does not charge a stock"
+        );
     }
 
     #[test]
