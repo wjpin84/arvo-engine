@@ -132,6 +132,54 @@ impl Recommendation {
 /// evidence is thin; one whose entries were refused says the run was not the
 /// rule — it skipped signals it could not pay for, so its trades, its return
 /// and its verdict all describe a different, starved strategy.
+/// When the run trades options: the losses first, and what the history cannot
+/// contain (#85).
+///
+/// # The sample
+///
+/// Option bars reach back to January 2024 and no further. That window holds
+/// the August 2024 and April 2025 volatility spikes and nothing of the scale of
+/// March 2020 or 2022 — so a strategy short volatility has not been tested
+/// against the kind of day that ends such strategies, and its worst period here
+/// is a floor on its worst period, not an estimate of it.
+///
+/// ponytail: the dates are the Alpaca archive's today; read them from the
+/// library's first option bar if a second vendor reaches further back.
+fn option_tail(experiment: &crate::Experiment, curve: &[crate::EquityPoint]) -> Vec<Recommendation> {
+    if arvo_data::option::OptionContract::parse(&experiment.instrument).is_none() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    if let Some(tail) = crate::evaluation::tail(curve) {
+        out.push(Recommendation::new(
+            Severity::Warning,
+            "An option strategy's risk is in its worst periods, and a Sharpe ratio averages them away.",
+            "Read these before the return. Ask whether the account survives the worst period \
+             happening twice in a row, not whether the average is good.",
+            format!(
+                "worst {} {:+.1}%, worst month {}, mean of the worst 5% of periods {:+.1}%",
+                experiment.interval,
+                tail.worst_period * 100.0,
+                tail.worst_month
+                    .map_or("n/a (under two months)".to_owned(), |m| format!("{:+.1}%", m * 100.0)),
+                tail.expected_shortfall * 100.0,
+            ),
+        ));
+    }
+    out.push(Recommendation::new(
+        Severity::Warning,
+        "The option history this ran on holds no crash.",
+        "Treat the worst period above as a floor. Before trusting a strategy that is short \
+         options, find out what it would have lost on a day like 16 March 2020.",
+        format!(
+            "option bars from January 2024 to {}: the August 2024 and April 2025 spikes, \
+             nothing of 2020 or 2022 scale",
+            experiment.window.to
+        ),
+    ));
+    out
+}
+
 fn refusals(refused: crate::Refused) -> Option<Recommendation> {
     refused.any().then(|| {
         Recommendation::new(
@@ -234,6 +282,13 @@ pub fn recommend(found: &FamilyEvidence) -> Vec<Recommendation> {
             },
         ));
     }
+
+    // Before any warning about the return, because for an option the return is
+    // the part least worth reading first.
+    out.extend(option_tail(
+        &found.out_of_sample_evidence.experiment,
+        &evaluation.strategy_curve,
+    ));
 
     // The benchmark starves the same way the strategy does, out of the same
     // account. When it holds fewer members than the book names, the comparison
@@ -850,6 +905,8 @@ pub fn recommend_walk_forward(found: &WalkForwardEvidence) -> Vec<Recommendation
 
     // ---- warning: readable, but resting on something fragile -------------
 
+    out.extend(option_tail(&found.template, &found.combined_curve));
+
     for axis in &found.stability {
         if axis.distinct > 1 && axis.modal_share < MODAL_SHARE_FLOOR {
             out.push(Recommendation::new(
@@ -1107,6 +1164,35 @@ mod tests {
             commission: 1.0,
             exit_reason: reason,
         }
+    }
+
+    #[test]
+    fn an_option_run_leads_with_its_losses_and_what_its_history_lacks() {
+        // Collects 0.2% on 59 days and loses 15% on one: a Sharpe-friendly
+        // shape until that one day.
+        let start = chrono::NaiveDate::from_ymd_opt(2024, 3, 1).expect("valid");
+        let mut equity = 100_000.0;
+        let curve: Vec<crate::EquityPoint> = (0..61)
+            .map(|day| {
+                if day > 0 {
+                    equity *= if day == 45 { 0.85 } else { 1.002 };
+                }
+                crate::EquityPoint {
+                    at: (start + chrono::Duration::days(day)).and_time(chrono::NaiveTime::MIN),
+                    equity,
+                }
+            })
+            .collect();
+
+        let mut option = experiment();
+        option.instrument = "SPY240621P00500000.AOPT".to_owned();
+        let advice = option_tail(&option, &curve);
+        assert_eq!(advice.len(), 2);
+        assert!(advice[0].evidence.contains("worst 1day -15.0%"), "{}", advice[0].evidence);
+        assert!(advice[0].evidence.contains("worst month"), "{}", advice[0].evidence);
+        assert!(advice[1].finding.contains("no crash"));
+
+        assert!(option_tail(&experiment(), &curve).is_empty(), "a stock run is unaffected");
     }
 
     #[test]
