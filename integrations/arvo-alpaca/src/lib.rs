@@ -51,6 +51,7 @@
 
 mod auth;
 mod execution;
+pub mod options;
 mod parse;
 mod source;
 
