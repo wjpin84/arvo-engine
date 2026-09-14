@@ -16,6 +16,7 @@ members = [
     "integrations/arvo-robinhood",
     "integrations/arvo-yfinance",
     "app/arvo-runtime",
+    "app/arvo-mcp-server",
     "plugins/stub",
 ]
 

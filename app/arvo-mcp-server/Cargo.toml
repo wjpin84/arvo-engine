@@ -1,0 +1,19 @@
+[package]
+name = "arvo-mcp-server"
+description = "Arvo as an MCP server over stdio: an agent can read research memory and run studies, never trade."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+arvo-data.workspace = true
+arvo-nautilus.workspace = true
+arvo-research.workspace = true
+# The same research entry points the window calls — the grid, the split, the
+# cost and risk assumptions — so an agent's study is the study a person runs.
+arvo-runtime = { path = "../arvo-runtime" }
+chrono.workspace = true
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
