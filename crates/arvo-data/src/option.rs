@@ -133,6 +133,64 @@ impl OptionContract {
     }
 }
 
+/// A contract worth fetching, and the days to fetch it for.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Wanted {
+    pub contract: OptionContract,
+    pub from: NaiveDate,
+    pub to: NaiveDate,
+}
+
+/// The contracts whose strike came within `band` of where the underlying
+/// traded in the `horizon_days` up to and including expiration, each with that
+/// window.
+///
+/// A whole chain is several hundred contracts per expiration, most of them so
+/// far from the money they never trade. This keeps what a strategy could have
+/// chosen: the band is taken around the underlying's low and high over the
+/// window, so a strike that was near the money on *any* day of it is kept.
+///
+/// # The files are a superset, not a signal
+///
+/// That makes what exists depend on where the underlying went later: a put
+/// struck 10% below the market survives if the market fell to meet it, and its
+/// twin 10% above does not. A strategy must choose strikes by a rule on the
+/// underlying at the time — a delta, a distance from spot — and never by which
+/// contracts happen to be in the library, or it is reading the future.
+///
+/// A contract with no underlying bars in its window is left out: there is
+/// nothing to say it was near anything.
+#[must_use]
+pub fn near_the_money(
+    contracts: &[OptionContract],
+    underlying: &[crate::Bar],
+    band: f64,
+    horizon_days: i64,
+) -> Vec<Wanted> {
+    contracts
+        .iter()
+        .filter_map(|contract| {
+            let from = contract.expiration - chrono::Duration::days(horizon_days);
+            let to = contract.expiration;
+            let (low, high) = underlying
+                .iter()
+                .filter(|bar| (from..=to).contains(&bar.at.date()))
+                .fold(None, |range: Option<(f64, f64)>, bar| {
+                    Some(range.map_or((bar.low, bar.high), |(low, high)| {
+                        (low.min(bar.low), high.max(bar.high))
+                    }))
+                })?;
+            let near =
+                contract.strike >= low * (1.0 - band) && contract.strike <= high * (1.0 + band);
+            near.then(|| Wanted {
+                contract: contract.clone(),
+                from,
+                to,
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -208,6 +266,63 @@ mod tests {
         assert!(call.intrinsic(750.0).abs() < 1e-12);
         assert!((put.intrinsic(750.0) - 10.0).abs() < 1e-9);
         assert!(put.intrinsic(765.5).abs() < 1e-12);
+    }
+
+    fn day(month: u32, dom: u32, low: f64, high: f64) -> crate::Bar {
+        crate::Bar {
+            at: date(2025, month, dom).and_time(chrono::NaiveTime::MIN),
+            open: low,
+            high,
+            low,
+            close: high,
+            volume: 1.0,
+        }
+    }
+
+    #[test]
+    fn a_strike_the_underlying_came_near_on_any_day_is_kept() {
+        let chain: Vec<OptionContract> = [
+            "SPY250912P00580000",
+            "SPY250912P00620000",
+            "SPY250912C00650000",
+            "SPY250912C00700000",
+        ]
+        .iter()
+        .map(|symbol| OptionContract::parse(symbol).expect("valid"))
+        .collect();
+        // Traded 640-645 early in the window, fell to 600-610 on expiry.
+        let underlying = [day(8, 1, 640.0, 645.0), day(9, 12, 600.0, 610.0)];
+
+        let wanted = near_the_money(&chain, &underlying, 0.05, 45);
+        let kept: Vec<String> = wanted.iter().map(|w| w.contract.symbol()).collect();
+        // 5% band: 570..677.25.
+        assert_eq!(
+            kept,
+            [
+                "SPY250912P00580000",
+                "SPY250912P00620000",
+                "SPY250912C00650000"
+            ]
+        );
+        assert_eq!(wanted[0].from, date(2025, 7, 29));
+        assert_eq!(wanted[0].to, date(2025, 9, 12));
+    }
+
+    #[test]
+    fn a_zero_day_horizon_looks_only_at_the_expiration_day() {
+        let chain = [OptionContract::parse("SPY250912P00580000").expect("valid")];
+        let underlying = [day(8, 1, 570.0, 575.0), day(9, 12, 640.0, 645.0)];
+        assert!(
+            near_the_money(&chain, &underlying, 0.05, 0).is_empty(),
+            "580 is 9% below that day"
+        );
+        assert_eq!(near_the_money(&chain, &underlying, 0.10, 0).len(), 1);
+    }
+
+    #[test]
+    fn a_contract_with_no_underlying_in_its_window_is_left_out() {
+        let chain = [OptionContract::parse("SPY250912P00640000").expect("valid")];
+        assert!(near_the_money(&chain, &[day(1, 2, 640.0, 640.0)], 0.5, 30).is_empty());
     }
 
     #[test]

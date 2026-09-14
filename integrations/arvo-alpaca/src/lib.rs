@@ -50,6 +50,7 @@
 //! answers the search box.
 
 mod auth;
+pub mod chain;
 mod execution;
 pub mod options;
 mod parse;
