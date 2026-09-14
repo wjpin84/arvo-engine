@@ -631,7 +631,7 @@ impl<E: Executor> Session<E> {
 
         if found.found_anything() {
             self.gate.kill(&format!(
-                "this session started against an account that already held {} position{}                  and {} resting order{}{}; nothing was proposed until you released it",
+                "this session started against an account that already held {} position{} and {} resting order{}{}; nothing was proposed until you released it",
                 found.adopted.len(),
                 if found.adopted.len() == 1 { "" } else { "s" },
                 found.cancelled.len() + found.stranded.len(),
