@@ -220,6 +220,13 @@ pub struct Summary {
     /// field fails to parse, is treated as empty, and is rebuilt from the
     /// findings. Defaulting would have kept every cached book wrong.
     pub alongside: Vec<String>,
+    /// The agent that ran it, or `None` for a person.
+    ///
+    /// On the summary so History can mark an agent's finding without opening
+    /// it: a number an agent produced must not read, in a list, like one a
+    /// person produced (#33). Required, like `alongside`, so an index written
+    /// before it is rebuilt rather than read as "all by people".
+    pub agent: Option<String>,
 }
 
 /// A finding that could not be read, and why.
@@ -312,6 +319,7 @@ impl StoredRecord {
             instrument,
             interval,
             alongside,
+            agent: self.author.agent().map(ToOwned::to_owned),
         }
     }
 }

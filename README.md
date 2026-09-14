@@ -43,7 +43,23 @@ Headless examples, useful without the window:
 cargo run -p arvo-runtime --example fetch -- <data-dir> [--source yahoo] SYMBOL...
 cargo run -p arvo-runtime --example second_source -- SYMBOL...   # cross-check two vendors
 cargo run -p arvo-runtime --example study -- <data-dir> SYMBOL
+cargo run -p arvo-runtime --example recheck -- <data-dir> <evidence-dir>   # re-run stored findings
 ```
+
+### As an MCP server
+
+An agent can read research memory and run studies — never fetch or trade —
+through a stdio MCP server over the window's own folders
+([ADR-0016](docs/adr/0016-an-agent-reaches-arvo-through-a-tool-list-that-cannot-trade.md)):
+
+```
+cargo build --release -p arvo-mcp-server
+claude mcp add arvo -- <path-to>/target/release/arvo-mcp-server
+```
+
+With no argument it uses `%APPDATA%/com.arvo.desktop`; pass a directory to use
+another. Runs are saved as the agent's findings, deflated against everything
+that agent has run, and every call is appended to `agent-audit.jsonl`.
 
 ## Licence
 

@@ -78,6 +78,7 @@ app/           the desktop application
 | `app/arvo-runtime` | The Tauri host, the source registry, commands |
 | `app/arvo-views` | The shapes crossing to the UI, defined once |
 | `app/arvo-editor` | The Leptos workbench |
+| `app/arvo-mcp-server` | Arvo as a stdio MCP server: an agent reads and runs research, never trades |
 
 Crates provide *architecture* (compile-time boundaries). Extensions provide
 *replaceable runtime capabilities*. Not every crate is an extension, and not
