@@ -183,6 +183,49 @@ fn max_drawdown(curve: &[EquityPoint]) -> f64 {
     worst
 }
 
+/// How bad the bad days were (#85).
+///
+/// A Sharpe ratio averages the tail away, which is exactly the wrong thing to
+/// do to a strategy whose risk *is* its tail: one that sells options collects a
+/// little on most days and gives back months of it on one. These are the
+/// numbers to read before any return.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Tail {
+    /// The worst single period's return, at the run's resolution. Negative.
+    pub worst_period: f64,
+    /// The worst calendar month's return. `None` inside a single month.
+    pub worst_month: Option<f64>,
+    /// The mean of the worst 5% of periods: what a bad period costs, on
+    /// average, once it is bad.
+    pub expected_shortfall: f64,
+}
+
+/// The tail of an equity curve's period returns.
+///
+/// `None` for a curve too short to have a period return at all.
+#[must_use]
+pub fn tail(curve: &[EquityPoint]) -> Option<Tail> {
+    let mut returns: Vec<f64> = curve
+        .windows(2)
+        .filter(|pair| pair[0].equity > 0.0)
+        .map(|pair| (pair[1].equity - pair[0].equity) / pair[0].equity)
+        .collect();
+    if returns.is_empty() {
+        return None;
+    }
+    returns.sort_by(f64::total_cmp);
+    // At least one period, so a short run's expected shortfall is its worst
+    // period rather than an average over nothing.
+    let worst = returns.len().div_ceil(20);
+    let months = monthly_returns(curve);
+    Some(Tail {
+        worst_period: returns[0],
+        worst_month: (months.len() > 1)
+            .then(|| months.iter().map(|month| month.value).fold(f64::INFINITY, f64::min)),
+        expected_shortfall: returns[..worst].iter().sum::<f64>() / worst as f64,
+    })
+}
+
 /// One calendar month's return.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct MonthlyReturn {
@@ -651,6 +694,26 @@ mod tests {
 
     /// Dates are irrelevant to every statistic here, so the fixtures walk one
     /// day at a time and the tests stay about the numbers.
+    #[test]
+    fn the_tail_is_the_worst_period_the_worst_month_and_the_worst_twentieth() {
+        // 40 daily periods: 38 small gains, a -10% and a -4% day.
+        let mut values = vec![100.0];
+        for day in 1..=40 {
+            let last = *values.last().expect("seeded");
+            values.push(last * match day {
+                10 => 0.90,
+                30 => 0.96,
+                _ => 1.001,
+            });
+        }
+        let tail = tail(&curve(&values)).expect("a tail");
+        assert!((tail.worst_period + 0.10).abs() < 1e-9, "{}", tail.worst_period);
+        // 5% of 40 is two periods: (-10% + -4%) / 2.
+        assert!((tail.expected_shortfall + 0.07).abs() < 1e-9, "{}", tail.expected_shortfall);
+        assert!(tail.worst_month.is_some_and(|month| month < -0.05));
+        assert_eq!(super::tail(&curve(&[100.0])), None);
+    }
+
     fn curve(values: &[f64]) -> Vec<EquityPoint> {
         let start = chrono::NaiveDate::from_ymd_opt(2024, 1, 1)
             .expect("valid")
