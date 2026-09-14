@@ -580,14 +580,14 @@ fn read_record(path: &Path) -> Result<StoredRecord, String> {
     let where_ = path.display();
     if schema > u64::from(SCHEMA) {
         return Err(format!(
-            "{where_}: written by a newer version of Arvo              (format {schema}, this build reads {SCHEMA})"
+            "{where_}: written by a newer version of Arvo (format {schema}, this build reads {SCHEMA})"
         ));
     }
 
     serde_json::from_str(&text).map_err(|err| {
         if schema < u64::from(SCHEMA) {
             format!(
-                "{where_}: written by an older version of Arvo (format {schema})                  and cannot be read: {err}"
+                "{where_}: written by an older version of Arvo (format {schema}) and cannot be read: {err}"
             )
         } else {
             format!("{where_}: {err}")

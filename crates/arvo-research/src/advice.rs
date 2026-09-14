@@ -163,7 +163,7 @@ pub fn recommend(found: &FamilyEvidence) -> Vec<Recommendation> {
         out.push(Recommendation::new(
             Severity::Blocking,
             "The engine disagrees with itself about this run.",
-            "Do not read any number here. Two figures for the same fact came out              differently, so at least one of them is wrong and nothing downstream              can be trusted until it is known which.",
+            "Do not read any number here. Two figures for the same fact came out differently, so at least one of them is wrong and nothing downstream can be trusted until it is known which.",
             format!(
                 "{}: expected {:.2}, got {:.2} — {}",
                 discrepancy.invariant,

@@ -466,7 +466,7 @@ impl RiskModel {
             }
             if cap.max_positions == 0 {
                 return Err(
-                    "correlation_cap.max_positions of 0 refuses every correlated trade;                      remove the cap instead of setting it to zero"
+                    "correlation_cap.max_positions of 0 refuses every correlated trade; remove the cap instead of setting it to zero"
                         .to_owned(),
                 );
             }

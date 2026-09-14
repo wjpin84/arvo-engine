@@ -739,7 +739,7 @@ fn run_backtest(
                 // reaching here. The compiler cannot see that, so this says
                 // it rather than pretending the case is possible.
                 return Err(SimulationError::Rejected(
-                    "a ranking rule is added once across every instrument, not once per                      instrument"
+                    "a ranking rule is added once across every instrument, not once per instrument"
                         .to_owned(),
                 ));
             }
@@ -1725,7 +1725,7 @@ mod tests {
         );
         assert!(
             stats.stop_exits > 0,
-            "a one-ATR stop on an oscillating fixture must be hit at least once;              got {} signal exits and no stops",
+            "a one-ATR stop on an oscillating fixture must be hit at least once; got {} signal exits and no stops",
             stats.signal_exits
         );
     }
@@ -2011,7 +2011,7 @@ mod tests {
             );
             assert!(
                 gap.overstatement > 0.0,
-                "this rule is out of the market for part of the window, so it must forgo                  strictly more than buy-and-hold does — a gap of zero here means the                  measurement is not seeing the ledger: benchmark {} against strategy {}",
+                "this rule is out of the market for part of the window, so it must forgo strictly more than buy-and-hold does — a gap of zero here means the measurement is not seeing the ledger: benchmark {} against strategy {}",
                 gap.benchmark_income,
                 gap.strategy_income
             );
@@ -2683,7 +2683,7 @@ mod tests {
                 .expect("the unconstrained run works");
             assert!(
                 worst_window(&unconstrained.ledger) > arvo_research::PDT_DAY_TRADES,
-                "the control must breach the budget or the constraint below                  proves nothing: worst window held {}",
+                "the control must breach the budget or the constraint below proves nothing: worst window held {}",
                 worst_window(&unconstrained.ledger)
             );
 
@@ -2692,7 +2692,7 @@ mod tests {
                 .expect("the constrained run works");
             assert!(
                 worst_window(&held.ledger) <= arvo_research::PDT_DAY_TRADES,
-                "a $2,000 margin account may not exceed {} day trades in any                  five-business-day window, and its worst held {}",
+                "a $2,000 margin account may not exceed {} day trades in any five-business-day window, and its worst held {}",
                 arvo_research::PDT_DAY_TRADES,
                 worst_window(&held.ledger)
             );
