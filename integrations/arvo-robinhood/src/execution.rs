@@ -61,6 +61,9 @@ const ORDERS: &str = "get_equity_orders";
 const CANCEL: &str = "cancel_equity_order";
 /// The MCP tool that says what the account holds.
 const POSITIONS: &str = "get_equity_positions";
+/// The MCP tool that says what the account can spend. `get_accounts` does not
+/// return a reliable figure; the server says so and routes it here.
+const PORTFOLIO: &str = "get_portfolio";
 
 /// How long an unfilled order may rest before it is cancelled.
 ///
@@ -263,6 +266,42 @@ impl Executor for RobinhoodExecutor {
                 reason: err.to_string(),
             })
     }
+
+    async fn buying_power(&self) -> Result<Option<f64>, ExecutionError> {
+        let client = connect().await.map_err(|err| ExecutionError::Transport {
+            venue: VENUE.to_owned(),
+            detail: err.to_string(),
+        })?;
+        let portfolio = client
+            .call_tool_json(PORTFOLIO, json!({ "account_number": self.account }))
+            .await
+            .map_err(|err| ExecutionError::Transport {
+                venue: VENUE.to_owned(),
+                detail: err.to_string(),
+            })?;
+        buying_power(&portfolio).map(Some)
+    }
+}
+
+/// What the account can buy with, from `get_portfolio`.
+///
+/// `buying_power.unleveraged_buying_power`, not `buying_power.buying_power`,
+/// for the reason the Alpaca executor reads its non-marginable figure: the
+/// agentic account is limited margin, a leveraged figure would size entries
+/// the cash-account backtest behind the strategy refused, and ADR-0009 is the
+/// rule that forbids the two drifting. Shape read from the live server on
+/// 2026-09-14. Required — a reply without it is a shape change, not an
+/// unlimited account.
+fn buying_power(response: &Value) -> Result<f64, ExecutionError> {
+    response
+        .pointer("/data/buying_power/unleveraged_buying_power")
+        .or_else(|| response.pointer("/buying_power/unleveraged_buying_power"))
+        .and_then(Value::as_str)
+        .and_then(|raw| raw.parse::<f64>().ok())
+        .ok_or_else(|| ExecutionError::Transport {
+            venue: VENUE.to_owned(),
+            detail: format!("no readable buying_power.unleveraged_buying_power in {response}"),
+        })
 }
 
 /// What the venue says the account holds.
@@ -448,6 +487,45 @@ mod tests {
         NaiveDate::from_ymd_opt(2026, 9, 9)
             .expect("valid")
             .and_time(NaiveTime::from_hms_opt(14, minute, second).expect("valid"))
+    }
+
+    #[test]
+    fn buying_power_is_the_unleveraged_figure_from_the_portfolio() {
+        // The shape the server returned on 2026-09-14, with the leveraged
+        // figure set apart from the cash one so reading the wrong field fails.
+        let portfolio = json!({ "data": {
+            "cash": "1000",
+            "buying_power": {
+                "buying_power": "2000.0000",
+                "unleveraged_buying_power": "987.6500",
+                "display_currency": "USD",
+            },
+            "crypto_buying_power": { "buying_power": "0.0000" },
+        }});
+        assert!((buying_power(&portfolio).expect("readable") - 987.65).abs() < 1e-9);
+    }
+
+    /// Reads the live account's buying power through this executor's own
+    /// client. Read-only: it calls `get_portfolio` and nothing else.
+    ///
+    /// `ARVO_RH_ACCOUNT=<number> cargo test -p arvo-robinhood -- --ignored live_buying_power`
+    #[tokio::test]
+    #[ignore = "reads the live Robinhood account"]
+    async fn live_buying_power_is_readable() {
+        let account = std::env::var("ARVO_RH_ACCOUNT").expect("ARVO_RH_ACCOUNT names the account");
+        let figure = RobinhoodExecutor::new(account)
+            .buying_power()
+            .await
+            .expect("the portfolio reads")
+            .expect("the executor states a figure");
+        assert!(figure >= 0.0, "{figure}");
+        println!("unleveraged buying power: {figure}");
+    }
+
+    #[test]
+    fn a_portfolio_without_the_figure_is_an_error_not_an_unlimited_account() {
+        let portfolio = json!({ "data": { "buying_power": { "buying_power": "2000" } } });
+        assert!(matches!(buying_power(&portfolio), Err(ExecutionError::Transport { .. })));
     }
 
     fn order() -> Order {
