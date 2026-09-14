@@ -195,6 +195,68 @@ pub struct CostModel {
     /// broker schedule, checked against a current one.
     #[serde(default)]
     pub sell_notional_bps: f64,
+    /// What an option fill pays in spread, instead of [`Self::slippage_bps`].
+    ///
+    /// `None` for anything that is not an option, and skipped when absent so
+    /// every record written before options existed serialises byte for byte
+    /// as it did. An option run without one is refused, not run free.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub option_spread: Option<OptionSpread>,
+}
+
+/// Half the bid-ask spread an option fill crosses (#14).
+///
+/// # Why not basis points
+///
+/// Slippage in basis points of price is an equity model: a spread there is a
+/// few cents on a hundred-dollar share. An option's spread is a floor of a
+/// cent or two on a premium that may be a dime, so it is a *large* fraction of
+/// a cheap contract and a small one of an expensive contract — and no single
+/// rate says both. So: a dollar floor, or a fraction of the premium, whichever
+/// is more.
+///
+/// # What the defaults were measured on
+///
+/// [`Self::MEASURED`] is the 90th percentile of SPY half-spreads recorded on
+/// 2026-09-14, 18:27-19:57 UTC — seven snapshots, 24k quotes, on Alpaca's
+/// *indicative* feed, on a calm afternoon. By premium:
+///
+/// | premium | p50 half-spread | p90 | model |
+/// |---|---|---|---|
+/// | under $0.10 | $0.005 | $0.015-0.025 | $0.025 |
+/// | $0.10-1 | $0.005 | $0.025 | $0.025 |
+/// | $1-3 | $0.010 | $0.035 | $0.025-0.06 |
+/// | $3-10 | $0.02-0.035 | $0.07-0.12 | $0.06-0.20 |
+/// | $10+, 1-30 days | $0.27-1.70 | $1.7-2.2 | **$0.20-0.60+** |
+///
+/// Pessimistic up to $10, which is where a 0DTE or a sold out-of-the-money
+/// contract trades. **It underprices deep in-the-money contracts** over $10
+/// with more than a day left, whose indicative spreads were several percent;
+/// a strategy that trades those must raise the fraction. And one calm
+/// afternoon says nothing about the open, the close or a stressed market,
+/// when spreads widen most — recalibrate as the recorder (#83) accumulates.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct OptionSpread {
+    /// The smallest half-spread charged, in dollars per share.
+    pub min_half_spread: f64,
+    /// Half-spread as a fraction of the premium.
+    pub half_spread_fraction: f64,
+}
+
+impl OptionSpread {
+    /// The 2026-09-14 calibration. See the type's docs for what it misses.
+    pub const MEASURED: Self = Self {
+        min_half_spread: 0.025,
+        half_spread_fraction: 0.02,
+    };
+
+    /// Half the spread, in dollars per share, on a contract trading at
+    /// `premium`.
+    #[must_use]
+    pub fn half_spread(&self, premium: f64) -> f64 {
+        self.min_half_spread
+            .max(self.half_spread_fraction * premium.abs())
+    }
 }
 
 impl CostModel {
@@ -212,6 +274,7 @@ impl CostModel {
             per_fill: 0.0,
             per_unit_sold: 0.0,
             sell_notional_bps: 0.0,
+            option_spread: None,
         }
     }
 
@@ -242,6 +305,28 @@ impl CostModel {
         ] {
             if !value.is_finite() || value < 0.0 {
                 return Err(format!("{name} must be zero or positive, got {value}"));
+            }
+        }
+        if let Some(spread) = self.option_spread {
+            for (name, value) in [
+                ("option_spread.min_half_spread", spread.min_half_spread),
+                (
+                    "option_spread.half_spread_fraction",
+                    spread.half_spread_fraction,
+                ),
+            ] {
+                if !value.is_finite() || value < 0.0 {
+                    return Err(format!("{name} must be zero or positive, got {value}"));
+                }
+            }
+            // Half the spread larger than the premium: the bid would be below
+            // zero. That is a percent typed as a fraction, not a market.
+            if spread.half_spread_fraction >= 1.0 {
+                return Err(format!(
+                    "option_spread.half_spread_fraction {} is a fraction of the premium; \
+                     {} would put the bid below zero",
+                    spread.half_spread_fraction, spread.half_spread_fraction
+                ));
             }
         }
         Ok(())
@@ -806,6 +891,39 @@ pub trait SimulationProvider: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_option_spread_is_a_floor_or_a_fraction_of_the_premium() {
+        let spread = OptionSpread::MEASURED;
+        assert!(
+            (spread.half_spread(0.10) - 0.025).abs() < 1e-12,
+            "a dime pays the floor"
+        );
+        assert!((spread.half_spread(5.0) - 0.10).abs() < 1e-12, "$5 pays 2%");
+    }
+
+    #[test]
+    fn a_nonsense_option_spread_is_refused() {
+        let with = |min_half_spread, half_spread_fraction| CostModel {
+            option_spread: Some(OptionSpread {
+                min_half_spread,
+                half_spread_fraction,
+            }),
+            ..CostModel::proportional(0.0, 0.0)
+        };
+        assert!(with(0.025, 0.02).check().is_ok());
+        for bad in [with(-0.01, 0.02), with(0.025, f64::NAN), with(0.025, 2.0)] {
+            assert!(bad.check().is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_cost_model_without_an_option_spread_serialises_as_it_always_did() {
+        // Stored records and shared experiments carry their cost model; adding a
+        // field must not change what an old one looks like.
+        let text = serde_json::to_string(&CostModel::proportional(1.0, 2.0)).expect("serialises");
+        assert!(!text.contains("option_spread"), "{text}");
+    }
 
     fn date(y: i32, m: u32, d: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(y, m, d).expect("test date is valid")

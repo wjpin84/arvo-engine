@@ -58,13 +58,17 @@ use nautilus_execution::models::{fee::FeeModelHandle, fill::FillModelHandle};
 use nautilus_core::UnixNanos;
 use nautilus_model::{
     data::{Bar, BarSpecification, BarType, Data},
-    enums::{AccountType, AggregationSource, BarAggregation, BookType, OmsType, PriceType},
+    enums::{
+        AccountType, AggregationSource, AssetClass, BarAggregation, BookType, OmsType, OptionKind,
+        PriceType,
+    },
     identifiers::{InstrumentId, Symbol},
-    instruments::{Equity, InstrumentAny},
+    instruments::{Equity, InstrumentAny, OptionContract},
     types::{Currency, Money, Price, Quantity},
 };
 use nautilus_trading::strategy::{StrategyConfig, StrategyCore};
 use rust_decimal::Decimal;
+use ustr::Ustr;
 
 /// The Nautilus version this crate is pinned to, recorded on every result.
 ///
@@ -184,6 +188,47 @@ impl<P: BarProvider> SimulationProvider for NautilusSimulation<P> {
         experiment
             .check_instruments()
             .map_err(SimulationError::Rejected)?;
+
+        // An option run is priced by the option spread, and only by it. With no
+        // spread every fill lands on the traded price for free; with equity
+        // basis points as well, the cost is stated twice and applied once.
+        let contracts: Vec<_> = experiment
+            .instruments()
+            .iter()
+            .filter_map(|name| arvo_data::option::OptionContract::parse(name))
+            .collect();
+        // A position held through expiry is neither exercised nor assigned nor
+        // expired — it stays open, marked at its last trade, for as long as
+        // the window runs. Settlement is #84; until it exists a window that
+        // outlives a contract is refused rather than valued as if it had not.
+        if let Some(contract) = contracts
+            .iter()
+            .find(|contract| experiment.window.to > contract.expiration)
+        {
+            return Err(SimulationError::Rejected(format!(
+                "{} expires {} and the window runs to {}: settlement at expiry is not \
+                 modelled yet, so end the window on or before the expiration",
+                contract.symbol(),
+                contract.expiration,
+                experiment.window.to
+            )));
+        }
+        if !contracts.is_empty() {
+            if experiment.costs.option_spread.is_none() {
+                return Err(SimulationError::Rejected(
+                    "cost model: an option run needs option_spread — without it every fill \
+                     is at the traded price and crosses no spread"
+                        .to_owned(),
+                ));
+            }
+            if experiment.costs.slippage_bps != 0.0 {
+                return Err(SimulationError::Rejected(
+                    "cost model: slippage_bps is equity basis points; an option's spread is \
+                     option_spread, so state it there and set slippage_bps to zero"
+                        .to_owned(),
+                ));
+            }
+        }
 
         // Every instrument the run holds, each with its own series. All of
         // them are checked before any of them is simulated: a book that is
@@ -539,6 +584,14 @@ fn run_backtest(
             .map_err(SimulationError::Rejected)?;
         engine.change_fill_model(venue, FillModelHandle::new(model));
     }
+    // `run` has refused an option run without a spread, or with basis points
+    // beside it, so this is the only fill model an option run can have.
+    if let Some(spread) = experiment.costs.option_spread {
+        engine.change_fill_model(
+            venue,
+            FillModelHandle::new(fill::PremiumSpread::new(spread)),
+        );
+    }
 
     let (step, aggregation) = aggregation_of(experiment.interval)?;
     let spec = BarSpecification::new_checked(step, aggregation, PriceType::Last)
@@ -546,8 +599,17 @@ fn run_backtest(
 
     let mut bar_types = Vec::with_capacity(book.len());
     for (instrument_id, _, bars) in book {
-        let instrument = equity(*instrument_id, currency, experiment.costs.commission_bps)
-            .map_err(|err| rejected("building the instrument", &err))?;
+        let instrument = match arvo_data::option::OptionContract::parse(&instrument_id.to_string())
+        {
+            Some(contract) => option(
+                *instrument_id,
+                &contract,
+                currency,
+                experiment.costs.commission_bps,
+            ),
+            None => equity(*instrument_id, currency, experiment.costs.commission_bps),
+        }
+        .map_err(|err| rejected("building the instrument", &err))?;
         engine
             .add_instrument(&instrument)
             .map_err(|err| rejected("adding the instrument", &err))?;
@@ -829,6 +891,68 @@ fn equity(
         .build()?;
 
     Ok(InstrumentAny::Equity(equity))
+}
+
+/// Builds an option contract, traded in shares of what it delivers.
+///
+/// # A multiplier of one, in lots of a hundred
+///
+/// A contract is 100 shares' worth, quoted per share. Nautilus can carry that
+/// as a multiplier of 100 on a quantity of contracts — and then every figure
+/// Arvo derives from a fill (the equity curve, a stop distance, sizing, the
+/// per-unit fees) would need to know to multiply, and each one that did not
+/// would be wrong by a factor of a hundred without failing.
+///
+/// So the unit is one share of the deliverable: a multiplier of one, a price
+/// per share as quoted, and a quantity that the risk gate only ever sizes in
+/// hundreds (`arvo_research::risk`). A price times a quantity is dollars
+/// everywhere, as it is for a stock.
+///
+/// The expiration is real, so Nautilus refuses an order after it, and that
+/// refusal reaches the ledger like any other.
+fn option(
+    instrument_id: InstrumentId,
+    contract: &arvo_data::option::OptionContract,
+    currency: Currency,
+    commission_bps: f64,
+) -> anyhow::Result<InstrumentAny> {
+    let fee = Decimal::try_from(commission_bps / 10_000.0)?;
+    let tick = Price::new_checked(0.01, PRICE_PRECISION)?;
+    let expires = contract
+        .expires_at()
+        .and_utc()
+        .timestamp_nanos_opt()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "expiration {} is not a representable instant",
+                contract.expiration
+            )
+        })?;
+
+    let option = OptionContract::builder()
+        .instrument_id(instrument_id)
+        .raw_symbol(Symbol::from(instrument_id.symbol.as_str()))
+        .asset_class(AssetClass::Equity)
+        .underlying(Ustr::from(contract.underlying.as_str()))
+        .option_kind(match contract.right {
+            arvo_data::option::Right::Call => OptionKind::Call,
+            arvo_data::option::Right::Put => OptionKind::Put,
+        })
+        .strike_price(Price::new_checked(contract.strike, PRICE_PRECISION)?)
+        .currency(currency)
+        .activation_ns(UnixNanos::default())
+        .expiration_ns(UnixNanos::from(u64::try_from(expires)?))
+        .price_precision(PRICE_PRECISION)
+        .price_increment(tick)
+        .multiplier(Quantity::from(1))
+        .lot_size(Quantity::from(arvo_data::option::MULTIPLIER as u64))
+        .maker_fee(fee)
+        .taker_fee(fee)
+        .ts_event(UnixNanos::default())
+        .ts_init(UnixNanos::default())
+        .build()?;
+
+    Ok(InstrumentAny::OptionContract(option))
 }
 
 fn to_nautilus_bar(
@@ -1487,6 +1611,139 @@ mod tests {
             "slipped {} should end below unslipped {}",
             final_equity(&with),
             final_equity(&without)
+        );
+    }
+
+    /// The sawtooth, fifty times cheaper and on whole cents: an option's price.
+    fn premium_path(days: usize) -> Vec<arvo_data::Bar> {
+        let cents = |value: f64| (value / 50.0 * 100.0).round() / 100.0;
+        sawtooth(days)
+            .into_iter()
+            .map(|bar| arvo_data::Bar {
+                open: cents(bar.open),
+                high: cents(bar.high),
+                low: cents(bar.low),
+                close: cents(bar.close),
+                ..bar
+            })
+            .collect()
+    }
+
+    fn option_run(
+        contract: &str,
+        costs: CostModel,
+        bars: &[arvo_data::Bar],
+    ) -> Result<SimulationResult, SimulationError> {
+        let mut experiment = experiment(params(5.0, 10.0), bars);
+        experiment.instrument = contract.to_owned();
+        experiment.costs = costs;
+        NautilusSimulation::new(InMemoryBars::new().with_instrument(contract, bars.to_vec()))
+            .run(&experiment)
+    }
+
+    const LATE_CONTRACT: &str = "SPY241220C00100000.AOPT";
+
+    fn spread(spread: arvo_research::OptionSpread) -> CostModel {
+        CostModel {
+            option_spread: Some(spread),
+            ..CostModel::proportional(0.0, 0.0)
+        }
+    }
+
+    #[test]
+    fn an_option_run_without_a_spread_is_refused_not_run_free() {
+        let bars = premium_path(200);
+        let err = option_run(LATE_CONTRACT, CostModel::proportional(1.0, 0.0), &bars)
+            .expect_err("no spread");
+        assert!(
+            matches!(err, SimulationError::Rejected(ref why) if why.contains("option_spread")),
+            "{err}"
+        );
+
+        let mut both = spread(arvo_research::OptionSpread::MEASURED);
+        both.slippage_bps = 5.0;
+        let err = option_run(LATE_CONTRACT, both, &bars).expect_err("a cost stated twice");
+        assert!(
+            matches!(err, SimulationError::Rejected(ref why) if why.contains("slippage_bps")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn an_option_trades_whole_contracts_and_pays_its_spread_on_every_fill() {
+        let bars = premium_path(200);
+        let tight = option_run(
+            LATE_CONTRACT,
+            spread(arvo_research::OptionSpread {
+                min_half_spread: 0.0,
+                half_spread_fraction: 0.0,
+            }),
+            &bars,
+        )
+        .expect("runs");
+        let measured = option_run(
+            LATE_CONTRACT,
+            spread(arvo_research::OptionSpread::MEASURED),
+            &bars,
+        )
+        .expect("runs");
+
+        assert!(
+            measured.trades > 0,
+            "the fixture has to trade to test anything"
+        );
+        assert_eq!(
+            tight.trades, measured.trades,
+            "the spread costs money; it does not move signals"
+        );
+        for trade in &measured.ledger {
+            assert!(
+                trade.quantity >= 100.0 && trade.quantity % 100.0 == 0.0,
+                "{} is not whole contracts",
+                trade.quantity
+            );
+        }
+        // The tightest book still moves a price one tick, so the traded price
+        // is that tick back from the tight fill. From there the measured model
+        // moves it by half the spread — 2% of a ~$2 premium, over the $0.025
+        // floor — in whole ticks, on the way in and on the way out.
+        let ticks = |premium: f64| {
+            (arvo_research::OptionSpread::MEASURED.half_spread(premium) / 0.01 - 1e-9).ceil() * 0.01
+        };
+        for (tight, measured) in tight.ledger.iter().zip(&measured.ledger) {
+            let traded = tight.entry - 0.01;
+            assert!(
+                (measured.entry - (traded + ticks(traded))).abs() < 1e-9,
+                "entry {} from {traded}",
+                measured.entry
+            );
+            if let (Some(a), Some(b)) = (tight.exit, measured.exit) {
+                let traded = a + 0.01;
+                assert!(
+                    (b - (traded - ticks(traded))).abs() < 1e-9,
+                    "exit {b} from {traded}"
+                );
+            }
+        }
+        let final_equity =
+            |result: &SimulationResult| result.equity_curve.last().expect("non-empty").equity;
+        assert!(final_equity(&measured) < final_equity(&tight));
+    }
+
+    #[test]
+    fn a_window_past_a_contracts_expiration_is_refused_until_settlement_exists() {
+        // Found by holding one through: the position stayed open for four
+        // months after the contract ceased to exist, marked at its last trade.
+        let bars = premium_path(200);
+        let err = option_run(
+            "SPY240315C00100000.AOPT",
+            spread(arvo_research::OptionSpread::MEASURED),
+            &bars,
+        )
+        .expect_err("the window runs to July");
+        assert!(
+            matches!(err, SimulationError::Rejected(ref why) if why.contains("2024-03-15")),
+            "{err}"
         );
     }
 
@@ -2295,6 +2552,7 @@ mod tests {
                 per_fill: 0.65,
                 per_unit_sold: 0.000_166,
                 sell_notional_bps: 0.278,
+                option_spread: None,
             },
         ];
 
