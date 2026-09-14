@@ -31,9 +31,9 @@ use std::path::{Path, PathBuf};
 use arvo_data::{BarProvider, CsvBars};
 use arvo_nautilus::NautilusSimulation;
 use arvo_research::{
-    DateRange, EvaluationCriteria, EvidenceStore, Record, StoredRecord, Verdict,
+    EvaluationCriteria, EvidenceStore, Record, StoredRecord, Verdict,
 };
-use arvo_runtime_lib::research::{study_for, walk_forward_for, StrategyPlan};
+use arvo_runtime_lib::research::{study_data, study_for, walk_forward_for, StrategyPlan};
 use serde_json::{json, Value};
 
 /// The protocol revision this speaks, the one `arvo-mcp` speaks as a client.
@@ -213,18 +213,8 @@ impl Server {
                 "{strategy} ranks instruments against each other and cannot be run on one"
             ));
         }
-        let interval = plan.interval();
         let bars = CsvBars::new(&self.data);
-        let missing = || format!("{instrument} holds no {interval} bars, the resolution {strategy} runs at");
-        let (from, to) = bars
-            .coverage(instrument, interval)
-            .map_err(|err| err.to_string())?
-            .ok_or_else(missing)?;
-        let fingerprint = bars
-            .fingerprint(instrument, interval)
-            .map_err(|err| err.to_string())?
-            .ok_or_else(missing)?;
-        let window = DateRange::new(from, to).map_err(|err| err.to_string())?;
+        let (window, fingerprint) = study_data(&bars, instrument, plan)?;
         let simulation = NautilusSimulation::new(CsvBars::new(&self.data));
         let criteria = EvaluationCriteria::default();
 

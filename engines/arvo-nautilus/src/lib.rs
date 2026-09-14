@@ -84,7 +84,6 @@ const BUY_AND_HOLD: &str = arvo_research::evaluation::BUY_AND_HOLD;
 /// menu can run one yet.
 pub const SELL_AND_HOLD: &str = "sell_and_hold";
 /// Sell put spreads on an underlying, choosing contracts from its chain (#86).
-/// Not in [`STRATEGIES`] for the reason [`SELL_AND_HOLD`] is not.
 pub const PUT_SPREAD: &str = "put_spread";
 const OPENING_RANGE: &str = "opening_range";
 const VOLATILITY_BREAKOUT: &str = "volatility_breakout";
@@ -104,6 +103,7 @@ pub const STRATEGIES: &[&str] = &[
     MOMENTUM_BREAKOUT,
     CROSS_SECTIONAL,
     BUY_AND_HOLD,
+    PUT_SPREAD,
 ];
 
 /// Strategies that rank instruments against each other, and therefore need
@@ -1269,7 +1269,8 @@ fn finish(
     Ok(SimulationResult {
         experiment: experiment.id.clone(),
         engine: ENGINE.to_owned(),
-        trades: u32::try_from(ledger.len()).unwrap_or(u32::MAX),
+        // Positions, not legs: a spread is one trade (see `trade::positions`).
+        trades: u32::try_from(arvo_research::trade::positions(&ledger).len()).unwrap_or(u32::MAX),
         equity_curve,
         ledger,
         refused,
@@ -1844,10 +1845,20 @@ mod tests {
                     ("exit_period".to_owned(), 10.0),
                     ("lookback".to_owned(), 60.0),
                     ("hold_top".to_owned(), 3.0),
+                    ("dte".to_owned(), 35.0),
+                    ("exit_dte".to_owned(), 21.0),
+                    ("short_delta".to_owned(), 0.2),
+                    ("width".to_owned(), 5.0),
+                    ("take_profit".to_owned(), 0.5),
+                    ("rate".to_owned(), 0.04),
+                    ("dividend_yield".to_owned(), 0.013),
                 ]),
             };
+            // At whichever resolution the rule is defined: the session rules
+            // intraday, a put spread on daily closes.
             assert!(
-                Plan::from_spec(&spec, intraday).is_ok(),
+                Plan::from_spec(&spec, intraday).is_ok()
+                    || Plan::from_spec(&spec, arvo_data::BarInterval::DAILY).is_ok(),
                 "{name} is advertised but cannot be planned"
             );
         }

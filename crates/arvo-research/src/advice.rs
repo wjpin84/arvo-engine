@@ -352,7 +352,10 @@ pub fn recommend(found: &FamilyEvidence) -> Vec<Recommendation> {
 
     // ---- warning: readable, but resting on something fragile -------------
 
-    out.extend(shape_warnings(trades));
+    out.extend(shape_warnings(
+        trades,
+        found.out_of_sample_evidence.experiment.risk.stop_atr_multiple.is_some(),
+    ));
 
     if trades.halted {
         out.push(Recommendation::new(
@@ -941,7 +944,10 @@ pub fn recommend_walk_forward(found: &WalkForwardEvidence) -> Vec<Recommendation
         }
     }
 
-    out.extend(shape_warnings(&found.combined_trades));
+    out.extend(shape_warnings(
+        &found.combined_trades,
+        found.template.risk.stop_atr_multiple.is_some(),
+    ));
 
     if found.excess_return <= 0.0 && found.verdict != Verdict::Inconclusive {
         out.push(Recommendation::new(
@@ -1057,7 +1063,7 @@ fn never_traded(found: &FamilyEvidence) -> Vec<String> {
 ///
 /// Only computed on enough closed trades to describe: a win rate over four
 /// round trips is a statement about four round trips.
-fn shape_warnings(trades: &TradeStats) -> Vec<Recommendation> {
+fn shape_warnings(trades: &TradeStats, stopped: bool) -> Vec<Recommendation> {
     let mut out = Vec::new();
     if trades.closed < MIN_TRADES_TO_CHARACTERISE {
         return out;
@@ -1103,7 +1109,9 @@ fn shape_warnings(trades: &TradeStats) -> Vec<Recommendation> {
         }
     }
 
-    if trades.closed > 0 {
+    // Only a rule that has a stop can be told its stop never bound. A put
+    // spread has none and was told so anyway.
+    if stopped && trades.closed > 0 {
         let stop_share = f64::from(trades.stop_exits) / f64::from(trades.closed);
         if stop_share > STOP_DOMINANCE {
             out.push(Recommendation::new(
@@ -1225,7 +1233,7 @@ mod tests {
             .collect();
         ledger.extend((6..11).map(|day| trade(day, 3, -100.0, ExitReason::Stop)));
 
-        let warnings = shape_warnings(&TradeStats::from_ledger(&ledger));
+        let warnings = shape_warnings(&TradeStats::from_ledger(&ledger), true);
         assert!(
             warnings.iter().any(|r| r.action.contains("exit is the problem")),
             "{warnings:#?}"
@@ -1239,7 +1247,7 @@ mod tests {
             .collect();
         ledger.push(trade(11, 3, 5_000.0, ExitReason::Signal));
 
-        let warnings = shape_warnings(&TradeStats::from_ledger(&ledger));
+        let warnings = shape_warnings(&TradeStats::from_ledger(&ledger), true);
         let concentration = warnings
             .iter()
             .find(|r| r.finding.contains("One trade"))
@@ -1258,7 +1266,7 @@ mod tests {
         ledger.push(trade(4, 3, 5_000.0, ExitReason::Signal));
 
         assert!(
-            shape_warnings(&TradeStats::from_ledger(&ledger)).is_empty(),
+            shape_warnings(&TradeStats::from_ledger(&ledger), true).is_empty(),
             "a handful of trades has no shape to describe"
         );
     }
@@ -1268,7 +1276,7 @@ mod tests {
         let ledger: Vec<Trade> = (0..12)
             .map(|day| trade(day, 3, 10.0, ExitReason::Signal))
             .collect();
-        let notes = shape_warnings(&TradeStats::from_ledger(&ledger));
+        let notes = shape_warnings(&TradeStats::from_ledger(&ledger), true);
         let untested = notes
             .iter()
             .find(|r| r.finding.contains("stop never bound"))
@@ -1283,7 +1291,7 @@ mod tests {
             .collect();
         ledger.push(trade(11, 3, 10.0, ExitReason::Signal));
 
-        let warnings = shape_warnings(&TradeStats::from_ledger(&ledger));
+        let warnings = shape_warnings(&TradeStats::from_ledger(&ledger), true);
         assert!(
             warnings.iter().any(|r| r.finding.contains("ended at the stop")),
             "{warnings:#?}"
