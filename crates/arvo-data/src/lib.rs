@@ -22,6 +22,7 @@
 pub mod source;
 pub mod agreement;
 pub mod interval;
+pub mod option;
 pub mod quality;
 pub mod session;
 
@@ -336,6 +337,10 @@ pub struct CsvBars {
 /// Where distribution files live, relative to the library root.
 const DIVIDEND_SUBDIR: &str = "dividends";
 
+/// Where option contracts' bars live, relative to the library root:
+/// `options/<UNDERLYING>/<interval>/<OCC>.<VENUE>.csv`.
+const OPTION_SUBDIR: &str = "options";
+
 /// An instrument name that cannot escape the library root.
 ///
 /// Instrument names arrive from config files and UI fields, so this is a trust
@@ -501,9 +506,19 @@ impl CsvBars {
     /// trust boundary: `../../etc/passwd` is rejected here rather than handed
     /// to the filesystem.
     fn path_for(&self, instrument: &str, interval: BarInterval) -> Result<PathBuf, DataError> {
-        Ok(self
-            .directory(interval)
-            .join(format!("{}.csv", safe_name(instrument)?)))
+        let file = format!("{}.csv", safe_name(instrument)?);
+        // An option contract files under its underlying, at every resolution.
+        // A chain is thousands of contracts, most of which expire within weeks;
+        // beside the stocks they would bury the library listing.
+        if let Some(contract) = option::OptionContract::parse(instrument) {
+            return Ok(self
+                .root
+                .join(OPTION_SUBDIR)
+                .join(&contract.underlying)
+                .join(interval.to_string())
+                .join(file));
+        }
+        Ok(self.directory(interval).join(file))
     }
 }
 
@@ -795,6 +810,29 @@ mod dividend_tests {
         library.write_dividends("MSFT.RH", &[paid(2, 0.75)]).expect("write");
 
         assert_eq!(library.instruments().expect("list"), vec!["MSFT.RH"]);
+    }
+
+    #[test]
+    fn a_contract_reads_back_like_a_stock_and_is_not_listed_as_one() {
+        let (_dir, library) = library();
+        let bar = Bar {
+            at: NaiveDate::from_ymd_opt(2024, 3, 1).expect("valid").and_time(NaiveTime::MIN),
+            open: 1.75,
+            high: 2.27,
+            low: 1.7,
+            close: 1.83,
+            volume: 3812.0,
+        };
+        for name in ["SPY.AIEX", "SPY240315C00510000.AOPT"] {
+            library.write(name, BarInterval::DAILY, &[bar]).expect("write");
+        }
+        let (from, to) = window();
+        assert_eq!(
+            library.bars("SPY240315C00510000.AOPT", BarInterval::DAILY, from, to).expect("read"),
+            vec![bar]
+        );
+        assert!(library.fingerprint("SPY240315C00510000.AOPT", BarInterval::DAILY).expect("hash").is_some());
+        assert_eq!(library.instruments().expect("list"), vec!["SPY.AIEX"], "a chain would bury the library");
     }
 
     #[test]

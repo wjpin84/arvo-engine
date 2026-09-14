@@ -19,8 +19,9 @@
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
+use arvo_data::option::{OptionContract, Right};
 use arvo_data::source::SourceError;
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 use crate::auth::get;
@@ -45,10 +46,7 @@ pub const HORIZON_DAYS: i64 = 60;
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChainQuote {
     pub symbol: String,
-    pub expiration: NaiveDate,
-    /// `'C'` or `'P'`.
-    pub right: char,
-    pub strike: f64,
+    pub contract: OptionContract,
     pub quote_at: DateTime<Utc>,
     pub bid: f64,
     pub ask: f64,
@@ -166,9 +164,12 @@ fn row(recorded_at: DateTime<Utc>, q: &ChainQuote, under_bid: f64, under_ask: f6
         "{},{},{},{},{},{},{},{},{},{},{},{}",
         recorded_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         q.symbol,
-        q.expiration,
-        q.right,
-        q.strike,
+        q.contract.expiration,
+        match q.contract.right {
+            Right::Call => 'C',
+            Right::Put => 'P',
+        },
+        q.contract.strike,
         q.quote_at
             .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
         q.bid,
@@ -194,7 +195,7 @@ pub(crate) fn parse_chain(body: &Value) -> Result<Vec<ChainQuote>, SourceError> 
         let Some(quote) = snapshot.get("latestQuote") else {
             continue;
         };
-        let (expiration, right, strike) = occ(symbol)
+        let contract = OptionContract::parse(symbol)
             .ok_or_else(|| malformed(format!("{symbol:?} is not an OCC option symbol")))?;
         let field = |name: &str| quote.get(name).and_then(Value::as_f64);
         let (Some(bid), Some(ask)) = (field("bp"), field("ap")) else {
@@ -211,9 +212,7 @@ pub(crate) fn parse_chain(body: &Value) -> Result<Vec<ChainQuote>, SourceError> 
             .with_timezone(&Utc);
         quotes.push(ChainQuote {
             symbol: symbol.clone(),
-            expiration,
-            right,
-            strike,
+            contract,
             quote_at,
             bid,
             ask,
@@ -222,20 +221,6 @@ pub(crate) fn parse_chain(body: &Value) -> Result<Vec<ChainQuote>, SourceError> 
         });
     }
     Ok(quotes)
-}
-
-/// Expiration, right and strike from an OCC symbol: root, `YYMMDD`, `C`/`P`,
-/// strike × 1000 in eight digits. Read from the end, because the root is
-/// variable length.
-fn occ(symbol: &str) -> Option<(NaiveDate, char, f64)> {
-    let tail = symbol.get(symbol.len().checked_sub(15)?..)?;
-    let expiration = NaiveDate::parse_from_str(&format!("20{}", &tail[..6]), "%Y%m%d").ok()?;
-    let right = tail[6..7]
-        .chars()
-        .next()
-        .filter(|c| *c == 'C' || *c == 'P')?;
-    let strike = tail[7..].parse::<u32>().ok()?;
-    Some((expiration, right, f64::from(strike) / 1000.0))
 }
 
 fn io(err: std::io::Error) -> SourceError {
@@ -249,29 +234,6 @@ fn io(err: std::io::Error) -> SourceError {
 mod tests {
     use super::*;
     use serde_json::json;
-
-    #[test]
-    fn an_occ_symbol_reads_from_the_end() {
-        assert_eq!(
-            occ("SPY260914C00760000"),
-            Some((
-                NaiveDate::from_ymd_opt(2026, 9, 14).expect("valid"),
-                'C',
-                760.0
-            ))
-        );
-        assert_eq!(
-            occ("SPXW261016P05822500"),
-            Some((
-                NaiveDate::from_ymd_opt(2026, 10, 16).expect("valid"),
-                'P',
-                5822.5
-            )),
-            "a longer root and a half-dollar strike"
-        );
-        assert_eq!(occ("SPY"), None);
-        assert_eq!(occ("SPY260914X00760000"), None);
-    }
 
     #[test]
     fn reads_a_chain_snapshot_and_leaves_out_contracts_with_no_quote() {
@@ -291,7 +253,7 @@ mod tests {
         assert_eq!(quotes.len(), 2, "no quote is not a zero quote");
         assert_eq!(quotes[0].symbol, "SPY260914C00760000");
         assert!((quotes[0].ask - quotes[0].bid - 0.01).abs() < 1e-9);
-        assert_eq!(quotes[1].right, 'P');
+        assert_eq!(quotes[1].contract.right, Right::Put);
         assert!(
             quotes[1].bid.abs() < 1e-12,
             "a zero bid is kept: it is the answer"
@@ -313,9 +275,7 @@ mod tests {
     fn a_row_has_a_value_for_every_header_column() {
         let quote = ChainQuote {
             symbol: "SPY260914C00760000".to_owned(),
-            expiration: NaiveDate::from_ymd_opt(2026, 9, 14).expect("valid"),
-            right: 'C',
-            strike: 760.0,
+            contract: OptionContract::parse("SPY260914C00760000").expect("valid"),
             quote_at: DateTime::parse_from_rfc3339("2026-09-14T18:22:59Z")
                 .expect("valid")
                 .with_timezone(&Utc),
