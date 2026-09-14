@@ -372,6 +372,23 @@ pub trait Source: Send + Sync {
     /// so a new source has to say, and the compiler makes it.
     fn basis(&self) -> Basis;
 
+    /// The widest window, in calendar days, one fetch at `interval` may ask
+    /// for. `None` when this source sets no limit it will refuse over.
+    ///
+    /// Declared because the limits differ by two orders of magnitude and
+    /// nothing in a reply says so until it is refused: Robinhood refuses more
+    /// than 5,000 bars, Yahoo keeps five-minute bars for sixty days, and Alpaca
+    /// pages through years. A default window that ignored this was either too
+    /// wide for one source or a waste of the others — it was thirty days of
+    /// intraday for all three, which is thirty sessions to judge a day-trading
+    /// rule on (#10).
+    ///
+    /// Defaulted, like [`Self::credential`]: a source that forgets gets its
+    /// own refusal back, naming the limit, rather than a quietly wrong answer.
+    fn max_days(&self, _interval: BarInterval) -> Option<u32> {
+        None
+    }
+
     /// Whether a usable credential is held.
     ///
     /// `true` for a source that needs none, which is the honest answer to "can
@@ -567,6 +584,26 @@ pub async fn ingest(
         quality,
         revision,
     })
+}
+
+/// How far back a fetch reaches when nobody says: ten years of daily bars, two
+/// of intraday, or as much of either as every named source will serve.
+///
+/// Two years of intraday rather than ten because the same span is two orders
+/// of magnitude more bars — about 39,000 at five minutes — and two years is
+/// already enough folds for a walk-forward to say something.
+///
+/// ponytail: one span per resolution class. A one-minute pull of two years is
+/// ~195,000 bars; scale the span by bars per day if that becomes a cost.
+#[must_use]
+pub fn default_days(sources: &[&dyn Source], interval: BarInterval) -> u32 {
+    const DAILY: u32 = 3_650;
+    const INTRADAY: u32 = 730;
+    let wanted = if interval.is_intraday() { INTRADAY } else { DAILY };
+    sources
+        .iter()
+        .filter_map(|source| source.max_days(interval))
+        .fold(wanted, u32::min)
 }
 
 /// Two vendors' answers to the same question, and how far apart they are.

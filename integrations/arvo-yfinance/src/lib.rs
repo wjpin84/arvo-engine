@@ -136,6 +136,10 @@ impl Source for Yahoo {
         }
     }
 
+    fn max_days(&self, interval: BarInterval) -> Option<u32> {
+        max_days(interval)
+    }
+
     async fn bars(
         &self,
         symbol: &str,
@@ -153,7 +157,7 @@ impl Source for Yahoo {
         }
         let body = chart(symbol, interval, from, to).await?;
         Ok(Fetched {
-            bars: parse_bars(&body, self.total_return)?,
+            bars: parse_bars(&body, interval, self.total_return)?,
             // Yahoo drops a session it has no print for rather than filling it,
             // so there is nothing invented to count. `parse_bars` drops any
             // half-formed bar for the same reason.
@@ -231,6 +235,22 @@ fn malformed(detail: impl Into<String>) -> SourceError {
     }
 }
 
+/// How far back Yahoo keeps bars at `interval`, in calendar days.
+///
+/// Not documented by Yahoo; these are the limits its chart endpoint enforces,
+/// measured back from today — one-minute bars for a week, sub-hourly for sixty
+/// days, hourly for two years. One day short of each, so a window that ends
+/// today and is counted inclusively stays inside it.
+fn max_days(interval: BarInterval) -> Option<u32> {
+    match interval.unit {
+        IntervalUnit::Second => Some(0),
+        IntervalUnit::Minute if interval.step == 1 => Some(6),
+        IntervalUnit::Minute => Some(59),
+        IntervalUnit::Hour => Some(729),
+        IntervalUnit::Day | IntervalUnit::Week => None,
+    }
+}
+
 /// Arvo's interval spelling in Yahoo's vocabulary.
 fn spelling(interval: BarInterval) -> String {
     let unit = match interval.unit {
@@ -267,7 +287,11 @@ fn result(body: &serde_json::Value) -> Result<&serde_json::Value, SourceError> {
 /// `adjclose / close`. Yahoo adjusts only the close, and a bar whose open, high
 /// and low stayed on the split basis would have its close outside its own
 /// range on every day before a distribution.
-fn parse_bars(body: &serde_json::Value, total_return: bool) -> Result<Vec<Bar>, SourceError> {
+fn parse_bars(
+    body: &serde_json::Value,
+    interval: BarInterval,
+    total_return: bool,
+) -> Result<Vec<Bar>, SourceError> {
     let result = result(body)?;
     let times = result
         .pointer("/timestamp")
@@ -335,12 +359,18 @@ fn parse_bars(body: &serde_json::Value, total_return: bool) -> Result<Vec<Bar>, 
         let (open, high, low, close) = (open * factor, high * factor, low * factor, close * factor);
 
         bars.push(Bar {
-            // Yahoo stamps a daily bar at the session *open* in exchange time.
-            // Arvo's `Bar::at` is also the opening instant, so the two agree —
-            // and the engine adds the interval to reach the close, which is the
-            // convention that keeps trade instants and curve instants on one
-            // clock.
-            at: at.date().and_time(chrono::NaiveTime::MIN),
+            // A daily bar opens at midnight of its date in Arvo, and Yahoo
+            // stamps one at the session open, so the date is kept and the time
+            // dropped. Only for daily and coarser: an intraday bar's instant
+            // *is* the bar, and dropping it stamped every five-minute bar of a
+            // day at midnight — where de-duplication kept one of them. Yahoo
+            // intraday was one bar a day until the regular-session check
+            // flagged all of them as outside it.
+            at: if interval.is_intraday() {
+                at
+            } else {
+                at.date().and_time(chrono::NaiveTime::MIN)
+            },
             open,
             high,
             low,
@@ -431,7 +461,7 @@ mod tests {
     }
 
     fn parse_bars_split(body: &serde_json::Value) -> Result<Vec<Bar>, SourceError> {
-        parse_bars(body, false)
+        parse_bars(body, BarInterval::DAILY, false)
     }
 
     #[test]
@@ -442,7 +472,7 @@ mod tests {
         body["chart"]["result"][0]["indicators"]["adjclose"] =
             serde_json::json!([{ "adjclose": [98.0, 100.0] }]);
 
-        let bars = parse_bars(&body, true).expect("a total-return reply");
+        let bars = parse_bars(&body, BarInterval::DAILY, true).expect("a total-return reply");
         assert!((bars[0].close - 98.0).abs() < 1e-9);
         assert!(
             (bars[0].high - 98.98).abs() < 1e-9,
@@ -455,14 +485,14 @@ mod tests {
             "no distribution since, no factor"
         );
 
-        let split = parse_bars(&body, false).expect("the same reply, split basis");
+        let split = parse_bars(&body, BarInterval::DAILY, false).expect("the same reply, split basis");
         assert!((split[0].close - 100.0).abs() < 1e-9, "adjclose ignored");
     }
 
     #[test]
     fn a_total_return_reply_without_adjclose_is_refused_not_served_split() {
         let body = reply(&[1_700_000_000], &[Some(100.0)]);
-        let Err(SourceError::Malformed { detail, .. }) = parse_bars(&body, true) else {
+        let Err(SourceError::Malformed { detail, .. }) = parse_bars(&body, BarInterval::DAILY, true) else {
             panic!("a missing adjclose is a shape problem");
         };
         assert!(detail.contains("adjclose"), "{detail}");
@@ -475,6 +505,21 @@ mod tests {
         assert_ne!(split.venue(), total.venue());
         assert_eq!(split.basis().adjustment, Adjustment::Split);
         assert_eq!(total.basis().adjustment, Adjustment::TotalReturn);
+    }
+
+    #[test]
+    fn intraday_bars_keep_their_time_of_day() {
+        // Two five-minute bars on one morning: 13:30 and 13:35 UTC.
+        let (open, next) = (1_783_949_400, 1_783_949_700);
+        let bars = parse_bars(
+            &reply(&[open, next], &[Some(1.0), Some(2.0)]),
+            BarInterval::new(5, IntervalUnit::Minute),
+            false,
+        )
+        .expect("a well-formed reply");
+        assert_eq!(bars.len(), 2, "a day's bars are not one bar");
+        assert_eq!(bars[1].at - bars[0].at, chrono::Duration::minutes(5));
+        assert_eq!(bars[0].at.time(), chrono::NaiveTime::from_hms_opt(13, 30, 0).expect("valid"));
     }
 
     #[test]

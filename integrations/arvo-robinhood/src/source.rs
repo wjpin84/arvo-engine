@@ -69,6 +69,10 @@ impl Source for Robinhood {
         }
     }
 
+    fn max_days(&self, interval: BarInterval) -> Option<u32> {
+        max_days(interval)
+    }
+
     async fn connected(&self) -> Result<bool, SourceError> {
         is_connected()
     }
@@ -186,6 +190,31 @@ impl Source for Robinhood {
 /// something close — and its one-minute bar is named `minute`, not `1minute`,
 /// which is exactly the sort of near-miss that would come back as data for the
 /// wrong resolution if it were guessed.
+/// The most bars one historicals request may be estimated at.
+const BAR_CAP: u32 = 5_000;
+
+/// The widest window Robinhood will accept at `interval`, in calendar days.
+///
+/// Its refusal says how it counts — "estimated 20435 bars exceeds cap of 5000"
+/// for a year of five-minute bars is 262 weekdays times 78 — so this counts the
+/// same way: bars in a 390-minute session, times weekdays, under the cap. Only
+/// whole weeks are taken, so where a window starts cannot add a weekday to it.
+fn max_days(interval: BarInterval) -> Option<u32> {
+    const SESSION_SECONDS: u32 = 390 * 60;
+    let step = interval.step.max(1);
+    let bar_seconds = match interval.unit {
+        IntervalUnit::Second => step,
+        IntervalUnit::Minute => step * 60,
+        IntervalUnit::Hour => step * 3_600,
+        IntervalUnit::Day => SESSION_SECONDS,
+        // A weekly bar is a fifth of a bar per weekday; the cap is years off.
+        IntervalUnit::Week => return Some(BAR_CAP * 7 * step),
+    };
+    let per_weekday = SESSION_SECONDS.div_ceil(bar_seconds);
+    let weekdays = BAR_CAP / per_weekday;
+    Some(weekdays / 5 * 7)
+}
+
 fn spelling(interval: BarInterval) -> Result<String, SourceError> {
     let supported: &[(u32, IntervalUnit)] = &[
         (15, IntervalUnit::Second),
@@ -222,6 +251,32 @@ fn spelling(interval: BarInterval) -> Result<String, SourceError> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_default_window_never_asks_for_more_than_robinhood_estimates_it_allows() {
+        // It counts weekdays times bars per session, and refuses above 5,000:
+        // "estimated 20435 bars exceeds cap of 5000" for a year of five-minute.
+        for (step, unit) in [
+            (15, IntervalUnit::Second),
+            (1, IntervalUnit::Minute),
+            (5, IntervalUnit::Minute),
+            (30, IntervalUnit::Minute),
+            (1, IntervalUnit::Hour),
+            (4, IntervalUnit::Hour),
+            (1, IntervalUnit::Day),
+        ] {
+            let interval = BarInterval::new(step, unit);
+            let days = max_days(interval).expect("capped");
+            let per_session = (390 * 60_u32)
+                .div_ceil(u32::try_from(interval.duration().num_seconds()).expect("small"))
+                .max(1);
+            // Whole weeks, so exactly this many weekdays whatever day it starts.
+            let estimated = days / 7 * 5 * per_session;
+            assert!(estimated <= BAR_CAP, "{interval}: {days} days is {estimated} estimated bars");
+        }
+        assert_eq!(max_days(BarInterval::new(5, IntervalUnit::Minute)), Some(84));
+    }
+
     use super::*;
 
     #[test]
