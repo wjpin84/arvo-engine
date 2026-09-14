@@ -195,6 +195,23 @@ pub trait BarProvider: Send + Sync {
         Ok(None)
     }
 
+    /// Every option contract on `underlying` this source holds at `interval`,
+    /// as instrument names (`SPY250912P00640000.AOPT`), in no promised order.
+    ///
+    /// A chain is what a rule that picks its own contracts reads from (#86).
+    /// Defaulted to none: only a library that files contracts holds any.
+    ///
+    /// # Errors
+    ///
+    /// [`DataError`] if the contracts exist and cannot be listed.
+    fn option_contracts(
+        &self,
+        _underlying: &str,
+        _interval: BarInterval,
+    ) -> Result<Vec<String>, DataError> {
+        Ok(Vec::new())
+    }
+
     /// A content hash of every bar this source holds for `instrument`.
     ///
     /// This is what makes a result reproducible rather than merely repeatable.
@@ -319,6 +336,24 @@ impl BarProvider for InMemoryBars {
             .iter()
             .filter(|bar| bar.at.date() >= from && bar.at.date() <= to)
             .copied()
+            .collect())
+    }
+
+    fn option_contracts(
+        &self,
+        underlying: &str,
+        interval: BarInterval,
+    ) -> Result<Vec<String>, DataError> {
+        let spelled = interval.to_string();
+        Ok(self
+            .bars
+            .keys()
+            .filter(|(name, at)| {
+                *at == spelled
+                    && option::OptionContract::parse(name)
+                        .is_some_and(|contract| contract.underlying == underlying)
+            })
+            .map(|(name, _)| name.clone())
             .collect())
     }
 }
@@ -870,6 +905,48 @@ impl BarProvider for CsvBars {
         paid.sort_by_key(|dividend| dividend.ex_date);
         Ok(Some(paid))
     }
+
+    /// Reads the symbol column of every expiration file under
+    /// `options/<UNDERLYING>/<interval>/`, naming each contract with the venue
+    /// its file is filed under.
+    fn option_contracts(
+        &self,
+        underlying: &str,
+        interval: BarInterval,
+    ) -> Result<Vec<String>, DataError> {
+        let folder = self
+            .root
+            .join(OPTION_SUBDIR)
+            .join(safe_name(underlying)?)
+            .join(interval.to_string());
+        let entries = match std::fs::read_dir(&folder) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(source) => return Err(DataError::Io { path: folder, source }),
+        };
+        let mut names = std::collections::BTreeSet::new();
+        for path in entries.flatten().map(|entry| entry.path()) {
+            // `2025-09-12.AOPT.csv`: the venue is the stem's second part.
+            let Some(venue) = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .and_then(|stem| stem.split_once('.'))
+                .map(|(_, venue)| venue.to_owned())
+            else {
+                continue;
+            };
+            let text = std::fs::read_to_string(&path).map_err(|source| DataError::Io {
+                path: path.clone(),
+                source,
+            })?;
+            for line in text.lines().skip(1) {
+                if let Some(symbol) = line.split(',').next().filter(|s| !s.is_empty()) {
+                    names.insert(format!("{symbol}.{venue}"));
+                }
+            }
+        }
+        Ok(names.into_iter().collect())
+    }
 }
 
 #[cfg(test)]
@@ -968,6 +1045,34 @@ mod dividend_tests {
         );
         assert!(library.fingerprint("SPY240315C00510000.AOPT", BarInterval::DAILY).expect("hash").is_some());
         assert_eq!(library.instruments().expect("list"), vec!["SPY.AIEX"], "a chain would bury the library");
+    }
+
+    #[test]
+    fn a_library_lists_the_contracts_it_holds_on_an_underlying() {
+        let (_dir, library) = library();
+        let bar = Bar {
+            at: NaiveDate::from_ymd_opt(2024, 3, 1).expect("valid").and_time(NaiveTime::MIN),
+            open: 1.0,
+            high: 1.0,
+            low: 1.0,
+            close: 1.0,
+            volume: 1.0,
+        };
+        library
+            .write_contracts(
+                BarInterval::DAILY,
+                &BTreeMap::from([
+                    ("SPY240315P00500000.AOPT".to_owned(), vec![bar]),
+                    ("SPY240322P00500000.AOPT".to_owned(), vec![bar]),
+                    ("QQQ240315P00400000.AOPT".to_owned(), vec![bar]),
+                ]),
+            )
+            .expect("write");
+        let mut listed = library.option_contracts("SPY", BarInterval::DAILY).expect("list");
+        listed.sort();
+        assert_eq!(listed, ["SPY240315P00500000.AOPT", "SPY240322P00500000.AOPT"]);
+        assert!(library.option_contracts("SPY", BarInterval::new(5, IntervalUnit::Minute)).expect("list").is_empty());
+        assert!(library.option_contracts("IWM", BarInterval::DAILY).expect("list").is_empty());
     }
 
     #[test]

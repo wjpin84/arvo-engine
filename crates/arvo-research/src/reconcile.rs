@@ -309,11 +309,26 @@ fn drawdown_covers_the_realised_losses(
 
     // Worst peak-to-trough of the running realised total, as a fraction of the
     // opening balance — the same denominator the curve's drawdown uses.
+    //
+    // In the order positions *closed*, with everything that closed at one
+    // instant netted first. Positions closed together are one event on the
+    // curve, and walked a trade at a time the losing leg of a spread would be
+    // realised before its winning leg — found when both legs of every SPY put
+    // spread closed at once and this reported a 5.8% drawdown the account never
+    // had. The same instant, taken in ledger order, also let two overlapping
+    // positions be realised in the order they opened rather than closed.
+    let mut by_close: std::collections::BTreeMap<chrono::NaiveDateTime, f64> =
+        std::collections::BTreeMap::new();
+    for trade in ledger {
+        if let Some(closed) = trade.closed {
+            *by_close.entry(closed).or_default() += trade.pnl;
+        }
+    }
     let mut running = 0.0;
     let mut peak: f64 = 0.0;
     let mut worst_realised: f64 = 0.0;
-    for trade in ledger.iter().filter(|trade| trade.closed.is_some()) {
-        running += trade.pnl;
+    for pnl in by_close.values() {
+        running += pnl;
         peak = peak.max(running);
         worst_realised = worst_realised.max((peak - running) / (opening + peak));
     }
@@ -350,6 +365,23 @@ mod tests {
     use super::*;
     use crate::{CostModel, DatasetRef, DateRange, Direction, EquityPoint, ExitReason, ExperimentId,
                 HypothesisId, StrategySpec};
+
+    #[test]
+    fn legs_that_close_together_are_one_realised_event() {
+        // A spread closed at a small profit: the short leg realises a loss and
+        // the long leg a larger gain, at the same instant. The curve never
+        // fell; neither did the account.
+        // Short sold at 2, bought back at 6; long bought at 1, sold at 5.2.
+        let mut short = trade(2.0, 6.0, 100.0, 0.0);
+        short.direction = Direction::Short;
+        short.pnl = -400.0;
+        let long = trade(1.0, 5.2, 100.0, 0.0);
+        let curve = vec![
+            EquityPoint { at: at(1), equity: 10_000.0 },
+            EquityPoint { at: at(3), equity: 10_020.0 },
+        ];
+        assert_eq!(drawdown_covers_the_realised_losses(&curve, &[short, long]), None);
+    }
 
     fn at(day: u32) -> chrono::NaiveDateTime {
         chrono::NaiveDate::from_ymd_opt(2024, 1, day)

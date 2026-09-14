@@ -127,6 +127,7 @@ impl BuyAndHold {
         bar_type: BarType,
         trade_size: Quantity,
         starting_cash: f64,
+        costs: arvo_research::CostModel,
         correlations: std::sync::Arc<arvo_research::RollingCorrelations>,
     ) -> Self {
         Self {
@@ -146,9 +147,9 @@ impl BuyAndHold {
                         atr_period: 1,
                         ..arvo_research::RiskModel::default()
                     },
-                    // Unused: the benchmark buys its fixed size directly and
-                    // never asks the gate, so there is no entry to size.
-                    costs: arvo_research::CostModel::proportional(0.0, 0.0),
+                    // Not the gate's: the benchmark never asks it. Read only to
+                    // price what the account can pay for on the first bar.
+                    costs,
                     starting_cash,
                 },
                 trade_size,
@@ -172,12 +173,44 @@ impl DataActor for BuyAndHold {
         Ok(())
     }
 
-    fn on_bar(&mut self, _bar: &Bar) -> anyhow::Result<()> {
+    fn on_bar(&mut self, bar: &Bar) -> anyhow::Result<()> {
         if self.entered {
             return Ok(());
         }
         self.entered = true;
         let size = self.position.default_size();
+
+        // The stated size, or as much of it as the account can pay for — never
+        // nothing. A put spread's trade size is 100 units, one contract; copied
+        // to its benchmark that asked for 100 SPY shares in a $25,000 account,
+        // the venue refused, and the rule's -1.7% was judged against a flat
+        // line that held no SPY at all. Whole contracts for an option.
+        let lot = if arvo_data::option::OptionContract::parse(&self.instrument_id.to_string()).is_some() {
+            arvo_data::option::MULTIPLIER
+        } else {
+            1.0
+        };
+        let costs = self.position.risk().costs;
+        let price = bar.close.as_f64();
+        let per_unit = costs
+            .option_spread
+            .filter(|_| lot > 1.0)
+            .map_or(price * (1.0 + costs.slippage_bps / 10_000.0), |spread| {
+                price + spread.half_spread(price)
+            })
+            * (1.0 + costs.commission_bps / 10_000.0);
+        let affordable = super::spendable(&self.cache(), &self.instrument_id.venue)
+            .filter(|_| per_unit > 0.0)
+            .map(|cash| (((cash - costs.per_fill) / per_unit / lot).floor() * lot).max(0.0));
+        let size = match affordable {
+            // Still sent at full size when not one unit is affordable, so the
+            // venue refuses it and the refusal is counted, rather than the
+            // benchmark quietly holding nothing.
+            Some(units) if units >= lot && units < size.as_f64() => {
+                Quantity::new_checked(units, 0).unwrap_or(size)
+            }
+            _ => size,
+        };
         self.send(OrderSide::Buy, size, None)
     }
 }

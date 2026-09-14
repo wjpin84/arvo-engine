@@ -145,8 +145,19 @@ impl Recommendation {
 ///
 /// ponytail: the dates are the Alpaca archive's today; read them from the
 /// library's first option bar if a second vendor reaches further back.
-fn option_tail(experiment: &crate::Experiment, curve: &[crate::EquityPoint]) -> Vec<Recommendation> {
-    if arvo_data::option::OptionContract::parse(&experiment.instrument).is_none() {
+fn option_tail(
+    experiment: &crate::Experiment,
+    curve: &[crate::EquityPoint],
+    ledger: &[crate::Trade],
+) -> Vec<Recommendation> {
+    // An option run is one whose instrument is a contract, or one that traded
+    // contracts while reading something else — a put spread runs on SPY and
+    // holds nothing but puts (#86).
+    let options = arvo_data::option::OptionContract::parse(&experiment.instrument).is_some()
+        || ledger
+            .iter()
+            .any(|trade| arvo_data::option::OptionContract::parse(&trade.instrument).is_some());
+    if !options {
         return Vec::new();
     }
     let mut out = Vec::new();
@@ -288,6 +299,7 @@ pub fn recommend(found: &FamilyEvidence) -> Vec<Recommendation> {
     out.extend(option_tail(
         &found.out_of_sample_evidence.experiment,
         &evaluation.strategy_curve,
+        &evaluation.strategy_ledger,
     ));
 
     // The benchmark starves the same way the strategy does, out of the same
@@ -905,7 +917,12 @@ pub fn recommend_walk_forward(found: &WalkForwardEvidence) -> Vec<Recommendation
 
     // ---- warning: readable, but resting on something fragile -------------
 
-    out.extend(option_tail(&found.template, &found.combined_curve));
+    let fold_ledgers: Vec<crate::Trade> = found
+        .folds
+        .iter()
+        .flat_map(|fold| fold.out_of_sample_evidence.evaluation.strategy_ledger.iter().cloned())
+        .collect();
+    out.extend(option_tail(&found.template, &found.combined_curve, &fold_ledgers));
 
     for axis in &found.stability {
         if axis.distinct > 1 && axis.modal_share < MODAL_SHARE_FLOOR {
@@ -1186,13 +1203,17 @@ mod tests {
 
         let mut option = experiment();
         option.instrument = "SPY240621P00500000.AOPT".to_owned();
-        let advice = option_tail(&option, &curve);
+        let advice = option_tail(&option, &curve, &[]);
         assert_eq!(advice.len(), 2);
         assert!(advice[0].evidence.contains("worst 1day -15.0%"), "{}", advice[0].evidence);
         assert!(advice[0].evidence.contains("worst month"), "{}", advice[0].evidence);
         assert!(advice[1].finding.contains("no crash"));
 
-        assert!(option_tail(&experiment(), &curve).is_empty(), "a stock run is unaffected");
+        assert!(option_tail(&experiment(), &curve, &[]).is_empty(), "a stock run is unaffected");
+        // A put spread reads SPY and holds puts: its ledger makes it an option run.
+        let mut put = trade(0, 3, -50.0, ExitReason::Signal);
+        put.instrument = "SPY240621P00500000.AOPT".to_owned();
+        assert_eq!(option_tail(&experiment(), &curve, &[put]).len(), 2);
     }
 
     #[test]
