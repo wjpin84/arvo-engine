@@ -195,6 +195,54 @@ pub trait BarProvider: Send + Sync {
         Ok(None)
     }
 
+    /// Every option contract on `underlying` this source holds at `interval`,
+    /// as instrument names (`SPY250912P00640000.AOPT`), in no promised order.
+    ///
+    /// A chain is what a rule that picks its own contracts reads from (#86).
+    /// Defaulted to none: only a library that files contracts holds any.
+    ///
+    /// # Errors
+    ///
+    /// [`DataError`] if the contracts exist and cannot be listed.
+    fn option_contracts(
+        &self,
+        _underlying: &str,
+        _interval: BarInterval,
+    ) -> Result<Vec<String>, DataError> {
+        Ok(Vec::new())
+    }
+
+    /// A content hash of every option bar this source holds on `underlying` at
+    /// `interval`: the chain as one dataset, so a finding a chain produced can
+    /// be found stale when any contract in it changes.
+    ///
+    /// Defaulted to fingerprinting each listed contract, which is right and
+    /// slow; a library that files contracts together hashes them in one pass.
+    /// `None` when there is no chain.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::fingerprint`].
+    fn option_chain_fingerprint(
+        &self,
+        underlying: &str,
+        interval: BarInterval,
+    ) -> Result<Option<String>, DataError> {
+        let mut contracts = self.option_contracts(underlying, interval)?;
+        if contracts.is_empty() {
+            return Ok(None);
+        }
+        contracts.sort();
+        let mut hasher = blake3::Hasher::new();
+        for contract in contracts {
+            hasher.update(contract.as_bytes());
+            if let Some(fingerprint) = self.fingerprint(&contract, interval)? {
+                hasher.update(fingerprint.as_bytes());
+            }
+        }
+        Ok(Some(hasher.finalize().to_hex().to_string()))
+    }
+
     /// A content hash of every bar this source holds for `instrument`.
     ///
     /// This is what makes a result reproducible rather than merely repeatable.
@@ -319,6 +367,24 @@ impl BarProvider for InMemoryBars {
             .iter()
             .filter(|bar| bar.at.date() >= from && bar.at.date() <= to)
             .copied()
+            .collect())
+    }
+
+    fn option_contracts(
+        &self,
+        underlying: &str,
+        interval: BarInterval,
+    ) -> Result<Vec<String>, DataError> {
+        let spelled = interval.to_string();
+        Ok(self
+            .bars
+            .keys()
+            .filter(|(name, at)| {
+                *at == spelled
+                    && option::OptionContract::parse(name)
+                        .is_some_and(|contract| contract.underlying == underlying)
+            })
+            .map(|(name, _)| name.clone())
             .collect())
     }
 }
@@ -870,6 +936,103 @@ impl BarProvider for CsvBars {
         paid.sort_by_key(|dividend| dividend.ex_date);
         Ok(Some(paid))
     }
+
+    /// Hashes each expiration file's parsed rows, files in name order, rows as
+    /// they sort — one pass, where fingerprinting every contract separately
+    /// reparses its whole file once per contract. Parsed rather than raw bytes,
+    /// for the reason [`BarProvider::fingerprint`] gives.
+    fn option_chain_fingerprint(
+        &self,
+        underlying: &str,
+        interval: BarInterval,
+    ) -> Result<Option<String>, DataError> {
+        let folder = self
+            .root
+            .join(OPTION_SUBDIR)
+            .join(safe_name(underlying)?)
+            .join(interval.to_string());
+        let mut files: Vec<PathBuf> = match std::fs::read_dir(&folder) {
+            Ok(entries) => entries.flatten().map(|entry| entry.path()).collect(),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => return Err(DataError::Io { path: folder, source }),
+        };
+        if files.is_empty() {
+            return Ok(None);
+        }
+        files.sort();
+        let mut hasher = blake3::Hasher::new();
+        for path in files {
+            let text = std::fs::read_to_string(&path).map_err(|source| DataError::Io {
+                path: path.clone(),
+                source,
+            })?;
+            hasher.update(path.file_name().and_then(|n| n.to_str()).unwrap_or_default().as_bytes());
+            let mut rows: Vec<(&str, Bar)> = Vec::new();
+            for (index, line) in text.lines().enumerate().skip(1) {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                let (symbol, rest) = line.split_once(',').ok_or_else(|| DataError::Malformed {
+                    path: path.clone(),
+                    line: index + 1,
+                    reason: "expected symbol,date,open,high,low,close,volume".to_owned(),
+                })?;
+                rows.push((symbol, parse_row(&path, index + 1, rest)?));
+            }
+            rows.sort_by(|a, b| a.0.cmp(b.0).then(a.1.at.cmp(&b.1.at)));
+            for (symbol, bar) in rows {
+                hasher.update(symbol.as_bytes());
+                hasher.update(&bar.at.and_utc().timestamp().to_le_bytes());
+                for value in [bar.open, bar.high, bar.low, bar.close, bar.volume] {
+                    hasher.update(&value.to_bits().to_le_bytes());
+                }
+            }
+        }
+        Ok(Some(hasher.finalize().to_hex().to_string()))
+    }
+
+    /// Reads the symbol column of every expiration file under
+    /// `options/<UNDERLYING>/<interval>/`, naming each contract with the venue
+    /// its file is filed under.
+    fn option_contracts(
+        &self,
+        underlying: &str,
+        interval: BarInterval,
+    ) -> Result<Vec<String>, DataError> {
+        let folder = self
+            .root
+            .join(OPTION_SUBDIR)
+            .join(safe_name(underlying)?)
+            .join(interval.to_string());
+        let entries = match std::fs::read_dir(&folder) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(source) => return Err(DataError::Io { path: folder, source }),
+        };
+        let mut names = std::collections::BTreeSet::new();
+        for path in entries.flatten().map(|entry| entry.path()) {
+            // `2025-09-12.AOPT.csv`: the venue is the stem's second part.
+            let Some(venue) = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .and_then(|stem| stem.split_once('.'))
+                .map(|(_, venue)| venue.to_owned())
+            else {
+                continue;
+            };
+            let text = std::fs::read_to_string(&path).map_err(|source| DataError::Io {
+                path: path.clone(),
+                source,
+            })?;
+            for line in text.lines().skip(1) {
+                if let Some(symbol) = line.split(',').next().filter(|s| !s.is_empty()) {
+                    names.insert(format!("{symbol}.{venue}"));
+                }
+            }
+        }
+        Ok(names.into_iter().collect())
+    }
 }
 
 #[cfg(test)]
@@ -968,6 +1131,45 @@ mod dividend_tests {
         );
         assert!(library.fingerprint("SPY240315C00510000.AOPT", BarInterval::DAILY).expect("hash").is_some());
         assert_eq!(library.instruments().expect("list"), vec!["SPY.AIEX"], "a chain would bury the library");
+    }
+
+    #[test]
+    fn a_library_lists_the_contracts_it_holds_on_an_underlying() {
+        let (_dir, library) = library();
+        let bar = Bar {
+            at: NaiveDate::from_ymd_opt(2024, 3, 1).expect("valid").and_time(NaiveTime::MIN),
+            open: 1.0,
+            high: 1.0,
+            low: 1.0,
+            close: 1.0,
+            volume: 1.0,
+        };
+        library
+            .write_contracts(
+                BarInterval::DAILY,
+                &BTreeMap::from([
+                    ("SPY240315P00500000.AOPT".to_owned(), vec![bar]),
+                    ("SPY240322P00500000.AOPT".to_owned(), vec![bar]),
+                    ("QQQ240315P00400000.AOPT".to_owned(), vec![bar]),
+                ]),
+            )
+            .expect("write");
+        let mut listed = library.option_contracts("SPY", BarInterval::DAILY).expect("list");
+        listed.sort();
+        assert_eq!(listed, ["SPY240315P00500000.AOPT", "SPY240322P00500000.AOPT"]);
+        assert!(library.option_contracts("SPY", BarInterval::new(5, IntervalUnit::Minute)).expect("list").is_empty());
+        assert!(library.option_contracts("IWM", BarInterval::DAILY).expect("list").is_empty());
+
+        let before = library.option_chain_fingerprint("SPY", BarInterval::DAILY).expect("hash");
+        assert!(before.is_some());
+        assert_eq!(library.option_chain_fingerprint("IWM", BarInterval::DAILY).expect("hash"), None);
+        let revised = Bar { close: 1.5, high: 1.5, ..bar };
+        library.write("SPY240322P00500000.AOPT", BarInterval::DAILY, &[revised]).expect("write");
+        assert_ne!(
+            library.option_chain_fingerprint("SPY", BarInterval::DAILY).expect("hash"),
+            before,
+            "one contract's revision is a different chain"
+        );
     }
 
     #[test]

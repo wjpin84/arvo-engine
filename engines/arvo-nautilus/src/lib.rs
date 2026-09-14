@@ -83,6 +83,8 @@ const BUY_AND_HOLD: &str = arvo_research::evaluation::BUY_AND_HOLD;
 /// it only means anything on an option contract, and nothing that offers the
 /// menu can run one yet.
 pub const SELL_AND_HOLD: &str = "sell_and_hold";
+/// Sell put spreads on an underlying, choosing contracts from its chain (#86).
+pub const PUT_SPREAD: &str = "put_spread";
 const OPENING_RANGE: &str = "opening_range";
 const VOLATILITY_BREAKOUT: &str = "volatility_breakout";
 const VWAP_REVERSION: &str = "vwap_reversion";
@@ -101,6 +103,7 @@ pub const STRATEGIES: &[&str] = &[
     MOMENTUM_BREAKOUT,
     CROSS_SECTIONAL,
     BUY_AND_HOLD,
+    PUT_SPREAD,
 ];
 
 /// Strategies that rank instruments against each other, and therefore need
@@ -192,6 +195,10 @@ impl<P: BarProvider> SimulationProvider for NautilusSimulation<P> {
         experiment
             .check_instruments()
             .map_err(SimulationError::Rejected)?;
+
+        if matches!(plan, Plan::PutSpread { .. }) {
+            return self.run_put_spread(experiment, &plan);
+        }
 
         // An option run is priced by the option spread, and only by it. With no
         // spread every fill lands on the traded price for free; with equity
@@ -291,6 +298,9 @@ impl<P: BarProvider> SimulationProvider for NautilusSimulation<P> {
 struct Settlement {
     /// The underlying's symbol, which Nautilus looks up on the option's venue.
     symbol: String,
+    /// The underlying's own bars, when a rule reads them to decide (#86).
+    /// Empty for a run that only settles against it.
+    drive: Vec<arvo_data::Bar>,
     /// Each contract expiring inside the window, with the underlying's close on
     /// that contract's expiration date.
     closes: Vec<(arvo_data::option::OptionContract, f64)>,
@@ -309,14 +319,24 @@ impl<P: BarProvider> NautilusSimulation<P> {
         experiment: &Experiment,
         contracts: &[arvo_data::option::OptionContract],
     ) -> Result<Settlement, SimulationError> {
-        let rejected = |why: String| SimulationError::Rejected(why);
         let name = experiment.underlying.as_deref().ok_or_else(|| {
-            rejected(
+            SimulationError::Rejected(
                 "an option run needs `underlying`, the stock series it settles against \
                  (e.g. SPY.AIEX): without it a contract held to expiry is never settled"
                     .to_owned(),
             )
         })?;
+        self.settlement_against(name, experiment, contracts)
+    }
+
+    /// As [`Self::settlement`], against a named underlying.
+    fn settlement_against(
+        &self,
+        name: &str,
+        experiment: &Experiment,
+        contracts: &[arvo_data::option::OptionContract],
+    ) -> Result<Settlement, SimulationError> {
+        let rejected = |why: String| SimulationError::Rejected(why);
         let symbol = name.split('.').next().unwrap_or_default();
         if let Some(contract) = contracts.iter().find(|c| c.underlying != symbol) {
             return Err(rejected(format!(
@@ -353,8 +373,152 @@ impl<P: BarProvider> NautilusSimulation<P> {
         }
         Ok(Settlement {
             symbol: symbol.to_owned(),
+            drive: Vec::new(),
             closes,
         })
+    }
+}
+
+/// How far below the underlying's lowest close a put spread run loads strikes.
+///
+/// Wide on purpose. A 20-delta put a month out sits a few percent below spot; a
+/// short strike the rule wants that lies below what was loaded is caught and
+/// skipped (`put_spread::Skip::EdgeOfChain`) rather than silently replaced.
+const PUT_SPREAD_REACH: f64 = 0.30;
+
+impl<P: BarProvider> NautilusSimulation<P> {
+    /// A put spread run: the underlying drives, the chain's puts trade (#86).
+    ///
+    /// # Which contracts are loaded
+    ///
+    /// Puts expiring from the window's start to the rule's target days past its
+    /// end, struck between [`PUT_SPREAD_REACH`] below the underlying's lowest
+    /// price and its highest, over the days each could have been opened on.
+    /// That range reads prices after an entry date, which would be look-ahead
+    /// if it chose anything; it only decides what is *available*, as wide as the
+    /// rule could want, and the rule refuses a strike at its edge.
+    fn run_put_spread(
+        &self,
+        experiment: &Experiment,
+        plan: &Plan,
+    ) -> Result<SimulationResult, SimulationError> {
+        let Plan::PutSpread { rule, .. } = *plan else {
+            return Err(SimulationError::Rejected("not a put spread plan".to_owned()));
+        };
+        let rejected = |why: String| SimulationError::Rejected(why);
+        let name = experiment.instrument.as_str();
+        if arvo_data::option::OptionContract::parse(name).is_some()
+            || !experiment.alongside.is_empty()
+        {
+            return Err(rejected(
+                "put_spread runs on one underlying (e.g. SPY.AIEX) and chooses its own contracts"
+                    .to_owned(),
+            ));
+        }
+        if experiment
+            .underlying
+            .as_deref()
+            .is_some_and(|underlying| underlying != name)
+        {
+            return Err(rejected(format!(
+                "put_spread settles against its own instrument {name}, not {:?}",
+                experiment.underlying
+            )));
+        }
+        // The rule sizes by collateral and exits by its own levels. A stop, a
+        // risk fraction or a drawdown halt would be recorded and not applied.
+        let risk = experiment.risk;
+        if risk.stop_atr_multiple.is_some()
+            || risk.risk_per_trade.is_some()
+            || risk.max_drawdown.is_some()
+        {
+            return Err(rejected(
+                "put_spread does not apply a stop, a risk fraction or a drawdown halt; leave \
+                 them unset rather than record limits the run ignores"
+                    .to_owned(),
+            ));
+        }
+        if experiment.costs.option_spread.is_none() || experiment.costs.slippage_bps != 0.0 {
+            return Err(rejected(
+                "cost model: an option run needs option_spread and no slippage_bps".to_owned(),
+            ));
+        }
+
+        let (from, to) = (experiment.window.from, experiment.window.to);
+        let underlying = self
+            .bars
+            .bars(name, experiment.interval, from, to)
+            .map_err(|err| rejected(format!("reading {name}: {err}")))?;
+        if underlying.is_empty() {
+            return Err(SimulationError::NoData {
+                instrument: name.to_owned(),
+                from,
+                to,
+            });
+        }
+        let symbol = name.split('.').next().unwrap_or_default();
+
+        let reach = chrono::Duration::days(rule.dte + 7);
+        let mut book = Vec::new();
+        let mut contracts = Vec::new();
+        let listed = self
+            .bars
+            .option_contracts(symbol, experiment.interval)
+            .map_err(|err| rejected(format!("listing {symbol} contracts: {err}")))?;
+        for contract_name in listed {
+            let Some(contract) = arvo_data::option::OptionContract::parse(&contract_name) else {
+                continue;
+            };
+            if contract.right != arvo_data::option::Right::Put
+                || contract.expiration < from
+                || contract.expiration > to + reach
+            {
+                continue;
+            }
+            let openable = underlying
+                .iter()
+                .filter(|bar| {
+                    bar.at.date() >= contract.expiration - reach
+                        && bar.at.date() <= contract.expiration
+                })
+                .map(|bar| (bar.low, bar.high))
+                .reduce(|(low, high), (l, h)| (low.min(l), high.max(h)));
+            let Some((low, high)) = openable else {
+                continue;
+            };
+            if contract.strike < low * (1.0 - PUT_SPREAD_REACH) || contract.strike > high {
+                continue;
+            }
+            let bars = self
+                .bars
+                .bars(&contract_name, experiment.interval, from, to)
+                .map_err(|err| rejected(format!("reading {contract_name}: {err}")))?;
+            if bars.is_empty() {
+                continue;
+            }
+            let id = InstrumentId::from_str(&contract_name)
+                .map_err(|err| rejected(format!("instrument {contract_name:?}: {err}")))?;
+            contracts.push(contract);
+            book.push((id, contract_name, bars));
+        }
+        let Some(venue) = book.first().map(|(id, _, _)| id.venue) else {
+            return Err(rejected(format!(
+                "no {symbol} puts in the library for {from}..{to} at {}; fetch the chain first",
+                experiment.interval
+            )));
+        };
+        if let Some((_, other, _)) = book.iter().find(|(id, _, _)| id.venue != venue) {
+            return Err(rejected(format!(
+                "{other} is not on {venue}: a shared account cannot span venues"
+            )));
+        }
+        // Sorted, so instruments are added and ids issued in the same order on
+        // every run.
+        book.sort_by(|a, b| a.1.cmp(&b.1));
+
+        let mut settlement = self.settlement_against(name, experiment, &contracts)?;
+        settlement.drive = underlying;
+        run_backtest(experiment, plan, &book, Some(&settlement))
     }
 }
 
@@ -412,6 +576,10 @@ enum Plan {
         trade_size: f64,
     },
     SellAndHold {
+        trade_size: f64,
+    },
+    PutSpread {
+        rule: strategy::PutSpreadRule,
         trade_size: f64,
     },
 }
@@ -532,6 +700,61 @@ impl Plan {
             SELL_AND_HOLD => Ok(Self::SellAndHold {
                 trade_size: trade_size()?,
             }),
+            PUT_SPREAD => {
+                // Chosen on a day's closes against a day's settlement; an
+                // intraday version is #87, and a different rule.
+                if interval != arvo_data::BarInterval::DAILY {
+                    return Err(SimulationError::Rejected(format!(
+                        "put_spread decides on daily closes and cannot run on {interval} bars"
+                    )));
+                }
+                let fraction = |name: &str, upper_inclusive: bool| -> Result<f64, SimulationError> {
+                    let value = param(name)?;
+                    let fits = value.is_finite()
+                        && value > 0.0
+                        && (value < 1.0 || (upper_inclusive && value <= 1.0));
+                    if !fits {
+                        return Err(SimulationError::Rejected(format!(
+                            "{name} must be a fraction between 0 and 1, got {value}"
+                        )));
+                    }
+                    Ok(value)
+                };
+                let rate = |name: &str| -> Result<f64, SimulationError> {
+                    let value = param(name)?;
+                    if !value.is_finite() || !(0.0..0.5).contains(&value) {
+                        return Err(SimulationError::Rejected(format!(
+                            "{name} is a yearly fraction (0.04 is 4%), got {value}"
+                        )));
+                    }
+                    Ok(value)
+                };
+                let dte = period("dte")?;
+                let exit_dte = param("exit_dte")?;
+                if !exit_dte.is_finite() || exit_dte < 0.0 || exit_dte.fract() != 0.0 || exit_dte >= dte as f64 {
+                    return Err(SimulationError::Rejected(format!(
+                        "exit_dte must be a whole number of days below dte ({dte}), got {exit_dte}"
+                    )));
+                }
+                let width = param("width")?;
+                if !width.is_finite() || width <= 0.0 {
+                    return Err(SimulationError::Rejected(format!(
+                        "width is a strike distance in dollars and must be positive, got {width}"
+                    )));
+                }
+                Ok(Self::PutSpread {
+                    rule: strategy::PutSpreadRule {
+                        dte: dte as i64,
+                        short_delta: fraction("short_delta", false)?,
+                        width,
+                        take_profit: fraction("take_profit", true)?,
+                        exit_dte: exit_dte as i64,
+                        rate: rate("rate")?,
+                        dividend_yield: rate("dividend_yield")?,
+                    },
+                    trade_size: trade_size()?,
+                })
+            }
             _ => Err(SimulationError::UnknownStrategy(spec.name.clone())),
         }
     }
@@ -554,7 +777,7 @@ impl Plan {
             Self::CrossSectionalMomentum { lookback, .. } => *lookback,
             // One to buy on, and at least one more for the position to have
             // done anything.
-            Self::BuyAndHold { .. } | Self::SellAndHold { .. } => 1,
+            Self::BuyAndHold { .. } | Self::SellAndHold { .. } | Self::PutSpread { .. } => 1,
         }
     }
 
@@ -567,7 +790,8 @@ impl Plan {
             | Self::MomentumBreakout { trade_size, .. }
             | Self::CrossSectionalMomentum { trade_size, .. }
             | Self::BuyAndHold { trade_size }
-            | Self::SellAndHold { trade_size } => *trade_size,
+            | Self::SellAndHold { trade_size }
+            | Self::PutSpread { trade_size, .. } => *trade_size,
         }
     }
 }
@@ -726,6 +950,7 @@ fn run_backtest(
     // expiration gets exactly one: that day's close, a nanosecond before the
     // contract's expiry fires. Daily bars are stamped at the end of their day,
     // after 16:00 — without this, a daily run would settle on the day before.
+    let mut driver: Option<BarType> = None;
     if let Some(settlement) = settlement {
         let underlying_id = InstrumentId::from(format!("{}.{venue}", settlement.symbol).as_str());
         let index = IndexInstrument::builder()
@@ -779,6 +1004,18 @@ fn run_backtest(
                 .add_data(prints, None, true, true)
                 .map_err(|err| rejected("adding settlement prints", &err))?;
         }
+        if !settlement.drive.is_empty() {
+            let bar_type = BarType::new(underlying_id, spec, AggregationSource::External);
+            let data = settlement
+                .drive
+                .iter()
+                .map(|bar| to_nautilus_bar(bar_type, bar, experiment.interval).map(Data::Bar))
+                .collect::<Result<Vec<_>, _>>()?;
+            engine
+                .add_data(data, None, true, true)
+                .map_err(|err| rejected("adding underlying bars", &err))?;
+            driver = Some(bar_type);
+        }
     }
 
     let trade_size = Quantity::new_checked(plan.trade_size(), SIZE_PRECISION)
@@ -820,6 +1057,26 @@ fn run_backtest(
     // instrument: it has to see every score before it can say which is best.
     // So it is added once, subscribed to all of them, and the per-instrument
     // loop below is skipped entirely.
+    if let (Plan::PutSpread { rule, .. }, Some(driver)) = (plan, driver) {
+        let core = StrategyCore::new(StrategyConfig {
+            strategy_id: None,
+            order_id_tag: Some("001".to_owned()),
+            oms_type: Some(OmsType::Netting),
+            ..StrategyConfig::default()
+        });
+        engine
+            .add_strategy(strategy::PutSpread::new(
+                core,
+                driver,
+                bar_types.clone(),
+                *rule,
+                risk,
+                trade_size,
+            ))
+            .map_err(|err| rejected("adding the strategy", &err))?;
+        return finish(engine, experiment, book);
+    }
+
     if let Plan::CrossSectionalMomentum {
         lookback, hold_top, ..
     } = *plan
@@ -942,6 +1199,7 @@ fn run_backtest(
                     bar_type,
                     trade_size,
                     experiment.starting_cash,
+                    experiment.costs,
                     correlations.clone(),
                 ))
             }
@@ -952,12 +1210,12 @@ fn run_backtest(
                 risk,
                 correlations.clone(),
             )),
-            Plan::CrossSectionalMomentum { .. } => {
+            Plan::CrossSectionalMomentum { .. } | Plan::PutSpread { .. } => {
                 // Added once for the whole set above, and returned before
                 // reaching here. The compiler cannot see that, so this says
                 // it rather than pretending the case is possible.
                 return Err(SimulationError::Rejected(
-                    "a ranking rule is added once across every instrument, not once per instrument"
+                    "a ranking or chain rule is added once across every instrument, not once per instrument"
                         .to_owned(),
                 ));
             }
@@ -1011,7 +1269,8 @@ fn finish(
     Ok(SimulationResult {
         experiment: experiment.id.clone(),
         engine: ENGINE.to_owned(),
-        trades: u32::try_from(ledger.len()).unwrap_or(u32::MAX),
+        // Positions, not legs: a spread is one trade (see `trade::positions`).
+        trades: u32::try_from(arvo_research::trade::positions(&ledger).len()).unwrap_or(u32::MAX),
         equity_curve,
         ledger,
         refused,
@@ -1586,10 +1845,20 @@ mod tests {
                     ("exit_period".to_owned(), 10.0),
                     ("lookback".to_owned(), 60.0),
                     ("hold_top".to_owned(), 3.0),
+                    ("dte".to_owned(), 35.0),
+                    ("exit_dte".to_owned(), 21.0),
+                    ("short_delta".to_owned(), 0.2),
+                    ("width".to_owned(), 5.0),
+                    ("take_profit".to_owned(), 0.5),
+                    ("rate".to_owned(), 0.04),
+                    ("dividend_yield".to_owned(), 0.013),
                 ]),
             };
+            // At whichever resolution the rule is defined: the session rules
+            // intraday, a put spread on daily closes.
             assert!(
-                Plan::from_spec(&spec, intraday).is_ok(),
+                Plan::from_spec(&spec, intraday).is_ok()
+                    || Plan::from_spec(&spec, arvo_data::BarInterval::DAILY).is_ok(),
                 "{name} is advertised but cannot be planned"
             );
         }
@@ -2011,6 +2280,118 @@ mod tests {
         assert_eq!(arvo_research::reconcile::reconcile(&small, &result), Vec::new());
     }
 
+    /// A put chain on the sawtooth: every strike from 70 to 110 on four monthly
+    /// expirations, each priced every day by the model at 20% volatility from
+    /// that day's close, so the deltas the rule implies are real ones.
+    fn put_chain() -> InMemoryBars {
+        let underlying = sawtooth(200);
+        let market = |spot| arvo_research::greeks::Market {
+            spot,
+            rate: 0.04,
+            dividend_yield: 0.013,
+        };
+        let mut library = InMemoryBars::new().with_instrument(UNDERLYING, underlying.clone());
+        for expiration in [date(2024, 3, 15), date(2024, 4, 19), date(2024, 5, 17), date(2024, 6, 21)] {
+            for strike in (70..=110).step_by(1) {
+                let contract = arvo_data::option::OptionContract {
+                    underlying: "SPY".to_owned(),
+                    expiration,
+                    right: arvo_data::option::Right::Put,
+                    strike: f64::from(strike),
+                };
+                let bars: Vec<arvo_data::Bar> = underlying
+                    .iter()
+                    .filter(|bar| bar.at.date() <= expiration)
+                    .map(|bar| {
+                        let as_of = arvo_data::session::regular_close(bar.at.date());
+                        let years = arvo_research::greeks::years_to_expiry(&contract, as_of);
+                        let price = arvo_research::greeks::greeks(&contract, market(bar.close), years, 0.20).price;
+                        let price = ((price * 100.0).round() / 100.0).max(0.01);
+                        arvo_data::Bar { at: bar.at, open: price, high: price, low: price, close: price, volume: 100.0 }
+                    })
+                    .collect();
+                library = library.with_instrument(&format!("{}.AOPT", contract.symbol()), bars);
+            }
+        }
+        library
+    }
+
+    fn spread_experiment(cash: f64, units: f64) -> Experiment {
+        let underlying = sawtooth(200);
+        let mut spread_run = experiment(
+            BTreeMap::from([
+                ("dte".to_owned(), 35.0),
+                ("exit_dte".to_owned(), 7.0),
+                ("short_delta".to_owned(), 0.20),
+                ("width".to_owned(), 5.0),
+                ("take_profit".to_owned(), 0.5),
+                ("rate".to_owned(), 0.04),
+                ("dividend_yield".to_owned(), 0.013),
+                ("trade_size".to_owned(), units),
+            ]),
+            &underlying,
+        );
+        spread_run.strategy.name = PUT_SPREAD.to_owned();
+        spread_run.instrument = UNDERLYING.to_owned();
+        spread_run.starting_cash = cash;
+        spread_run.costs = CostModel {
+            commission_bps: 2.0,
+            ..spread(arvo_research::OptionSpread::MEASURED)
+        };
+        spread_run
+    }
+
+    #[test]
+    fn a_put_spread_run_sells_spreads_a_width_apart_and_reconciles() {
+        let run = spread_experiment(100_000.0, 200.0);
+        let result = NautilusSimulation::new(put_chain()).run(&run).expect("runs");
+
+        let shorts: Vec<_> = result.ledger.iter().filter(|t| t.direction == arvo_research::Direction::Short).collect();
+        let longs: Vec<_> = result.ledger.iter().filter(|t| t.direction == arvo_research::Direction::Long).collect();
+        assert!(!shorts.is_empty(), "sold nothing: {:?}", result.ledger);
+        assert_eq!(shorts.len(), longs.len(), "every short has its long: {:?}", result.ledger);
+        for (short, long) in shorts.iter().zip(&longs) {
+            let (s, l) = (
+                arvo_data::option::OptionContract::parse(&short.instrument).expect("contract"),
+                arvo_data::option::OptionContract::parse(&long.instrument).expect("contract"),
+            );
+            assert_eq!(s.expiration, l.expiration);
+            assert!((s.strike - l.strike - 5.0).abs() < 1e-9, "{} / {}", short.instrument, long.instrument);
+            assert_eq!(short.opened, long.opened, "opened together");
+            assert!((short.quantity - 200.0).abs() < 1e-9 && (long.quantity - 200.0).abs() < 1e-9);
+        }
+        assert_eq!(arvo_research::reconcile::reconcile(&run, &result), Vec::new());
+    }
+
+    #[test]
+    fn a_put_spread_run_opens_only_what_its_cash_secures() {
+        // Two spreads $5 wide reserve $1,000, which $900 cannot secure: it sells
+        // one, as the gate sizes any entry down to what the account can pay.
+        let result = NautilusSimulation::new(put_chain()).run(&spread_experiment(900.0, 200.0)).expect("runs");
+        assert!(!result.ledger.is_empty());
+        assert!(result.ledger.iter().all(|trade| (trade.quantity - 100.0).abs() < 1e-9), "{:?}", result.ledger);
+        // $400 cannot secure one. It must open nothing — not buy a long leg,
+        // find the short refused and sell it back, every day it looks.
+        let result = NautilusSimulation::new(put_chain()).run(&spread_experiment(400.0, 100.0)).expect("runs");
+        assert!(result.ledger.is_empty(), "{:?}", result.ledger);
+    }
+
+    #[test]
+    fn a_put_spread_run_refuses_limits_it_would_not_apply() {
+        let mut stopped = spread_experiment(100_000.0, 100.0);
+        stopped.risk.stop_atr_multiple = Some(2.0);
+        let err = NautilusSimulation::new(put_chain()).run(&stopped).expect_err("refused");
+        assert!(err.to_string().contains("stop"), "{err}");
+
+        let mut intraday = spread_experiment(100_000.0, 100.0);
+        intraday.interval = arvo_data::BarInterval::new(5, arvo_data::IntervalUnit::Minute);
+        assert!(NautilusSimulation::new(put_chain()).run(&intraday).is_err());
+
+        let empty = NautilusSimulation::new(InMemoryBars::new().with_instrument(UNDERLYING, sawtooth(200)));
+        let err = empty.run(&spread_experiment(100_000.0, 100.0)).expect_err("no chain");
+        assert!(err.to_string().contains("fetch the chain"), "{err}");
+    }
+
     #[test]
     fn a_sold_put_that_expires_worthless_keeps_its_premium() {
         // Strike 100 against an underlying that ends near 107: out of the money.
@@ -2411,15 +2792,32 @@ mod tests {
     fn an_order_the_account_cannot_pay_for_is_counted_not_lost() {
         // Buy-and-hold sends its fixed size without asking the gate, so an
         // account too small for it is refused by the venue. Before refusals
-        // were counted that run reported no trades and nothing else.
+        // were counted that run reported no trades and nothing else. It buys
+        // what it can afford when that is less than its size, so the account
+        // here cannot afford one share.
         let bars = sawtooth(60);
         let mut experiment = experiment(params(10.0, 30.0), &bars);
         experiment.strategy.name = BUY_AND_HOLD.to_owned();
-        experiment.starting_cash = 1_000.0;
+        experiment.starting_cash = 50.0;
 
         let result = provider(bars).run(&experiment).expect("runs");
         assert!(result.ledger.is_empty(), "nothing could be bought");
         assert!(result.refused.entries >= 1, "{:?}", result.refused);
+    }
+
+    #[test]
+    fn a_benchmark_too_large_for_its_account_holds_what_the_account_can_pay_for() {
+        // Found judging SPY put spreads: the rule's 100-unit trade size, copied
+        // to its benchmark, asked for 100 shares a $25,000 account could not
+        // buy, and the rule was scored against a line that held nothing.
+        let bars = sawtooth(60);
+        let mut experiment = experiment(params(10.0, 30.0), &bars);
+        experiment.strategy.name = BUY_AND_HOLD.to_owned();
+        experiment.starting_cash = 1_000.0;
+        let result = provider(bars).run(&experiment).expect("runs");
+        assert_eq!(result.ledger.len(), 1, "{:?}", result.refused);
+        assert!((result.ledger[0].quantity - 9.0).abs() < 1e-9, "$1,000 at ~$100 with commission: {}", result.ledger[0].quantity);
+        assert_eq!(result.refused.entries, 0);
     }
 
     #[test]

@@ -89,7 +89,16 @@ pub(crate) fn parse_contracts(body: &Value) -> Result<Vec<OptionContract>, Sourc
     };
     Ok(rows
         .iter()
-        .filter(|row| row.get("multiplier").and_then(Value::as_str) == Some("100"))
+        .filter(|row| {
+            // `size` is the deliverable, and the check that matters. Listings
+            // for contracts that expired before mid-2024 carry a multiplier of
+            // "0" beside a size of "100" — a defect in the archive, and the
+            // reason a filter on the multiplier alone found no SPY contracts
+            // at all for February to April 2024. Any other multiplier is an
+            // adjusted contract and stays out.
+            let field = |name: &str| row.get(name).and_then(Value::as_str);
+            field("size") == Some("100") && matches!(field("multiplier"), Some("100" | "0"))
+        })
         .filter_map(|row| row.get("symbol").and_then(Value::as_str))
         .filter_map(OptionContract::parse)
         .collect())
@@ -161,12 +170,14 @@ mod tests {
     #[test]
     fn an_adjusted_contract_is_left_out_of_the_listing() {
         let body = json!({ "option_contracts": [
-            { "symbol": "SPY250912C00640000", "multiplier": "100", "status": "inactive" },
-            { "symbol": "SPY250912P00640000", "multiplier": "100", "status": "inactive" },
-            { "symbol": "XYZ1250912C00050000", "multiplier": "150" },
+            { "symbol": "SPY250912C00640000", "multiplier": "100", "size": "100", "status": "inactive" },
+            { "symbol": "SPY250912P00640000", "multiplier": "100", "size": "100", "status": "inactive" },
+            { "symbol": "XYZ1250912C00050000", "multiplier": "150", "size": "150" },
+            // The early-2024 archive's defect: a zero multiplier on a standard contract.
+            { "symbol": "SPY240315P00500000", "multiplier": "0", "size": "100", "status": "inactive" },
         ], "next_page_token": null });
         let listed = parse_contracts(&body).expect("well formed");
-        assert_eq!(listed.len(), 2);
+        assert_eq!(listed.len(), 3);
         assert!(listed.iter().all(|contract| contract.underlying == "SPY"));
     }
 

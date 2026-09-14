@@ -172,11 +172,96 @@ pub struct TradeStats {
     pub halted: bool,
 }
 
+/// A ledger as positions: option legs taken on and off together as one (#86).
+///
+/// A put spread is two contracts, and the engine records each as its own round
+/// trip. Counted that way, one spread is two trades — which halves the trade
+/// count the evaluation requires before it will read a result, and makes every
+/// spread one win and one loss whatever it did. Found when twelve SPY spreads
+/// reported "24 trades, 50% won".
+///
+/// Legs are one position when they are option contracts on the same underlying
+/// and expiration, opened at the same instant and closed at the same instant
+/// (or both still open). Anything else — a stock, a leg unwound on its own, two
+/// members of a book that happened to trade together — is left as it was.
+///
+/// The combined trade nets its legs per share: entry is the credit (or debit)
+/// taken, exit what it cost to close, quantity the largest leg, direction short
+/// when a short leg is the dearer, and profit and commission their sums. So its
+/// profit is still what its own entry, exit and size say it is.
+#[must_use]
+pub fn positions(ledger: &[Trade]) -> Vec<Trade> {
+    use arvo_data::option::OptionContract;
+
+    let key = |trade: &Trade| {
+        OptionContract::parse(&trade.instrument).map(|contract| {
+            (contract.underlying, contract.expiration, trade.opened, trade.closed)
+        })
+    };
+    let mut out: Vec<Trade> = Vec::with_capacity(ledger.len());
+    let mut taken = vec![false; ledger.len()];
+    for (index, trade) in ledger.iter().enumerate() {
+        if taken[index] {
+            continue;
+        }
+        let Some(group_key) = key(trade) else {
+            out.push(trade.clone());
+            continue;
+        };
+        let legs: Vec<usize> = (index..ledger.len())
+            .filter(|&other| !taken[other] && key(&ledger[other]).as_ref() == Some(&group_key))
+            .collect();
+        if legs.len() < 2 {
+            out.push(trade.clone());
+            continue;
+        }
+        let sign = |leg: &Trade| match leg.direction {
+            Direction::Long => -1.0,
+            Direction::Short => 1.0,
+        };
+        let mut combined = trade.clone();
+        combined.instrument = legs
+            .iter()
+            .map(|&leg| ledger[leg].instrument.as_str())
+            .collect::<Vec<_>>()
+            .join("+");
+        // Credit taken per share: shorts sold add, longs bought subtract.
+        let credit: f64 = legs.iter().map(|&leg| sign(&ledger[leg]) * ledger[leg].entry).sum();
+        let debit: Option<f64> = legs
+            .iter()
+            .map(|&leg| ledger[leg].exit.map(|exit| sign(&ledger[leg]) * exit))
+            .sum();
+        combined.direction = if credit >= 0.0 { Direction::Short } else { Direction::Long };
+        let flip = match combined.direction {
+            Direction::Short => 1.0,
+            Direction::Long => -1.0,
+        };
+        combined.entry = flip * credit;
+        combined.exit = debit.map(|debit| flip * debit);
+        combined.quantity = legs.iter().map(|&leg| ledger[leg].quantity).fold(0.0, f64::max);
+        combined.pnl = legs.iter().map(|&leg| ledger[leg].pnl).sum();
+        combined.commission = legs.iter().map(|&leg| ledger[leg].commission).sum();
+        combined.exit_reason = legs
+            .iter()
+            .map(|&leg| &ledger[leg])
+            .find(|leg| leg.direction == Direction::Short)
+            .unwrap_or(trade)
+            .exit_reason;
+        for &leg in &legs {
+            taken[leg] = true;
+        }
+        out.push(combined);
+    }
+    out
+}
+
 impl TradeStats {
-    /// Counts a ledger.
+    /// Counts a ledger, as positions — see [`positions`].
     #[must_use]
     #[allow(clippy::cast_precision_loss, reason = "trade counts are small")]
     pub fn from_ledger(ledger: &[Trade]) -> Self {
+        let combined = positions(ledger);
+        let ledger = combined.as_slice();
         let mut stats = Self {
             closed: 0,
             still_open: 0,
@@ -387,6 +472,57 @@ pub fn equity_curve(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn leg(instrument: &str, direction: Direction, entry: f64, exit: f64, close_day: u32) -> Trade {
+        let sign = match direction {
+            Direction::Long => 1.0,
+            Direction::Short => -1.0,
+        };
+        Trade {
+            instrument: instrument.to_owned(),
+            opened: at(2),
+            closed: Some(at(close_day)),
+            direction,
+            quantity: 100.0,
+            entry,
+            exit: Some(exit),
+            pnl: sign * (exit - entry) * 100.0 - 1.0,
+            commission: 1.0,
+            exit_reason: ExitReason::Signal,
+        }
+    }
+
+    #[test]
+    fn a_spread_is_one_position_whose_profit_is_its_own_prices() {
+        // Sold the 500 put at 2.00, bought the 495 at 1.20: a 0.80 credit.
+        // Closed for 0.30 (0.50 and 0.20). Kept 0.50 a share.
+        let short = leg("SPY240315P00500000.AOPT", Direction::Short, 2.00, 0.50, 9);
+        let long = leg("SPY240315P00495000.AOPT", Direction::Long, 1.20, 0.20, 9);
+        let combined = positions(&[short, long]);
+        let [spread] = combined.as_slice() else {
+            panic!("{combined:?}");
+        };
+        assert_eq!(spread.direction, Direction::Short);
+        assert!((spread.entry - 0.80).abs() < 1e-9 && (spread.exit.expect("closed") - 0.30).abs() < 1e-9);
+        assert!((spread.pnl - (48.0)).abs() < 1e-9, "{}", spread.pnl);
+        assert!((spread.pnl - ((spread.entry - spread.exit.expect("closed")) * spread.quantity - spread.commission)).abs() < 1e-9);
+
+        let stats = TradeStats::from_ledger(&[
+            leg("SPY240315P00500000.AOPT", Direction::Short, 2.00, 0.50, 9),
+            leg("SPY240315P00495000.AOPT", Direction::Long, 1.20, 0.20, 9),
+        ]);
+        assert_eq!((stats.closed, stats.wins, stats.losses), (1, 1, 0), "one spread, one win");
+    }
+
+    #[test]
+    fn only_legs_taken_on_and_off_together_are_combined() {
+        let stock = Trade { instrument: "SPY.AIEX".to_owned(), ..leg("x", Direction::Long, 1.0, 2.0, 9) };
+        let other_expiry = leg("SPY240419P00495000.AOPT", Direction::Long, 1.2, 0.2, 9);
+        let unwound_alone = leg("SPY240315P00490000.AOPT", Direction::Long, 1.0, 0.9, 3);
+        let short = leg("SPY240315P00500000.AOPT", Direction::Short, 2.0, 0.5, 9);
+        let ledger = [stock, other_expiry, unwound_alone, short];
+        assert_eq!(positions(&ledger).len(), 4, "nothing here shares a key");
+    }
 
     fn at(day: u32) -> NaiveDateTime {
         chrono::NaiveDate::from_ymd_opt(2024, 1, day)
