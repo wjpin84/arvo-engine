@@ -102,6 +102,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         reference_price: price,
         stop_distance: None,
         desired_quantity: Some(1.0),
+        opens_short: false,
     };
     match session.propose(&proposal, now(), None).await? {
         Some(order) => println!("submitted: {order}"),

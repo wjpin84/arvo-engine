@@ -51,7 +51,8 @@ use nautilus_trading::strategy::{Strategy, StrategyNative};
 
 pub(crate) use cross_sectional::CrossSectionalMomentum;
 pub(crate) use rules::{
-    BuyAndHold, MomentumBreakout, OpeningRange, SmaCross, VolatilityBreakout, VwapReversion,
+    BuyAndHold, MomentumBreakout, OpeningRange, SellAndHold, SmaCross, VolatilityBreakout,
+    VwapReversion,
 };
 
 /// Tags stamped on a closing order to say why it was sent.
@@ -309,7 +310,8 @@ pub(crate) fn account_from_positions(
             positions.insert(
                 position.instrument_id.to_string(),
                 arvo_research::Position {
-                    quantity: position.quantity.as_f64(),
+                    // Signed: a short's collateral is read from its sign.
+                    quantity: position.signed_qty,
                     entry: position.avg_px_open,
                 },
             );
@@ -378,6 +380,7 @@ pub(crate) fn spendable(
 /// function `arvo_execution`'s live gate calls with its own book.
 #[expect(clippy::too_many_arguments, reason = "it is one call, spelled out")]
 pub(crate) fn decide_entry(
+    opens_short: bool,
     risk: Risk,
     default_size: Quantity,
     instrument: &str,
@@ -405,6 +408,7 @@ pub(crate) fn decide_entry(
         // What the rule trades absent risk sizing, so the engine's fixed trade
         // size survives the move to a shared policy.
         desired_quantity: Some(default_size.as_f64()),
+        opens_short,
     };
 
     arvo_research::decide(
@@ -453,7 +457,7 @@ pub(crate) trait Managed: Strategy + StrategyNative + DataActorNative {
             return Ok(false);
         };
 
-        let Some(decision) = self.ask_risk(price, stop_distance) else {
+        let Some(decision) = self.ask_risk(price, stop_distance, false) else {
             return Ok(false);
         };
         let arvo_research::Decision::Accept { quantity } = decision else {
@@ -476,10 +480,34 @@ pub(crate) trait Managed: Strategy + StrategyNative + DataActorNative {
         Ok(true)
     }
 
+    /// Sells an option contract to open, sized by the cash its worst case at
+    /// expiry needs (#84).
+    ///
+    /// Unstopped and untargeted: [`Self::exit_on_levels`] reads a long's levels,
+    /// and a rule that sells manages its own exit. The gate refuses anything
+    /// that is not an option, and any call it could not cover.
+    fn enter_short(&mut self, price: f64) -> anyhow::Result<bool> {
+        let Some(arvo_research::Decision::Accept { quantity }) = self.ask_risk(price, None, true)
+        else {
+            return Ok(false);
+        };
+        let Ok(size) = Quantity::new_checked(quantity, 0) else {
+            return Ok(false);
+        };
+        self.position_mut().hold(size);
+        self.send(OrderSide::Sell, size, None)?;
+        Ok(true)
+    }
+
     /// This strategy's entry, put to the shared policy.
     ///
     /// `None` when there is no bar yet, which is before anything can trade.
-    fn ask_risk(&self, price: f64, stop_distance: Option<f64>) -> Option<arvo_research::Decision> {
+    fn ask_risk(
+        &self,
+        price: f64,
+        stop_distance: Option<f64>,
+        opens_short: bool,
+    ) -> Option<arvo_research::Decision> {
         let now = self.position().last_bar_at?;
         // Bound, not inlined: `positions` borrows from the cache handle, and a
         // temporary would be dropped at the end of the expression.
@@ -496,6 +524,7 @@ pub(crate) trait Managed: Strategy + StrategyNative + DataActorNative {
             .map(nautilus_model::types::Money::as_f64)
             .unwrap_or(self.position().risk.starting_cash);
         Some(decide_entry(
+            opens_short,
             self.position().risk,
             self.position().default_size,
             &self.instrument().to_string(),
@@ -554,16 +583,21 @@ pub(crate) trait Managed: Strategy + StrategyNative + DataActorNative {
         let intended = self.position_mut().release();
 
         let instrument = self.instrument();
-        let actual = self.portfolio().net_position(&instrument);
-        let size = match f64::try_from(actual).ok().filter(|held| *held > 0.0) {
-            Some(held) => Quantity::new_checked(held, 0).ok(),
-            None => intended,
+        let actual = f64::try_from(self.portfolio().net_position(&instrument)).unwrap_or(0.0);
+        // A short is closed by buying it back. The venue's sign decides, since
+        // this strategy's own record holds a size and not a side.
+        let (side, size) = if actual < 0.0 {
+            (OrderSide::Buy, Quantity::new_checked(-actual, 0).ok())
+        } else if actual > 0.0 {
+            (OrderSide::Sell, Quantity::new_checked(actual, 0).ok())
+        } else {
+            (OrderSide::Sell, intended)
         };
 
         let Some(size) = size else {
             return Ok(());
         };
-        self.send(OrderSide::Sell, size, Some(reason))
+        self.send(side, size, Some(reason))
     }
 
     /// Squares what this strategy believes it holds with the venue, after the
@@ -759,6 +793,7 @@ mod tests {
             .stop_distance(atr)
             .expect("the caller knows whether the ATR is ready");
         decide_entry(
+            false,
             risk,
             quantity(100.0),
             "MSFT.NASDAQ",
@@ -870,6 +905,7 @@ mod tests {
             ..UNSTOPPED
         };
         let refused = decide_entry(
+            false,
             risk,
             quantity(100.0),
             "MSFT.NASDAQ",
@@ -916,6 +952,7 @@ mod tests {
         }
 
         let refused = decide_entry(
+            false,
             risk,
             quantity(100.0),
             "MSFT.NASDAQ",
@@ -946,6 +983,7 @@ mod tests {
         // session runs — which is the point — and the fact that it cannot fire
         // here is precisely the gap paper trading exists to measure.
         let accepted = decide_entry(
+            false,
             UNSTOPPED,
             quantity(100.0),
             "MSFT.NASDAQ",

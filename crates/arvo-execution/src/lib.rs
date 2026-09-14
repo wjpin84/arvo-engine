@@ -888,6 +888,7 @@ mod tests {
             reference_price: 100.0,
             stop_distance: None,
             desired_quantity: Some(5_000.0),
+            opens_short: false,
         };
         session
             .propose(&proposal, signalled, None)
@@ -1079,6 +1080,7 @@ mod tests {
             reference_price: 100.0,
             stop_distance: Some(2.0),
             desired_quantity: None,
+            opens_short: false,
         };
         assert!(
             session

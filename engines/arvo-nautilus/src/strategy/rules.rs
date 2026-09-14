@@ -182,6 +182,65 @@ impl DataActor for BuyAndHold {
     }
 }
 
+/// Sells one option contract to open on the first bar it can, and holds it to
+/// expiry (#84).
+///
+/// The control every premium-selling rule has to beat: sell, do nothing, and
+/// let settlement decide. Unlike [`BuyAndHold`] it goes through the gate,
+/// because the gate is what makes a short in a cash account possible at all —
+/// it sizes the sale by the cash its worst case needs and refuses one that
+/// cannot be covered.
+///
+/// It tries again on each bar until something is sold, since a refusal for
+/// want of cash today can clear tomorrow.
+pub(crate) struct SellAndHold {
+    core: StrategyCore,
+    bar_type: BarType,
+    instrument_id: InstrumentId,
+    position: Position,
+    entered: bool,
+}
+
+impl SellAndHold {
+    pub(crate) fn new(
+        core: StrategyCore,
+        bar_type: BarType,
+        trade_size: Quantity,
+        risk: Risk,
+        correlations: std::sync::Arc<arvo_research::RollingCorrelations>,
+    ) -> Self {
+        Self {
+            core,
+            bar_type,
+            instrument_id: bar_type.instrument_id(),
+            position: Position::new(risk, trade_size, correlations),
+            entered: false,
+        }
+    }
+}
+
+managed_strategy!(SellAndHold);
+
+impl DataActor for SellAndHold {
+    fn on_start(&mut self) -> anyhow::Result<()> {
+        self.subscribe_bars(self.bar_type, None, None);
+        Ok(())
+    }
+
+    fn on_stop(&mut self) -> anyhow::Result<()> {
+        self.unsubscribe_bars(self.bar_type, None, None);
+        Ok(())
+    }
+
+    fn on_bar(&mut self, bar: &Bar) -> anyhow::Result<()> {
+        self.observe_bar(bar);
+        if !self.entered {
+            self.entered = self.enter_short(bar.close.as_f64())?;
+        }
+        Ok(())
+    }
+}
+
 // ------------------------------------------------------------- the rules ---
 
 /// Opening range breakout: the session's first bars set a range, and a break

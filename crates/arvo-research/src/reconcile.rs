@@ -258,11 +258,15 @@ fn fees_match_the_cost_model(experiment: &Experiment, ledger: &[Trade]) -> Optio
 
         expected += (entry_notional + exit_notional) * costs.commission_bps / 10_000.0;
         expected += costs.per_fill * sides;
-        // Sell-side charges fall on the closing fill of a long, which is the
-        // only side this engine sells on.
-        if trade.exit.is_some() && !settled {
+        // Sell-side charges fall on whichever fill sold: a long's close, or a
+        // short's open (#84). A settled close is not a fill at all.
+        let sold = match trade.direction {
+            crate::Direction::Long => (trade.exit.is_some() && !settled).then_some(exit_notional),
+            crate::Direction::Short => Some(entry_notional),
+        };
+        if let Some(notional) = sold {
             expected += costs.per_unit_sold * trade.quantity;
-            expected += exit_notional * costs.sell_notional_bps / 10_000.0;
+            expected += notional * costs.sell_notional_bps / 10_000.0;
         }
     }
 

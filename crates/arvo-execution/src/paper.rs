@@ -308,6 +308,7 @@ mod tests {
             reference_price: price,
             stop_distance: Some(2.0),
             desired_quantity: None,
+            opens_short: false,
         }
     }
 
