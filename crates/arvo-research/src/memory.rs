@@ -208,6 +208,18 @@ pub struct Summary {
     /// recomputed the same way it was produced.
     pub instrument: Option<String>,
     pub interval: Option<arvo_data::BarInterval>,
+    /// Instruments a book held alongside [`Self::instrument`]; empty for
+    /// anything else.
+    ///
+    /// A book's dataset version is every member's hash combined, so checking
+    /// it against the head instrument alone called every book stale forever —
+    /// and refused to replay any of them.
+    ///
+    /// Required rather than `default`, on purpose. Summaries are only ever
+    /// persisted in the index, which is a cache: an index written before this
+    /// field fails to parse, is treated as empty, and is rebuilt from the
+    /// findings. Defaulting would have kept every cached book wrong.
+    pub alongside: Vec<String>,
 }
 
 /// A finding that could not be read, and why.
@@ -276,16 +288,18 @@ impl StoredRecord {
     /// What the history list needs, without the finding itself.
     #[must_use]
     pub fn summary(&self) -> Summary {
-        let (instrument, interval) = match &self.record {
+        let (instrument, interval, alongside) = match &self.record {
             Record::Study(evidence) => (
                 Some(evidence.selected.instrument.clone()),
                 Some(evidence.selected.interval),
+                evidence.selected.alongside.clone(),
             ),
             Record::WalkForward(evidence) => (
                 Some(evidence.template.instrument.clone()),
                 Some(evidence.template.interval),
+                evidence.template.alongside.clone(),
             ),
-            Record::Panel(_) => (None, None),
+            Record::Panel(_) => (None, None, Vec::new()),
         };
         Summary {
             id: self.id.clone(),
@@ -297,6 +311,7 @@ impl StoredRecord {
             dataset_version: self.record.dataset_version().to_owned(),
             instrument,
             interval,
+            alongside,
         }
     }
 }
@@ -653,6 +668,30 @@ pub(crate) mod tests {
             let (summaries, unreadable) = store.summaries().expect("lists");
             assert_eq!(summaries.len(), 1);
             assert!(unreadable.is_empty());
+        }
+
+        #[test]
+        fn an_index_from_before_books_were_summarised_is_rebuilt_not_trusted() {
+            // Cached summaries without `alongside` would keep every book
+            // checked against its head instrument alone.
+            let (dir, store) = store();
+            let mut stored = record("AAPL.NASDAQ", 1_700_000_000);
+            if let Record::Study(found) = &mut stored.record {
+                found.selected.alongside = vec!["MSFT.NASDAQ".to_owned()];
+            }
+            store.save(&stored).expect("saves");
+            store.summaries().expect("builds the index");
+
+            let path = dir.path().join(INDEX);
+            let mut old: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).expect("index")).expect("json");
+            for summary in old.as_array_mut().expect("a list") {
+                summary.as_object_mut().expect("object").remove("alongside");
+            }
+            std::fs::write(&path, old.to_string()).expect("write");
+
+            let (summaries, _) = store.summaries().expect("lists");
+            assert_eq!(summaries[0].alongside, vec!["MSFT.NASDAQ".to_owned()]);
         }
 
         #[test]
