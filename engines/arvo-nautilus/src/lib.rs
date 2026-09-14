@@ -85,6 +85,9 @@ const BUY_AND_HOLD: &str = arvo_research::evaluation::BUY_AND_HOLD;
 pub const SELL_AND_HOLD: &str = "sell_and_hold";
 /// Sell put spreads on an underlying, choosing contracts from its chain (#86).
 pub const PUT_SPREAD: &str = "put_spread";
+/// Sell a same-day put spread at a fixed time and settle it, or stop out, by
+/// the close (#87).
+pub const ZERO_DTE_PUT_SPREAD: &str = "zero_dte_put_spread";
 const OPENING_RANGE: &str = "opening_range";
 const VOLATILITY_BREAKOUT: &str = "volatility_breakout";
 const VWAP_REVERSION: &str = "vwap_reversion";
@@ -104,6 +107,7 @@ pub const STRATEGIES: &[&str] = &[
     CROSS_SECTIONAL,
     BUY_AND_HOLD,
     PUT_SPREAD,
+    ZERO_DTE_PUT_SPREAD,
 ];
 
 /// Strategies that rank instruments against each other, and therefore need
@@ -700,12 +704,15 @@ impl Plan {
             SELL_AND_HOLD => Ok(Self::SellAndHold {
                 trade_size: trade_size()?,
             }),
-            PUT_SPREAD => {
-                // Chosen on a day's closes against a day's settlement; an
-                // intraday version is #87, and a different rule.
-                if interval != arvo_data::BarInterval::DAILY {
+            PUT_SPREAD | ZERO_DTE_PUT_SPREAD => {
+                let same_day = spec.name == ZERO_DTE_PUT_SPREAD;
+                // A month-out spread is chosen on a day's closes; a same-day one
+                // at a time of day, which daily bars do not have.
+                if same_day != interval.is_intraday() {
                     return Err(SimulationError::Rejected(format!(
-                        "put_spread decides on daily closes and cannot run on {interval} bars"
+                        "{} decides on {} bars and cannot run on {interval} bars",
+                        spec.name,
+                        if same_day { "intraday" } else { "daily" }
                     )));
                 }
                 let fraction = |name: &str, upper_inclusive: bool| -> Result<f64, SimulationError> {
@@ -729,13 +736,36 @@ impl Plan {
                     }
                     Ok(value)
                 };
-                let dte = period("dte")?;
-                let exit_dte = param("exit_dte")?;
-                if !exit_dte.is_finite() || exit_dte < 0.0 || exit_dte.fract() != 0.0 || exit_dte >= dte as f64 {
-                    return Err(SimulationError::Rejected(format!(
-                        "exit_dte must be a whole number of days below dte ({dte}), got {exit_dte}"
-                    )));
-                }
+                let (dte, exit_dte, stop_multiple, entry_minutes) = if same_day {
+                    let stop = param("stop_multiple")?;
+                    if !stop.is_finite() || stop <= 1.0 || stop > 20.0 {
+                        return Err(SimulationError::Rejected(format!(
+                            "stop_multiple is what buying the spread back may cost as a multiple \
+                             of its credit, above 1 and no more than 20, got {stop}"
+                        )));
+                    }
+                    let entry = param("entry_minutes")?;
+                    // Leaves the last hour: an entry in it is a different trade.
+                    if !entry.is_finite() || entry.fract() != 0.0 || !(0.0..=330.0).contains(&entry) {
+                        return Err(SimulationError::Rejected(format!(
+                            "entry_minutes is whole minutes after the open, 0 to 330, got {entry}"
+                        )));
+                    }
+                    (0, None, Some(stop), Some(entry as i64))
+                } else {
+                    let dte = period("dte")?;
+                    let exit_dte = param("exit_dte")?;
+                    if !exit_dte.is_finite()
+                        || exit_dte < 0.0
+                        || exit_dte.fract() != 0.0
+                        || exit_dte >= dte as f64
+                    {
+                        return Err(SimulationError::Rejected(format!(
+                            "exit_dte must be a whole number of days below dte ({dte}), got {exit_dte}"
+                        )));
+                    }
+                    (dte as i64, Some(exit_dte as i64), None, None)
+                };
                 let width = param("width")?;
                 if !width.is_finite() || width <= 0.0 {
                     return Err(SimulationError::Rejected(format!(
@@ -744,11 +774,13 @@ impl Plan {
                 }
                 Ok(Self::PutSpread {
                     rule: strategy::PutSpreadRule {
-                        dte: dte as i64,
+                        dte,
                         short_delta: fraction("short_delta", false)?,
                         width,
                         take_profit: fraction("take_profit", true)?,
-                        exit_dte: exit_dte as i64,
+                        exit_dte,
+                        stop_multiple,
+                        entry_minutes,
                         rate: rate("rate")?,
                         dividend_yield: rate("dividend_yield")?,
                     },
@@ -1074,7 +1106,10 @@ fn run_backtest(
                 trade_size,
             ))
             .map_err(|err| rejected("adding the strategy", &err))?;
-        return finish(engine, experiment, book);
+        let clock = settlement.map(|settlement| {
+            (format!("{}.{venue}", settlement.symbol), settlement.drive.as_slice())
+        });
+        return finish_marked(engine, experiment, book, clock);
     }
 
     if let Plan::CrossSectionalMomentum {
@@ -1232,9 +1267,26 @@ fn run_backtest(
 /// across all of them — so a ranking rule and an ordinary one cannot come to
 /// differ in how their results are collected.
 fn finish(
+    engine: BacktestEngine,
+    experiment: &Experiment,
+    book: &[(InstrumentId, String, Vec<arvo_data::Bar>)],
+) -> Result<SimulationResult, SimulationError> {
+    finish_marked(engine, experiment, book, None)
+}
+
+/// As [`finish`], with the curve's clock taken from `driver` and only the
+/// instruments the ledger holds marked (#87).
+///
+/// A chain run holds tens of thousands of contracts it never trades. Marking
+/// the curve against every one of them at every bar is instants times
+/// instruments — minutes per run at five-minute bars, for a curve that only the
+/// traded few can move. The underlying's bars give every instant a session
+/// has; the traded contracts give every mark.
+fn finish_marked(
     mut engine: BacktestEngine,
     experiment: &Experiment,
     book: &[(InstrumentId, String, Vec<arvo_data::Bar>)],
+    driver: Option<(String, &[arvo_data::Bar])>,
 ) -> Result<SimulationResult, SimulationError> {
     // The window is already expressed by the data: bars were filtered to it on
     // the way in, so bounding the run again would only add a way to disagree
@@ -1255,10 +1307,23 @@ fn finish(
     // account excludes the market value of anything held. Buying reads as a
     // catastrophic loss and selling as an enormous gain, both the size of the
     // position's notional. See `arvo_research::trade::equity_curve`.
-    let series: Vec<(String, Vec<arvo_data::Bar>)> = book
-        .iter()
-        .map(|(_, name, bars)| (name.clone(), bars.clone()))
-        .collect();
+    let series: Vec<(String, Vec<arvo_data::Bar>)> = match driver {
+        None => book
+            .iter()
+            .map(|(_, name, bars)| (name.clone(), bars.clone()))
+            .collect(),
+        Some((name, bars)) => {
+            let traded: std::collections::BTreeSet<&str> =
+                ledger.iter().map(|trade| trade.instrument.as_str()).collect();
+            std::iter::once((name, bars.to_vec()))
+                .chain(
+                    book.iter()
+                        .filter(|(_, name, _)| traded.contains(name.as_str()))
+                        .map(|(_, name, bars)| (name.clone(), bars.clone())),
+                )
+                .collect()
+        }
+    };
     let equity_curve = arvo_research::trade::equity_curve(
         experiment.starting_cash,
         &series,
@@ -1852,6 +1917,8 @@ mod tests {
                     ("take_profit".to_owned(), 0.5),
                     ("rate".to_owned(), 0.04),
                     ("dividend_yield".to_owned(), 0.013),
+                    ("stop_multiple".to_owned(), 2.0),
+                    ("entry_minutes".to_owned(), 30.0),
                 ]),
             };
             // At whichever resolution the rule is defined: the session rules
@@ -2339,6 +2406,122 @@ mod tests {
             ..spread(arvo_research::OptionSpread::MEASURED)
         };
         spread_run
+    }
+
+    /// Ten sessions of five-minute SPY bars with a same-day put chain on each,
+    /// every contract priced at every bar by the model from that bar's close,
+    /// so the deltas the rule implies are real ones.
+    ///
+    /// At 150% volatility, because the fixture moves ten points a session on a
+    /// hundred: priced at 20% its out-of-the-money puts were all a cent, no
+    /// spread had a credit, and the rule rightly sold nothing.
+    fn zero_dte_library() -> InMemoryBars {
+        let five = arvo_data::BarInterval::new(5, arvo_data::IntervalUnit::Minute);
+        let underlying = sessions(10, 78);
+        let market = |spot| arvo_research::greeks::Market {
+            spot,
+            rate: 0.04,
+            dividend_yield: 0.013,
+        };
+        let mut library = InMemoryBars::new().with_interval(UNDERLYING, five, underlying.clone());
+        let days: std::collections::BTreeSet<chrono::NaiveDate> =
+            underlying.iter().map(|bar| bar.at.date()).collect();
+        for day in days {
+            for strike in 90..=110 {
+                let contract = arvo_data::option::OptionContract {
+                    underlying: "SPY".to_owned(),
+                    expiration: day,
+                    right: arvo_data::option::Right::Put,
+                    strike: f64::from(strike),
+                };
+                let bars: Vec<arvo_data::Bar> = underlying
+                    .iter()
+                    .filter(|bar| bar.at.date() == day)
+                    .map(|bar| {
+                        let closes = bar.at + chrono::Duration::minutes(5);
+                        let years = arvo_research::greeks::years_to_expiry(&contract, closes);
+                        let price = arvo_research::greeks::greeks(&contract, market(bar.close), years, 1.50).price;
+                        let price = ((price * 100.0).round() / 100.0).max(0.01);
+                        arvo_data::Bar { at: bar.at, open: price, high: price, low: price, close: price, volume: 100.0 }
+                    })
+                    .collect();
+                library = library.with_interval(&format!("{}.AOPT", contract.symbol()), five, bars);
+            }
+        }
+        library
+    }
+
+    fn zero_dte_experiment() -> Experiment {
+        let underlying = sessions(10, 78);
+        let mut run = experiment(
+            BTreeMap::from([
+                ("short_delta".to_owned(), 0.20),
+                ("width".to_owned(), 2.0),
+                ("take_profit".to_owned(), 1.0),
+                ("stop_multiple".to_owned(), 2.0),
+                ("entry_minutes".to_owned(), 30.0),
+                ("rate".to_owned(), 0.04),
+                ("dividend_yield".to_owned(), 0.013),
+                ("trade_size".to_owned(), 100.0),
+            ]),
+            &underlying,
+        );
+        run.strategy.name = ZERO_DTE_PUT_SPREAD.to_owned();
+        run.instrument = UNDERLYING.to_owned();
+        run.interval = arvo_data::BarInterval::new(5, arvo_data::IntervalUnit::Minute);
+        run.costs = CostModel {
+            commission_bps: 2.0,
+            ..spread(arvo_research::OptionSpread::MEASURED)
+        };
+        run
+    }
+
+    #[test]
+    fn a_same_day_spread_opens_once_a_session_in_its_window_and_is_gone_by_the_close() {
+        let run = zero_dte_experiment();
+        let result = NautilusSimulation::new(zero_dte_library()).run(&run).expect("runs");
+        let spreads = arvo_research::trade::positions(&result.ledger);
+        assert!(!spreads.is_empty(), "sold nothing: {:?}", result.ledger);
+
+        let mut days = std::collections::BTreeSet::new();
+        for spread in &spreads {
+            assert!(spread.instrument.contains('+'), "a spread, not a leg: {}", spread.instrument);
+            let opened = spread.opened;
+            assert!(days.insert(opened.date()), "twice on {}", opened.date());
+            // 14:30 open: the 15:00 bar is 30 minutes in, and the window is half an hour.
+            let minutes = (opened - opened.date().and_hms_opt(14, 30, 0).expect("valid")).num_minutes();
+            assert!((30..=60).contains(&minutes), "opened {minutes} minutes in");
+            let closed = spread.closed.expect("never held past the session");
+            assert_eq!(closed.date(), opened.date(), "{spread:?}");
+        }
+        // A stop, a target — with a 100% target, a spread whose legs are both
+        // worthless — or settlement; never a position left for tomorrow.
+        assert!(
+            spreads.iter().all(|s| matches!(
+                s.exit_reason,
+                arvo_research::ExitReason::Signal | arvo_research::ExitReason::Expired
+            )),
+            "{spreads:?}"
+        );
+        assert!(spreads.iter().any(|s| s.pnl < 0.0), "the fixture's falling sessions stop some out");
+        // A 100% target never closes a spread early, so the unstopped ones settle.
+        assert!(
+            spreads.iter().any(|s| s.exit_reason == arvo_research::ExitReason::Expired),
+            "{spreads:?}"
+        );
+        assert_eq!(arvo_research::reconcile::reconcile(&run, &result), Vec::new());
+    }
+
+    #[test]
+    fn a_same_day_spread_refuses_daily_bars_and_a_stop_that_is_not_a_loss() {
+        let mut daily = zero_dte_experiment();
+        daily.interval = arvo_data::BarInterval::DAILY;
+        assert!(NautilusSimulation::new(zero_dte_library()).run(&daily).is_err());
+
+        let mut free = zero_dte_experiment();
+        free.strategy.params.insert("stop_multiple".to_owned(), 0.5);
+        let err = NautilusSimulation::new(zero_dte_library()).run(&free).expect_err("refused");
+        assert!(err.to_string().contains("stop_multiple"), "{err}");
     }
 
     #[test]
