@@ -121,7 +121,7 @@ pub fn period_returns(curve: &[crate::EquityPoint]) -> Vec<f64> {
 ///
 /// Via `libm::erf`, which is already in the build, rather than a hand-rolled
 /// rational approximation — one fewer piece of numerics to be wrong about.
-fn normal_cdf(x: f64) -> f64 {
+pub(crate) fn normal_cdf(x: f64) -> f64 {
     0.5 * (1.0 + libm::erf(x / std::f64::consts::SQRT_2))
 }
 

@@ -32,6 +32,7 @@ pub mod correlation;
 pub mod dividend;
 pub mod evaluation;
 pub mod family;
+pub mod greeks;
 pub mod memory;
 pub mod overnight;
 pub mod panel;
