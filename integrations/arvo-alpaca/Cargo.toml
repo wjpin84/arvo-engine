@@ -19,4 +19,5 @@ serde_json = "1"
 uuid = { version = "1.26", features = ["v5"] }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt"] }
+arvo-research.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "time"] }
