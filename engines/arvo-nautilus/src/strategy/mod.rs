@@ -84,6 +84,9 @@ pub(crate) const PROPOSER: &str = "engine";
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Risk {
     pub(crate) model: arvo_research::RiskModel,
+    /// What a fill costs on top of its price, from the experiment, so an entry
+    /// is sized at what the account can pay all in.
+    pub(crate) costs: arvo_research::CostModel,
     /// Opening balance. Every fractional limit in the model is a fraction of
     /// this, resolved at decision time rather than up front so the engine and a
     /// live gate divide the same numbers the same way.
@@ -341,6 +344,29 @@ pub(crate) fn account_from_positions(
     (positions, realised_today, day_trades_used)
 }
 
+/// Free cash in the account at `venue`, as the engine holds it.
+///
+/// `None` before the account exists, which leaves the cash ceiling off for
+/// the one entry that cannot need it: nothing has been spent yet.
+///
+/// Read as the account's only currency rather than `balance_free(None)`, which
+/// panics on an account with no base currency — every backtest account here.
+///
+/// ponytail: `None` for a multi-currency account, which has no single cash
+/// figure; price the balances in one currency if a run ever holds two.
+pub(crate) fn spendable(
+    cache: &nautilus_common::cache::CacheApi<'_>,
+    venue: &nautilus_model::identifiers::Venue,
+) -> Option<f64> {
+    use nautilus_model::accounts::Account as _;
+    let free = cache.account_for_venue(venue)?.balances_free();
+    let mut balances = free.values();
+    match (balances.next(), balances.next()) {
+        (Some(only), None) => Some(only.as_f64()),
+        _ => None,
+    }
+}
+
 /// Puts one entry to the same risk policy a live session uses.
 ///
 /// # Why the engine asks rather than deciding
@@ -363,6 +389,7 @@ pub(crate) fn decide_entry(
     halted: bool,
     equity: f64,
     day_trades_used: usize,
+    spendable: Option<f64>,
     correlations: Option<&dyn arvo_research::Correlations>,
 ) -> arvo_research::Decision {
     let proposal = arvo_research::Proposal {
@@ -389,12 +416,14 @@ pub(crate) fn decide_entry(
             equity,
             day_trades_used,
             halted: halted.then_some("the account drawdown limit was reached"),
+            spendable,
         },
         &proposal,
         now,
         // Never stale. See `signalled_at` above.
         i64::MAX,
         correlations,
+        Some(&risk.costs),
     )
 }
 
@@ -478,6 +507,7 @@ pub(crate) trait Managed: Strategy + StrategyNative + DataActorNative {
             self.position().is_halted(),
             equity,
             day_trades_used,
+            spendable(&self.cache(), &self.instrument().venue),
             Some(self.position().correlations.as_ref()),
         ))
     }
@@ -534,6 +564,24 @@ pub(crate) trait Managed: Strategy + StrategyNative + DataActorNative {
             return Ok(());
         };
         self.send(OrderSide::Sell, size, Some(reason))
+    }
+
+    /// Squares what this strategy believes it holds with the venue, after the
+    /// venue refused an order.
+    ///
+    /// A position is recorded when its entry is *sent*, so a refused entry
+    /// left the strategy holding nothing and believing otherwise: it sat out
+    /// the session, then sent an exit for shares it never bought. Released
+    /// only when the venue is flat — a refused *exit* leaves the shares held,
+    /// and the gate reads those from the engine rather than from here. Counted
+    /// after the run, from the engine's order records; see `ledger::refused`.
+    fn refused(&mut self) {
+        let instrument = self.instrument();
+        let flat = f64::try_from(self.portfolio().net_position(&instrument))
+            .is_ok_and(|held| held == 0.0);
+        if flat {
+            self.position_mut().release();
+        }
     }
 
     /// The exit every rule shares: stop first, then target.
@@ -629,7 +677,14 @@ pub(crate) trait Managed: Strategy + StrategyNative + DataActorNative {
 /// field holds what.
 macro_rules! managed_strategy {
     ($ty:ident) => {
-        nautilus_trading::nautilus_strategy!($ty);
+        nautilus_trading::nautilus_strategy!($ty, {
+            fn on_order_denied(&mut self, _event: nautilus_model::events::OrderDenied) {
+                crate::strategy::Managed::refused(self);
+            }
+            fn on_order_rejected(&mut self, _event: nautilus_model::events::OrderRejected) {
+                crate::strategy::Managed::refused(self);
+            }
+        });
 
         impl crate::strategy::Managed for $ty {
             fn position(&self) -> &crate::strategy::Position {
@@ -670,6 +725,7 @@ mod tests {
 
     /// A risk model with nothing switched on, and a $100k account.
     const UNSTOPPED: Risk = Risk {
+        costs: arvo_research::CostModel::proportional(0.0, 0.0),
         model: arvo_research::RiskModel {
             stop_atr_multiple: None,
             atr_period: 14,
@@ -714,6 +770,7 @@ mod tests {
             false,
             UNSTOPPED.starting_cash,
             0,
+            None,
             None,
         )
     }
@@ -826,6 +883,7 @@ mod tests {
             UNSTOPPED.starting_cash,
             0,
             None,
+            None,
         );
         assert!(matches!(
             refused,
@@ -870,6 +928,7 @@ mod tests {
             UNSTOPPED.starting_cash,
             0,
             None,
+            None,
         );
         assert!(matches!(
             refused,
@@ -898,6 +957,7 @@ mod tests {
             false,
             UNSTOPPED.starting_cash,
             0,
+            None,
             None,
         );
         assert!(matches!(

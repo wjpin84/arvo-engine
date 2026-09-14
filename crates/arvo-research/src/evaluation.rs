@@ -370,6 +370,16 @@ pub struct Evaluation {
     /// measured — which is the honest description of it.
     #[serde(default)]
     pub dividend_gap: Option<crate::DividendGap>,
+    /// Orders the venue refused during the strategy's run.
+    ///
+    /// Beside the result rather than in the verdict, like the dividend gap:
+    /// scoring stays a function of the curves. It changes how the result is
+    /// read, and `advice` makes any refusal blocking — a run that skipped
+    /// signals it could not pay for is not a run of the rule.
+    ///
+    /// `default` because this is a persisted format.
+    #[serde(default)]
+    pub refused_orders: crate::Refused,
     /// Strategy return minus benchmark return. The number that matters:
     /// absolute return mostly measures whether the market went up.
     ///
@@ -405,6 +415,13 @@ impl Evaluation {
     #[must_use]
     pub fn with_dividend_gap(mut self, gap: Option<crate::DividendGap>) -> Self {
         self.dividend_gap = gap;
+        self
+    }
+
+    /// Records the orders the venue refused during the strategy's run.
+    #[must_use]
+    pub const fn with_refused(mut self, refused: crate::Refused) -> Self {
+        self.refused_orders = refused;
         self
     }
 
@@ -469,6 +486,7 @@ impl Evaluation {
             // Attached by `with_dividend_gap` when a series exists. `new` stays
             // a function of the curves and the criteria alone.
             dividend_gap: None,
+            refused_orders: crate::Refused::default(),
             benchmark_instruments: Vec::new(),
             excess_return,
             verdict,
@@ -561,6 +579,7 @@ pub fn evaluate_against_benchmark(
         criteria,
     )
     .with_trades(strategy_result.ledger.clone())
+    .with_refused(strategy_result.refused)
     .with_dividend_gap(dividend_gap)
     .with_benchmark_instruments(held(&benchmark_result.ledger));
 

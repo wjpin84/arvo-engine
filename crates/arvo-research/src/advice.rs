@@ -126,6 +126,29 @@ impl Recommendation {
     }
 }
 
+/// Orders the venue refused, as the blocking item they are.
+///
+/// Above the trade count on purpose. A result with too few trades says the
+/// evidence is thin; one whose entries were refused says the run was not the
+/// rule — it skipped signals it could not pay for, so its trades, its return
+/// and its verdict all describe a different, starved strategy.
+fn refusals(refused: crate::Refused) -> Option<Recommendation> {
+    refused.any().then(|| {
+        Recommendation::new(
+            Severity::Blocking,
+            "The venue refused orders this run tried to place.",
+            "Do not read the trades or the return as the rule's. Every refused entry is a signal that was never acted on, so this measured a different strategy. The usual cause is an entry sized beyond the cash on hand; lower the position cap or the risk per trade, or give the account more capital, and run it again.",
+            format!(
+                "{} entr{} and {} exit{} refused",
+                refused.entries,
+                if refused.entries == 1 { "y" } else { "ies" },
+                refused.exits,
+                if refused.exits == 1 { "" } else { "s" },
+            ),
+        )
+    })
+}
+
 /// A fraction of the window, phrased the way a person would say it.
 fn share(fraction: f64) -> String {
     match fraction {
@@ -172,6 +195,10 @@ pub fn recommend(found: &FamilyEvidence) -> Vec<Recommendation> {
                 discrepancy.detail,
             ),
         ));
+    }
+
+    if let Some(item) = refusals(evaluation.refused_orders) {
+        out.push(item);
     }
 
     if evaluation.strategy.trades < criteria.min_trades {
@@ -763,6 +790,17 @@ pub fn recommend_walk_forward(found: &WalkForwardEvidence) -> Vec<Recommendation
     let mut out = Vec::new();
 
     // ---- blocking: the result cannot be read -----------------------------
+
+    let refused = found.folds.iter().fold(crate::Refused::default(), |sum, fold| {
+        let each = fold.out_of_sample_evidence.evaluation.refused_orders;
+        crate::Refused {
+            entries: sum.entries + each.entries,
+            exits: sum.exits + each.exits,
+        }
+    });
+    if let Some(item) = refusals(refused) {
+        out.push(item);
+    }
 
     if folds == 0 {
         out.push(Recommendation::new(
@@ -1470,6 +1508,7 @@ mod tests {
                         strategy_trades: TradeStats::default(),
                         strategy_ledger: Vec::new(),
                 dividend_gap: None,
+                refused_orders: crate::Refused::default(),
                         benchmark_instruments: Vec::new(),
                         excess_return: 0.2,
                         verdict: Verdict::Supported,
@@ -1614,6 +1653,27 @@ mod tests {
         study.selected = experiment;
         study.out_of_sample_evidence.evaluation.strategy_ledger = ledger;
         study
+    }
+
+    #[test]
+    fn a_run_the_venue_refused_orders_in_blocks() {
+        // A refused entry is a signal never acted on: the run measured a
+        // starved strategy, not the rule.
+        let mut study = book_study(&["AAPL.NASDAQ"]);
+        study.out_of_sample_evidence.evaluation.refused_orders = crate::Refused {
+            entries: 69,
+            exits: 0,
+        };
+        let out = recommend(&study);
+        let item = out
+            .iter()
+            .find(|item| item.finding.contains("refused orders"))
+            .unwrap_or_else(|| panic!("{}", findings(&out)));
+        assert_eq!(item.severity, Severity::Blocking);
+        assert!(item.evidence.contains("69 entries"), "{}", item.evidence);
+
+        study.out_of_sample_evidence.evaluation.refused_orders = crate::Refused::default();
+        assert!(!recommend(&study).iter().any(|item| item.finding.contains("refused orders")));
     }
 
     #[test]

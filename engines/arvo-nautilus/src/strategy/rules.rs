@@ -146,6 +146,9 @@ impl BuyAndHold {
                         atr_period: 1,
                         ..arvo_research::RiskModel::default()
                     },
+                    // Unused: the benchmark buys its fixed size directly and
+                    // never asks the gate, so there is no entry to size.
+                    costs: arvo_research::CostModel::proportional(0.0, 0.0),
                     starting_cash,
                 },
                 trade_size,

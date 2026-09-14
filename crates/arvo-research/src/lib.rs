@@ -662,6 +662,28 @@ pub struct EquityPoint {
     pub equity: f64,
 }
 
+/// Orders the venue would not take, by what they were for.
+///
+/// Counted because an order refused *after* the gate accepted it used to
+/// vanish: the strategy believed it held a position it never bought, sat out
+/// the rest of the session, and the run reported a rule that rarely traded.
+/// On two years of five-minute AAPL an opening-range rule took 3 of 72
+/// breakouts and nothing anywhere said so.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Refused {
+    /// Entries refused — signals the result never acted on.
+    pub entries: usize,
+    /// Exits refused — positions held longer than the rule decided to.
+    pub exits: usize,
+}
+
+impl Refused {
+    #[must_use]
+    pub const fn any(&self) -> bool {
+        self.entries > 0 || self.exits > 0
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SimulationResult {
     pub experiment: ExperimentId,
@@ -681,6 +703,10 @@ pub struct SimulationResult {
     /// the honest description of a result recorded before this was captured.
     #[serde(default)]
     pub ledger: Vec<Trade>,
+    /// Orders the venue refused. `default`: a result from before this was
+    /// counted says nothing about refusals, which is what it knew.
+    #[serde(default)]
+    pub refused: Refused,
 }
 
 impl SimulationResult {
@@ -902,6 +928,7 @@ mod tests {
             engine: "test 0".to_owned(),
             trades: 0,
             ledger: Vec::new(),
+            refused: Refused::default(),
             equity_curve: vec![EquityPoint {
                 at: NaiveDate::from_ymd_opt(2024, 1, 1)
                     .expect("valid")

@@ -36,6 +36,27 @@ use nautilus_model::{
 /// Sorted rather than taken in cache order: the ledger is read as a sequence
 /// by anything that looks at streaks or holding periods, and neither cache
 /// iteration order nor snapshot order is part of Nautilus's contract.
+/// Orders the venue denied or rejected, split by what they were for.
+///
+/// Read from the engine's own order records rather than tallied by the
+/// strategies, for the reason `from_cache` reads positions: a second count of
+/// something the engine already holds is a second thing that can be wrong.
+pub fn refused(cache: &Cache) -> arvo_research::Refused {
+    use nautilus_model::enums::{OrderSide, OrderStatus};
+
+    let mut refused = arvo_research::Refused::default();
+    for order in cache.orders(None, None, None, None, None) {
+        if !matches!(order.status(), OrderStatus::Denied | OrderStatus::Rejected) {
+            continue;
+        }
+        match order.order_side() {
+            OrderSide::Buy => refused.entries += 1,
+            _ => refused.exits += 1,
+        }
+    }
+    refused
+}
+
 pub fn from_cache(cache: &Cache) -> Vec<Trade> {
     let mut positions = cache.position_snapshots(None, None);
     positions.extend(

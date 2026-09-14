@@ -593,6 +593,7 @@ fn run_backtest(
     // session cannot drift apart on how a limit is applied.
     let risk = strategy::Risk {
         model: experiment.risk,
+        costs: experiment.costs,
         starting_cash: experiment.starting_cash,
     };
 
@@ -770,6 +771,7 @@ fn finish(
     // Before `dispose`: the positions live in the kernel's cache, and
     // disposal is what tears it down.
     let ledger = ledger::from_cache(&engine.kernel_mut().cache.borrow());
+    let refused = ledger::refused(&engine.kernel_mut().cache.borrow());
     engine.dispose();
 
     // From the ledger and the prices, not from `engine.get_result()`. Nautilus
@@ -795,6 +797,7 @@ fn finish(
         trades: u32::try_from(ledger.len()).unwrap_or(u32::MAX),
         equity_curve,
         ledger,
+        refused,
     })
 }
 
@@ -1756,6 +1759,21 @@ mod tests {
             (extra - expected).abs() < 1.0,
             "expected about {expected} of extra fees, got {extra}"
         );
+    }
+
+    #[test]
+    fn an_order_the_account_cannot_pay_for_is_counted_not_lost() {
+        // Buy-and-hold sends its fixed size without asking the gate, so an
+        // account too small for it is refused by the venue. Before refusals
+        // were counted that run reported no trades and nothing else.
+        let bars = sawtooth(60);
+        let mut experiment = experiment(params(10.0, 30.0), &bars);
+        experiment.strategy.name = BUY_AND_HOLD.to_owned();
+        experiment.starting_cash = 1_000.0;
+
+        let result = provider(bars).run(&experiment).expect("runs");
+        assert!(result.ledger.is_empty(), "nothing could be bought");
+        assert!(result.refused.entries >= 1, "{:?}", result.refused);
     }
 
     #[test]
@@ -2805,21 +2823,17 @@ mod tests {
     }
 
     #[test]
-    fn a_book_too_small_for_all_its_members_crowds_the_later_ones_out() {
-        // The measurement the whole thing exists for, and the one no amount of
+    fn a_book_too_small_for_all_its_members_gives_the_later_ones_what_is_left() {
+        // The measurement a book exists for, and the one no amount of
         // combining separate runs can produce.
         //
-        // Each member wants roughly 100 x $100 = $10,000 and the account holds
-        // $12,000. Run separately they both trade in full and their results
-        // add. Sharing one balance, the first member takes the only position
-        // the account can fund and the second is denied every time — so the
-        // book is not *less* than twice the single run, it is exactly *equal*
-        // to it, and one of its two instruments never trades at all.
-        //
-        // That is worth asserting precisely rather than as an inequality: a
-        // reader pointing a rule at more instruments than the account can fund
-        // gets a result whose extra members are silently absent, and the
-        // number that gives it away is the trade count, not the return.
+        // Each member wants 100 x ~$100 = ~$10,000 and the account holds
+        // $12,000. The first to signal takes its full size. The second used to
+        // be *denied* — an order for money the account did not have, refused by
+        // the venue, and silently absent from the result; that was asserted
+        // here as the behaviour. Entries are now sized to the cash on hand, so
+        // the second member buys what the remainder affords: it trades, and
+        // smaller, and nothing is refused.
         let bars = sawtooth(200);
         let mut alone = experiment(params(10.0, 30.0), &bars);
         alone.starting_cash = 12_000.0;
@@ -2834,26 +2848,20 @@ mod tests {
             .expect("the book should run");
 
         assert!(single.trades > 0, "the fixture has to trade");
-        assert_eq!(
-            book.trades, single.trades,
-            "an account with room for one position funds one member, not two"
-        );
-        assert!(
-            (realised(&book) - realised(&single)).abs() < 1e-6,
-            "book {:.2} against the single run {:.2}",
-            realised(&book),
-            realised(&single),
-        );
+        assert_eq!(book.refused, arvo_research::Refused::default(), "nothing asked for money that was not there");
 
-        let traded: std::collections::BTreeSet<&str> = book
-            .ledger
-            .iter()
-            .map(|trade| trade.instrument.as_str())
-            .collect();
-        assert_eq!(
-            traded.len(),
-            1,
-            "the crowded-out member should not appear in the ledger at all, got {traded:?}"
+        let size_of = |name: &str| {
+            book.ledger
+                .iter()
+                .filter(|trade| trade.instrument == name)
+                .map(|trade| trade.quantity)
+                .fold(0.0_f64, f64::max)
+        };
+        let (first, second) = (size_of("AAPL.NASDAQ"), size_of("MSFT.NASDAQ"));
+        assert!(first > 0.0 && second > 0.0, "both members trade: {first} and {second}");
+        assert!(
+            first.min(second) < 100.0,
+            "the later member takes what the remainder affords, not its full size: {first} and {second}"
         );
     }
 

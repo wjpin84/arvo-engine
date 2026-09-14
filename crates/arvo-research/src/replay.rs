@@ -576,6 +576,7 @@ mod tests {
             strategy_trades: crate::TradeStats::default(),
             strategy_ledger: Vec::new(),
             dividend_gap: None,
+            refused_orders: crate::Refused::default(),
             benchmark_instruments: Vec::new(),
             excess_return: 0.1,
             verdict: crate::Verdict::Supported,
@@ -638,6 +639,7 @@ mod tests {
                     trades: *trades,
                     equity_curve: curve(values),
                     ledger: Vec::new(),
+                    refused: crate::Refused::default(),
                 }),
             }
         }
