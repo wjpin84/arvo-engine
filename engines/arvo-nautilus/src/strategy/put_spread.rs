@@ -1,4 +1,4 @@
-//! Selling SPY put spreads (#86).
+//! Selling SPY put spreads (#86), a month out or the same day (#87).
 //!
 //! The first rule that does not trade the series it reads. It watches the
 //! underlying's daily closes and trades contracts it chooses from the chain:
@@ -70,13 +70,33 @@ pub(crate) struct Rule {
     pub short_delta: f64,
     /// Strike distance from the short put down to the long one, in dollars.
     pub width: f64,
-    /// Close once this fraction of the opening credit has been kept.
+    /// Close once this fraction of the opening credit has been kept. At 1.0,
+    /// never: all of it is kept only once the spread is worthless, and buying
+    /// back a worthless spread pays two fills' spread for nothing settlement
+    /// would not give free — found when a same-day rule closed 113 of 135
+    /// spreads that way.
     pub take_profit: f64,
-    /// Close at or below this many days to expiration.
-    pub exit_dte: i64,
+    /// Close at or below this many days to expiration. `None` holds into
+    /// settlement unless a target or stop closes it first.
+    pub exit_dte: Option<i64>,
+    /// Close once the spread costs this multiple of its credit to buy back —
+    /// 2.0 closes it at a loss the size of the credit. `None` has no stop.
+    pub stop_multiple: Option<f64>,
+    /// Intraday: open only in the half hour from this many minutes after the
+    /// session opens, once a session. `None` decides on daily closes.
+    pub entry_minutes: Option<i64>,
     pub rate: f64,
     pub dividend_yield: f64,
 }
+
+/// How long after `entry_minutes` an intraday entry may still be taken.
+///
+/// A fixed-time rule whose contracts did not trade at the stated bar would
+/// otherwise drift to whatever time they next did, and the result would
+/// describe entries at noon under a 10:00 name.
+///
+/// ponytail: fixed. Make it a parameter if thin chains need a wider window.
+const ENTRY_WINDOW_MINUTES: i64 = 30;
 
 /// A spread to open.
 #[derive(Debug, Clone, PartialEq)]
@@ -112,10 +132,14 @@ pub(crate) fn choose(
     traded: &[(OptionContract, f64)],
 ) -> Result<Choice, Skip> {
     let dte = |contract: &OptionContract| contract.days_to_expiry(day);
+    // Same day means the same day: a 0DTE rule that took tomorrow's contract
+    // when today's did not trade would be a different rule.
+    let tolerance = if rule.dte == 0 { 0 } else { DTE_TOLERANCE };
     let expiration = loaded
         .iter()
-        .filter(|c| c.right == Right::Put && dte(c) > rule.exit_dte)
-        .filter(|c| (dte(c) - rule.dte).abs() <= DTE_TOLERANCE)
+        .filter(|c| c.right == Right::Put && dte(c) >= 0)
+        .filter(|c| rule.exit_dte.is_none_or(|exit| dte(c) > exit))
+        .filter(|c| (dte(c) - rule.dte).abs() <= tolerance)
         .map(|c| (c.expiration, (dte(c) - rule.dte).abs()))
         .min_by_key(|(expiration, distance)| (*distance, *expiration))
         .map(|(expiration, _)| expiration)
@@ -213,6 +237,8 @@ pub(crate) struct PutSpread {
     latest: HashMap<InstrumentId, (UnixNanos, f64)>,
     filling: Option<UnixNanos>,
     open: Option<Open>,
+    /// The session an intraday rule last opened in. Once a session.
+    entered_on: Option<NaiveDate>,
     /// A spread whose long leg has been sent and whose short waits on its fill.
     pending: Option<Pending>,
     /// An order the fill handler could not send, raised on the next bar: the
@@ -251,6 +277,7 @@ impl PutSpread {
             latest: HashMap::new(),
             filling: None,
             open: None,
+            entered_on: None,
             pending: None,
             failed: None,
             skipped: BTreeMap::new(),
@@ -271,13 +298,17 @@ impl PutSpread {
 
     /// Everything the rule does at one completed instant.
     fn decide(&mut self, at: UnixNanos) -> anyhow::Result<()> {
-        // Daily bars are stamped at the end of their day; the day they describe
-        // is the one before, and its prices are the 16:00 close.
+        // A bar is stamped at the end of its period. A daily bar's day is the
+        // one before its stamp and its prices are that day's 16:00 close; an
+        // intraday bar's prices are as of its stamp.
         let Some(stamped) = super::nanos_to_instant(at) else {
             return Ok(());
         };
         let day = (stamped - chrono::Duration::seconds(1)).date();
-        let as_of = arvo_data::session::regular_close(day);
+        let as_of = match self.rule.entry_minutes {
+            Some(_) => stamped,
+            None => arvo_data::session::regular_close(day),
+        };
 
         if self.pending.is_some() {
             return Ok(());
@@ -292,15 +323,33 @@ impl PutSpread {
                     .zip(self.printed(&open.long, at))
                     .map(|(s, l)| s - l);
                 let broken = short == 0.0 || long == 0.0;
-                let expiring = (open.expiration - day).num_days() <= self.rule.exit_dte;
-                let kept =
-                    value.is_some_and(|value| value <= open.credit * (1.0 - self.rule.take_profit));
-                if broken || ((expiring || kept) && value.is_some()) {
+                let expiring = self
+                    .rule
+                    .exit_dte
+                    .is_some_and(|exit| (open.expiration - day).num_days() <= exit);
+                let kept = self.rule.take_profit < 1.0
+                    && value.is_some_and(|value| value <= open.credit * (1.0 - self.rule.take_profit));
+                let stopped = value.zip(self.rule.stop_multiple).is_some_and(
+                    |(value, multiple)| value >= open.credit * multiple,
+                );
+                if broken || ((expiring || kept || stopped) && value.is_some()) {
                     // The short first: buying it back releases the cash the
                     // long sale does not need.
                     self.flatten(open.short)?;
                     self.flatten(open.long)?;
                 }
+                return Ok(());
+            }
+        }
+
+        // An intraday rule opens once a session, in its entry window.
+        if let Some(entry) = self.rule.entry_minutes {
+            if self.entered_on == Some(day) {
+                return Ok(());
+            }
+            let opened = arvo_data::session::regular_close(day) - chrono::Duration::minutes(390);
+            let minutes = (stamped - opened).num_minutes();
+            if minutes < entry || minutes > entry + ENTRY_WINDOW_MINUTES {
                 return Ok(());
             }
         }
@@ -367,6 +416,7 @@ impl PutSpread {
             return Ok(());
         };
         self.send(long_id, OrderSide::Buy, size, None)?;
+        self.entered_on = Some(now.date());
         self.pending = Some(Pending {
             open: Open {
                 short: short_id,
@@ -618,7 +668,9 @@ mod tests {
             short_delta: 0.20,
             width: 5.0,
             take_profit: 0.5,
-            exit_dte: 21,
+            exit_dte: Some(21),
+            stop_multiple: None,
+            entry_minutes: None,
             rate: 0.04,
             dividend_yield: 0.013,
         }
@@ -636,7 +688,8 @@ mod tests {
             rate: 0.04,
             dividend_yield: 0.013,
         };
-        let as_of = arvo_data::session::regular_close(day);
+        // Priced the morning of `day`, so a same-day chain still has time left.
+        let as_of = day.and_hms_opt(14, 30, 0).expect("valid");
         strikes
             .step_by(5)
             .map(|strike| {
@@ -704,9 +757,34 @@ mod tests {
     }
 
     #[test]
+    fn a_same_day_rule_takes_only_the_same_day() {
+        let day = date(8, 8);
+        let as_of = day.and_hms_opt(14, 30, 0).expect("valid");
+        let zero = Rule {
+            dte: 0,
+            exit_dte: None,
+            stop_multiple: Some(2.0),
+            entry_minutes: Some(30),
+            short_delta: 0.10,
+            ..rule()
+        };
+        let tomorrow = chain(date(8, 11), 580..=610, day);
+        let loaded: Vec<_> = tomorrow.iter().map(|(c, _)| c.clone()).collect();
+        assert_eq!(
+            choose(zero, 600.0, day, as_of, &loaded, &tomorrow),
+            Err(Skip::NoExpiration),
+            "Monday's contract is not Friday's 0DTE"
+        );
+        let today = chain(day, 580..=610, day);
+        let loaded: Vec<_> = today.iter().map(|(c, _)| c.clone()).collect();
+        let choice = choose(zero, 600.0, day, as_of, &loaded, &today).expect("a spread");
+        assert_eq!(choice.short.expiration, day);
+    }
+
+    #[test]
     fn skips_rather_than_choosing_by_what_was_fetched() {
         let day = date(8, 8);
-        let as_of = arvo_data::session::regular_close(day);
+        let as_of = day.and_hms_opt(14, 30, 0).expect("valid");
         // Only strikes near the money were loaded: the 20-delta strike is below
         // all of them, so the nearest loaded one is not the rule's choice.
         let narrow = chain(date(9, 12), 590..=620, day);
