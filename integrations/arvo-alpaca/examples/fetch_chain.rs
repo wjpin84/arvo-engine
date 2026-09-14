@@ -74,22 +74,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for (expiration, group) in by_expiry {
         let symbols: Vec<String> = group.iter().map(|w| w.contract.symbol()).collect();
         let fetched = chain::bars(&symbols, interval, group[0].from, group[0].to).await?;
-        for symbol in &symbols {
-            match fetched.get(symbol) {
-                Some(series) => {
-                    library.write(&format!("{symbol}.{}", chain::VENUE), interval, series)?;
-                    written += 1;
-                    bars += series.len();
-                }
-                None => silent += 1,
-            }
-        }
-        println!(
-            "{expiration}: {} contracts, {} traded",
-            symbols.len(),
-            symbols.iter().filter(|s| fetched.contains_key(*s)).count()
-        );
+        silent += symbols.len() - fetched.len();
+        written += fetched.len();
+        bars += fetched.values().map(Vec::len).sum::<usize>();
+        // The whole expiration in one write: one file, rewritten once.
+        let named: BTreeMap<String, Vec<_>> = fetched
+            .into_iter()
+            .map(|(symbol, series)| (format!("{symbol}.{}", chain::VENUE), series))
+            .collect();
+        let traded = named.len();
+        library.write_contracts(interval, &named)?;
+        println!("{expiration}: {} contracts, {traded} traded", symbols.len());
     }
-    println!("wrote {written} contracts, {bars} bars; {silent} never traded in their window and have no file");
+    println!("wrote {written} contracts, {bars} bars; {silent} never traded in their window and have no rows");
     Ok(())
 }

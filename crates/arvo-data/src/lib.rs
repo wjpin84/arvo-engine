@@ -338,7 +338,7 @@ pub struct CsvBars {
 const DIVIDEND_SUBDIR: &str = "dividends";
 
 /// Where option contracts' bars live, relative to the library root:
-/// `options/<UNDERLYING>/<interval>/<OCC>.<VENUE>.csv`.
+/// `options/<UNDERLYING>/<interval>/<EXPIRATION>.<VENUE>.csv`.
 const OPTION_SUBDIR: &str = "options";
 
 /// An instrument name that cannot escape the library root.
@@ -396,36 +396,101 @@ impl CsvBars {
         interval: BarInterval,
         bars: &[Bar],
     ) -> Result<PathBuf, DataError> {
-        let path = self.path_for(instrument, interval)?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|source| DataError::Io {
-                path: parent.to_path_buf(),
-                source,
-            })?;
+        if option::OptionContract::parse(instrument).is_some() {
+            let one = BTreeMap::from([(instrument.to_owned(), bars.to_vec())]);
+            let mut paths = self.write_contracts(interval, &one)?;
+            return Ok(paths.remove(0));
         }
+        let path = self.path_for(instrument, interval)?;
+        create_parent(&path)?;
 
         let mut out = String::with_capacity(bars.len() * 64 + 32);
         out.push_str("date,open,high,low,close,volume\n");
         for bar in bars {
-            // A daily bar keeps its bare date so an exported file still looks
-            // like the free daily exports this format came from; anything
-            // finer needs the time or the resolution is lost.
-            let at = if interval == BarInterval::DAILY {
-                bar.at.date().to_string()
-            } else {
-                bar.at.format("%Y-%m-%dT%H:%M:%S").to_string()
-            };
-            out.push_str(&format!(
-                "{at},{},{},{},{},{}\n",
-                bar.open, bar.high, bar.low, bar.close, bar.volume
-            ));
+            out.push_str(&row_text(bar, interval));
+            out.push('\n');
+        }
+        write_file(&path, &out)?;
+        Ok(path)
+    }
+
+    /// Writes option contracts' bars, replacing each named contract's rows and
+    /// keeping every other contract in the same files.
+    ///
+    /// # One file per expiration, not per contract
+    ///
+    /// A year of daily SPY expirations near the money is tens of thousands of
+    /// contracts. A file each is a directory nobody can open and a fingerprint
+    /// check that stats every one. They are read an expiration at a time — a
+    /// strategy picks from the contracts expiring on a date — so that is the
+    /// file: `options/SPY/5minute/2025-09-12.AOPT.csv`, rows keyed by symbol.
+    ///
+    /// Each file is rewritten once however many of its contracts are given,
+    /// which is why a fetch hands over a whole expiration rather than calling
+    /// [`Self::write`] per contract.
+    ///
+    /// # Errors
+    ///
+    /// [`DataError::UnsafeInstrument`] for a name that is not an option
+    /// contract, before anything is written; [`DataError::Io`] and
+    /// [`DataError::Malformed`] from the files being merged into.
+    pub fn write_contracts(
+        &self,
+        interval: BarInterval,
+        series: &BTreeMap<String, Vec<Bar>>,
+    ) -> Result<Vec<PathBuf>, DataError> {
+        let mut by_file: BTreeMap<PathBuf, Vec<(String, &[Bar])>> = BTreeMap::new();
+        for (instrument, bars) in series {
+            let contract = option::OptionContract::parse(instrument)
+                .ok_or_else(|| DataError::UnsafeInstrument(instrument.clone()))?;
+            by_file
+                .entry(self.path_for(instrument, interval)?)
+                .or_default()
+                .push((contract.symbol(), bars));
         }
 
-        std::fs::write(&path, out).map_err(|source| DataError::Io {
-            path: path.clone(),
-            source,
-        })?;
-        Ok(path)
+        for (path, contracts) in &by_file {
+            let replaced: std::collections::BTreeSet<&str> =
+                contracts.iter().map(|(symbol, _)| symbol.as_str()).collect();
+            let mut rows: Vec<String> = match std::fs::read_to_string(path) {
+                Ok(text) => text
+                    .lines()
+                    .skip(1)
+                    .filter(|line| {
+                        let symbol = line.split(',').next().unwrap_or_default();
+                        !line.trim().is_empty() && !replaced.contains(symbol)
+                    })
+                    .map(ToOwned::to_owned)
+                    .collect(),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+                Err(source) => {
+                    return Err(DataError::Io {
+                        path: path.clone(),
+                        source,
+                    })
+                }
+            };
+            for (symbol, bars) in contracts {
+                rows.extend(
+                    bars.iter()
+                        .map(|bar| format!("{symbol},{}", row_text(bar, interval))),
+                );
+            }
+            // Symbol then time, because every row's time is fixed-width: the
+            // file diffs cleanly between fetches.
+            rows.sort();
+
+            create_parent(path)?;
+            let mut out = String::with_capacity(rows.len() * 72 + 48);
+            out.push_str(OPTION_HEADER);
+            out.push('\n');
+            for row in rows {
+                out.push_str(&row);
+                out.push('\n');
+            }
+            write_file(path, &out)?;
+        }
+        Ok(by_file.into_keys().collect())
     }
 
     /// Writes an instrument's distributions, replacing whatever was there.
@@ -507,19 +572,62 @@ impl CsvBars {
     /// to the filesystem.
     fn path_for(&self, instrument: &str, interval: BarInterval) -> Result<PathBuf, DataError> {
         let file = format!("{}.csv", safe_name(instrument)?);
-        // An option contract files under its underlying, at every resolution.
-        // A chain is thousands of contracts, most of which expire within weeks;
-        // beside the stocks they would bury the library listing.
+        // An option contract files with the rest of its expiration, under its
+        // underlying — see `write_contracts`. Beside the stocks, a chain would
+        // bury the library listing.
         if let Some(contract) = option::OptionContract::parse(instrument) {
+            // The venue stays in the name, so two vendors' copies of one
+            // expiration are two files, as two copies of a stock are.
+            let stem = match instrument.split_once('.') {
+                Some((_, venue)) => format!("{}.{venue}", contract.expiration),
+                None => contract.expiration.to_string(),
+            };
             return Ok(self
                 .root
                 .join(OPTION_SUBDIR)
                 .join(&contract.underlying)
                 .join(interval.to_string())
-                .join(file));
+                .join(format!("{stem}.csv")));
         }
         Ok(self.directory(interval).join(file))
     }
+}
+
+/// The header of an expiration file.
+const OPTION_HEADER: &str = "symbol,date,open,high,low,close,volume";
+
+/// One bar as a CSV row, without a symbol.
+///
+/// A daily bar keeps its bare date so an exported file still looks like the
+/// free daily exports this format came from; anything finer needs the time or
+/// the resolution is lost.
+fn row_text(bar: &Bar, interval: BarInterval) -> String {
+    let at = if interval == BarInterval::DAILY {
+        bar.at.date().to_string()
+    } else {
+        bar.at.format("%Y-%m-%dT%H:%M:%S").to_string()
+    };
+    format!(
+        "{at},{},{},{},{},{}",
+        bar.open, bar.high, bar.low, bar.close, bar.volume
+    )
+}
+
+fn create_parent(path: &Path) -> Result<(), DataError> {
+    match path.parent() {
+        Some(parent) => std::fs::create_dir_all(parent).map_err(|source| DataError::Io {
+            path: parent.to_path_buf(),
+            source,
+        }),
+        None => Ok(()),
+    }
+}
+
+fn write_file(path: &Path, text: &str) -> Result<(), DataError> {
+    std::fs::write(path, text).map_err(|source| DataError::Io {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 impl CsvBars {
@@ -667,16 +775,43 @@ impl BarProvider for CsvBars {
             Err(source) => return Err(DataError::Io { path, source }),
         };
 
+        // In an expiration file, only this contract's rows.
+        let symbol = option::OptionContract::parse(instrument).map(|contract| contract.symbol());
+
         let mut bars = Vec::new();
         for (index, line) in text.lines().enumerate() {
             let line = line.trim();
             // Skip the header and any blank separator lines.
-            if line.is_empty() || index == 0 && line.starts_with("date") {
+            if line.is_empty() || index == 0 && (line.starts_with("date") || line.starts_with("symbol")) {
                 continue;
             }
+            let line = match &symbol {
+                Some(symbol) => match line.split_once(',') {
+                    Some((row_symbol, rest)) if row_symbol == symbol => rest,
+                    Some(_) => continue,
+                    None => {
+                        return Err(DataError::Malformed {
+                            path,
+                            line: index + 1,
+                            reason: "expected symbol,date,open,high,low,close,volume".to_owned(),
+                        })
+                    }
+                },
+                None => line,
+            };
             let bar = parse_row(&path, index + 1, line)?;
             if bar.at.date() >= from && bar.at.date() <= to {
                 bars.push(bar);
+            }
+        }
+
+        // A contract absent from its expiration's file is unknown, exactly as a
+        // stock with no file is. Checked over the whole file, not the window,
+        // so a known contract with no bars in the window stays an empty series.
+        if let Some(symbol) = &symbol {
+            let prefix = format!("{symbol},");
+            if bars.is_empty() && !text.lines().any(|line| line.trim().starts_with(&prefix)) {
+                return Err(DataError::UnknownInstrument(instrument.to_owned()));
             }
         }
 
@@ -833,6 +968,52 @@ mod dividend_tests {
         );
         assert!(library.fingerprint("SPY240315C00510000.AOPT", BarInterval::DAILY).expect("hash").is_some());
         assert_eq!(library.instruments().expect("list"), vec!["SPY.AIEX"], "a chain would bury the library");
+    }
+
+    #[test]
+    fn contracts_share_their_expirations_file_and_rewriting_one_keeps_the_rest() {
+        let (_dir, library) = library();
+        let (from, to) = window();
+        let bar = |day: u32, close: f64| Bar {
+            at: NaiveDate::from_ymd_opt(2024, 3, day).expect("valid").and_time(NaiveTime::MIN),
+            open: close,
+            high: close,
+            low: close,
+            close,
+            volume: 1.0,
+        };
+        let call = "SPY240315C00510000.AOPT";
+        let put = "SPY240315P00510000.AOPT";
+        let later = "SPY240322C00510000.AOPT";
+        let paths = library
+            .write_contracts(
+                BarInterval::DAILY,
+                &BTreeMap::from([
+                    (call.to_owned(), vec![bar(1, 1.0), bar(4, 1.5)]),
+                    (put.to_owned(), vec![bar(1, 2.0)]),
+                    (later.to_owned(), vec![bar(1, 3.0)]),
+                ]),
+            )
+            .expect("write");
+        assert_eq!(paths.len(), 2, "two expirations, two files");
+        assert!(paths[0].ends_with(Path::new("options").join("SPY").join("1day").join("2024-03-15.AOPT.csv")), "{}", paths[0].display());
+
+        library.write(call, BarInterval::DAILY, &[bar(5, 9.0)]).expect("rewrite one");
+        assert_eq!(library.bars(call, BarInterval::DAILY, from, to).expect("read"), vec![bar(5, 9.0)], "replaced, not merged");
+        assert_eq!(library.bars(put, BarInterval::DAILY, from, to).expect("read"), vec![bar(1, 2.0)], "its neighbour is untouched");
+        assert_eq!(library.bars(later, BarInterval::DAILY, from, to).expect("read"), vec![bar(1, 3.0)]);
+
+        assert!(matches!(
+            library.bars("SPY240315C00999000.AOPT", BarInterval::DAILY, from, to),
+            Err(DataError::UnknownInstrument(_))
+        ), "a contract not in its expiration's file is unknown, not empty");
+        let march = NaiveDate::from_ymd_opt(2024, 3, 20).expect("valid");
+        assert_eq!(library.bars(put, BarInterval::DAILY, march, to).expect("known"), Vec::new(), "known but outside the window is empty");
+
+        assert!(matches!(
+            library.write_contracts(BarInterval::DAILY, &BTreeMap::from([("SPY.AIEX".to_owned(), vec![bar(1, 1.0)])])),
+            Err(DataError::UnsafeInstrument(_))
+        ));
     }
 
     #[test]
