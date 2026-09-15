@@ -12,6 +12,8 @@ libm = "0.2"
 # For BarInterval only: the resolution an experiment ran at is part of its
 # record, and one crate has to own that vocabulary.
 arvo-data.workspace = true
+# The gate, costs and trades, which the live path shares without the rest of this.
+arvo-risk.workspace = true
 chrono.workspace = true
 serde.workspace = true
 serde_json = "1"

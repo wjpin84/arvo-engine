@@ -50,7 +50,7 @@ pub mod poll;
 use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
 
-use arvo_research::risk::{Decision, Proposal, Rejection, RiskGate};
+use arvo_risk::{Decision, Proposal, Rejection, RiskGate};
 
 /// Which way an order goes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -442,7 +442,7 @@ impl<E: Executor> Session<E> {
     ///
     /// `now` is passed rather than read from a clock, so a session replays
     /// identically under test and in a backtest. See
-    /// `arvo_research::risk::RiskGate::propose`.
+    /// `arvo_risk::RiskGate::propose`.
     ///
     /// # Errors
     ///
@@ -452,7 +452,7 @@ impl<E: Executor> Session<E> {
         &mut self,
         proposal: &Proposal,
         now: NaiveDateTime,
-        correlations: Option<&dyn arvo_research::risk::Correlations>,
+        correlations: Option<&dyn arvo_risk::Correlations>,
     ) -> Result<Option<OrderId>, ExecutionError> {
         // Asked per proposal, not cached: every fill and every working order
         // changes it, and a stale figure is the refused order this exists to
@@ -723,7 +723,7 @@ impl<E: Executor> Session<E> {
     ///
     /// `false` means this session is halted for a reason nobody chose — a
     /// drawdown breach — and that one does not lift. See
-    /// `arvo_research::risk::Halt::manual`.
+    /// `arvo_risk::Halt::manual`.
     pub fn rearm(&mut self) -> bool {
         self.gate.release()
     }

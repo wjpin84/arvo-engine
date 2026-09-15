@@ -663,63 +663,6 @@ fn stability(folds: &[FamilyEvidence]) -> Vec<AxisStability> {
         .collect()
 }
 
-impl TradeStats {
-    /// Adds several runs' statistics together as if they were one record.
-    ///
-    /// Every field is additive or reconstructible from additive parts, which
-    /// is why this is exact rather than an approximation: gross profit is
-    /// `average_win × wins`, and summing those across folds gives the same
-    /// number a single pass over the concatenated ledgers would.
-    #[must_use]
-    pub fn combine<'a>(parts: impl Iterator<Item = &'a Self>) -> Self {
-        let mut out = Self::default();
-        let mut gross_win = 0.0;
-        let mut gross_loss = 0.0;
-        let mut holding = 0.0;
-
-        for part in parts {
-            out.closed += part.closed;
-            out.still_open += part.still_open;
-            out.wins += part.wins;
-            out.losses += part.losses;
-            out.total_commission += part.total_commission;
-            out.signal_exits += part.signal_exits;
-            out.stop_exits += part.stop_exits;
-            // Any fold halting is the whole record halting: the stitched run
-            // has a hole in it wherever that fold stopped early.
-            out.halted |= part.halted;
-            gross_win += part.average_win.unwrap_or_default() * f64::from(part.wins);
-            gross_loss += part.average_loss.unwrap_or_default() * f64::from(part.losses);
-            holding += part.average_holding_secs.unwrap_or_default() * f64::from(part.closed);
-            out.largest_win = pick(out.largest_win, part.largest_win, f64::max);
-            out.largest_loss = pick(out.largest_loss, part.largest_loss, f64::min);
-        }
-
-        if out.closed > 0 {
-            let closed = f64::from(out.closed);
-            out.win_rate = Some(f64::from(out.wins) / closed);
-            out.average_holding_secs = Some(holding / closed);
-        }
-        if out.wins > 0 {
-            out.average_win = Some(gross_win / f64::from(out.wins));
-        }
-        if out.losses > 0 {
-            out.average_loss = Some(gross_loss / f64::from(out.losses));
-        }
-        if gross_loss > 0.0 {
-            out.profit_factor = Some(gross_win / gross_loss);
-        }
-        out
-    }
-}
-
-fn pick(left: Option<f64>, right: Option<f64>, choose: fn(f64, f64) -> f64) -> Option<f64> {
-    match (left, right) {
-        (Some(left), Some(right)) => Some(choose(left, right)),
-        (found, None) | (None, found) => found,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

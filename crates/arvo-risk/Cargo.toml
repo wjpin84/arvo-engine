@@ -1,0 +1,15 @@
+[package]
+name = "arvo-risk"
+description = "The risk gate every order passes, live or backtested, and the cost and trade types it reasons about."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# Option contract parsing and `Bar`, for sizing contracts and marking trades.
+arvo-data.workspace = true
+chrono.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+serde_json = "1"

@@ -61,7 +61,7 @@ async fn one_exit_the_venue_refuses_does_not_strand_the_others() {
     // The failure mode a `?` would have shipped: the first unreachable
     // instrument aborts the flatten and everything after it stays held, by
     // an account nobody is watching any more because the button was pressed.
-    use arvo_research::{risk::RiskGate, RiskModel};
+    use arvo_risk::{RiskGate, RiskModel};
 
     let day = NaiveDate::from_ymd_opt(2026, 9, 9).expect("valid");
     let mut gate = RiskGate::new(RiskModel::default(), 10_000.0, day);
@@ -123,10 +123,7 @@ impl Executor for Funded {
 }
 
 async fn sent_for(cash: Option<f64>) -> Vec<f64> {
-    use arvo_research::{
-        risk::{Proposal, RiskGate},
-        CostModel, RiskModel,
-    };
+    use arvo_risk::{CostModel, Proposal, RiskGate, RiskModel};
     let gate = RiskGate::new(RiskModel::default(), 100_000.0, day())
         .with_costs(CostModel::proportional(1.0, 1.0));
     let mut session = Session::new(
@@ -208,7 +205,7 @@ fn day() -> NaiveDate {
 }
 
 fn stocked(state: VenueState, immovable: Vec<&'static str>) -> Session<Stocked> {
-    use arvo_research::{risk::RiskGate, RiskModel};
+    use arvo_risk::{RiskGate, RiskModel};
     Session::new(
         RiskGate::new(RiskModel::default(), 10_000.0, day()),
         Stocked { state, immovable },
@@ -329,7 +326,7 @@ async fn finding_anything_stops_the_account_until_a_person_looks() {
     let why = session.gate().halted().expect("halted").to_owned();
     assert!(why.contains("1 position"), "{why}");
 
-    let proposal = arvo_research::risk::Proposal {
+    let proposal = arvo_risk::Proposal {
         instrument: "AAPL.RH".to_owned(),
         proposer: "technical".to_owned(),
         signalled_at: at(0, 0, 0),

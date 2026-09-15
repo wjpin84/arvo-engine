@@ -22,9 +22,16 @@
 //! second risk engine on the live side would not be a refinement; it would make
 //! every stored verdict a statement about a system that does not exist.
 //!
-//! [`RiskGate`] therefore takes a [`crate::RiskModel`] — the same one pinned
-//! into every [`crate::Experiment`] — and nothing else. It knows nothing about
+//! [`RiskGate`] therefore takes a [`RiskModel`] — the same one pinned into
+//! every `arvo_research::Experiment` — and nothing else. It knows nothing about
 //! brokers, venues, order types or wire formats.
+//!
+//! # Why a crate of its own
+//!
+//! So the code that places orders compiles against the gate and not against
+//! the research that judges strategies. `arvo-execution` depends on this and
+//! nothing of `arvo-research`; `arvo-research` depends on this and re-exports
+//! it, as `arvo_research::risk`, so a backtest reaches the same function.
 //!
 //! # What it deliberately does not do
 //!
@@ -40,13 +47,20 @@
 //! | `sizing` | how much of an accepted proposal to send |
 //! | `gate` | [`RiskGate`], a live account's own book around `decide` |
 //! | `pdt` | the pattern-day-trader rule |
+//! | [`collateral`] | the cash an option position must have set aside |
+//! | `costs` | [`CostModel`], what a fill is assumed to cost |
+//! | [`trade`] | the round trips a run made, which the day-trade count reads |
 
+pub mod collateral;
+mod costs;
 mod decide;
 mod gate;
 mod model;
 mod pdt;
 mod sizing;
+pub mod trade;
 
+pub use costs::{CostModel, OptionSpread};
 pub use decide::{decide, AccountState, Decision, Position, Proposal, Rejection};
 pub use gate::{Halt, RiskGate};
 pub use model::RiskModel;
@@ -54,6 +68,7 @@ pub use pdt::{
     business_days_before, day_trades_in_window, DayTradingRule, PDT_DAY_TRADES, PDT_EQUITY_FLOOR,
     PDT_WINDOW_DAYS,
 };
+pub use trade::{Direction, ExitReason, Trade, TradeStats};
 
 use serde::{Deserialize, Serialize};
 
@@ -105,6 +120,20 @@ pub struct CorrelationCap {
 pub trait Correlations: Send + Sync {
     /// Correlation between two instruments' returns, in `-1.0..=1.0`.
     fn between(&self, first: &str, second: &str) -> Option<f64>;
+}
+
+/// Account equity at one instant.
+///
+/// Dated, not just ordered. A bare `Vec<f64>` was enough to compute a return
+/// and is not enough to draw one, to align two runs against each other, or to
+/// say when a drawdown happened — and the engine knows the dates already, so
+/// discarding them was throwing away something free.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct EquityPoint {
+    /// When, to the resolution the experiment ran at. A date was enough
+    /// while everything was daily and is not once two points can share one.
+    pub at: chrono::NaiveDateTime,
+    pub equity: f64,
 }
 
 #[cfg(test)]

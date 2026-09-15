@@ -28,8 +28,7 @@ use std::time::Duration;
 use arvo_alpaca::{Alpaca, AlpacaExecutor};
 use arvo_data::source::Source;
 use arvo_execution::{Executor, Session};
-use arvo_research::risk::{Proposal, RiskGate};
-use arvo_research::RiskModel;
+use arvo_risk::{Proposal, RiskGate, RiskModel};
 
 /// The library suffix positions are filed under: the free feed's venue.
 const VENUE: &str = arvo_alpaca::IEX_VENUE;

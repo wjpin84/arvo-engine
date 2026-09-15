@@ -28,9 +28,7 @@ pub mod advice;
 pub mod agent_search;
 pub mod book;
 pub mod breadth;
-pub mod collateral;
 pub mod correlation;
-mod costs;
 pub mod dividend;
 pub mod evaluation;
 mod experiment;
@@ -43,11 +41,9 @@ pub mod psr;
 pub mod reconcile;
 pub mod regime;
 pub mod replay;
-pub mod risk;
 pub mod share;
 mod simulation;
 pub mod stress;
-pub mod trade;
 pub mod walk_forward;
 
 pub use advice::{
@@ -80,11 +76,15 @@ pub use panel::{run_panel, InstrumentOutcome, PanelEvidence, PanelStudy, PooledO
 pub use trade::{Direction, ExitReason, Trade, TradeStats};
 pub use walk_forward::{run_walk_forward, AxisStability, WalkForward, WalkForwardEvidence};
 
-pub use costs::{CostModel, OptionSpread};
+// The risk crate, where it has always been reached from: `arvo_research::risk`,
+// `arvo_research::trade` and `arvo_research::collateral` are the same modules
+// the live path uses directly.
+pub use arvo_risk as risk;
+pub use arvo_risk::{collateral, trade, CostModel, EquityPoint, OptionSpread};
 pub use experiment::{
     DatasetRef, DateRange, Experiment, ExperimentError, ExperimentId, Hypothesis, HypothesisId,
     StrategySpec,
 };
 pub use simulation::{
-    EquityPoint, Refused, SimulationError, SimulationProvider, SimulationResult,
+    Refused, SimulationError, SimulationProvider, SimulationResult,
 };

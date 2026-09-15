@@ -106,10 +106,10 @@ pub struct RiskModel {
     /// a cap on the count alone says nothing about it.
     ///
     /// `None` is no cap. Setting one requires something that can supply
-    /// correlations at decision time — see [`crate::risk::Correlations`], and
+    /// correlations at decision time — see [`crate::Correlations`], and
     /// note that a cap with no source refuses rather than passes.
     #[serde(default)]
-    pub correlation_cap: Option<crate::risk::CorrelationCap>,
+    pub correlation_cap: Option<crate::CorrelationCap>,
     /// Which day-trading constraint the account is subject to.
     ///
     /// A backtest that ignores this is backtesting a system nobody can open: a
@@ -120,7 +120,7 @@ pub struct RiskModel {
     /// `default` is unconstrained, which is what every finding recorded before
     /// this existed actually ran under.
     #[serde(default)]
-    pub day_trading: crate::risk::DayTradingRule,
+    pub day_trading: crate::DayTradingRule,
 }
 
 impl Default for RiskModel {
@@ -150,7 +150,7 @@ impl Default for RiskModel {
             // Unconstrained, and named rather than implied: modelling the
             // pattern-day-trader rule changes how many trades a run can make,
             // so switching it on silently would change every stored result.
-            day_trading: crate::risk::DayTradingRule::Unconstrained,
+            day_trading: crate::DayTradingRule::Unconstrained,
         }
     }
 }
