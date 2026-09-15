@@ -511,6 +511,14 @@ impl Evaluation {
                 strategy.max_drawdown, criteria.max_drawdown
             ));
             Verdict::NotSupported
+        } else if strategy.total_return < 0.0 {
+            // A strategy that lost money cannot be Supported, however much its benchmark
+        // lost. Excess return alone let one: SPY 0DTE breakout options lost 0.34%
+        // out of sample on a 36% win rate and were Supported because SPY lost
+        // 0.61% over the two months judged. Beating a falling market by holding
+        // cash is not evidence of an edge.
+            reasons.push(losing_reason(strategy.total_return, benchmark.total_return));
+            Verdict::Inconclusive
         } else {
             reasons.push(format!(
                 "beat buy-and-hold by {excess_return:.4} over {} trades, worst drawdown {:.4}",
@@ -536,6 +544,17 @@ impl Evaluation {
             reasons,
         }
     }
+}
+
+/// Why a strategy that lost money is not Supported, in the words every verdict
+/// uses for it.
+pub(crate) fn losing_reason(strategy_return: f64, benchmark_return: f64) -> String {
+    format!(
+        "lost {:.2}% itself, and beat buy-and-hold only because buy-and-hold lost {:.2}%; a \
+         result that loses money is not evidence of an edge",
+        -strategy_return * 100.0,
+        -benchmark_return * 100.0
+    )
 }
 
 /// The durable record: what was asked, what was run, and what it showed.
@@ -690,6 +709,29 @@ mod tests {
             psr: None,
             trades,
         }
+    }
+
+    #[test]
+    fn a_strategy_that_lost_money_is_not_supported_by_a_benchmark_that_lost_more() {
+        let evaluation = Evaluation::new(
+            metrics(-0.0034, 0.008, 42),
+            metrics(-0.0061, 0.04, 1),
+            Vec::new(),
+            Vec::new(),
+            &EvaluationCriteria::default(),
+        );
+        assert_eq!(evaluation.verdict, Verdict::Inconclusive);
+        assert!(evaluation.excess_return > 0.0, "it did beat the benchmark");
+        assert!(evaluation.reasons[0].contains("lost 0.34% itself"), "{:?}", evaluation.reasons);
+
+        let made_money = Evaluation::new(
+            metrics(0.002, 0.008, 42),
+            metrics(-0.0061, 0.04, 1),
+            Vec::new(),
+            Vec::new(),
+            &EvaluationCriteria::default(),
+        );
+        assert_eq!(made_money.verdict, Verdict::Supported, "making money while the market fell still counts");
     }
 
     /// Dates are irrelevant to every statistic here, so the fixtures walk one

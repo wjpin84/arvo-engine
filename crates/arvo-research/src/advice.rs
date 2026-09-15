@@ -191,6 +191,25 @@ fn option_tail(
     out
 }
 
+/// A rule that lost money and beat a benchmark that lost more, as the blocking
+/// item it is. See `evaluation::losing_reason`.
+fn lost_money(strategy_return: f64, excess_return: f64) -> Option<Recommendation> {
+    (strategy_return < 0.0 && excess_return >= 0.0).then(|| {
+        Recommendation::new(
+            Severity::Blocking,
+            "It lost money, and beat holding only because holding lost more.",
+            "Do not read the margin over buy-and-hold as an edge. A rule sitting mostly in cash \
+             beats a falling market by doing nothing; judge it on a window where the market \
+             rose as well, or on what it made rather than what it avoided.",
+            format!(
+                "strategy {:+.2}%, buy-and-hold {:+.2}%",
+                strategy_return * 100.0,
+                (strategy_return - excess_return) * 100.0
+            ),
+        )
+    })
+}
+
 fn refusals(refused: crate::Refused) -> Option<Recommendation> {
     refused.any().then(|| {
         Recommendation::new(
@@ -257,6 +276,10 @@ pub fn recommend(found: &FamilyEvidence) -> Vec<Recommendation> {
     }
 
     if let Some(item) = refusals(evaluation.refused_orders) {
+        out.push(item);
+    }
+
+    if let Some(item) = lost_money(evaluation.strategy.total_return, evaluation.excess_return) {
         out.push(item);
     }
 
@@ -904,6 +927,10 @@ pub fn recommend_walk_forward(found: &WalkForwardEvidence) -> Vec<Recommendation
         ));
     }
 
+    if let Some(item) = lost_money(found.combined.total_return, found.excess_return) {
+        out.push(item);
+    }
+
     if found.folds_without_trades > 0 {
         out.push(Recommendation::new(
             Severity::Blocking,
@@ -1192,6 +1219,15 @@ mod tests {
     }
 
     #[test]
+    fn losing_less_than_a_falling_market_blocks() {
+        let item = lost_money(-0.0034, 0.0027).expect("lost money and beat a falling benchmark");
+        assert_eq!(item.severity, Severity::Blocking);
+        assert!(item.evidence.contains("strategy -0.34%, buy-and-hold -0.61%"), "{}", item.evidence);
+        assert!(lost_money(0.01, 0.02).is_none(), "made money");
+        assert!(lost_money(-0.05, -0.02).is_none(), "already NotSupported: it lost to the benchmark");
+    }
+
+    #[test]
     fn an_option_run_leads_with_its_losses_and_what_its_history_lacks() {
         // Collects 0.2% on 59 days and loses 15% on one: a Sharpe-friendly
         // shape until that one day.
@@ -1344,6 +1380,7 @@ mod tests {
                 instruments: 4,
                 total_trades: 60,
                 mean_excess_return: 0.1,
+                mean_return: 0.0,
                 beat_benchmark: 4,
             distinct: 4,
             distinct_beat: 4,

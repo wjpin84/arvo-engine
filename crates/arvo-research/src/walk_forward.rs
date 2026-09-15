@@ -569,6 +569,16 @@ fn judge(
         return Verdict::NotSupported;
     }
 
+    // As a single study: a stitched record that lost money is not Supported
+    // however much buy-and-hold lost across the same folds.
+    if combined.total_return < 0.0 {
+        reasons.push(crate::evaluation::losing_reason(
+            combined.total_return,
+            combined.total_return - excess_return,
+        ));
+        return Verdict::Inconclusive;
+    }
+
     reasons.push(format!(
         "beat buy-and-hold by {excess_return:.4} over {} round trips across {} folds, {surviving} \
          of which selected better than chance; worst drawdown {:.4}",
