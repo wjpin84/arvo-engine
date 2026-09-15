@@ -216,6 +216,7 @@ fn clean_panel() -> PanelEvidence {
         book: None,
         study: None,
         criteria: None,
+        ended_early: Vec::new(),
         failures: Vec::new(),
         verdict: Verdict::Supported,
         reasons: Vec::new(),
@@ -400,6 +401,23 @@ fn every_panel_is_told_its_members_are_survivors() {
         item.evidence.contains("4 securities judged over 2024-01-01 to 2024-01-09"),
         "{}",
         item.evidence
+    );
+}
+
+#[test]
+fn a_member_that_stopped_trading_is_named_and_counted_as_a_casualty() {
+    let mut panel = clean_panel();
+    panel.ended_early = vec!["SIVB.AIEX".to_owned()];
+    let out = recommend_panel(&panel, &EvaluationCriteria::default());
+    let item = out
+        .iter()
+        .find(|item| item.finding.contains("stopped trading"))
+        .unwrap_or_else(|| panic!("{}", findings(&out)));
+    assert!(item.evidence.contains("1 of 4 members ended early: SIVB.AIEX"), "{}", item.evidence);
+    assert!(
+        out.iter().any(|item| item.evidence.contains("1 of them a casualty")),
+        "{}",
+        findings(&out)
     );
 }
 
