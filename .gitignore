@@ -3,3 +3,6 @@
 /Cargo.lock
 /build/
 __pycache__/
+.venv/
+.pytest_cache/
+/python/uv.lock
