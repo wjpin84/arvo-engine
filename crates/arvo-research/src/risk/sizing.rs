@@ -1,0 +1,149 @@
+//! How much of an accepted proposal to send.
+
+use super::decide::{AccountState, Decision, Proposal, Rejection};
+use crate::{CostModel, RiskModel};
+
+/// How much of it to buy.
+///
+/// # Why this sizes off the opening balance and not current equity
+///
+/// Because the backtest does. `arvo-nautilus` resolves `risk_per_trade` and
+/// `max_position_fraction` into currency amounts **once, before the run**, as
+/// fractions of `starting_cash`. A live gate that sized off a moving equity
+/// figure would compound where the backtest did not, and the two systems would
+/// then differ in the one number that decides how much money is at stake —
+/// which is exactly the divergence this whole design exists to prevent.
+///
+/// It also means an account that has lost money keeps proposing the same size.
+/// That is the backtest's behaviour and it is deliberate here; the control that
+/// is *supposed* to respond to losses is the drawdown halt, not a quiet
+/// shrinking of every position.
+///
+/// The cap is not a refinement: position size is capital-at-risk over stop
+/// distance, so a *tight* stop buys a *bigger* position, and without a ceiling a
+/// five-minute ATR asks for several times the account. Whether the account can
+/// actually pay is settled at the venue, in a backtest by the engine rejecting
+/// the order and live by the broker doing the same.
+///
+/// # What it can pay, and what it costs to
+///
+/// That last sentence was the design, and it failed silently: the engine
+/// refused the order, the strategy was never told, and a rule that had lost
+/// money once took almost none of its later signals. So both ceilings are now
+/// in *all-in* terms — price plus the experiment's slippage and commission —
+/// and when the caller knows the account's cash, the entry is also capped at
+/// what that cash can buy. Sizing still comes off the opening balance; only
+/// affordability reads the live figure.
+///
+/// ponytail: the fill lands at the next bar's price, not the reference, and
+/// slippage rounds up to a whole tick. Flooring to whole shares absorbs both
+/// almost always; a gap past the slack is still refused, and now counted.
+/// The most contracts one proposal may sell, however much cash there is. A
+/// bound on the collateral search, not a trading limit anyone should meet.
+const MAX_CONTRACTS: u32 = 10_000;
+
+pub(super) fn size(
+    model: &RiskModel,
+    account: &AccountState<'_>,
+    proposal: &Proposal,
+    costs: Option<&CostModel>,
+) -> Decision {
+    let starting_cash = account.starting_cash;
+    if proposal.reference_price <= 0.0 {
+        return Decision::Reject(Rejection::TooSmall { affordable: 0.0 });
+    }
+
+    let by_risk = match (model.risk_per_trade, proposal.stop_distance) {
+        (Some(_), None | Some(0.0)) => return Decision::Reject(Rejection::NoStop),
+        (Some(fraction), Some(distance)) => Some(starting_cash * fraction / distance),
+        (None, _) => None,
+    };
+
+    // An option is traded in shares of what it delivers, a contract at a time:
+    // units of 100, each priced per share as quoted. Holding the unit at one
+    // share keeps every dollar figure downstream — curve, stops, P&L — the
+    // product of a price and a quantity, with no multiplier to forget.
+    let lot = if arvo_data::option::OptionContract::parse(&proposal.instrument).is_some() {
+        arvo_data::option::MULTIPLIER
+    } else {
+        1.0
+    };
+
+    // What one unit costs to buy, all in. An option pays half its spread
+    // rather than equity basis points.
+    let (per_unit, per_fill) = costs.map_or((proposal.reference_price, 0.0), |costs| {
+        let crossed = match costs.option_spread {
+            Some(spread) if lot > 1.0 => {
+                proposal.reference_price + spread.half_spread(proposal.reference_price)
+            }
+            _ => proposal.reference_price * (1.0 + costs.slippage_bps / 10_000.0),
+        };
+        (
+            crossed * (1.0 + costs.commission_bps / 10_000.0),
+            costs.per_fill,
+        )
+    });
+    let ceiling = model.max_position_fraction.unwrap_or(1.0);
+
+    // Cash already promised against the options the account is short (#84). A
+    // cash account cannot spend it twice, and the venue's free balance does not
+    // know it is promised: selling a put *adds* its premium to that balance.
+    let held: Vec<(&str, f64)> = account
+        .positions
+        .iter()
+        .map(|(name, position)| (name.as_str(), position.quantity))
+        .collect();
+    let reserve = match crate::collateral::reserved(held.iter().copied()) {
+        Ok(reserve) => reserve,
+        Err(uncovered) => {
+            return Decision::Reject(Rejection::Uncovered {
+                underlying: uncovered.underlying,
+                expiration: uncovered.expiration,
+            })
+        }
+    };
+    let spendable = account.spendable.map(|cash| cash - reserve);
+
+    if proposal.opens_short {
+        if lot <= 1.0 {
+            return Decision::Reject(Rejection::CannotShort {
+                instrument: proposal.instrument.clone(),
+            });
+        }
+        // Sized by the cash its worst case at expiry needs, not by its premium:
+        // selling a $2 put asks for $200 and can cost $64,000.
+        let available = spendable
+            .unwrap_or(starting_cash)
+            .min(starting_cash * ceiling)
+            - per_fill;
+        let wanted = by_risk
+            .or(proposal.desired_quantity)
+            .map_or(MAX_CONTRACTS, |units| (units / lot).floor().clamp(0.0, f64::from(MAX_CONTRACTS)) as u32);
+        return match crate::collateral::sellable(&held, &proposal.instrument, available, wanted) {
+            Err(uncovered) => Decision::Reject(Rejection::Uncovered {
+                underlying: uncovered.underlying,
+                expiration: uncovered.expiration,
+            }),
+            Ok(0) => Decision::Reject(Rejection::TooSmall {
+                affordable: available.max(0.0),
+            }),
+            Ok(contracts) => Decision::Accept {
+                quantity: f64::from(contracts) * lot,
+            },
+        };
+    }
+
+    let by_cap = ((starting_cash * ceiling - per_fill) / per_unit).max(0.0);
+    let by_cash = spendable.map(|cash| ((cash - per_fill) / per_unit).max(0.0));
+    let by_cap = by_cash.map_or(by_cap, |by_cash| by_cap.min(by_cash));
+
+    // Risk sizing wins where it applies; otherwise what was asked for; and the
+    // cap bounds either. A proposer's desired size is a request, never a
+    // permission.
+    let wanted = by_risk.or(proposal.desired_quantity).unwrap_or(by_cap);
+    let quantity = (wanted.min(by_cap) / lot).floor() * lot;
+    if quantity < lot {
+        return Decision::Reject(Rejection::TooSmall { affordable: by_cap });
+    }
+    Decision::Accept { quantity }
+}
