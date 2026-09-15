@@ -1,4 +1,5 @@
 use super::*;
+use crate::convert::close_of_bar;
 use arvo_data::InMemoryBars;
 use chrono::NaiveTime;
 use arvo_research::{

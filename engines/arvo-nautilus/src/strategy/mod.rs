@@ -32,7 +32,7 @@
 //! session. On daily bars a session is one bar: the opening range is the whole
 //! day and a session VWAP is that day's typical price. Both would still *run*
 //! and produce numbers. Refusing them is the point — see
-//! [`crate::Plan::from_spec`].
+//! [`crate::plan::Plan::from_spec`].
 //!
 //! A strategy here is a Nautilus component, which is why it lives on this side
 //! of the boundary. `arvo-research` names it by string in `StrategySpec` and
