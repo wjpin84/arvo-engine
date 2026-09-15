@@ -377,8 +377,43 @@ fn a_panel_that_dropped_instruments_blocks_rather_than_warns() {
 #[test]
 fn a_clean_panel_still_says_one_finding_is_where_the_work_starts() {
     let out = recommend_panel(&clean_panel(), &EvaluationCriteria::default());
-    assert_eq!(out.len(), 1, "{}", findings(&out));
-    assert_eq!(out[0].severity, Severity::Note);
+    let severities: Vec<_> = out.iter().map(|item| item.severity).collect();
+    assert_eq!(
+        severities,
+        [Severity::Warning, Severity::Note],
+        "survivorship, then the note: {}",
+        findings(&out)
+    );
+}
+
+#[test]
+fn every_panel_is_told_its_members_are_survivors() {
+    // Nothing records point-in-time membership or delistings (#9), so a
+    // panel that looks clean is exactly the one this matters for.
+    let out = recommend_panel(&clean_panel(), &EvaluationCriteria::default());
+    let item = out
+        .iter()
+        .find(|item| item.finding.contains("still trade"))
+        .unwrap_or_else(|| panic!("{}", findings(&out)));
+    assert_eq!(item.severity, Severity::Warning);
+    assert!(
+        item.evidence.contains("4 securities judged over 2024-01-01 to 2024-01-09"),
+        "{}",
+        item.evidence
+    );
+}
+
+#[test]
+fn a_one_instrument_panel_is_not_called_a_universe() {
+    let mut panel = clean_panel();
+    panel.pooled.instruments = 1;
+    panel.pooled.distinct = 1;
+    let out = recommend_panel(&panel, &EvaluationCriteria::default());
+    assert!(
+        !out.iter().any(|item| item.finding.contains("still trade")),
+        "{}",
+        findings(&out)
+    );
 }
 
 // ---- walk-forward ----------------------------------------------------
