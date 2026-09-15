@@ -185,6 +185,28 @@ pub fn recommend_panel(
         ));
     }
 
+    // After the note on purpose: this is about how the members were chosen,
+    // not about what they did, so it must not stop a clean panel being told
+    // it is clean. It fires on every panel because every panel earns it —
+    // members come from the library, the library holds what trades today,
+    // and nothing records what was in an index or delisted (#9). A company
+    // that went bankrupt mid-window is not a loser here; it is absent.
+    let securities = if pooled.distinct == 0 { pooled.instruments } else { pooled.distinct };
+    if securities > 1 {
+        out.push(Recommendation::new(
+            Severity::Warning,
+            "Every member was chosen from companies that still trade, so the panel holds no failures.",
+            "Read the pooled return as an upper bound. Companies that were delisted or dropped from \
+             an index during the window would have been in a universe picked on its first day, \
+             and they are the ones a long rule loses most on.",
+            format!(
+                "{securities} securities judged over {} to {}, none of them a casualty of that window",
+                found.in_sample.from,
+                found.out_of_sample.to,
+            ),
+        ));
+    }
+
     out.sort_by_key(|item| item.severity);
     out
 }
