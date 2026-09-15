@@ -43,6 +43,7 @@ pub mod reconcile;
 pub mod replay;
 pub mod risk;
 pub mod share;
+pub mod stress;
 pub mod trade;
 pub mod walk_forward;
 
@@ -898,6 +899,22 @@ pub trait SimulationProvider: Send + Sync {
         _experiment: &Experiment,
     ) -> std::collections::HashMap<String, Vec<arvo_data::Dividend>> {
         std::collections::HashMap::new()
+    }
+
+    /// One instrument's bars, for a report that needs a price the run's own
+    /// result does not carry — the underlying's, to replay an option run
+    /// through a crash (#85). Asked here for the reason [`Self::dividends`] is.
+    ///
+    /// Defaulted to none, which leaves such a report unmeasured rather than
+    /// wrong.
+    fn bars_for(
+        &self,
+        _instrument: &str,
+        _interval: arvo_data::BarInterval,
+        _from: NaiveDate,
+        _to: NaiveDate,
+    ) -> Option<Vec<arvo_data::Bar>> {
+        None
     }
 }
 

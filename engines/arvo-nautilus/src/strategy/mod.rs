@@ -40,6 +40,7 @@
 
 mod cross_sectional;
 mod indicator;
+mod breakout;
 mod put_spread;
 mod rules;
 
@@ -51,6 +52,7 @@ use nautilus_model::{data::Bar, enums::OrderSide, identifiers::InstrumentId, typ
 use nautilus_trading::strategy::{Strategy, StrategyNative};
 
 pub(crate) use cross_sectional::CrossSectionalMomentum;
+pub(crate) use breakout::{Rule as BreakoutRule, ZeroDteBreakout};
 pub(crate) use put_spread::{PutSpread, Rule as PutSpreadRule};
 pub(crate) use rules::{
     BuyAndHold, MomentumBreakout, OpeningRange, SellAndHold, SmaCross, VolatilityBreakout,
