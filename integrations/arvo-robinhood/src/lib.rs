@@ -55,4 +55,5 @@ mod source;
 
 pub use auth::{access_token, begin_sign_in, complete_sign_in, disconnect, is_connected};
 pub use execution::{RobinhoodExecutor, DEFAULT_MAX_ORDER_AGE_SECS};
+pub use parse::{Held, HeldAccount};
 pub use source::{Robinhood, SOURCE_ID, VENUE};

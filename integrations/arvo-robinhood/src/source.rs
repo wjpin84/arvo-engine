@@ -13,7 +13,10 @@ use arvo_data::{BarInterval, IntervalUnit};
 use serde_json::json;
 
 use crate::auth::{connect, is_connected, transport};
-use crate::parse::{parse_bars, parse_matches, parse_quotes, parse_sectors};
+use crate::parse::{
+    parse_accounts, parse_bars, parse_cash, parse_crypto_marks, parse_crypto_positions,
+    parse_equity_positions, parse_matches, parse_quotes, parse_sectors, HeldAccount,
+};
 
 /// Where the token lives in the OS keychain, and how this source is named.
 pub const SOURCE_ID: &str = "robinhood";
@@ -27,6 +30,11 @@ const HISTORICALS: &str = "get_equity_historicals";
 const SEARCH: &str = "search";
 const QUOTES: &str = "get_equity_quotes";
 const FUNDAMENTALS: &str = "get_equity_fundamentals";
+const ACCOUNTS: &str = "get_accounts";
+const EQUITY_POSITIONS: &str = "get_equity_positions";
+const CRYPTO_POSITIONS: &str = "get_crypto_positions";
+const CRYPTO_QUOTES: &str = "get_crypto_quotes";
+const PORTFOLIO: &str = "get_portfolio";
 
 /// The most symbols one fundamentals request takes.
 const FUNDAMENTALS_PER_CALL: usize = 10;
@@ -72,6 +80,59 @@ impl Robinhood {
             out.extend(parse_sectors(&response));
         }
         Ok(out)
+    }
+
+    /// Every open account's positions, priced by Robinhood, and its cash (#27).
+    ///
+    /// Read-only: every tool called here reads. One account failing fails the
+    /// whole sync, because a portfolio written from part of what was asked
+    /// for looks complete.
+    ///
+    /// # Errors
+    ///
+    /// [`SourceError`] if Robinhood is not signed in, a request fails, or a
+    /// reply cannot be read whole.
+    pub async fn holdings(&self) -> Result<Vec<HeldAccount>, SourceError> {
+        let client = connect().await?;
+        let call = |tool: &'static str, arguments: serde_json::Value| {
+            let client = &client;
+            async move { client.call_tool_json(tool, arguments).await.map_err(transport) }
+        };
+
+        let mut accounts = Vec::new();
+        for (number, crypto_number) in parse_accounts(&call(ACCOUNTS, json!({})).await?) {
+            let mut holdings = parse_equity_positions(
+                &call(EQUITY_POSITIONS, json!({ "account_number": number })).await?,
+            )?;
+            if !holdings.is_empty() {
+                let symbols: Vec<&str> = holdings.iter().map(|held| held.symbol.as_str()).collect();
+                let priced = parse_quotes(&call(QUOTES, json!({ "symbols": symbols })).await?);
+                for held in &mut holdings {
+                    held.price = priced.get(&held.symbol).map(|(price, _)| *price);
+                }
+            }
+
+            let mut coins = parse_crypto_positions(
+                &call(CRYPTO_POSITIONS, json!({ "rhs_account_number": crypto_number })).await?,
+            )?;
+            if !coins.is_empty() {
+                let symbols: Vec<&str> = coins.iter().map(|held| held.symbol.as_str()).collect();
+                let marks = parse_crypto_marks(&call(CRYPTO_QUOTES, json!({ "symbols": symbols })).await?);
+                for coin in &mut coins {
+                    // The reply spells the pair without its hyphen.
+                    coin.price = marks.get(&coin.symbol.replace('-', "")).copied();
+                }
+            }
+            holdings.extend(coins);
+
+            let cash = parse_cash(&call(PORTFOLIO, json!({ "account_number": number })).await?)?;
+            accounts.push(HeldAccount {
+                account_number: number,
+                holdings,
+                cash,
+            });
+        }
+        Ok(accounts)
     }
 }
 

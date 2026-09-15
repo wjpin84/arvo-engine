@@ -130,6 +130,170 @@ pub(crate) fn parse_matches(
         .unwrap_or_default()
 }
 
+/// One position at the broker. Priced separately, because positions carry no
+/// price.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Held {
+    /// `MSFT` for a stock, `XRP-USD` for a coin.
+    pub symbol: String,
+    pub quantity: f64,
+    /// Total paid for what is held now. `None` when the broker cannot say for
+    /// all of it — see [`parse_crypto_positions`].
+    pub cost_basis: Option<f64>,
+    /// The broker's own current price. `None` when it did not quote one.
+    pub price: Option<f64>,
+}
+
+/// What one brokerage account holds.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HeldAccount {
+    pub account_number: String,
+    pub holdings: Vec<Held>,
+    pub cash: f64,
+}
+
+fn number(value: Option<&Value>) -> Option<f64> {
+    value?.as_str()?.parse::<f64>().ok()
+}
+
+/// Account numbers to read: `(account_number, rhs_account_number)`, skipping
+/// closed accounts.
+pub(crate) fn parse_accounts(response: &Value) -> Vec<(String, String)> {
+    response
+        .pointer("/data/accounts")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|account| account.get("deactivated").and_then(Value::as_bool) != Some(true))
+        .filter_map(|account| {
+            let number = account.get("account_number")?.as_str()?.to_owned();
+            let crypto = account
+                .get("rhs_account_number")
+                .and_then(Value::as_str)
+                .map_or_else(|| number.clone(), str::to_owned);
+            Some((number, crypto))
+        })
+        .collect()
+}
+
+/// A reply that says there is more is refused rather than half-read: a
+/// portfolio missing its second page looks complete and is not.
+///
+/// ponytail: one page only; follow the cursor if an account ever has one.
+fn single_page(response: &Value) -> Result<(), SourceError> {
+    match response.pointer("/data/next") {
+        Some(Value::String(next)) if !next.is_empty() => Err(malformed(
+            "positions run to a second page, and reading only the first would drop holdings",
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Stock positions, unpriced.
+///
+/// Cost basis is quantity times `average_buy_price`, which the tool says
+/// already reflects partial sells; a position still reconciling has none.
+pub(crate) fn parse_equity_positions(response: &Value) -> Result<Vec<Held>, SourceError> {
+    single_page(response)?;
+    let positions = response
+        .pointer("/data/positions")
+        .and_then(Value::as_array)
+        .ok_or_else(|| malformed("no data.positions array"))?;
+
+    let mut out = Vec::new();
+    for position in positions {
+        let symbol = position
+            .get("symbol")
+            .and_then(Value::as_str)
+            .ok_or_else(|| malformed("a position has no symbol"))?;
+        if position.get("type").and_then(Value::as_str).is_some_and(|kind| kind != "long") {
+            return Err(SourceError::Unsupported(format!(
+                "{symbol} is held short, and a holdings file has no way to say so"
+            )));
+        }
+        let quantity = number(position.get("quantity"))
+            .ok_or_else(|| malformed(format!("{symbol} has no readable quantity")))?;
+        if quantity == 0.0 {
+            continue;
+        }
+        out.push(Held {
+            symbol: symbol.to_owned(),
+            quantity,
+            cost_basis: number(position.get("average_buy_price")).map(|average| average * quantity),
+            price: None,
+        });
+    }
+    Ok(out)
+}
+
+/// Coin positions, unpriced, as `CODE-USD`.
+///
+/// The cost bases cover **direct purchases over the position's life**, not
+/// the units held: 400 coins bought for $800 with 100 still held. So the
+/// average is taken over what was bought and applied to what is held. When
+/// fewer units were bought than are held, the rest arrived by transfer or
+/// reward with no cost, and a basis over part of the units would understate
+/// the whole — `None`.
+pub(crate) fn parse_crypto_positions(response: &Value) -> Result<Vec<Held>, SourceError> {
+    single_page(response)?;
+    let results = response
+        .pointer("/data/results")
+        .and_then(Value::as_array)
+        .ok_or_else(|| malformed("no data.results array"))?;
+
+    let mut out = Vec::new();
+    for position in results {
+        let code = position
+            .pointer("/currency/code")
+            .and_then(Value::as_str)
+            .ok_or_else(|| malformed("a coin position has no currency code"))?;
+        let quantity = number(position.get("quantity"))
+            .ok_or_else(|| malformed(format!("{code} has no readable quantity")))?;
+        if quantity == 0.0 {
+            continue;
+        }
+        let (bought, paid) = position
+            .get("cost_bases")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .fold((0.0, 0.0), |(bought, paid), basis| {
+                (
+                    bought + number(basis.get("direct_quantity")).unwrap_or_default(),
+                    paid + number(basis.get("direct_cost_basis")).unwrap_or_default(),
+                )
+            });
+        out.push(Held {
+            symbol: format!("{code}-USD"),
+            quantity,
+            cost_basis: (bought >= quantity && bought > 0.0).then(|| paid / bought * quantity),
+            price: None,
+        });
+    }
+    Ok(out)
+}
+
+/// Coin prices by pair as the reply spells it, `XRPUSD`. A zero mark means
+/// the book is empty, and is no price at all.
+pub(crate) fn parse_crypto_marks(response: &Value) -> std::collections::HashMap<String, f64> {
+    response
+        .pointer("/data/results")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|quote| {
+            let symbol = quote.get("symbol")?.as_str()?;
+            let mark = number(quote.get("mark_price")).filter(|mark| *mark > 0.0)?;
+            Some((symbol.to_owned(), mark))
+        })
+        .collect()
+}
+
+/// Cash in the account.
+pub(crate) fn parse_cash(response: &Value) -> Result<f64, SourceError> {
+    number(response.pointer("/data/cash")).ok_or_else(|| malformed("no readable data.cash"))
+}
+
 /// Sector by symbol, for the names the vendor classifies.
 ///
 /// A name with no sector is absent rather than filed under an empty string. An
@@ -308,6 +472,69 @@ mod tests {
         let found = parse_matches(&body, &known);
         assert_eq!(found[0].instrument, "MSFT.NASDAQ");
         assert_eq!(found[1].instrument, "NVDA.RH", "unheld falls back to ours");
+    }
+
+    #[test]
+    fn stock_cost_is_quantity_times_the_average_and_a_reconciling_one_has_none() {
+        // Fields as `get_equity_positions` answered on 2026-09-15.
+        let body = json!({ "data": { "positions": [
+            { "symbol": "CSX", "quantity": "3.500000", "average_buy_price": "25.000000", "type": "long" },
+            { "symbol": "NEW", "quantity": "2.0", "type": "long" },
+            { "symbol": "SOLD", "quantity": "0.000000", "average_buy_price": "10.0", "type": "long" },
+        ]}});
+        let held = parse_equity_positions(&body).unwrap();
+        assert_eq!(held.len(), 2, "a closed-out row is not a holding");
+        assert!((held[0].cost_basis.unwrap() - 87.5).abs() < 1e-9);
+        assert_eq!(held[1].cost_basis, None);
+    }
+
+    #[test]
+    fn a_second_page_or_a_short_is_refused_rather_than_half_read() {
+        let paged = json!({ "data": { "positions": [], "next": "https://…?cursor=abc" } });
+        assert!(parse_equity_positions(&paged).is_err());
+        let short = json!({ "data": { "positions": [
+            { "symbol": "GME", "quantity": "5", "type": "short" },
+        ]}});
+        assert!(matches!(parse_equity_positions(&short), Err(SourceError::Unsupported(_))));
+    }
+
+    #[test]
+    fn coin_cost_is_the_bought_average_applied_to_what_is_still_held() {
+        // The real shape: 400 bought over the position's life for $800, 100
+        // still held. Summing the basis would say $800 was paid for 100 coins.
+        let body = json!({ "data": { "results": [
+            { "currency": { "code": "XRP" }, "quantity": "100",
+              "cost_bases": [{ "direct_quantity": "400", "direct_cost_basis": "800.00" }] },
+            { "currency": { "code": "DOGE" }, "quantity": "100",
+              "cost_bases": [{ "direct_quantity": "40", "direct_cost_basis": "4.00" }] },
+        ]}});
+        let held = parse_crypto_positions(&body).unwrap();
+        assert_eq!(held[0].symbol, "XRP-USD");
+        assert!((held[0].cost_basis.unwrap() - 200.0).abs() < 1e-9);
+        assert_eq!(held[1].cost_basis, None, "60 of 100 arrived with no cost");
+    }
+
+    #[test]
+    fn an_empty_book_is_no_coin_price_and_cash_must_be_readable() {
+        let quotes = json!({ "data": { "results": [
+            { "symbol": "XRPUSD", "mark_price": "1.40044333" },
+            { "symbol": "DEADUSD", "mark_price": "0" },
+        ]}});
+        let marks = parse_crypto_marks(&quotes);
+        assert!((marks["XRPUSD"] - 1.400_443_33).abs() < 1e-12);
+        assert!(!marks.contains_key("DEADUSD"));
+
+        assert!((parse_cash(&json!({ "data": { "cash": "10.1" } })).unwrap() - 10.1).abs() < 1e-12);
+        assert!(parse_cash(&json!({ "data": {} })).is_err(), "not zero");
+    }
+
+    #[test]
+    fn a_closed_account_is_not_read() {
+        let body = json!({ "data": { "accounts": [
+            { "account_number": "111", "rhs_account_number": "111", "deactivated": false },
+            { "account_number": "222", "deactivated": true },
+        ]}});
+        assert_eq!(parse_accounts(&body), [("111".to_owned(), "111".to_owned())]);
     }
 
     #[test]

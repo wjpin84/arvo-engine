@@ -530,8 +530,14 @@ fn holding_from(fields: &[String], mapping: &Mapping) -> Option<Holding> {
     // dollars and no price, because its price is one. The valuation layer has
     // always known that; this check did not, so a cash line was silently
     // dropped from a file that parsed perfectly otherwise.
+    //
+    // A quantity with no price is a position too. The valuation prices it from
+    // the last close or names it unpriced, and the sidebar has always told
+    // people a blank price does that; this check dropped the row as if it were
+    // a disclaimer instead. A footer has no readable quantity, which is what
+    // still keeps it out.
     let is_cash = instrument.eq_ignore_ascii_case(crate::CASH);
-    if !is_cash && value.is_none() && !(quantity.is_some() && price.is_some()) {
+    if !is_cash && value.is_none() && quantity.is_none() {
         return None;
     }
 
@@ -722,6 +728,17 @@ AAPL,not-a-number,oops
         assert!(imported[0].portfolio.holdings.is_empty());
         assert_eq!(imported[0].report.rows_imported, 0);
         assert_eq!(imported[0].report.rows_skipped.len(), 1);
+    }
+
+    #[test]
+    fn a_blank_price_is_a_holding_left_for_the_valuation_to_price() {
+        let imported = load("instrument,quantity,cost_basis,price\nMSFT.RH,2,900,\n");
+        assert_eq!(imported[0].report.rows_skipped, Vec::<String>::new());
+        let holding = &imported[0].portfolio.holdings[0];
+        assert_eq!(holding.price, None);
+        let closes = BTreeMap::from([("MSFT.RH".to_owned(), 500.0)]);
+        let valued = imported[0].portfolio.value(&closes);
+        assert!((valued.total_value - 1000.0).abs() < 1e-9, "priced at the last close");
     }
 
     #[test]
