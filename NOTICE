@@ -60,3 +60,18 @@ TradingView Lightweight Charts — Apache License 2.0
   Unlike the NautilusTrader entry above, this imposes no obligation on Arvo's
   own licensing: Apache-2.0 is the licence Arvo already uses, and shipping a
   copy needs only the notice and the retained header.
+
+--------------------------------------------------------------------------------
+
+Monaco Editor, web-tree-sitter and tree-sitter-python — MIT License
+  https://github.com/microsoft/monaco-editor (v0.56.0)
+  https://github.com/tree-sitter/tree-sitter (web-tree-sitter v0.27.0)
+  https://github.com/tree-sitter/tree-sitter-python (v0.25.0)
+
+  Vendored at public/vendor/monaco, bundled by tools/monaco/build.mjs, with
+  each project's licence beside it (LICENSE.monaco-editor,
+  LICENSE.web-tree-sitter, LICENSE.tree-sitter-python) and the bundle's
+  retained third-party comments (DOMPurify, Apache-2.0/MPL-2.0) in
+  arvo-monaco.js.LEGAL.txt. tree-sitter-python.wasm and python-highlights.scm
+  are that release's assets unmodified. MIT asks only that the notice travel
+  with the copies, and places no obligation on Arvo's own licensing.
