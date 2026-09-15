@@ -1347,6 +1347,7 @@ fn a_drawdown_limit_stops_the_run_and_the_ledger_says_so() {
         max_concurrent_positions: None,
         max_daily_loss: None,
         correlation_cap: None,
+        sector_cap: None,
         day_trading: arvo_research::DayTradingRule::Unconstrained,
     };
 
@@ -1402,6 +1403,7 @@ fn without_a_limit_the_same_run_keeps_trading() {
         max_concurrent_positions: None,
         max_daily_loss: None,
         correlation_cap: None,
+        sector_cap: None,
         day_trading: arvo_research::DayTradingRule::Unconstrained,
     };
 
@@ -1976,6 +1978,7 @@ fn an_intraday_curve_agrees_with_its_ledger() {
         max_concurrent_positions: None,
         max_daily_loss: None,
         correlation_cap: None,
+        sector_cap: None,
         day_trading: arvo_research::DayTradingRule::Unconstrained,
     };
 
@@ -2226,6 +2229,37 @@ fn no_cap_is_the_behaviour_every_recorded_run_had() {
 }
 
 
+/// The sector cap, end to end through a real backtest: two members on the same
+/// bars, held together when their sectors differ and one at a time when they
+/// match. Fails if the engine stops handing the experiment's risk model to the
+/// gate.
+#[test]
+fn a_sector_cap_holds_one_name_per_sector_in_a_real_book() {
+    let bars = sawtooth(400);
+    let simulation = book_provider(&["AAPL.NASDAQ", "MSFT.NASDAQ"], &bars);
+    let run = |msft: &str| {
+        let mut experiment = experiment(params(10.0, 30.0), &bars);
+        experiment.alongside = vec!["MSFT.NASDAQ".to_owned()];
+        experiment.risk.sector_cap = Some(arvo_research::SectorCap {
+            max_positions: 1,
+            sectors: [("AAPL", "Technology"), ("MSFT", msft)]
+                .into_iter()
+                .map(|(ticker, sector)| (ticker.to_owned(), sector.to_owned()))
+                .collect(),
+        });
+        simulation.run(&experiment).expect("the book should run").ledger
+    };
+
+    let apart = run("Software");
+    assert!(
+        correlation_cap::concurrent_peak(&apart) >= 2,
+        "different sectors must both be held, or the next assertion proves nothing"
+    );
+    let together = run("Technology");
+    assert!(!together.is_empty(), "a cap must bind, not refuse everything");
+    assert_eq!(correlation_cap::concurrent_peak(&together), 1);
+}
+
 /// The correlation cap, end to end through a real backtest.
 ///
 /// Every layer of this has unit tests that would still pass with the
@@ -2251,7 +2285,7 @@ mod correlation_cap {
         book_provider(&["AAPL.NASDAQ", "MSFT.NASDAQ"], bars)
     }
 
-    fn concurrent_peak(ledger: &[arvo_research::Trade]) -> usize {
+    pub(super) fn concurrent_peak(ledger: &[arvo_research::Trade]) -> usize {
         // How many were open at once, at the worst moment.
         let mut events: Vec<(chrono::NaiveDateTime, i32)> = Vec::new();
         for trade in ledger {

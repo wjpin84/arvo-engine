@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use super::pdt::{DayTradingRule, PDT_DAY_TRADES, PDT_EQUITY_FLOOR};
 use super::sizing::size;
-use super::{CorrelationCap, Correlations};
+use super::{CorrelationCap, Correlations, SectorCap};
 use crate::{CostModel, RiskModel};
 
 /// What a proposer wants to do.
@@ -86,6 +86,18 @@ pub enum Rejection {
     /// silently allows everything is worse than no limit, because the operator
     /// believes they have one.
     CorrelationUnknown { instrument: String, against: String },
+    /// The sector this name is in already holds as many positions as it may.
+    Sector {
+        sector: String,
+        with: Vec<String>,
+        limit: usize,
+    },
+    /// A sector cap is configured and has no sector for this name, or for one
+    /// already held.
+    ///
+    /// Refused for the reason [`Self::CorrelationUnknown`] is: a name with no
+    /// label could be in any sector, including the full one.
+    SectorUnknown { instrument: String },
     /// Opening this would risk a fourth day trade in five business days on an
     /// account below the pattern-day-trader floor.
     ///
@@ -297,7 +309,42 @@ pub fn decide(
         }
     }
 
+    if let Some(cap) = &model.sector_cap {
+        if let Some(rejection) = sector_check(account.positions, &proposal.instrument, cap) {
+            return Decision::Reject(rejection);
+        }
+    }
+
     size(model, account, proposal, costs)
+}
+
+/// Whether this instrument would over-fill its sector.
+fn sector_check(
+    positions: &BTreeMap<String, Position>,
+    instrument: &str,
+    cap: &SectorCap,
+) -> Option<Rejection> {
+    let sector_of = |id: &str| cap.sectors.get(arvo_data::source::symbol_of(id));
+    let unknown = |id: &str| Rejection::SectorUnknown {
+        instrument: id.to_owned(),
+    };
+
+    let Some(sector) = sector_of(instrument) else {
+        return Some(unknown(instrument));
+    };
+    let mut with = Vec::new();
+    for held in positions.keys() {
+        match sector_of(held) {
+            Some(theirs) if theirs == sector => with.push(held.clone()),
+            Some(_) => {}
+            None => return Some(unknown(held)),
+        }
+    }
+    (with.len() >= cap.max_positions).then(|| Rejection::Sector {
+        sector: sector.clone(),
+        with,
+        limit: cap.max_positions,
+    })
 }
 
 /// Whether this instrument would over-fill a correlated cluster.

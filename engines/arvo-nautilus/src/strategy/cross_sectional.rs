@@ -143,7 +143,7 @@ impl CrossSectionalMomentum {
         for bar_type in &bar_types {
             let id = bar_type.instrument_id();
             scores.insert(id, Momentum::new(lookback));
-            positions.insert(id, Position::new(shared, trade_size, correlations.clone()));
+            positions.insert(id, Position::new(shared.clone(), trade_size, correlations.clone()));
             atrs.insert(id, Atr::new(risk.model.atr_period));
         }
 

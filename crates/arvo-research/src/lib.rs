@@ -69,8 +69,8 @@ pub use reconcile::{reconcile, reconcile_parts, Discrepancy};
 pub use replay::{replay, Divergence, Replay};
 pub use risk::{
     day_trades_in_window, decide, AccountState, CorrelationCap, Correlations, DayTradingRule,
-    Decision, Position, Proposal, Rejection, RiskGate, RiskModel, PDT_DAY_TRADES, PDT_EQUITY_FLOOR,
-    PDT_WINDOW_DAYS,
+    Decision, Position, Proposal, Rejection, RiskGate, RiskModel, SectorCap, PDT_DAY_TRADES,
+    PDT_EQUITY_FLOOR, PDT_WINDOW_DAYS,
 };
 pub use panel::{run_panel, InstrumentOutcome, PanelEvidence, PanelStudy, PooledOutcome};
 pub use trade::{Direction, ExitReason, Trade, TradeStats};

@@ -282,6 +282,80 @@ fn the_drawdown_halt_sees_open_positions_move_against_the_account() {
     assert!(gate.halted().is_some(), "unrealised losses count");
 }
 
+fn sectors(cap: usize, labels: &[(&str, &str)]) -> RiskModel {
+    RiskModel {
+        sector_cap: Some(SectorCap {
+            max_positions: cap,
+            sectors: labels
+                .iter()
+                .map(|(ticker, sector)| ((*ticker).to_owned(), (*sector).to_owned()))
+                .collect(),
+        }),
+        ..model()
+    }
+}
+
+#[test]
+fn a_full_sector_refuses_another_name_in_it_and_admits_one_outside_it() {
+    // Two utilities that correlate weakly are still one bet on rates.
+    let mut gate = gate(sectors(1, &[("NEE", "Utilities"), ("DUK", "Utilities"), ("KO", "Staples")]));
+    gate.opened("NEE.RH", 5.0, 100.0, day(9));
+
+    let duke = proposal("DUK.YF");
+    assert_eq!(
+        gate.propose(&duke, immediately(&duke), None),
+        Decision::Reject(Rejection::Sector {
+            sector: "Utilities".to_owned(),
+            with: vec!["NEE.RH".to_owned()],
+            limit: 1,
+        }),
+        "labels are by ticker, so a different venue is the same company"
+    );
+
+    let coke = proposal("KO.RH");
+    assert!(matches!(
+        gate.propose(&coke, immediately(&coke), None),
+        Decision::Accept { .. }
+    ));
+}
+
+#[test]
+fn a_name_with_no_sector_is_refused_whether_proposed_or_held() {
+    // Unlabelled could mean the full sector.
+    let mut gate = gate(sectors(2, &[("NEE", "Utilities")]));
+    let unlabelled = proposal("KO.RH");
+    assert_eq!(
+        gate.propose(&unlabelled, immediately(&unlabelled), None),
+        Decision::Reject(Rejection::SectorUnknown {
+            instrument: "KO.RH".to_owned()
+        })
+    );
+
+    gate.opened("KO.RH", 5.0, 100.0, day(9));
+    let nee = proposal("NEE.RH");
+    assert_eq!(
+        gate.propose(&nee, immediately(&nee), None),
+        Decision::Reject(Rejection::SectorUnknown {
+            instrument: "KO.RH".to_owned()
+        })
+    );
+}
+
+#[test]
+fn a_sector_cap_that_could_only_refuse_is_not_a_model() {
+    assert!(sectors(0, &[("NEE", "Utilities")]).check().is_err());
+    assert!(sectors(1, &[]).check().is_err());
+    assert!(sectors(1, &[("NEE", "Utilities")]).check().is_ok());
+}
+
+#[test]
+fn a_model_stored_before_sector_caps_loads_as_uncapped() {
+    let mut stored = serde_json::to_value(RiskModel::default()).expect("serialises");
+    stored.as_object_mut().expect("object").remove("sector_cap");
+    let loaded: RiskModel = serde_json::from_value(stored).expect("still loads");
+    assert_eq!(loaded.sector_cap, None);
+}
+
 #[test]
 fn correlated_names_count_as_one_bet() {
     let mut gate = gate(RiskModel {

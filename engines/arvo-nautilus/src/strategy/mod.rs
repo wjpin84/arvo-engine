@@ -86,7 +86,7 @@ pub(crate) const PROPOSER: &str = "engine";
 /// [`arvo_research::decide`], which is the same function a live session calls.
 /// What stays here is the part that genuinely needs bars: turning an ATR into a
 /// stop distance.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct Risk {
     pub(crate) model: arvo_research::RiskModel,
     /// What a fill costs on top of its price, from the experiment, so an entry
@@ -209,8 +209,8 @@ impl Position {
         false
     }
 
-    pub(crate) const fn risk(&self) -> Risk {
-        self.risk
+    pub(crate) const fn risk(&self) -> &Risk {
+        &self.risk
     }
 
     pub(crate) const fn is_open(&self) -> bool {
@@ -385,7 +385,7 @@ pub(crate) fn spendable(
 #[expect(clippy::too_many_arguments, reason = "it is one call, spelled out")]
 pub(crate) fn decide_entry(
     opens_short: bool,
-    risk: Risk,
+    risk: &Risk,
     default_size: Quantity,
     instrument: &str,
     price: f64,
@@ -529,7 +529,7 @@ pub(crate) trait Managed: Strategy + StrategyNative + DataActorNative {
             .unwrap_or(self.position().risk.starting_cash);
         Some(decide_entry(
             opens_short,
-            self.position().risk,
+            &self.position().risk,
             self.position().default_size,
             &self.instrument().to_string(),
             price,
@@ -773,6 +773,7 @@ mod tests {
             max_concurrent_positions: None,
             max_daily_loss: None,
             correlation_cap: None,
+            sector_cap: None,
             day_trading: arvo_research::DayTradingRule::Unconstrained,
         },
         starting_cash: 100_000.0,
@@ -792,13 +793,13 @@ mod tests {
     /// the second implementation that has now been removed — testing it here
     /// again would re-create the thing the shared policy exists to prevent.
     fn entry(risk: Risk, price: f64, atr: Option<f64>) -> arvo_research::Decision {
-        let position = position(risk);
+        let position = position(risk.clone());
         let stop_distance = position
             .stop_distance(atr)
             .expect("the caller knows whether the ATR is ready");
         decide_entry(
             false,
-            risk,
+            &risk,
             quantity(100.0),
             "MSFT.NASDAQ",
             price,
@@ -860,7 +861,7 @@ mod tests {
         // A $0.10 stop on a $500 share: unbounded sizing asks for 10,000
         // shares, which is $5m against a $100k account.
         assert_eq!(
-            entry(risk, 500.0, Some(0.1)),
+            entry(risk.clone(), 500.0, Some(0.1)),
             arvo_research::Decision::Accept { quantity: 200.0 },
             "capped at one account's worth of a $500 share"
         );
@@ -910,7 +911,7 @@ mod tests {
         };
         let refused = decide_entry(
             false,
-            risk,
+            &risk,
             quantity(100.0),
             "MSFT.NASDAQ",
             100.0,
@@ -957,7 +958,7 @@ mod tests {
 
         let refused = decide_entry(
             false,
-            risk,
+            &risk,
             quantity(100.0),
             "MSFT.NASDAQ",
             100.0,
@@ -988,7 +989,7 @@ mod tests {
         // here is precisely the gap paper trading exists to measure.
         let accepted = decide_entry(
             false,
-            UNSTOPPED,
+            &UNSTOPPED,
             quantity(100.0),
             "MSFT.NASDAQ",
             100.0,
@@ -1008,19 +1009,21 @@ mod tests {
         ));
     }
 
-    const HALTING: Risk = Risk {
-        model: arvo_research::RiskModel {
-            max_drawdown: Some(0.10),
-            ..UNSTOPPED.model
-        },
-        ..UNSTOPPED
-    };
+    fn halting() -> Risk {
+        Risk {
+            model: arvo_research::RiskModel {
+                max_drawdown: Some(0.10),
+                ..UNSTOPPED.model
+            },
+            ..UNSTOPPED
+        }
+    }
 
     #[test]
     fn drawdown_is_measured_from_the_peak_not_from_the_start() {
         // Measuring against starting capital would let a rule give back every
         // gain it ever made without once registering a fall.
-        let mut position = position(HALTING);
+        let mut position = position(halting());
         assert!(!position.observe(100_000.0));
         assert!(!position.observe(200_000.0), "a new peak is not a drawdown");
         // 185k is 7.5% below the 200k peak, and 85% *above* the start.
@@ -1032,7 +1035,7 @@ mod tests {
     fn the_halt_is_permanent() {
         // Nothing else is coherent: a rule that has stopped trading cannot
         // recover the equity that would let it resume.
-        let mut position = position(HALTING);
+        let mut position = position(halting());
         position.observe(100_000.0);
         assert!(position.observe(89_000.0));
         assert!(position.is_halted());
