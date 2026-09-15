@@ -19,6 +19,7 @@
 //! observed, not operated. Execution remains a separate, later, explicit
 //! decision — see the architecture map.
 
+pub mod bands;
 pub mod csv;
 pub mod history;
 
