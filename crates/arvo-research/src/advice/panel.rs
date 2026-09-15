@@ -168,6 +168,22 @@ pub fn recommend_panel(
         ));
     }
 
+    if !found.ended_early.is_empty() {
+        out.push(Recommendation::new(
+            Severity::Warning,
+            "Part of the panel stopped trading before the window ended, and is valued at its last close.",
+            "Do not read those members' returns as what holding them paid. A delisted stock's last \
+             exchange price is rarely what its holders received; find what they did get, or run \
+             the panel without them and compare.",
+            format!(
+                "{} of {} members ended early: {}",
+                found.ended_early.len(),
+                pooled.instruments,
+                found.ended_early.join(", ")
+            ),
+        ));
+    }
+
     // ---- notes -----------------------------------------------------------
 
     if out.is_empty() && found.verdict == Verdict::Supported {
@@ -200,9 +216,13 @@ pub fn recommend_panel(
              an index during the window would have been in a universe picked on its first day, \
              and they are the ones a long rule loses most on.",
             format!(
-                "{securities} securities judged over {} to {}, none of them a casualty of that window",
+                "{securities} securities judged over {} to {}, {} of them a casualty of that window",
                 found.in_sample.from,
                 found.out_of_sample.to,
+                match found.ended_early.len() {
+                    0 => "none".to_owned(),
+                    n => n.to_string(),
+                },
             ),
         ));
     }

@@ -230,6 +230,16 @@ pub struct PanelEvidence {
     /// to prevent. `None` means not recorded, and says so.
     #[serde(default)]
     pub criteria: Option<EvaluationCriteria>,
+    /// Members whose history stopped before the rest of the panel's did.
+    ///
+    /// A delisted stock's bars end on its last exchange day, and the run marks
+    /// both the rule and buy-and-hold at that close. What a holder actually got
+    /// came later, often over the counter under another ticker, and is usually
+    /// far less: SVB's bars end at 106 on 9 March 2023, and the equity was
+    /// worth nothing. `default` because it is a persisted format; a panel
+    /// recorded before this was measured reads as having no casualties.
+    #[serde(default)]
+    pub ended_early: Vec<String>,
     /// Instrument/configuration combinations that could not be run.
     pub failures: Vec<String>,
     pub verdict: Verdict,
@@ -401,6 +411,7 @@ pub fn run_panel(
     }
 
     let pooled = pool(&per_instrument);
+    let ended_early = ended_early(&curves);
     let breadth = crate::breadth::measure(&curves);
     // The members were each run with the whole account behind them, so this
     // rescales rather than re-simulates: it cannot show capital contention
@@ -427,10 +438,35 @@ pub fn run_panel(
         book,
         study: Some(study.clone()),
         criteria: Some(*criteria),
+        ended_early,
         failures,
         verdict,
         reasons,
     })
+}
+
+/// Longer than any market closure, shorter than any delisting worth noticing.
+const GAP_WORTH_SAYING_DAYS: i64 = 7;
+
+/// Members whose last point falls well short of the panel's latest.
+///
+/// Measured against the other members rather than the window, because a
+/// window's end can be a weekend, a holiday or a date no bar has reached yet.
+///
+/// ponytail: a halt longer than a week that resumed reads as the same thing;
+/// tell them apart with Alpaca's asset status if one ever shows up.
+fn ended_early(curves: &[(String, Vec<crate::EquityPoint>)]) -> Vec<String> {
+    let last = |curve: &[crate::EquityPoint]| curve.last().map(|point| point.at);
+    let Some(latest) = curves.iter().filter_map(|(_, curve)| last(curve)).max() else {
+        return Vec::new();
+    };
+    curves
+        .iter()
+        .filter(|(_, curve)| {
+            last(curve).is_some_and(|at| (latest - at).num_days() > GAP_WORTH_SAYING_DAYS)
+        })
+        .map(|(instrument, _)| instrument.clone())
+        .collect()
 }
 
 /// How many distinct securities a set of outcomes covers.
@@ -698,6 +734,7 @@ mod tests {
             book: None,
             study: None,
             criteria: Some(criteria),
+            ended_early: Vec::new(),
             failures: Vec::new(),
             verdict,
             reasons,
@@ -951,6 +988,25 @@ mod tests {
             reasons.iter().any(|r| r.contains("not consistent")),
             "but the inconsistency must be stated: {reasons:?}"
         );
+    }
+
+    #[test]
+    fn a_member_whose_bars_stop_a_month_early_ended_early_and_a_long_weekend_does_not() {
+        let curve = |month: u32, day: u32| {
+            vec![crate::EquityPoint {
+                at: chrono::NaiveDate::from_ymd_opt(2023, month, day)
+                    .expect("valid")
+                    .and_hms_opt(0, 0, 0)
+                    .expect("valid"),
+                equity: 1.0,
+            }]
+        };
+        let curves = vec![
+            ("SPY.AIEX".to_owned(), curve(4, 28)),
+            ("KO.AIEX".to_owned(), curve(4, 25)),
+            ("SIVB.AIEX".to_owned(), curve(3, 9)),
+        ];
+        assert_eq!(ended_early(&curves), ["SIVB.AIEX"]);
     }
 
     #[test]
