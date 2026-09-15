@@ -164,6 +164,16 @@ impl<P: BarProvider> SimulationProvider for NautilusSimulation<P> {
     /// mapped to an empty list. `arvo_research::dividend` reads a missing key as
     /// *unknown* and an empty list as *paid nothing*, and those are different
     /// facts about a result.
+    fn bars_for(
+        &self,
+        instrument: &str,
+        interval: arvo_data::BarInterval,
+        from: chrono::NaiveDate,
+        to: chrono::NaiveDate,
+    ) -> Option<Vec<arvo_data::Bar>> {
+        self.bars.bars(instrument, interval, from, to).ok()
+    }
+
     fn dividends(
         &self,
         experiment: &Experiment,

@@ -413,6 +413,13 @@ pub struct Evaluation {
     /// measured — which is the honest description of it.
     #[serde(default)]
     pub dividend_gap: Option<crate::DividendGap>,
+    /// What the run's option positions would have lost on SPY's worst days
+    /// (#85). `None` for a run that held no options, or one whose underlying's
+    /// prices were not to hand.
+    ///
+    /// `default`, and skipped when absent, because this is a persisted format.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stress: Option<crate::stress::Stress>,
     /// Orders the venue refused during the strategy's run.
     ///
     /// Beside the result rather than in the verdict, like the dividend gap:
@@ -455,6 +462,13 @@ impl Evaluation {
     /// stay a function of the two curves and the criteria, so the verdict never
     /// starts depending on whether a distribution series happened to be on
     /// disk. The gap changes how a result is *read*, not whether it passed.
+    /// Records the crash replay of the run's option positions.
+    #[must_use]
+    pub fn with_stress(mut self, stress: Option<crate::stress::Stress>) -> Self {
+        self.stress = stress;
+        self
+    }
+
     #[must_use]
     pub fn with_dividend_gap(mut self, gap: Option<crate::DividendGap>) -> Self {
         self.dividend_gap = gap;
@@ -529,6 +543,7 @@ impl Evaluation {
             // Attached by `with_dividend_gap` when a series exists. `new` stays
             // a function of the curves and the criteria alone.
             dividend_gap: None,
+            stress: None,
             refused_orders: crate::Refused::default(),
             benchmark_instruments: Vec::new(),
             excess_return,
@@ -624,6 +639,7 @@ pub fn evaluate_against_benchmark(
     .with_trades(strategy_result.ledger.clone())
     .with_refused(strategy_result.refused)
     .with_dividend_gap(dividend_gap)
+    .with_stress(stress_for(provider, experiment, &strategy_result.ledger))
     .with_benchmark_instruments(held(&benchmark_result.ledger));
 
     Ok(Evidence {
@@ -634,6 +650,47 @@ pub fn evaluate_against_benchmark(
         criteria: *criteria,
         evaluation,
     })
+}
+
+/// The crash replay of an option run's positions, priced against its
+/// underlying: the experiment's `underlying` when it names one, else its own
+/// instrument (a chain rule runs on the underlying). The rate and yield are the
+/// experiment's own when it states them.
+fn stress_for(
+    provider: &dyn SimulationProvider,
+    experiment: &Experiment,
+    ledger: &[crate::Trade],
+) -> Option<crate::stress::Stress> {
+    if !ledger
+        .iter()
+        .any(|trade| arvo_data::option::OptionContract::parse(&trade.instrument).is_some())
+    {
+        return None;
+    }
+    let underlying = experiment.underlying.as_deref().unwrap_or(&experiment.instrument);
+    let bars = provider.bars_for(
+        underlying,
+        experiment.interval,
+        experiment.window.from,
+        experiment.window.to,
+    )?;
+    let step = experiment.interval.duration();
+    let param = |name: &str, default: f64| {
+        experiment.strategy.params.get(name).copied().unwrap_or(default)
+    };
+    crate::stress::replay(
+        ledger,
+        // The last close known at the instant: a bar's close is known once its
+        // period has ended.
+        |at| {
+            bars.iter()
+                .take_while(|bar| bar.at + step <= at)
+                .last()
+                .map(|bar| bar.close)
+        },
+        param("rate", 0.04),
+        param("dividend_yield", 0.013),
+    )
 }
 
 /// Derives the buy-and-hold run an experiment is scored against.
