@@ -303,16 +303,16 @@ pub fn recommend(found: &FamilyEvidence) -> Vec<Recommendation> {
             (
                 "Positions were held for less than a year on average.",
                 "In a taxable account these gains fall under short-term \
-                 treatment. The backtest does not model that, so the \
-                 after-tax result is worse than the figure shown — by how \
-                 much depends on your bracket and account type.",
+                 treatment. The verdict is judged pre-tax; read the after-tax \
+                 rows under the metrics, and redo them at your own bracket \
+                 before comparing this with holding.",
             )
         } else {
             (
                 "Positions were held for more than a year on average.",
                 "In a taxable account this is long-term treatment, which is \
-                 the favourable case. Still not modelled here, so read the \
-                 return as pre-tax.",
+                 the favourable case. The verdict is still judged pre-tax; \
+                 the after-tax rows under the metrics show the difference.",
             )
         };
         out.push(Recommendation::new(
