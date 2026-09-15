@@ -130,6 +130,33 @@ pub(crate) fn parse_matches(
         .unwrap_or_default()
 }
 
+/// Sector by symbol, for the names the vendor classifies.
+///
+/// A name with no sector is absent rather than filed under an empty string. An
+/// empty label would be a sector of its own, and a sector cap would admit one
+/// unclassified name as if it were diversification.
+///
+/// `Miscellaneous` is treated the same way. It is where funds go — SPY came
+/// back as it on 2026-09-15 — and taking it as a sector would cap an equity
+/// index, gold and long bonds as one bet.
+pub(crate) fn parse_sectors(response: &Value) -> std::collections::BTreeMap<String, String> {
+    response
+        .pointer("/data/results")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|found| {
+            let symbol = found.get("symbol").and_then(Value::as_str)?;
+            let sector = found
+                .get("sector")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|sector| !sector.is_empty() && *sector != "Miscellaneous")?;
+            Some((symbol.to_owned(), sector.to_owned()))
+        })
+        .collect()
+}
+
 /// Last price and the move since the previous close, by symbol.
 pub(crate) fn parse_quotes(response: &Value) -> std::collections::HashMap<String, (f64, Option<f64>)> {
     let mut out = std::collections::HashMap::new();
@@ -281,6 +308,26 @@ mod tests {
         let found = parse_matches(&body, &known);
         assert_eq!(found[0].instrument, "MSFT.NASDAQ");
         assert_eq!(found[1].instrument, "NVDA.RH", "unheld falls back to ours");
+    }
+
+    #[test]
+    fn a_name_with_no_sector_is_left_out_rather_than_given_an_empty_one() {
+        // The shape `get_equity_fundamentals` answered with on 2026-09-15:
+        // delisted names go to `not_found`, never into `results`.
+        let body = json!({ "data": {
+            "results": [
+                { "symbol": "KO", "sector": "Consumer Non-Durables", "industry": "Beverages: Non-Alcoholic" },
+                { "symbol": "NEE", "sector": "Utilities" },
+                { "symbol": "SPAC", "sector": "" },
+                { "symbol": "ETF", "sector": null },
+                { "symbol": "SPY", "sector": "Miscellaneous" },
+            ],
+            "not_found": ["SIVB"],
+        }});
+        let sectors = parse_sectors(&body);
+        assert_eq!(sectors.len(), 2, "{sectors:?}");
+        assert_eq!(sectors["KO"], "Consumer Non-Durables");
+        assert_eq!(sectors["NEE"], "Utilities");
     }
 
     #[test]

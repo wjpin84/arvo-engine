@@ -13,7 +13,7 @@ use arvo_data::{BarInterval, IntervalUnit};
 use serde_json::json;
 
 use crate::auth::{connect, is_connected, transport};
-use crate::parse::{parse_bars, parse_matches, parse_quotes};
+use crate::parse::{parse_bars, parse_matches, parse_quotes, parse_sectors};
 
 /// Where the token lives in the OS keychain, and how this source is named.
 pub const SOURCE_ID: &str = "robinhood";
@@ -26,6 +26,10 @@ pub const VENUE: &str = "RH";
 const HISTORICALS: &str = "get_equity_historicals";
 const SEARCH: &str = "search";
 const QUOTES: &str = "get_equity_quotes";
+const FUNDAMENTALS: &str = "get_equity_fundamentals";
+
+/// The most symbols one fundamentals request takes.
+const FUNDAMENTALS_PER_CALL: usize = 10;
 
 /// The Robinhood source.
 ///
@@ -39,6 +43,37 @@ const QUOTES: &str = "get_equity_quotes";
 /// it is not done here is that the cached client would also cache a token that
 /// `access_token` refreshes out from under it.
 pub struct Robinhood;
+
+impl Robinhood {
+    /// Sector by ticker, as Robinhood classifies each name **today**.
+    ///
+    /// Not a `Source` method: no other vendor supplies this, and a trait with
+    /// one implementer is a guess at a shape (ADR-0005). A name it does not
+    /// classify — delisted, a fund, a typo — is absent from the map, and the
+    /// caller decides what absence means.
+    ///
+    /// # Errors
+    ///
+    /// [`SourceError`] if Robinhood is not signed in or a request fails.
+    pub async fn sectors(
+        &self,
+        tickers: &[&str],
+    ) -> Result<std::collections::BTreeMap<String, String>, SourceError> {
+        let mut out = std::collections::BTreeMap::new();
+        if tickers.is_empty() {
+            return Ok(out);
+        }
+        let client = connect().await?;
+        for chunk in tickers.chunks(FUNDAMENTALS_PER_CALL) {
+            let response = client
+                .call_tool_json(FUNDAMENTALS, json!({ "symbols": chunk }))
+                .await
+                .map_err(transport)?;
+            out.extend(parse_sectors(&response));
+        }
+        Ok(out)
+    }
+}
 
 #[async_trait::async_trait]
 impl Source for Robinhood {
