@@ -127,7 +127,7 @@ pub(crate) fn run_backtest(
     // which is the same function a live gate calls — so the engine and a live
     // session cannot drift apart on how a limit is applied.
     let risk = strategy::Risk {
-        model: experiment.risk,
+        model: experiment.risk.clone(),
         costs: experiment.costs,
         starting_cash: experiment.starting_cash,
     };
@@ -193,7 +193,7 @@ pub(crate) fn run_backtest(
                 trade_size,
                 lookback,
                 hold_top,
-                risk,
+                risk.clone(),
                 correlations.clone(),
             ))
             .map_err(|err| rejected("adding the strategy", &err))?;
@@ -451,7 +451,7 @@ fn add_each(
                 trade_size,
                 fast_period,
                 slow_period,
-                risk,
+                risk.clone(),
                 correlations.clone(),
             )),
             Plan::OpeningRange {
@@ -464,7 +464,7 @@ fn add_each(
                 trade_size,
                 range_bars,
                 target_range_multiple,
-                risk,
+                risk.clone(),
                 correlations.clone(),
             )),
             Plan::VolatilityBreakout {
@@ -477,7 +477,7 @@ fn add_each(
                 trade_size,
                 entry_atr_multiple,
                 atr_period,
-                risk,
+                risk.clone(),
                 correlations.clone(),
             )),
             Plan::VwapReversion {
@@ -487,7 +487,7 @@ fn add_each(
                 bar_type,
                 trade_size,
                 entry_deviations,
-                risk,
+                risk.clone(),
                 correlations.clone(),
             )),
             Plan::MomentumBreakout {
@@ -500,7 +500,7 @@ fn add_each(
                 trade_size,
                 entry_period,
                 exit_period,
-                risk,
+                risk.clone(),
                 correlations.clone(),
             )),
             Plan::BuyAndHold { .. } => {
@@ -517,7 +517,7 @@ fn add_each(
                 core,
                 bar_type,
                 trade_size,
-                risk,
+                risk.clone(),
                 correlations.clone(),
             )),
             Plan::CrossSectionalMomentum { .. }

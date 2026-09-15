@@ -172,7 +172,7 @@ pub fn export(record: &Record) -> Result<SharedExperiment, ShareError> {
         window_days: in_days + out_days,
         interval: template.interval,
         costs: template.costs,
-        risk: template.risk,
+        risk: template.risk.clone(),
         starting_cash: template.starting_cash,
         seed: template.seed,
         criteria: found.out_of_sample_evidence.criteria,
@@ -267,7 +267,7 @@ impl SharedExperiment {
             dataset,
             strategy: self.strategy.clone(),
             costs: self.costs,
-            risk: self.risk,
+            risk: self.risk.clone(),
             starting_cash: self.starting_cash,
             seed: self.seed,
         };

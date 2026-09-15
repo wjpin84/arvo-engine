@@ -149,7 +149,7 @@ impl<P: BarProvider> NautilusSimulation<P> {
         }
         // The rule sizes by collateral and exits by its own levels. A stop, a
         // risk fraction or a drawdown halt would be recorded and not applied.
-        let risk = experiment.risk;
+        let risk = &experiment.risk;
         if risk.stop_atr_multiple.is_some()
             || risk.risk_per_trade.is_some()
             || risk.max_drawdown.is_some()

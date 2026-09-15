@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 /// but it should be a stated choice rather than an omission: an unstopped
 /// strategy has a fatter left tail than the stopped version of itself, so a
 /// backtest that quietly leaves the stop out flatters the idea.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RiskModel {
     /// Stop distance as a multiple of ATR. `None` runs with no stop at all.
     ///
@@ -110,6 +110,13 @@ pub struct RiskModel {
     /// note that a cap with no source refuses rather than passes.
     #[serde(default)]
     pub correlation_cap: Option<crate::CorrelationCap>,
+    /// How many positions may be held in one sector (#29).
+    ///
+    /// `None` is no cap, which is every run recorded before this existed. A
+    /// name the cap has no sector for is refused rather than assumed to be in
+    /// a sector of its own — see [`crate::Rejection::SectorUnknown`].
+    #[serde(default)]
+    pub sector_cap: Option<crate::SectorCap>,
     /// Which day-trading constraint the account is subject to.
     ///
     /// A backtest that ignores this is backtesting a system nobody can open: a
@@ -147,6 +154,7 @@ impl Default for RiskModel {
             // truncate sessions in every stored finding.
             max_daily_loss: None,
             correlation_cap: None,
+            sector_cap: None,
             // Unconstrained, and named rather than implied: modelling the
             // pattern-day-trader rule changes how many trades a run can make,
             // so switching it on silently would change every stored result.
@@ -221,6 +229,20 @@ impl RiskModel {
             if cap.max_positions == 0 {
                 return Err(
                     "correlation_cap.max_positions of 0 refuses every correlated trade; remove the cap instead of setting it to zero"
+                        .to_owned(),
+                );
+            }
+        }
+        if let Some(cap) = &self.sector_cap {
+            if cap.max_positions == 0 {
+                return Err(
+                    "sector_cap.max_positions of 0 refuses every trade; remove the cap instead of setting it to zero"
+                        .to_owned(),
+                );
+            }
+            if cap.sectors.is_empty() {
+                return Err(
+                    "sector_cap names no sectors, so it would refuse every trade as unclassified"
                         .to_owned(),
                 );
             }

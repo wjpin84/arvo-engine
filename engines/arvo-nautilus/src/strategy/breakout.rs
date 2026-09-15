@@ -251,7 +251,7 @@ impl ZeroDteBreakout {
             super::account_from_cache(&self.cache(), stamped.date());
         let decision = super::decide_entry(
             false,
-            self.risk,
+            &self.risk,
             self.trade_size,
             &id.to_string(),
             price,

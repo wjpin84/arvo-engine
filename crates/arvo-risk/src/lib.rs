@@ -108,6 +108,30 @@ pub struct CorrelationCap {
     pub max_positions: usize,
 }
 
+/// The most positions one sector may hold, and which sector each name is in.
+///
+/// # Why this is not a correlation cap
+///
+/// Because sector does not fall out of correlation. Two utilities can move
+/// weakly together over a quiet window and still both be the same bet on
+/// rates, and the day that bet goes wrong is the day their correlation
+/// arrives all at once.
+///
+/// # Why the labels travel with the cap
+///
+/// So a stored finding says which sectors it was judged under. A lookup at
+/// run time would let a reclassification change what an old result means with
+/// nothing in the record to show it — and the labels are today's, taken from a
+/// vendor that classifies names as they are now, not as they were.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SectorCap {
+    /// The most positions allowed in one sector.
+    pub max_positions: usize,
+    /// Sector by ticker, `KO` rather than `KO.RH`: a venue says where a price
+    /// came from, not what the company does.
+    pub sectors: std::collections::BTreeMap<String, String>,
+}
+
 /// Pairwise correlations, however the caller happens to know them.
 ///
 /// A trait rather than a matrix because the gate must not decide where

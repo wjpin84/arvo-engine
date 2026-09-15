@@ -516,7 +516,7 @@ impl PutSpread {
             super::account_from_cache(&self.cache(), now.date());
         super::decide_entry(
             opens_short,
-            self.risk,
+            &self.risk,
             Quantity::new_checked(size, 0).unwrap_or(self.trade_size),
             &id.to_string(),
             price,
