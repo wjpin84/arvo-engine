@@ -38,9 +38,7 @@ fn run() -> Result<(), String> {
     };
     let root = match args.first() {
         Some(dir) => PathBuf::from(dir),
-        None => std::env::var_os("APPDATA")
-            .map(|appdata| PathBuf::from(appdata).join("com.arvo.desktop"))
-            .ok_or("no app data directory given and APPDATA is not set")?,
+        None => arvo_engine::research::default_root()?,
     };
 
     let mut server = server::Server::new(&root, agent);
