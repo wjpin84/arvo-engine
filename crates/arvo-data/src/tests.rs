@@ -3,6 +3,7 @@
 /// as an instrument that exists on disk and holds no bars.
 mod round_trip {
     use super::super::*;
+    use chrono::NaiveTime;
 
     fn bars(interval: BarInterval) -> Vec<Bar> {
         (0..4)
@@ -122,6 +123,7 @@ mod round_trip {
 }
 
 use super::*;
+use std::path::Path;
 
 fn date(y: i32, m: u32, d: u32) -> NaiveDate {
     NaiveDate::from_ymd_opt(y, m, d).expect("test date is valid")
