@@ -44,6 +44,7 @@ pub mod replay;
 pub mod share;
 mod simulation;
 pub mod stress;
+pub mod tax;
 pub mod walk_forward;
 
 pub use advice::{
