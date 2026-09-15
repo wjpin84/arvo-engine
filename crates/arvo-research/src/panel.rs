@@ -86,6 +86,12 @@ pub struct PooledOutcome {
     pub total_trades: u32,
     /// Equal-weighted mean of the per-instrument excess returns.
     pub mean_excess_return: f64,
+    /// Mean of the per-instrument strategy returns, before the benchmark.
+    ///
+    /// `default` because this is a persisted format; a panel recorded before it
+    /// was measured reads as having lost nothing.
+    #[serde(default)]
+    pub mean_return: f64,
     /// How many instruments beat their own benchmark. Consistency and
     /// magnitude are different claims, and this is the one a single-instrument
     /// result cannot make.
@@ -456,6 +462,7 @@ fn pool(outcomes: &[InstrumentOutcome]) -> PooledOutcome {
             .map(|o| o.strategy.trades)
             .fold(0_u32, u32::saturating_add),
         mean_excess_return: outcomes.iter().map(|o| o.excess_return).sum::<f64>() / count,
+        mean_return: outcomes.iter().map(|o| o.strategy.total_return).sum::<f64>() / count,
         beat_benchmark: outcomes.iter().filter(|o| o.excess_return > 0.0).count(),
         distinct: distinct_securities(outcomes).len(),
         distinct_beat: distinct_securities(outcomes)
@@ -550,6 +557,13 @@ fn judge(
             pooled.mean_max_drawdown, criteria.max_drawdown, pooled.worst_max_drawdown
         ));
         Verdict::NotSupported
+    } else if pooled.mean_return < 0.0 {
+        // As a single study, across the panel on average.
+        reasons.push(crate::evaluation::losing_reason(
+            pooled.mean_return,
+            pooled.mean_return - pooled.mean_excess_return,
+        ));
+        Verdict::Inconclusive
     } else {
         reasons.push(format!(
             "beat buy-and-hold by {:.4} on average, on {winners} of {independent} securities, \
