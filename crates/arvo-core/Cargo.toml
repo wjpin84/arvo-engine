@@ -1,12 +1,13 @@
 [package]
 name = "arvo-core"
-description = "Platform primitives shared across Arvo: config, events, secrets."
+description = "Platform primitives shared across Arvo: config, events, secrets, and how to find the engine."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
 serde.workspace = true
+serde_json = "1"
 thiserror.workspace = true
 keyring = "4.2.0"
 toml = "1.1.5"
