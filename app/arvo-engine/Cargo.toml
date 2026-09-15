@@ -1,0 +1,35 @@
+[package]
+name = "arvo-engine"
+description = "Arvo's engine and its local gRPC API: research memory and research runs for every front end that is not the window (ADR-0018)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "arvo-engine"
+path = "src/main.rs"
+
+[dependencies]
+arvo-data.workspace = true
+arvo-nautilus.workspace = true
+arvo-research.workspace = true
+# The research entry points the window calls — the grid, the split, the cost
+# and risk assumptions — so a script's study is the study a person runs.
+# ponytail: they live in the Tauri crate today; move them out when the window
+# becomes a client of this engine (ADR-0018 stage 2).
+arvo-runtime = { path = "../arvo-runtime" }
+chrono.workspace = true
+prost.workspace = true
+rand = "0.8"
+serde_json = "1"
+tokio = { workspace = true, features = ["net", "signal", "time"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic.workspace = true
+tonic-prost.workspace = true
+
+[build-dependencies]
+protoc-bin-vendored.workspace = true
+tonic-prost-build.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

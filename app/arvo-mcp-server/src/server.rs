@@ -25,27 +25,16 @@
 //! finding it produced. A number an agent reports is traceable to the call
 //! that made it and the finding that holds it.
 
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use arvo_data::{BarProvider, CsvBars};
-use arvo_nautilus::NautilusSimulation;
-use arvo_research::{
-    EvaluationCriteria, EvidenceStore, Record, StoredRecord, Verdict,
-};
-use arvo_runtime_lib::research::{study_data, study_for, walk_forward_for, StrategyPlan};
+use arvo_engine::research::Research;
 use serde_json::{json, Value};
 
 /// The protocol revision this speaks, the one `arvo-mcp` speaks as a client.
 const PROTOCOL_VERSION: &str = "2025-06-18";
 
-/// Where tool calls are recorded, in the app data directory.
-pub const AUDIT_FILE: &str = "agent-audit.jsonl";
-
 pub struct Server {
-    data: PathBuf,
-    evidence: PathBuf,
-    audit: PathBuf,
+    research: Research,
     /// Who is running, once known.
     agent: Option<String>,
     /// Set by `--agent`, and then not overridden by the client's name.
@@ -55,9 +44,7 @@ pub struct Server {
 impl Server {
     pub fn new(root: &Path, agent: Option<String>) -> Self {
         Self {
-            data: root.join("data"),
-            evidence: root.join("evidence"),
-            audit: root.join(AUDIT_FILE),
+            research: Research::new(root),
             pinned: agent.is_some(),
             agent,
         }
@@ -102,7 +89,7 @@ impl Server {
                 let name = params.get("name").and_then(Value::as_str).unwrap_or("");
                 let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
                 let outcome = self.call(name, &arguments);
-                self.record(name, &arguments, &outcome);
+                self.research.audit("mcp", &self.agent(), name, &arguments, &outcome);
                 result(
                     id,
                     match outcome {
@@ -138,208 +125,20 @@ impl Server {
             "list_strategies" => arvo_runtime_lib::research::list_strategies()
                 .map_err(|err| err.to_string())
                 .and_then(|plans| serde_json::to_value(plans).map_err(|err| err.to_string())),
-            "list_instruments" => self.list_instruments(),
-            "list_findings" => self.list_findings(),
-            "open_finding" => {
-                let id = text("id")?;
-                let stored = self.store().open(&id).map_err(|err| err.to_string())?;
-                Ok(summarize(&stored))
+            "list_instruments" => self.research.list_instruments(),
+            "list_findings" => self.research.list_findings(),
+            "open_finding" => self.research.open_finding(&text("id")?),
+            "run_study" => {
+                self.research
+                    .run(&text("instrument")?, &text("strategy")?, false, &self.agent())
             }
-            "run_study" => self.run(&text("instrument")?, &text("strategy")?, false),
-            "run_walk_forward" => self.run(&text("instrument")?, &text("strategy")?, true),
+            "run_walk_forward" => {
+                self.research
+                    .run(&text("instrument")?, &text("strategy")?, true, &self.agent())
+            }
             other => Err(format!("no tool {other:?}; tools/list says what there is")),
         }
     }
-
-    fn store(&self) -> EvidenceStore {
-        EvidenceStore::new(&self.evidence)
-    }
-
-    fn list_instruments(&self) -> Result<Value, String> {
-        let bars = CsvBars::new(&self.data);
-        let mut out = Vec::new();
-        for interval in [
-            arvo_data::BarInterval::DAILY,
-            arvo_data::BarInterval::new(5, arvo_data::IntervalUnit::Minute),
-        ] {
-            let names: Vec<String> = if interval.is_intraday() {
-                std::fs::read_dir(self.data.join(interval.to_string()))
-                    .map(|entries| {
-                        entries
-                            .flatten()
-                            .filter_map(|entry| {
-                                entry.path().file_stem().map(|s| s.to_string_lossy().into_owned())
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default()
-            } else {
-                bars.instruments().map_err(|err| err.to_string())?
-            };
-            for name in names {
-                if let Ok(Some((from, to))) = bars.coverage(&name, interval) {
-                    out.push(json!({
-                        "instrument": name,
-                        "interval": interval.to_string(),
-                        "from": from.to_string(),
-                        "to": to.to_string(),
-                    }));
-                }
-            }
-        }
-        Ok(json!({ "instruments": out }))
-    }
-
-    fn list_findings(&self) -> Result<Value, String> {
-        let (summaries, unreadable) = self.store().summaries().map_err(|err| err.to_string())?;
-        Ok(json!({
-            "findings": summaries.iter().map(|s| json!({
-                "id": s.id,
-                "kind": s.kind,
-                "subject": s.subject,
-                "verdict": s.verdict,
-                "recorded_at": s.recorded_at.to_rfc3339(),
-                "agent": s.agent,
-            })).collect::<Vec<_>>(),
-            "unreadable": unreadable.len(),
-        }))
-    }
-
-    fn run(&self, instrument: &str, strategy: &str, rolling: bool) -> Result<Value, String> {
-        let plan = StrategyPlan::find(strategy)
-            .ok_or_else(|| format!("no strategy {strategy:?}; list_strategies says what there is"))?;
-        if plan.ranks_a_set() {
-            return Err(format!(
-                "{strategy} ranks instruments against each other and cannot be run on one"
-            ));
-        }
-        let bars = CsvBars::new(&self.data);
-        let (window, fingerprint) = study_data(&bars, instrument, plan)?;
-        let simulation = NautilusSimulation::new(CsvBars::new(&self.data));
-        let criteria = EvaluationCriteria::default();
-
-        let record = if rolling {
-            let procedure = walk_forward_for(instrument, plan, window, &fingerprint);
-            Record::WalkForward(Box::new(
-                arvo_research::run_walk_forward(&simulation, &procedure, &criteria)
-                    .map_err(|err| err.to_string())?,
-            ))
-        } else {
-            let family = study_for(instrument, plan, window, &fingerprint);
-            Record::Study(Box::new(
-                arvo_research::run_family(&simulation, &family, &criteria)
-                    .map_err(|err| err.to_string())?,
-            ))
-        };
-
-        let store = self.store();
-        let history = store.load().map_err(|err| err.to_string())?.records;
-        let stored = StoredRecord::by_agent(record, &self.agent(), &history, chrono::Utc::now());
-        store.save(&stored).map_err(|err| err.to_string())?;
-        Ok(summarize(&stored))
-    }
-
-    /// Appends one line to the audit trail. Best effort, loudly: a trail that
-    /// cannot be written is said on stderr, and never fails the call — the
-    /// finding, which is the durable record, is already saved.
-    fn record(&self, tool: &str, arguments: &Value, outcome: &Result<Value, String>) {
-        let line = json!({
-            "at": chrono::Utc::now().to_rfc3339(),
-            "agent": self.agent(),
-            "tool": tool,
-            "arguments": arguments,
-            "ok": outcome.is_ok(),
-            "finding": outcome.as_ref().ok().and_then(|value| value.get("id")).cloned(),
-            "error": outcome.as_ref().err(),
-        });
-        let written = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.audit)
-            .and_then(|mut file| writeln!(file, "{line}"));
-        if let Err(err) = written {
-            eprintln!("could not append to {}: {err}", self.audit.display());
-        }
-    }
-}
-
-/// What an agent needs to read a finding, and nothing it could mistake for
-/// more: the verdict before the numbers, the advice beside them, and who ran it
-/// against what bar.
-fn summarize(stored: &StoredRecord) -> Value {
-    let record = &stored.record;
-    let mut out = json!({
-        "id": stored.id,
-        "kind": record.kind(),
-        "subject": record.subject(),
-        "verdict": record.verdict(),
-        "recorded_at": stored.recorded_at.to_rfc3339(),
-        "author": stored.author,
-        "read_this_first": match record.verdict() {
-            Verdict::Supported => "Supported is the one verdict worth acting on, and only as far as the advice below allows.",
-            Verdict::NotSupported => "Not supported: the numbers below describe a rule that did not clear its bar. Do not report them as an edge.",
-            Verdict::Inconclusive => "Inconclusive: too little evidence to say either way. Do not report the numbers below as a result.",
-        },
-    });
-    match record {
-        Record::Study(found) => {
-            let evaluation = &found.out_of_sample_evidence.evaluation;
-            out["reasons"] = json!(found.reasons);
-            out["advice"] = advice(arvo_research::recommend(found));
-            out["search"] = json!({
-                "trials": found.selection.trials,
-                "prior_trials": found.selection.prior_trials,
-                "best_in_sample_sharpe": found.selection.best_sharpe,
-                "expected_best_under_null": found.selection.expected_best_under_null,
-                "survived_deflation": found.selection.survived_deflation,
-                "chosen": found.selected.strategy.params,
-            });
-            out["out_of_sample"] = json!({
-                "from": found.out_of_sample.from.to_string(),
-                "to": found.out_of_sample.to.to_string(),
-                "trades": evaluation.strategy.trades,
-                "total_return": evaluation.strategy.total_return,
-                "excess_return": evaluation.excess_return,
-                "sharpe": evaluation.strategy.sharpe,
-                "max_drawdown": evaluation.strategy.max_drawdown,
-                "refused_orders": evaluation.refused_orders,
-            });
-        }
-        Record::WalkForward(found) => {
-            out["reasons"] = json!(found.reasons);
-            out["advice"] = advice(arvo_research::recommend_walk_forward(found));
-            out["combined"] = json!({
-                "folds": found.folds.len(),
-                "folds_surviving_deflation": found.folds_surviving_deflation,
-                "trades": found.combined_trades.closed,
-                "total_return": found.combined.total_return,
-                "excess_return": found.excess_return,
-                "sharpe": found.combined.sharpe,
-                "max_drawdown": found.combined.max_drawdown,
-            });
-        }
-        Record::Panel(found) => {
-            out["reasons"] = json!(found.reasons);
-            out["pooled"] = json!({
-                "instruments": found.pooled.instruments,
-                "trades": found.pooled.total_trades,
-                "mean_excess_return": found.pooled.mean_excess_return,
-            });
-        }
-    }
-    out
-}
-
-fn advice(items: Vec<arvo_research::Recommendation>) -> Value {
-    json!(items
-        .iter()
-        .map(|item| json!({
-            "severity": item.severity.label(),
-            "finding": item.finding,
-            "action": item.action,
-            "evidence": item.evidence,
-        }))
-        .collect::<Vec<_>>())
 }
 
 fn tools() -> Value {
@@ -405,6 +204,7 @@ fn error(id: Value, code: i64, message: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arvo_engine::research::AUDIT_FILE;
 
     fn server() -> (tempfile::TempDir, Server) {
         let dir = tempfile::tempdir().expect("tempdir");
