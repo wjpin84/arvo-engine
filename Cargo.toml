@@ -4,6 +4,7 @@ members = [
     "crates/arvo-core",
     "crates/arvo-data",
     "crates/arvo-research",
+    "crates/arvo-risk",
     "crates/arvo-plugin-host",
     "crates/arvo-mcp",
     "crates/arvo-oauth",
@@ -40,6 +41,7 @@ arvo-views = { path = "app/arvo-views" }
 arvo-nautilus = { path = "engines/arvo-nautilus" }
 arvo-portfolio = { path = "crates/arvo-portfolio" }
 arvo-research = { path = "crates/arvo-research" }
+arvo-risk = { path = "crates/arvo-risk" }
 arvo-plugin-host = { path = "crates/arvo-plugin-host" }
 
 anyhow = "1.0.104"

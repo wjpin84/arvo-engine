@@ -215,8 +215,7 @@ impl Executor for PaperExecutor {
 mod tests {
     use super::*;
     use crate::{Divergence, Session, Side};
-    use arvo_research::risk::{Proposal, RiskGate};
-    use arvo_research::RiskModel;
+    use arvo_risk::{Proposal, RiskGate, RiskModel};
     use chrono::{NaiveDate, NaiveTime};
 
     fn day() -> NaiveDate {
@@ -380,7 +379,7 @@ mod tests {
         assert!(after.is_none());
         assert!(matches!(
             session.refusals().last(),
-            Some((_, arvo_research::risk::Rejection::Halted { .. }))
+            Some((_, arvo_risk::Rejection::Halted { .. }))
         ));
 
         assert!(session.rearm(), "a manual halt lifts");

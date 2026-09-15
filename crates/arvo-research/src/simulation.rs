@@ -3,26 +3,7 @@
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 
-use crate::{Experiment, ExperimentId, Trade};
-
-/// What came back from the engine.
-///
-/// The equity curve is the primitive on purpose: Sharpe, drawdown, hit rate
-/// and the rest all derive from it, so evaluation can grow without the engine
-/// boundary changing shape every time a new metric is wanted.
-/// Account equity at one instant.
-///
-/// Dated, not just ordered. A bare `Vec<f64>` was enough to compute a return
-/// and is not enough to draw one, to align two runs against each other, or to
-/// say when a drawdown happened — and the engine knows the dates already, so
-/// discarding them was throwing away something free.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub struct EquityPoint {
-    /// When, to the resolution the experiment ran at. A date was enough
-    /// while everything was daily and is not once two points can share one.
-    pub at: chrono::NaiveDateTime,
-    pub equity: f64,
-}
+use crate::{EquityPoint, Experiment, ExperimentId, Trade};
 
 /// Orders the venue would not take, by what they were for.
 ///
@@ -46,6 +27,11 @@ impl Refused {
     }
 }
 
+/// What came back from the engine.
+///
+/// The equity curve is the primitive on purpose: Sharpe, drawdown, hit rate
+/// and the rest all derive from it, so evaluation can grow without the engine
+/// boundary changing shape every time a new metric is wanted.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SimulationResult {
     pub experiment: ExperimentId,

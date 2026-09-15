@@ -66,7 +66,8 @@ app/           the desktop application
 |---|---|
 | `crates/arvo-core` | Secrets, config, events — platform primitives |
 | `crates/arvo-data` | `Bar`, `Dividend`, `BarProvider`, the CSV library, quality and agreement checks, and the `Source` trait with its ingest pipeline |
-| `crates/arvo-research` | Experiments, evaluation, evidence, advice, the risk policy |
+| `crates/arvo-research` | Experiments, evaluation, evidence, advice; re-exports `arvo-risk` as `arvo_research::risk` |
+| `crates/arvo-risk` | The risk gate, costs, collateral and trades — what the live path shares with the backtest, without the research |
 | `crates/arvo-portfolio` | Holdings imported from a statement |
 | `crates/arvo-execution` | The `Executor` trait, the paper executor, divergence |
 | `crates/arvo-mcp`, `crates/arvo-oauth` | Protocol and authorization, both vendor-agnostic |
@@ -97,7 +98,7 @@ crate — see [ADR-0005](adr/0005-providers-are-earned.md), and note that
 | `Source` | `arvo-data`, next to the library it fills |
 | `Executor` | `arvo-execution`, next to `PaperExecutor` |
 | `SimulationProvider` | `arvo-research`, to invert the dependency |
-| `Correlations` | `arvo-research`, next to the gate that consumes it |
+| `Correlations` | `arvo-risk`, next to the gate that consumes it |
 
 An integration depends only on `arvo-data` and its own protocol crates —
 never on `app/arvo-runtime`. The registry that knows every vendor is the one

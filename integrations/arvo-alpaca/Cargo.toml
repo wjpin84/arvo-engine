@@ -20,4 +20,5 @@ uuid = { version = "1.26", features = ["v5"] }
 
 [dev-dependencies]
 arvo-research.workspace = true
+arvo-risk.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "time"] }
