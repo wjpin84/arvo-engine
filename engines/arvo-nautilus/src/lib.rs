@@ -88,6 +88,8 @@ pub const PUT_SPREAD: &str = "put_spread";
 /// Sell a same-day put spread at a fixed time and settle it, or stop out, by
 /// the close (#87).
 pub const ZERO_DTE_PUT_SPREAD: &str = "zero_dte_put_spread";
+/// Buy a same-day call or put on a break of the session's opening range.
+pub const ZERO_DTE_BREAKOUT: &str = "zero_dte_breakout";
 const OPENING_RANGE: &str = "opening_range";
 const VOLATILITY_BREAKOUT: &str = "volatility_breakout";
 const VWAP_REVERSION: &str = "vwap_reversion";
@@ -108,6 +110,7 @@ pub const STRATEGIES: &[&str] = &[
     BUY_AND_HOLD,
     PUT_SPREAD,
     ZERO_DTE_PUT_SPREAD,
+    ZERO_DTE_BREAKOUT,
 ];
 
 /// Strategies that rank instruments against each other, and therefore need
@@ -210,7 +213,7 @@ impl<P: BarProvider> SimulationProvider for NautilusSimulation<P> {
             .check_instruments()
             .map_err(SimulationError::Rejected)?;
 
-        if matches!(plan, Plan::PutSpread { .. }) {
+        if matches!(plan, Plan::PutSpread { .. } | Plan::ZeroDteBreakout { .. }) {
             return self.run_put_spread(experiment, &plan);
         }
 
@@ -416,8 +419,13 @@ impl<P: BarProvider> NautilusSimulation<P> {
         experiment: &Experiment,
         plan: &Plan,
     ) -> Result<SimulationResult, SimulationError> {
-        let Plan::PutSpread { rule, .. } = *plan else {
-            return Err(SimulationError::Rejected("not a put spread plan".to_owned()));
+        // What the rule can choose from: how far past a day its expirations may
+        // lie, whether it buys calls too, and so which side of the money needs
+        // strikes.
+        let (days_out, calls) = match *plan {
+            Plan::PutSpread { rule, .. } => (rule.dte + 7, false),
+            Plan::ZeroDteBreakout { .. } => (0, true),
+            _ => return Err(SimulationError::Rejected("not a chain plan".to_owned())),
         };
         let rejected = |why: String| SimulationError::Rejected(why);
         let name = experiment.instrument.as_str();
@@ -472,7 +480,7 @@ impl<P: BarProvider> NautilusSimulation<P> {
         }
         let symbol = name.split('.').next().unwrap_or_default();
 
-        let reach = chrono::Duration::days(rule.dte + 7);
+        let reach = chrono::Duration::days(days_out);
         let mut book = Vec::new();
         let mut contracts = Vec::new();
         let listed = self
@@ -483,9 +491,8 @@ impl<P: BarProvider> NautilusSimulation<P> {
             let Some(contract) = arvo_data::option::OptionContract::parse(&contract_name) else {
                 continue;
             };
-            if contract.right != arvo_data::option::Right::Put
-                || contract.expiration < from
-                || contract.expiration > to + reach
+            let is_call = contract.right == arvo_data::option::Right::Call;
+            if (is_call && !calls) || contract.expiration < from || contract.expiration > to + reach
             {
                 continue;
             }
@@ -500,7 +507,12 @@ impl<P: BarProvider> NautilusSimulation<P> {
             let Some((low, high)) = openable else {
                 continue;
             };
-            if contract.strike < low * (1.0 - PUT_SPREAD_REACH) || contract.strike > high {
+            let (floor, ceiling) = if calls {
+                (low * (1.0 - PUT_SPREAD_REACH), high * (1.0 + PUT_SPREAD_REACH))
+            } else {
+                (low * (1.0 - PUT_SPREAD_REACH), high)
+            };
+            if contract.strike < floor || contract.strike > ceiling {
                 continue;
             }
             let bars = self
@@ -517,7 +529,7 @@ impl<P: BarProvider> NautilusSimulation<P> {
         }
         let Some(venue) = book.first().map(|(id, _, _)| id.venue) else {
             return Err(rejected(format!(
-                "no {symbol} puts in the library for {from}..{to} at {}; fetch the chain first",
+                "no {symbol} contracts in the library for {from}..{to} at {}; fetch the chain first",
                 experiment.interval
             )));
         };
@@ -594,6 +606,10 @@ enum Plan {
     },
     PutSpread {
         rule: strategy::PutSpreadRule,
+        trade_size: f64,
+    },
+    ZeroDteBreakout {
+        rule: strategy::BreakoutRule,
         trade_size: f64,
     },
 }
@@ -714,6 +730,54 @@ impl Plan {
             SELL_AND_HOLD => Ok(Self::SellAndHold {
                 trade_size: trade_size()?,
             }),
+            ZERO_DTE_BREAKOUT => {
+                if !interval.is_intraday() {
+                    return Err(SimulationError::Rejected(format!(
+                        "{ZERO_DTE_BREAKOUT} reads a session's opening range and cannot run on \
+                         {interval} bars"
+                    )));
+                }
+                let delta = param("delta")?;
+                if !delta.is_finite() || delta <= 0.0 || delta >= 1.0 {
+                    return Err(SimulationError::Rejected(format!(
+                        "delta must be a fraction between 0 and 1, got {delta}"
+                    )));
+                }
+                let target_multiple = param("target_multiple")?;
+                if !target_multiple.is_finite() || target_multiple <= 1.0 || target_multiple > 20.0 {
+                    return Err(SimulationError::Rejected(format!(
+                        "target_multiple is what the option must reach as a multiple of its price, \
+                         above 1 and no more than 20, got {target_multiple}"
+                    )));
+                }
+                let stop_fraction = param("stop_fraction")?;
+                if !stop_fraction.is_finite() || stop_fraction <= 0.0 || stop_fraction >= 1.0 {
+                    return Err(SimulationError::Rejected(format!(
+                        "stop_fraction is the share of the price lost before selling, between 0 \
+                         and 1, got {stop_fraction}"
+                    )));
+                }
+                let rate = |name: &str| -> Result<f64, SimulationError> {
+                    let value = param(name)?;
+                    if !value.is_finite() || !(0.0..0.5).contains(&value) {
+                        return Err(SimulationError::Rejected(format!(
+                            "{name} is a yearly fraction (0.04 is 4%), got {value}"
+                        )));
+                    }
+                    Ok(value)
+                };
+                Ok(Self::ZeroDteBreakout {
+                    rule: strategy::BreakoutRule {
+                        range_bars: period("range_bars")?,
+                        delta,
+                        target_multiple,
+                        stop_fraction,
+                        rate: rate("rate")?,
+                        dividend_yield: rate("dividend_yield")?,
+                    },
+                    trade_size: trade_size()?,
+                })
+            }
             PUT_SPREAD | ZERO_DTE_PUT_SPREAD => {
                 let same_day = spec.name == ZERO_DTE_PUT_SPREAD;
                 // A month-out spread is chosen on a day's closes; a same-day one
@@ -820,6 +884,8 @@ impl Plan {
             // One to buy on, and at least one more for the position to have
             // done anything.
             Self::BuyAndHold { .. } | Self::SellAndHold { .. } | Self::PutSpread { .. } => 1,
+            // The range has to be formed before a break means anything.
+            Self::ZeroDteBreakout { rule, .. } => rule.range_bars,
         }
     }
 
@@ -833,7 +899,8 @@ impl Plan {
             | Self::CrossSectionalMomentum { trade_size, .. }
             | Self::BuyAndHold { trade_size }
             | Self::SellAndHold { trade_size }
-            | Self::PutSpread { trade_size, .. } => *trade_size,
+            | Self::PutSpread { trade_size, .. }
+            | Self::ZeroDteBreakout { trade_size, .. } => *trade_size,
         }
     }
 }
@@ -1099,6 +1166,29 @@ fn run_backtest(
     // instrument: it has to see every score before it can say which is best.
     // So it is added once, subscribed to all of them, and the per-instrument
     // loop below is skipped entirely.
+    if let (Plan::ZeroDteBreakout { rule, .. }, Some(driver)) = (plan, driver) {
+        let core = StrategyCore::new(StrategyConfig {
+            strategy_id: None,
+            order_id_tag: Some("001".to_owned()),
+            oms_type: Some(OmsType::Netting),
+            ..StrategyConfig::default()
+        });
+        engine
+            .add_strategy(strategy::ZeroDteBreakout::new(
+                core,
+                driver,
+                bar_types.clone(),
+                *rule,
+                risk,
+                trade_size,
+            ))
+            .map_err(|err| rejected("adding the strategy", &err))?;
+        let clock = settlement.map(|settlement| {
+            (format!("{}.{venue}", settlement.symbol), settlement.drive.as_slice())
+        });
+        return finish_marked(engine, experiment, book, clock);
+    }
+
     if let (Plan::PutSpread { rule, .. }, Some(driver)) = (plan, driver) {
         let core = StrategyCore::new(StrategyConfig {
             strategy_id: None,
@@ -1255,7 +1345,9 @@ fn run_backtest(
                 risk,
                 correlations.clone(),
             )),
-            Plan::CrossSectionalMomentum { .. } | Plan::PutSpread { .. } => {
+            Plan::CrossSectionalMomentum { .. }
+            | Plan::PutSpread { .. }
+            | Plan::ZeroDteBreakout { .. } => {
                 // Added once for the whole set above, and returned before
                 // reaching here. The compiler cannot see that, so this says
                 // it rather than pretending the case is possible.
@@ -1929,6 +2021,9 @@ mod tests {
                     ("dividend_yield".to_owned(), 0.013),
                     ("stop_multiple".to_owned(), 2.0),
                     ("entry_minutes".to_owned(), 30.0),
+                    ("delta".to_owned(), 0.5),
+                    ("target_multiple".to_owned(), 2.0),
+                    ("stop_fraction".to_owned(), 0.5),
                 ]),
             };
             // At whichever resolution the rule is defined: the session rules
@@ -2437,11 +2532,14 @@ mod tests {
         let days: std::collections::BTreeSet<chrono::NaiveDate> =
             underlying.iter().map(|bar| bar.at.date()).collect();
         for day in days {
-            for strike in 90..=110 {
+            for (strike, right) in (90..=110).flat_map(|strike| {
+                [arvo_data::option::Right::Put, arvo_data::option::Right::Call]
+                    .map(|right| (strike, right))
+            }) {
                 let contract = arvo_data::option::OptionContract {
                     underlying: "SPY".to_owned(),
                     expiration: day,
-                    right: arvo_data::option::Right::Put,
+                    right,
                     strike: f64::from(strike),
                 };
                 let bars: Vec<arvo_data::Bar> = underlying
@@ -2519,6 +2617,41 @@ mod tests {
             spreads.iter().any(|s| s.exit_reason == arvo_research::ExitReason::Expired),
             "{spreads:?}"
         );
+        assert_eq!(arvo_research::reconcile::reconcile(&run, &result), Vec::new());
+    }
+
+    #[test]
+    fn a_breakout_buys_the_side_that_broke_once_a_session_and_is_out_by_the_close() {
+        let mut run = zero_dte_experiment();
+        run.strategy.name = ZERO_DTE_BREAKOUT.to_owned();
+        run.strategy.params = BTreeMap::from([
+            ("range_bars".to_owned(), 6.0),
+            ("delta".to_owned(), 0.5),
+            ("target_multiple".to_owned(), 2.0),
+            ("stop_fraction".to_owned(), 0.5),
+            ("rate".to_owned(), 0.04),
+            ("dividend_yield".to_owned(), 0.013),
+            ("trade_size".to_owned(), 100.0),
+        ]);
+        let result = NautilusSimulation::new(zero_dte_library()).run(&run).expect("runs");
+        assert!(!result.ledger.is_empty(), "bought nothing");
+
+        let mut days = std::collections::BTreeSet::new();
+        for trade in &result.ledger {
+            let contract = arvo_data::option::OptionContract::parse(&trade.instrument).expect("an option");
+            assert_eq!(trade.direction, arvo_research::Direction::Long);
+            assert!(days.insert(trade.opened.date()), "twice on {}", trade.opened.date());
+            assert_eq!(contract.expiration, trade.opened.date(), "same day");
+            assert_eq!(trade.closed.map(|c| c.date()), Some(trade.opened.date()));
+            // The fixture's sessions alternate: up on even days from 2 January.
+            let session = (trade.opened.date() - date(2024, 1, 2)).num_days();
+            let expected = if session % 2 == 0 {
+                arvo_data::option::Right::Call
+            } else {
+                arvo_data::option::Right::Put
+            };
+            assert_eq!(contract.right, expected, "on {}", trade.opened.date());
+        }
         assert_eq!(arvo_research::reconcile::reconcile(&run, &result), Vec::new());
     }
 
