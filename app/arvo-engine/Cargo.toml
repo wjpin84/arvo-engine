@@ -10,6 +10,7 @@ name = "arvo-engine"
 path = "src/main.rs"
 
 [dependencies]
+arvo-core.workspace = true
 arvo-data.workspace = true
 arvo-nautilus.workspace = true
 arvo-research.workspace = true

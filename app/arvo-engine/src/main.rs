@@ -26,7 +26,7 @@ async fn run() -> Result<(), String> {
         None => research::default_root()?,
     };
 
-    if let Some(found) = discovery::running(&root).await {
+    if let Some(found) = discovery::running(&root) {
         eprintln!(
             "arvo-engine: already running at {} (pid {}); leaving it",
             found.address, found.pid
