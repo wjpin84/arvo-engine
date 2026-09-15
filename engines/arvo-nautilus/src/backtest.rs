@@ -14,7 +14,7 @@ use nautilus_execution::models::{fee::FeeModelHandle, fill::FillModelHandle};
 use nautilus_model::{
     data::{BarSpecification, BarType, Data, IndexPriceUpdate},
     enums::{AccountType, AggregationSource, BookType, OmsType, PriceType},
-    identifiers::{InstrumentId, Symbol},
+    identifiers::{InstrumentId, Symbol, Venue},
     instruments::{IndexInstrument, InstrumentAny},
     types::{Currency, Money, Price, Quantity},
 };
@@ -60,10 +60,6 @@ pub(crate) fn run_backtest(
     book: &[(InstrumentId, String, Vec<arvo_data::Bar>)],
     settlement: Option<&Settlement>,
 ) -> Result<SimulationResult, SimulationError> {
-    let rejected = |context: &str, err: &dyn std::fmt::Display| {
-        SimulationError::Rejected(format!("{context}: {err}"))
-    };
-
     silence_nautilus_logging();
 
     // Checked by the caller, which will not build an empty book.
@@ -73,10 +69,165 @@ pub(crate) fn run_backtest(
         .0
         .venue;
 
+    let currency = Currency::USD();
+    let mut engine = engine_with_venue(experiment, venue, currency)?;
+
+    let (step, aggregation) = aggregation_of(experiment.interval)?;
+    let spec = BarSpecification::new_checked(step, aggregation, PriceType::Last)
+        .map_err(|err| rejected("bar specification", &err))?;
+
+    let bar_types = add_book(&mut engine, experiment, book, spec, currency)?;
+
+    // The underlying, on the option's venue, because that is where Nautilus's
+    // own settlement looks for it — and registered as an *index*, so that an
+    // in-the-money contract is settled in cash at its intrinsic value and an
+    // out-of-the-money one at nothing.
+    //
+    // # Cash, not shares
+    //
+    // SPY options deliver shares, and Nautilus will deliver them if asked. In a
+    // cash account that is wrong more often than right: sizing pays for the
+    // premium, not the strike, so exercising one in-the-money call a $10k
+    // account holds bought $64,000 of SPY it could never have owned, and every
+    // figure afterwards carried six times the account in stock. A broker sells
+    // such a contract at the close instead. Settling at intrinsic value against
+    // the close is that sale, and it is also what delivery nets to wherever the
+    // shares would be sold again — a spread's two legs, or a 0DTE position.
+    // What it does not model is a strategy that means to keep the shares.
+    //
+    // The one price settlement reads is the underlying's index price, so each
+    // expiration gets exactly one: that day's close, a nanosecond before the
+    // contract's expiry fires. Daily bars are stamped at the end of their day,
+    // after 16:00 — without this, a daily run would settle on the day before.
+    let driver = match settlement {
+        Some(settlement) => {
+            add_settlement(&mut engine, experiment, settlement, venue, spec, currency)?
+        }
+        None => None,
+    };
+
+    let trade_size = Quantity::new_checked(plan.trade_size(), SIZE_PRECISION)
+        .map_err(|err| rejected("trade size", &err))?;
+
+    // Risk is expressed as a fraction of capital in the record and as an
+    // amount of money here: the strategy needs a distance-to-loss in the same
+    // units as the price it is stopping against.
+    //
+    // Measured against *starting* capital rather than current equity, so
+    // sizing is fixed-fractional rather than compounding. That is a real and
+    // common choice, but it is a choice — a compounding version risks more
+    // after a win and less after a loss, and would produce a different curve.
+    //
+    // Every member of a book gets the same limits, expressed against the whole
+    // account rather than a share of it. That is deliberate: a per-member cap
+    // of `1/N` would pre-allocate capital and there would be nothing left to
+    // contend for. The contention is the measurement.
+    // The model travels whole rather than as resolved currency amounts. The
+    // fractions are divided out at decision time by `arvo_research::decide`,
+    // which is the same function a live gate calls — so the engine and a live
+    // session cannot drift apart on how a limit is applied.
+    let risk = strategy::Risk {
+        model: experiment.risk,
+        costs: experiment.costs,
+        starting_cash: experiment.starting_cash,
+    };
+
+    // One estimate for the whole run, shared by every strategy instance. A book's
+    // members know nothing of each other, so a per-instrument tracker would only
+    // ever see one series and could not correlate anything with anything.
+    //
+    // Fed from bars as the engine delivers them, never computed over the window
+    // up front — that would refuse a trade in March on the strength of how two
+    // instruments moved in November.
+    let correlations = std::sync::Arc::new(arvo_research::RollingCorrelations::default());
+
+    // A ranking rule is one decision-maker over the whole set, not one per
+    // instrument: it has to see every score before it can say which is best.
+    // So it is added once, subscribed to all of them, and the per-instrument
+    // loop below is skipped entirely.
+    if let (Plan::ZeroDteBreakout { rule, .. }, Some(driver)) = (plan, driver) {
+        let core = shared_core();
+        engine
+            .add_strategy(strategy::ZeroDteBreakout::new(
+                core,
+                driver,
+                bar_types.clone(),
+                *rule,
+                risk,
+                trade_size,
+            ))
+            .map_err(|err| rejected("adding the strategy", &err))?;
+        let clock = settlement.map(|settlement| {
+            (format!("{}.{venue}", settlement.symbol), settlement.drive.as_slice())
+        });
+        return finish_marked(engine, experiment, book, clock);
+    }
+
+    if let (Plan::PutSpread { rule, .. }, Some(driver)) = (plan, driver) {
+        let core = shared_core();
+        engine
+            .add_strategy(strategy::PutSpread::new(
+                core,
+                driver,
+                bar_types.clone(),
+                *rule,
+                risk,
+                trade_size,
+            ))
+            .map_err(|err| rejected("adding the strategy", &err))?;
+        let clock = settlement.map(|settlement| {
+            (format!("{}.{venue}", settlement.symbol), settlement.drive.as_slice())
+        });
+        return finish_marked(engine, experiment, book, clock);
+    }
+
+    if let Plan::CrossSectionalMomentum {
+        lookback, hold_top, ..
+    } = *plan
+    {
+        let core = shared_core();
+        engine
+            .add_strategy(strategy::CrossSectionalMomentum::new(
+                core,
+                bar_types.clone(),
+                trade_size,
+                lookback,
+                hold_top,
+                risk,
+                correlations.clone(),
+            ))
+            .map_err(|err| rejected("adding the strategy", &err))?;
+        return finish(engine, experiment, book);
+    }
+
+    // One strategy instance per instrument, all settling against the one
+    // account added above. This is what makes capital contention real: when two
+    // members want in at the same time, the second is filled out of whatever
+    // the first left, and on a cash account it may not be filled at all. A
+    // simulation that runs each instrument separately with the whole balance
+    // behind it cannot express that, however its results are combined
+    // afterwards.
+    //
+    // The rules themselves are untouched. Each still sees exactly one
+    // instrument; sharing is the account's job, not theirs.
+    add_each(&mut engine, experiment, plan, &bar_types, trade_size, risk, &correlations)?;
+
+    finish(engine, experiment, book)
+}
+
+fn rejected(context: &str, err: &dyn std::fmt::Display) -> SimulationError {
+    SimulationError::Rejected(format!("{context}: {err}"))
+}
+
+/// The engine, with the run's one venue and the fill model its costs call for.
+fn engine_with_venue(
+    experiment: &Experiment,
+    venue: Venue,
+    currency: Currency,
+) -> Result<BacktestEngine, SimulationError> {
     let mut engine = BacktestEngine::new(BacktestEngineConfig::default())
         .map_err(|err| rejected("creating the engine", &err))?;
 
-    let currency = Currency::USD();
     let starting_balance = Money::new_checked(experiment.starting_cash, currency)
         .map_err(|err| rejected("starting cash", &err))?;
 
@@ -120,10 +271,18 @@ pub(crate) fn run_backtest(
         );
     }
 
-    let (step, aggregation) = aggregation_of(experiment.interval)?;
-    let spec = BarSpecification::new_checked(step, aggregation, PriceType::Last)
-        .map_err(|err| rejected("bar specification", &err))?;
+    Ok(engine)
+}
 
+/// Every instrument in the book with its bars, returning each one's bar type
+/// in book order.
+fn add_book(
+    engine: &mut BacktestEngine,
+    experiment: &Experiment,
+    book: &[(InstrumentId, String, Vec<arvo_data::Bar>)],
+    spec: BarSpecification,
+    currency: Currency,
+) -> Result<Vec<BarType>, SimulationError> {
     let mut bar_types = Vec::with_capacity(book.len());
     for (instrument_id, _, bars) in book {
         let instrument = match arvo_data::option::OptionContract::parse(&instrument_id.to_string())
@@ -160,214 +319,108 @@ pub(crate) fn run_backtest(
         bar_types.push(bar_type);
     }
 
-    // The underlying, on the option's venue, because that is where Nautilus's
-    // own settlement looks for it — and registered as an *index*, so that an
-    // in-the-money contract is settled in cash at its intrinsic value and an
-    // out-of-the-money one at nothing.
-    //
-    // # Cash, not shares
-    //
-    // SPY options deliver shares, and Nautilus will deliver them if asked. In a
-    // cash account that is wrong more often than right: sizing pays for the
-    // premium, not the strike, so exercising one in-the-money call a $10k
-    // account holds bought $64,000 of SPY it could never have owned, and every
-    // figure afterwards carried six times the account in stock. A broker sells
-    // such a contract at the close instead. Settling at intrinsic value against
-    // the close is that sale, and it is also what delivery nets to wherever the
-    // shares would be sold again — a spread's two legs, or a 0DTE position.
-    // What it does not model is a strategy that means to keep the shares.
-    //
-    // The one price settlement reads is the underlying's index price, so each
-    // expiration gets exactly one: that day's close, a nanosecond before the
-    // contract's expiry fires. Daily bars are stamped at the end of their day,
-    // after 16:00 — without this, a daily run would settle on the day before.
+    Ok(bar_types)
+}
+
+/// The underlying an option run settles against: an index instrument, its
+/// close on each expiration, and its own bars when a rule reads them. Returns
+/// the bar type of those bars, which then drive the rule.
+fn add_settlement(
+    engine: &mut BacktestEngine,
+    experiment: &Experiment,
+    settlement: &Settlement,
+    venue: Venue,
+    spec: BarSpecification,
+    currency: Currency,
+) -> Result<Option<BarType>, SimulationError> {
     let mut driver: Option<BarType> = None;
-    if let Some(settlement) = settlement {
-        let underlying_id = InstrumentId::from(format!("{}.{venue}", settlement.symbol).as_str());
-        let index = IndexInstrument::builder()
-            .instrument_id(underlying_id)
-            .raw_symbol(Symbol::from(settlement.symbol.as_str()))
-            .currency(currency)
-            .price_precision(PRICE_PRECISION)
-            .size_precision(SIZE_PRECISION)
-            .price_increment(
-                Price::new_checked(0.01, PRICE_PRECISION)
-                    .map_err(|err| rejected("underlying tick", &err))?,
-            )
-            .size_increment(Quantity::from(1))
-            .ts_event(UnixNanos::default())
-            .ts_init(UnixNanos::default())
-            .build()
-            .map_err(|err| rejected("building the underlying", &err))?;
+    let underlying_id = InstrumentId::from(format!("{}.{venue}", settlement.symbol).as_str());
+    let index = IndexInstrument::builder()
+        .instrument_id(underlying_id)
+        .raw_symbol(Symbol::from(settlement.symbol.as_str()))
+        .currency(currency)
+        .price_precision(PRICE_PRECISION)
+        .size_precision(SIZE_PRECISION)
+        .price_increment(
+            Price::new_checked(0.01, PRICE_PRECISION)
+                .map_err(|err| rejected("underlying tick", &err))?,
+        )
+        .size_increment(Quantity::from(1))
+        .ts_event(UnixNanos::default())
+        .ts_init(UnixNanos::default())
+        .build()
+        .map_err(|err| rejected("building the underlying", &err))?;
+    engine
+        .add_instrument(&InstrumentAny::IndexInstrument(index))
+        .map_err(|err| rejected("adding the underlying", &err))?;
+    let prints = settlement
+        .closes
+        .iter()
+        .map(|(contract, close)| {
+            let at = contract
+                .expires_at()
+                .and_utc()
+                .timestamp_nanos_opt()
+                .and_then(|ns| u64::try_from(ns - 1).ok())
+                .ok_or_else(|| {
+                    SimulationError::Rejected(format!(
+                        "{} expiry is not representable",
+                        contract.symbol()
+                    ))
+                })?;
+            // ponytail: rounded to the cent, so a 657.535 close settles at
+            // 657.54 — up to half a cent a share, $0.50 a contract, either
+            // way. Round against each contract's holder if that matters.
+            let price = Price::new_checked(*close, PRICE_PRECISION)
+                .map_err(|err| rejected("underlying close", &err))?;
+            Ok(Data::IndexPrice(IndexPriceUpdate::new(
+                underlying_id,
+                price,
+                UnixNanos::from(at),
+                UnixNanos::from(at),
+            )))
+        })
+        .collect::<Result<Vec<_>, SimulationError>>()?;
+    if !prints.is_empty() {
         engine
-            .add_instrument(&InstrumentAny::IndexInstrument(index))
-            .map_err(|err| rejected("adding the underlying", &err))?;
-        let prints = settlement
-            .closes
+            .add_data(prints, None, true, true)
+            .map_err(|err| rejected("adding settlement prints", &err))?;
+    }
+    if !settlement.drive.is_empty() {
+        let bar_type = BarType::new(underlying_id, spec, AggregationSource::External);
+        let data = settlement
+            .drive
             .iter()
-            .map(|(contract, close)| {
-                let at = contract
-                    .expires_at()
-                    .and_utc()
-                    .timestamp_nanos_opt()
-                    .and_then(|ns| u64::try_from(ns - 1).ok())
-                    .ok_or_else(|| {
-                        SimulationError::Rejected(format!(
-                            "{} expiry is not representable",
-                            contract.symbol()
-                        ))
-                    })?;
-                // ponytail: rounded to the cent, so a 657.535 close settles at
-                // 657.54 — up to half a cent a share, $0.50 a contract, either
-                // way. Round against each contract's holder if that matters.
-                let price = Price::new_checked(*close, PRICE_PRECISION)
-                    .map_err(|err| rejected("underlying close", &err))?;
-                Ok(Data::IndexPrice(IndexPriceUpdate::new(
-                    underlying_id,
-                    price,
-                    UnixNanos::from(at),
-                    UnixNanos::from(at),
-                )))
-            })
-            .collect::<Result<Vec<_>, SimulationError>>()?;
-        if !prints.is_empty() {
-            engine
-                .add_data(prints, None, true, true)
-                .map_err(|err| rejected("adding settlement prints", &err))?;
-        }
-        if !settlement.drive.is_empty() {
-            let bar_type = BarType::new(underlying_id, spec, AggregationSource::External);
-            let data = settlement
-                .drive
-                .iter()
-                .map(|bar| to_nautilus_bar(bar_type, bar, experiment.interval).map(Data::Bar))
-                .collect::<Result<Vec<_>, _>>()?;
-            engine
-                .add_data(data, None, true, true)
-                .map_err(|err| rejected("adding underlying bars", &err))?;
-            driver = Some(bar_type);
-        }
-    }
-
-    let trade_size = Quantity::new_checked(plan.trade_size(), SIZE_PRECISION)
-        .map_err(|err| rejected("trade size", &err))?;
-
-    // Risk is expressed as a fraction of capital in the record and as an
-    // amount of money here: the strategy needs a distance-to-loss in the same
-    // units as the price it is stopping against.
-    //
-    // Measured against *starting* capital rather than current equity, so
-    // sizing is fixed-fractional rather than compounding. That is a real and
-    // common choice, but it is a choice — a compounding version risks more
-    // after a win and less after a loss, and would produce a different curve.
-    //
-    // Every member of a book gets the same limits, expressed against the whole
-    // account rather than a share of it. That is deliberate: a per-member cap
-    // of `1/N` would pre-allocate capital and there would be nothing left to
-    // contend for. The contention is the measurement.
-    // The model travels whole rather than as resolved currency amounts. The
-    // fractions are divided out at decision time by `arvo_research::decide`,
-    // which is the same function a live gate calls — so the engine and a live
-    // session cannot drift apart on how a limit is applied.
-    let risk = strategy::Risk {
-        model: experiment.risk,
-        costs: experiment.costs,
-        starting_cash: experiment.starting_cash,
-    };
-
-    // One estimate for the whole run, shared by every strategy instance. A book's
-    // members know nothing of each other, so a per-instrument tracker would only
-    // ever see one series and could not correlate anything with anything.
-    //
-    // Fed from bars as the engine delivers them, never computed over the window
-    // up front — that would refuse a trade in March on the strength of how two
-    // instruments moved in November.
-    let correlations = std::sync::Arc::new(arvo_research::RollingCorrelations::default());
-
-    // A ranking rule is one decision-maker over the whole set, not one per
-    // instrument: it has to see every score before it can say which is best.
-    // So it is added once, subscribed to all of them, and the per-instrument
-    // loop below is skipped entirely.
-    if let (Plan::ZeroDteBreakout { rule, .. }, Some(driver)) = (plan, driver) {
-        let core = StrategyCore::new(StrategyConfig {
-            strategy_id: None,
-            order_id_tag: Some("001".to_owned()),
-            oms_type: Some(OmsType::Netting),
-            ..StrategyConfig::default()
-        });
+            .map(|bar| to_nautilus_bar(bar_type, bar, experiment.interval).map(Data::Bar))
+            .collect::<Result<Vec<_>, _>>()?;
         engine
-            .add_strategy(strategy::ZeroDteBreakout::new(
-                core,
-                driver,
-                bar_types.clone(),
-                *rule,
-                risk,
-                trade_size,
-            ))
-            .map_err(|err| rejected("adding the strategy", &err))?;
-        let clock = settlement.map(|settlement| {
-            (format!("{}.{venue}", settlement.symbol), settlement.drive.as_slice())
-        });
-        return finish_marked(engine, experiment, book, clock);
+            .add_data(data, None, true, true)
+            .map_err(|err| rejected("adding underlying bars", &err))?;
+        driver = Some(bar_type);
     }
+    Ok(driver)
+}
 
-    if let (Plan::PutSpread { rule, .. }, Some(driver)) = (plan, driver) {
-        let core = StrategyCore::new(StrategyConfig {
-            strategy_id: None,
-            order_id_tag: Some("001".to_owned()),
-            oms_type: Some(OmsType::Netting),
-            ..StrategyConfig::default()
-        });
-        engine
-            .add_strategy(strategy::PutSpread::new(
-                core,
-                driver,
-                bar_types.clone(),
-                *rule,
-                risk,
-                trade_size,
-            ))
-            .map_err(|err| rejected("adding the strategy", &err))?;
-        let clock = settlement.map(|settlement| {
-            (format!("{}.{venue}", settlement.symbol), settlement.drive.as_slice())
-        });
-        return finish_marked(engine, experiment, book, clock);
-    }
+/// The strategy config a rule added once across the whole set runs under.
+fn shared_core() -> StrategyCore {
+    StrategyCore::new(StrategyConfig {
+        strategy_id: None,
+        order_id_tag: Some("001".to_owned()),
+        oms_type: Some(OmsType::Netting),
+        ..StrategyConfig::default()
+    })
+}
 
-    if let Plan::CrossSectionalMomentum {
-        lookback, hold_top, ..
-    } = *plan
-    {
-        let core = StrategyCore::new(StrategyConfig {
-            strategy_id: None,
-            order_id_tag: Some("001".to_owned()),
-            oms_type: Some(OmsType::Netting),
-            ..StrategyConfig::default()
-        });
-        engine
-            .add_strategy(strategy::CrossSectionalMomentum::new(
-                core,
-                bar_types.clone(),
-                trade_size,
-                lookback,
-                hold_top,
-                risk,
-                correlations.clone(),
-            ))
-            .map_err(|err| rejected("adding the strategy", &err))?;
-        return finish(engine, experiment, book);
-    }
-
-    // One strategy instance per instrument, all settling against the one
-    // account added above. This is what makes capital contention real: when two
-    // members want in at the same time, the second is filled out of whatever
-    // the first left, and on a cash account it may not be filled at all. A
-    // simulation that runs each instrument separately with the whole balance
-    // behind it cannot express that, however its results are combined
-    // afterwards.
-    //
-    // The rules themselves are untouched. Each still sees exactly one
-    // instrument; sharing is the account's job, not theirs.
+/// One strategy instance per instrument, on the shared account.
+fn add_each(
+    engine: &mut BacktestEngine,
+    experiment: &Experiment,
+    plan: &Plan,
+    bar_types: &[BarType],
+    trade_size: Quantity,
+    risk: strategy::Risk,
+    correlations: &std::sync::Arc<arvo_research::RollingCorrelations>,
+) -> Result<(), SimulationError> {
     for (index, bar_type) in bar_types.iter().copied().enumerate() {
         let core = StrategyCore::new(StrategyConfig {
             strategy_id: None,
@@ -482,7 +535,7 @@ pub(crate) fn run_backtest(
         .map_err(|err| rejected("adding the strategy", &err))?;
     }
 
-    finish(engine, experiment, book)
+    Ok(())
 }
 
 /// Runs the engine and reads the result back.
