@@ -7,6 +7,7 @@
 
 pub mod registry;
 pub mod source;
+pub mod supervisor;
 
 /// Generated from `protos/arvo/plugin/v1/plugin.proto`.
 pub mod plugin {

@@ -66,13 +66,11 @@ impl PluginRegistry {
         // meaningful status change. See ticket 02 of the arvo-core map.
         let mut entries = Vec::with_capacity(config.plugin.len());
         for plugin in &config.plugin {
-            let (status, sources) = probe(&plugin.address, &granter).await;
-            entries.push(PluginEntry {
-                id: plugin.id.clone(),
-                address: plugin.address.clone(),
-                status,
-                sources,
-            });
+            // A `command` entry is the supervisor's to start; it registers
+            // itself here once it has said where it listens.
+            let Some(address) = plugin.address.clone() else { continue };
+            let (status, sources) = probe(&address, &granter).await;
+            entries.push(PluginEntry { id: plugin.id.clone(), address, status, sources });
         }
 
         Self {
@@ -102,6 +100,12 @@ impl PluginRegistry {
 
         let mut refreshed = Vec::with_capacity(known.len());
         for old in known {
+            // A supervised plugin that is down has no address to probe; what
+            // the supervisor said about it stands until it is back.
+            if old.address.is_empty() {
+                refreshed.push(old);
+                continue;
+            }
             let (new_status, sources) = probe(&old.address, &self.granter).await;
 
             if status_kind(&new_status) != status_kind(&old.status) {
@@ -130,6 +134,62 @@ impl PluginRegistry {
     /// the app appends to its compiled-in sources.
     pub async fn served_sources(&self) -> Vec<GrpcSource> {
         self.entries.read().await.iter().flat_map(|entry| entry.sources.iter().cloned()).collect()
+    }
+
+    /// Registers a plugin that has just said where it listens, probing it.
+    /// Replaces an entry of that id: a supervised plugin restarted lands on a
+    /// new port and is the same plugin.
+    pub async fn add(&self, id: &str, address: String) {
+        let (status, sources) = probe(&address, &self.granter).await;
+        let kind = status_kind(&status);
+        let mut entries = self.entries.write().await;
+        let before = entries.iter().position(|entry| entry.id == id);
+        let changed = before.is_none_or(|at| status_kind(&entries[at].status) != kind);
+        let entry = PluginEntry { id: id.to_owned(), address, status, sources };
+        match before {
+            Some(at) => entries[at] = entry,
+            None => entries.push(entry),
+        }
+        drop(entries);
+        if changed {
+            let _ = self.events.send(Event::PluginStatusChanged { id: id.to_owned(), status: kind });
+        }
+    }
+
+    /// Forgets a plugin. One that was reachable going away is a change.
+    pub async fn remove(&self, id: &str) {
+        let mut entries = self.entries.write().await;
+        let Some(at) = entries.iter().position(|entry| entry.id == id) else { return };
+        let was = status_kind(&entries[at].status);
+        entries.remove(at);
+        drop(entries);
+        if was == StatusKind::Reachable {
+            let _ = self.events.send(Event::PluginStatusChanged { id: id.to_owned(), status: StatusKind::Unreachable });
+        }
+    }
+
+    /// Records why a supervised plugin is not answering, from the one that
+    /// knows. Its sources are gone with it; its address is kept so a
+    /// person can see where it was.
+    pub async fn set_unreachable(&self, id: &str, reason: String) {
+        let mut entries = self.entries.write().await;
+        let status = PluginStatus::Unreachable(reason);
+        let changed = match entries.iter_mut().find(|entry| entry.id == id) {
+            Some(entry) => {
+                let changed = status_kind(&entry.status) != StatusKind::Unreachable;
+                entry.status = status;
+                entry.sources.clear();
+                changed
+            }
+            None => {
+                entries.push(PluginEntry { id: id.to_owned(), address: String::new(), status, sources: Vec::new() });
+                false
+            }
+        };
+        drop(entries);
+        if changed {
+            let _ = self.events.send(Event::PluginStatusChanged { id: id.to_owned(), status: StatusKind::Unreachable });
+        }
     }
 }
 
@@ -190,7 +250,8 @@ mod tests {
         let config = PluginsConfig {
             plugin: vec![PluginConfigEntry {
                 id: "stub".into(),
-                address: "http://127.0.0.1:50061".into(),
+                address: Some("http://127.0.0.1:50061".into()),
+                command: None,
             }],
         };
 
@@ -211,7 +272,8 @@ mod tests {
                 id: "nothing-here".into(),
                 // ponytail: port picked to almost certainly have nothing
                 // listening; a flaky collision would fail loudly, not silently.
-                address: "http://127.0.0.1:50062".into(),
+                address: Some("http://127.0.0.1:50062".into()),
+                command: None,
             }],
         };
 
@@ -233,7 +295,8 @@ mod tests {
         let config = PluginsConfig {
             plugin: vec![PluginConfigEntry {
                 id: "events-stub".into(),
-                address: "http://127.0.0.1:50063".into(),
+                address: Some("http://127.0.0.1:50063".into()),
+                command: None,
             }],
         };
 

@@ -14,9 +14,15 @@ anyhow.workspace = true
 async-trait = "0.1.92"
 chrono.workspace = true
 prost.workspace = true
-tokio.workspace = true
+# process, io-util and net for the supervisor, which spawns and reads a child
+# and binds the port a served plugin hands back.
+tokio = { workspace = true, features = ["process", "io-util", "net", "time", "sync"] }
+# Serving on a listener bound first, so the port can be said before the
+# first request (the handshake).
+tokio-stream = { version = "0.1", features = ["net"] }
 tonic.workspace = true
 tonic-prost.workspace = true
+tracing = "0.1"
 
 [build-dependencies]
 protoc-bin-vendored.workspace = true

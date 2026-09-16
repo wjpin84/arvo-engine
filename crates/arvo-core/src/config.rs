@@ -2,16 +2,16 @@ use serde::Deserialize;
 use std::fmt;
 use std::path::Path;
 
-/// A plugin is a process speaking gRPC at `address`.
-///
-/// There used to be a second, optional `path` for an in-process WASM tier, and
-/// the pair had to be exactly-one-of. Both the field and the validation went
-/// with the tier: a required field enforces the same rule with no code, and
-/// serde reports a missing one better than a hand-written check did.
+/// A plugin is a process speaking gRPC. `address` means a person started it
+/// and Arvo probes it; `command` means Arvo starts it and owns it (ADR-0023
+/// point 3). An entry needs one of the two, which [`load`] checks.
 #[derive(Debug, Deserialize, Clone)]
 pub struct PluginConfigEntry {
     pub id: String,
-    pub address: String,
+    #[serde(default)]
+    pub address: Option<String>,
+    #[serde(default)]
+    pub command: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -30,6 +30,12 @@ pub enum ConfigError {
         path: String,
         source: toml::de::Error,
     },
+    /// Well-formed, and wrong: an entry that says neither where a plugin is
+    /// nor how to start it.
+    Invalid {
+        path: String,
+        detail: String,
+    },
 }
 
 impl fmt::Display for ConfigError {
@@ -37,6 +43,7 @@ impl fmt::Display for ConfigError {
         match self {
             ConfigError::Io { path, source } => write!(f, "failed to read {path}: {source}"),
             ConfigError::Parse { path, source } => write!(f, "failed to parse {path}: {source}"),
+            ConfigError::Invalid { path, detail } => write!(f, "{path}: {detail}"),
         }
     }
 }
@@ -60,10 +67,17 @@ pub fn load(path: &Path) -> Result<PluginsConfig, ConfigError> {
         }
     };
 
-    toml::from_str(&contents).map_err(|source| ConfigError::Parse {
+    let config: PluginsConfig = toml::from_str(&contents).map_err(|source| ConfigError::Parse {
         path: path.display().to_string(),
         source,
-    })
+    })?;
+    if let Some(entry) = config.plugin.iter().find(|entry| entry.address.is_none() && entry.command.is_none()) {
+        return Err(ConfigError::Invalid {
+            path: path.display().to_string(),
+            detail: format!("plugin {:?} has neither an address to probe nor a command to run", entry.id),
+        });
+    }
+    Ok(config)
 }
 
 #[cfg(test)]
@@ -94,7 +108,7 @@ mod tests {
         let config = load(file.path()).unwrap();
         assert_eq!(config.plugin.len(), 2);
         assert_eq!(config.plugin[0].id, "stub");
-        assert_eq!(config.plugin[1].address, "http://127.0.0.1:50052");
+        assert_eq!(config.plugin[1].address.as_deref(), Some("http://127.0.0.1:50052"));
     }
 
     #[test]
@@ -111,16 +125,25 @@ mod tests {
     }
 
     #[test]
-    fn an_entry_with_no_address_is_a_parse_error_rather_than_a_silent_skip() {
-        // Used to be a hand-written InvalidPluginEntry check. serde enforces
-        // it now that `address` is required, and says which field is missing.
+    fn an_entry_with_neither_address_nor_command_is_refused_rather_than_silently_skipped() {
         let file = write_temp(
             r#"
             [[plugin]]
             id = "empty"
             "#,
         );
+        assert!(matches!(load(file.path()), Err(ConfigError::Invalid { .. })));
 
-        assert!(matches!(load(file.path()), Err(ConfigError::Parse { .. })));
+        // Either one is enough: a command entry is the supervisor's to start.
+        let file = write_temp(
+            r#"
+            [[plugin]]
+            id = "mine"
+            command = "target/release/my-plugin --verbose"
+            "#,
+        );
+        let config = load(file.path()).unwrap();
+        assert!(config.plugin[0].address.is_none());
+        assert_eq!(config.plugin[0].command.as_deref(), Some("target/release/my-plugin --verbose"));
     }
 }

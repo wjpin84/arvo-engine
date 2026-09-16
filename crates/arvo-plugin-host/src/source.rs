@@ -49,6 +49,7 @@ use tonic::{Code, Request, Response, Status};
 
 use crate::plugin::plugin_server::{Plugin, PluginServer};
 use crate::plugin::{Capability, GetManifestRequest, Manifest};
+use crate::supervisor::HANDSHAKE;
 
 /// Generated from `protos/arvo/source/v1/source.proto`.
 pub mod v1 {
@@ -694,15 +695,23 @@ impl SourceService for Served {
 
 /// Serves the manifest and the sources at `addr` until the process ends.
 ///
+/// Binds first and says where, as `address=127.0.0.1:PORT` on stdout: the
+/// handshake a supervisor reads (ADR-0023 point 2). `addr` may name port 0,
+/// which is how a supervised plugin is started, and the line then names the
+/// port the OS chose.
+///
 /// # Errors
 ///
 /// The address cannot be bound, or the server fails while running.
-pub async fn serve(addr: SocketAddr, plugin: Served) -> Result<(), tonic::transport::Error> {
+pub async fn serve(addr: SocketAddr, plugin: Served) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    println!("{HANDSHAKE}{}", listener.local_addr()?);
     Server::builder()
         .add_service(PluginServer::new(plugin.clone()))
         .add_service(SourceServer::new(plugin))
-        .serve(addr)
-        .await
+        .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+        .await?;
+    Ok(())
 }
 
 #[cfg(test)]
