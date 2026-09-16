@@ -63,6 +63,15 @@ TradingView Lightweight Charts — Apache License 2.0
 
 --------------------------------------------------------------------------------
 
+xterm.js and its fit addon — MIT License
+  https://github.com/xtermjs/xterm.js (@xterm/xterm v6.0.0, @xterm/addon-fit)
+
+  Vendored at public/vendor/xterm as the package's own UMD builds, unmodified,
+  with the licence beside them (LICENSE.xterm). The integrated terminal's
+  front end; the shell it talks to runs in the runtime through portable-pty
+  (MIT, a Rust crate linked like any other). MIT asks only that the notice
+  travel with the copies, and places no obligation on Arvo's own licensing.
+
 Monaco Editor, web-tree-sitter and tree-sitter-python — MIT License
   https://github.com/microsoft/monaco-editor (v0.56.0)
   https://github.com/tree-sitter/tree-sitter (web-tree-sitter v0.27.0)
