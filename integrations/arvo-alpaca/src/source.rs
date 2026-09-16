@@ -112,6 +112,14 @@ impl Source for Alpaca {
         self.label
     }
 
+    fn vendor_label(&self) -> &'static str {
+        "Alpaca"
+    }
+
+    fn provides(&self) -> &'static [&'static str] {
+        &["bars", "option quotes"]
+    }
+
     fn venue(&self) -> &'static str {
         self.venue
     }

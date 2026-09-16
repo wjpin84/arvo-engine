@@ -146,6 +146,10 @@ impl Source for Robinhood {
         "Robinhood"
     }
 
+    fn provides(&self) -> &'static [&'static str] {
+        &["bars", "quotes", "holdings"]
+    }
+
     fn venue(&self) -> &'static str {
         VENUE
     }
