@@ -55,6 +55,26 @@ impl Env {
             Self::Live => "alpaca-live",
         }
     }
+
+    /// The trading API host for this environment. Paper and live are the same
+    /// API against different money, at different addresses.
+    #[must_use]
+    pub const fn trading_host(self) -> &'static str {
+        match self {
+            Self::Paper => "https://paper-api.alpaca.markets",
+            Self::Live => "https://api.alpaca.markets",
+        }
+    }
+
+    /// The venue a holding imported from this account is filed under: the
+    /// same names the executor trades as, so paper and live never mix.
+    #[must_use]
+    pub const fn venue(self) -> &'static str {
+        match self {
+            Self::Paper => "ALPACA-PAPER",
+            Self::Live => "ALPACA",
+        }
+    }
 }
 
 /// The single keychain entry Alpaca keys used to live under, before paper and

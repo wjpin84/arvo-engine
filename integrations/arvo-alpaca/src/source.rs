@@ -117,7 +117,7 @@ impl Source for Alpaca {
     }
 
     fn provides(&self) -> &'static [&'static str] {
-        &["bars", "option quotes"]
+        &["bars", "option quotes", "holdings"]
     }
 
     fn venue(&self) -> &'static str {
