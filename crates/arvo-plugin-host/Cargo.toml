@@ -29,7 +29,6 @@ protoc-bin-vendored.workspace = true
 tonic-prost-build.workspace = true
 
 [dev-dependencies]
-arvo-plugin-stub = { path = "../../plugins/stub" }
 # For the ignored end-to-end test that clones and builds a real plugin.
 serde_json = "1"
 tempfile = "3"

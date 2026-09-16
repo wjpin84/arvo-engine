@@ -19,7 +19,6 @@ members = [
     "app/arvo-runtime",
     "app/arvo-mcp-server",
     "app/arvo-engine",
-    "plugins/stub",
 ]
 
 # Single source of truth for versions shared across crates, so a bump happens

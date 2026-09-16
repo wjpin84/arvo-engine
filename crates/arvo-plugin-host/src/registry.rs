@@ -244,7 +244,8 @@ mod tests {
     #[tokio::test]
     async fn reachable_plugin_returns_its_manifest() {
         let addr = "127.0.0.1:50061".parse().unwrap();
-        tokio::spawn(arvo_plugin_stub::serve(addr));
+        // A manifest and nothing behind it: all a probe reads.
+        tokio::spawn(crate::source::serve(addr, crate::source::Served::new("stub", "Stub Plugin", "0.1.0", Vec::new())));
         wait_until_serving("http://127.0.0.1:50061").await;
 
         let config = PluginsConfig {
@@ -289,7 +290,7 @@ mod tests {
         use tokio::sync::broadcast::error::TryRecvError;
 
         let addr = "127.0.0.1:50063".parse().unwrap();
-        let handle = tokio::spawn(arvo_plugin_stub::serve(addr));
+        let handle = tokio::spawn(crate::source::serve(addr, crate::source::Served::new("stub", "Stub Plugin", "0.1.0", Vec::new())));
         wait_until_serving("http://127.0.0.1:50063").await;
 
         let config = PluginsConfig {
