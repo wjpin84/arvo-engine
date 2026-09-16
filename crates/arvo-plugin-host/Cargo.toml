@@ -7,7 +7,12 @@ license.workspace = true
 
 [dependencies]
 arvo-core.workspace = true
+# The Source trait, so a plugin-served source is a `dyn Source` like any other.
+arvo-data.workspace = true
 anyhow.workspace = true
+# Dyn-compatible async trait methods, the way `arvo_data::Source` is declared.
+async-trait = "0.1.92"
+chrono.workspace = true
 prost.workspace = true
 tokio.workspace = true
 tonic.workspace = true

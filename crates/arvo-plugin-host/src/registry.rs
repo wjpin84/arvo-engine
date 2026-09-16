@@ -1,5 +1,6 @@
 use crate::plugin::plugin_client::PluginClient;
 use crate::plugin::{GetManifestRequest, Manifest};
+use crate::source::{GrpcSource, SERVICE};
 use arvo_core::config::PluginsConfig;
 use arvo_core::events::{Event, StatusKind};
 use tokio::sync::{broadcast, RwLock};
@@ -15,6 +16,10 @@ pub struct PluginEntry {
     pub id: String,
     pub address: String,
     pub status: PluginStatus,
+    /// What it serves behind `arvo.source.v1.Source`, read when it was last
+    /// reachable and its manifest named the service (ADR-0022 point 2). Empty
+    /// for a plugin that serves something else, or is down.
+    pub sources: Vec<GrpcSource>,
 }
 
 /// Registered != Reachable — see the entry's `status`. A plugin being
@@ -52,11 +57,12 @@ impl PluginRegistry {
         // meaningful status change. See ticket 02 of the arvo-core map.
         let mut entries = Vec::with_capacity(config.plugin.len());
         for plugin in &config.plugin {
-            let status = probe(&plugin.address).await;
+            let (status, sources) = probe(&plugin.address).await;
             entries.push(PluginEntry {
                 id: plugin.id.clone(),
                 address: plugin.address.clone(),
                 status,
+                sources,
             });
         }
 
@@ -86,7 +92,7 @@ impl PluginRegistry {
 
         let mut refreshed = Vec::with_capacity(known.len());
         for old in known {
-            let new_status = probe(&old.address).await;
+            let (new_status, sources) = probe(&old.address).await;
 
             if status_kind(&new_status) != status_kind(&old.status) {
                 let _ = self.events.send(Event::PluginStatusChanged {
@@ -99,6 +105,7 @@ impl PluginRegistry {
                 id: old.id,
                 address: old.address,
                 status: new_status,
+                sources,
             });
         }
 
@@ -108,18 +115,44 @@ impl PluginRegistry {
     pub async fn snapshot(&self) -> Vec<PluginEntry> {
         self.entries.read().await.clone()
     }
+
+    /// Every source every reachable plugin serves, in registry order. What
+    /// the app appends to its compiled-in sources.
+    pub async fn served_sources(&self) -> Vec<GrpcSource> {
+        self.entries.read().await.iter().flat_map(|entry| entry.sources.iter().cloned()).collect()
+    }
 }
 
-async fn probe(address: &str) -> PluginStatus {
+/// The plugin's status, and its sources when its manifest names the service.
+///
+/// Discovery failing is not the plugin being unreachable: it answered its
+/// manifest. It is a plugin that claims a service it cannot describe, which
+/// is reported as reachable with no sources, and logged, rather than hidden
+/// behind an Unreachable that would send someone to check a process that is
+/// running.
+async fn probe(address: &str) -> (PluginStatus, Vec<GrpcSource>) {
     let mut client = match PluginClient::connect(address.to_string()).await {
         Ok(client) => client,
-        Err(err) => return PluginStatus::Unreachable(err.to_string()),
+        Err(err) => return (PluginStatus::Unreachable(err.to_string()), Vec::new()),
     };
 
-    match client.get_manifest(GetManifestRequest {}).await {
-        Ok(response) => PluginStatus::Reachable(response.into_inner()),
-        Err(status) => PluginStatus::Unreachable(status.to_string()),
-    }
+    let manifest = match client.get_manifest(GetManifestRequest {}).await {
+        Ok(response) => response.into_inner(),
+        Err(status) => return (PluginStatus::Unreachable(status.to_string()), Vec::new()),
+    };
+
+    let sources = if manifest.capabilities.iter().any(|capability| capability.name == SERVICE) {
+        match GrpcSource::discover(address).await {
+            Ok(sources) => sources,
+            Err(why) => {
+                eprintln!("plugin {} names {SERVICE} but could not describe it: {why}", manifest.id);
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    (PluginStatus::Reachable(manifest), sources)
 }
 
 #[cfg(test)]
