@@ -56,7 +56,7 @@ pub mod options;
 mod parse;
 mod source;
 
-pub use auth::{forget, store, Keys, CREDENTIAL_ID};
+pub use auth::{forget, has, store, Env, Keys, LEGACY_CREDENTIAL_ID};
 pub use execution::{AlpacaExecutor, DEFAULT_MAX_ORDER_AGE_SECS};
 pub use source::{
     Alpaca, IEX_SOURCE_ID, IEX_TOTAL_RETURN_SOURCE_ID, IEX_TOTAL_RETURN_VENUE, IEX_VENUE,
