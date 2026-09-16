@@ -17,6 +17,18 @@
 //! interval an `Empty` names). So [`SourceError::needs_sign_in`], the one
 //! question every caller asks of an error, survives the boundary.
 //!
+//! # A credential crosses per call, and never whole
+//!
+//! The host reads its keychain and sends what one call needs as a
+//! [`v1::Grant`]; the plugin uses it for that call and holds nothing
+//! (ADR-0022 point 4). On the host, a [`Granter`] answers "what may this
+//! vendor's calls use right now"; the runtime installs one that reads the
+//! keychain, and a source needing a credential the granter cannot supply is
+//! not connected without a round trip. On the plugin, [`Served::with_grants`]
+//! builds the sources for each call from the grant it arrived with, so a call
+//! with no grant is a call with no session whatever the plugin's own machine
+//! holds.
+//!
 //! # `&'static str` across a wire
 //!
 //! The trait names a source with `&'static str` because a compiled-in source
@@ -49,6 +61,18 @@ use v1::source_server::{Source as SourceService, SourceServer};
 /// The service name a manifest lists to say it serves sources (ADR-0022
 /// point 2). A manifest naming it is one the registry may call `Describe` on.
 pub const SERVICE: &str = "arvo.source.v1.Source";
+
+/// What the host hands a plugin for one call, by vendor. `None` when the host
+/// holds nothing for that vendor, which for a source that needs a credential
+/// means not connected.
+pub type Granter = Arc<dyn Fn(&str) -> Option<v1::Grant> + Send + Sync>;
+
+/// A granter that holds nothing: what a test, or a host with no keychain,
+/// hands every plugin.
+#[must_use]
+pub fn no_grants() -> Granter {
+    Arc::new(|_| None)
+}
 
 /// The wire spelling of a bar's opening time. No zone: [`Bar::at`] is naive.
 const AT: &str = "%Y-%m-%dT%H:%M:%S";
@@ -211,6 +235,7 @@ fn error_from(status: &Status, vendor: &'static str, id: &'static str, asked: Op
 #[derive(Clone)]
 pub struct GrpcSource {
     client: SourceClient<Channel>,
+    granter: Granter,
     id: &'static str,
     label: &'static str,
     venue: &'static str,
@@ -237,6 +262,16 @@ impl GrpcSource {
     /// The address is not a URI, the plugin cannot be reached, or a
     /// description is one the trait would refuse (no basis, no id).
     pub async fn discover(address: &str) -> Result<Vec<Self>, String> {
+        Self::discover_with(address, no_grants()).await
+    }
+
+    /// [`Self::discover`], with the granter every call will ask for what it
+    /// may use.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::discover`].
+    pub async fn discover_with(address: &str, granter: Granter) -> Result<Vec<Self>, String> {
         let channel = Channel::from_shared(address.to_owned())
             .map_err(|err| format!("{address:?} is not a plugin address: {err}"))?
             .connect_lazy();
@@ -249,11 +284,11 @@ impl GrpcSource {
         described
             .sources
             .into_iter()
-            .map(|description| Self::from_description(channel.clone(), description))
+            .map(|description| Self::from_description(channel.clone(), description, granter.clone()))
             .collect()
     }
 
-    fn from_description(channel: Channel, description: v1::Description) -> Result<Self, String> {
+    fn from_description(channel: Channel, description: v1::Description, granter: Granter) -> Result<Self, String> {
         if description.id.is_empty() {
             return Err("a source with no id".to_owned());
         }
@@ -293,6 +328,7 @@ impl GrpcSource {
             .collect();
         Ok(Self {
             client: SourceClient::new(channel),
+            granter,
             id,
             label,
             venue: intern(&description.venue),
@@ -309,6 +345,12 @@ impl GrpcSource {
 
     fn error(&self, status: &Status, asked: Option<(&str, BarInterval)>) -> SourceError {
         error_from(status, self.vendor, self.id, asked)
+    }
+
+    /// What this call may use, asked fresh each time: a key stored since the
+    /// last call is usable on this one.
+    fn grant(&self) -> Option<v1::Grant> {
+        (self.granter)(self.vendor)
     }
 }
 
@@ -351,9 +393,16 @@ impl Source for GrpcSource {
     }
 
     async fn connected(&self) -> Result<bool, SourceError> {
+        let grant = self.grant();
+        // A source that needs a credential the host does not hold is not
+        // connected, and that is known here without a round trip: the plugin
+        // would only be asked what it can do with nothing.
+        if self.credential != Credential::None && grant.is_none() {
+            return Ok(false);
+        }
         let mut client = self.client.clone();
         client
-            .connected(v1::SourceId { id: self.id.to_owned() })
+            .connected(v1::SourceId { id: self.id.to_owned(), grant })
             .await
             .map(|reply| reply.into_inner().connected)
             .map_err(|status| self.error(&status, None))
@@ -374,6 +423,7 @@ impl Source for GrpcSource {
                 interval: interval.to_string(),
                 from: from.format(DATE).to_string(),
                 to: to.format(DATE).to_string(),
+                grant: self.grant(),
             })
             .await
             .map_err(|status| self.error(&status, Some((symbol, interval))))?
@@ -390,6 +440,7 @@ impl Source for GrpcSource {
                 symbol: symbol.to_owned(),
                 from: from.format(DATE).to_string(),
                 to: to.format(DATE).to_string(),
+                grant: self.grant(),
             })
             .await
             .map_err(|status| self.error(&status, None))?
@@ -415,6 +466,7 @@ impl Source for GrpcSource {
                 library_root: root.to_string_lossy().into_owned(),
                 query: query.to_owned(),
                 limit: u32::try_from(limit).unwrap_or(u32::MAX),
+                grant: self.grant(),
             })
             .await
             .map_err(|status| self.error(&status, None))?
@@ -435,7 +487,7 @@ impl Source for GrpcSource {
     async fn quotes(&self, instruments: &[String]) -> Result<Vec<Quote>, SourceError> {
         let mut client = self.client.clone();
         let reply = client
-            .quotes(v1::QuotesRequest { id: self.id.to_owned(), instruments: instruments.to_vec() })
+            .quotes(v1::QuotesRequest { id: self.id.to_owned(), instruments: instruments.to_vec(), grant: self.grant() })
             .await
             .map_err(|status| self.error(&status, None))?
             .into_inner();
@@ -449,11 +501,46 @@ impl Source for GrpcSource {
 
 // ---- the plugin's half -------------------------------------------------------------
 
+/// Builds a plugin's sources for one call from the grant it brought.
+type Build = Box<dyn Fn(Option<&v1::Grant>) -> Vec<Box<dyn Source>> + Send + Sync>;
+
+/// How a plugin's sources come to be for a call.
+enum Sources {
+    /// Built once, for sources that need nothing from the caller.
+    Fixed(Vec<Box<dyn Source>>),
+    /// Built per call from the grant that arrived with it, so a credential
+    /// lives exactly as long as the call that carried it.
+    PerGrant(Build),
+}
+
+/// The sources for one call: borrowed from a fixed set, or built for it.
+enum Found<'a> {
+    Borrowed(&'a [Box<dyn Source>]),
+    Owned(Vec<Box<dyn Source>>),
+}
+
+impl Found<'_> {
+    fn all(&self) -> &[Box<dyn Source>] {
+        match self {
+            Found::Borrowed(sources) => sources,
+            Found::Owned(sources) => sources,
+        }
+    }
+
+    fn find(&self, id: &str) -> Result<&dyn Source, Status> {
+        self.all()
+            .iter()
+            .find(|source| source.id() == id)
+            .map(AsRef::as_ref)
+            .ok_or_else(|| Status::not_found(format!("this plugin serves no source called {id:?}")))
+    }
+}
+
 struct Inner {
     id: String,
     name: String,
     version: String,
-    sources: Vec<Box<dyn Source>>,
+    sources: Sources,
 }
 
 /// What a plugin binary serves: its manifest, and the sources behind
@@ -467,16 +554,37 @@ impl Served {
     /// version, which is why it is a parameter rather than this crate's.
     #[must_use]
     pub fn new(id: &str, name: &str, version: &str, sources: Vec<Box<dyn Source>>) -> Self {
-        Self(Arc::new(Inner { id: id.to_owned(), name: name.to_owned(), version: version.to_owned(), sources }))
+        Self(Arc::new(Inner {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            version: version.to_owned(),
+            sources: Sources::Fixed(sources),
+        }))
     }
 
-    fn find(&self, id: &str) -> Result<&dyn Source, Status> {
-        self.0
-            .sources
-            .iter()
-            .find(|source| source.id() == id)
-            .map(AsRef::as_ref)
-            .ok_or_else(|| Status::not_found(format!("this plugin serves no source called {id:?}")))
+    /// A plugin whose sources need what the call brings. `build` is given the
+    /// call's grant, `None` when it brought none, and returns the sources as
+    /// they stand for that call; it must hand a source only what it was given.
+    #[must_use]
+    pub fn with_grants(
+        id: &str,
+        name: &str,
+        version: &str,
+        build: impl Fn(Option<&v1::Grant>) -> Vec<Box<dyn Source>> + Send + Sync + 'static,
+    ) -> Self {
+        Self(Arc::new(Inner {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            version: version.to_owned(),
+            sources: Sources::PerGrant(Box::new(build)),
+        }))
+    }
+
+    fn sources(&self, grant: Option<&v1::Grant>) -> Found<'_> {
+        match &self.0.sources {
+            Sources::Fixed(sources) => Found::Borrowed(sources),
+            Sources::PerGrant(build) => Found::Owned(build(grant)),
+        }
     }
 }
 
@@ -490,12 +598,11 @@ impl Plugin for Served {
             api_version: "v1".to_owned(),
             capabilities: vec![Capability {
                 name: SERVICE.to_owned(),
-                description: format!(
-                    "{} source{}: {}",
-                    self.0.sources.len(),
-                    if self.0.sources.len() == 1 { "" } else { "s" },
-                    self.0.sources.iter().map(|s| s.id()).collect::<Vec<_>>().join(", ")
-                ),
+                description: {
+                    let sources = self.sources(None);
+                    let ids: Vec<&str> = sources.all().iter().map(|s| s.id()).collect();
+                    format!("{} source{}: {}", ids.len(), if ids.len() == 1 { "" } else { "s" }, ids.join(", "))
+                },
             }],
         }))
     }
@@ -505,19 +612,22 @@ impl Plugin for Served {
 impl SourceService for Served {
     async fn describe(&self, _request: Request<v1::Empty>) -> Result<Response<v1::Descriptions>, Status> {
         Ok(Response::new(v1::Descriptions {
-            sources: self.0.sources.iter().map(|source| describe(source.as_ref())).collect(),
+            sources: self.sources(None).all().iter().map(|source| describe(source.as_ref())).collect(),
         }))
     }
 
     async fn connected(&self, request: Request<v1::SourceId>) -> Result<Response<v1::ConnectedReply>, Status> {
-        let source = self.find(&request.into_inner().id)?;
+        let request = request.into_inner();
+        let sources = self.sources(request.grant.as_ref());
+        let source = sources.find(&request.id)?;
         let connected = source.connected().await.map_err(status_from)?;
         Ok(Response::new(v1::ConnectedReply { connected }))
     }
 
     async fn bars(&self, request: Request<v1::BarsRequest>) -> Result<Response<v1::BarsReply>, Status> {
         let request = request.into_inner();
-        let source = self.find(&request.id)?;
+        let sources = self.sources(request.grant.as_ref());
+        let source = sources.find(&request.id)?;
         let interval: BarInterval = request
             .interval
             .parse()
@@ -533,7 +643,8 @@ impl SourceService for Served {
 
     async fn dividends(&self, request: Request<v1::DividendsRequest>) -> Result<Response<v1::DividendsReply>, Status> {
         let request = request.into_inner();
-        let source = self.find(&request.id)?;
+        let sources = self.sources(request.grant.as_ref());
+        let source = sources.find(&request.id)?;
         let from = date_from_wire(&request.from, "from")?;
         let to = date_from_wire(&request.to, "to")?;
         let dividends = source.dividends(&request.symbol, from, to).await.map_err(status_from)?;
@@ -547,7 +658,8 @@ impl SourceService for Served {
 
     async fn search(&self, request: Request<v1::SearchRequest>) -> Result<Response<v1::Matches>, Status> {
         let request = request.into_inner();
-        let source = self.find(&request.id)?;
+        let sources = self.sources(request.grant.as_ref());
+        let source = sources.find(&request.id)?;
         let matches = source
             .search(Path::new(&request.library_root), &request.query, request.limit as usize)
             .await
@@ -568,7 +680,8 @@ impl SourceService for Served {
 
     async fn quotes(&self, request: Request<v1::QuotesRequest>) -> Result<Response<v1::QuotesReply>, Status> {
         let request = request.into_inner();
-        let source = self.find(&request.id)?;
+        let sources = self.sources(request.grant.as_ref());
+        let source = sources.find(&request.id)?;
         let quotes = source.quotes(&request.instruments).await.map_err(status_from)?;
         Ok(Response::new(v1::QuotesReply {
             quotes: quotes
@@ -655,7 +768,7 @@ mod tests {
     // `connect_lazy` still wants a reactor to hand the channel to.
     #[tokio::test]
     async fn a_description_keeps_every_declaration_through_the_wire() {
-        let source = GrpcSource::from_description(lazy(), describe(&Fake)).expect("a described source");
+        let source = GrpcSource::from_description(lazy(), describe(&Fake), no_grants()).expect("a described source");
         assert_eq!(source.id(), "fake-tr");
         assert_eq!(source.label(), "Fake (total return)");
         assert_eq!(source.venue(), "FAKETR");
@@ -673,7 +786,7 @@ mod tests {
     async fn a_source_without_a_basis_is_refused_not_defaulted() {
         let mut description = describe(&Fake);
         description.basis = None;
-        assert!(GrpcSource::from_description(lazy(), description).is_err());
+        assert!(GrpcSource::from_description(lazy(), description, no_grants()).is_err());
     }
 
     #[test]
@@ -705,6 +818,68 @@ mod tests {
         ));
     }
 
+    /// A source that is only what its grant made it: no key, no session.
+    struct Keyed(Option<String>);
+
+    #[async_trait::async_trait]
+    impl Source for Keyed {
+        fn id(&self) -> &'static str {
+            "keyed"
+        }
+        fn label(&self) -> &'static str {
+            "Keyed"
+        }
+        fn venue(&self) -> &'static str {
+            "KEY"
+        }
+        fn credential(&self) -> Credential {
+            Credential::Keys
+        }
+        fn basis(&self) -> Basis {
+            Basis { feed: Feed::Consolidated, adjustment: Adjustment::Split }
+        }
+        async fn connected(&self) -> Result<bool, SourceError> {
+            Ok(self.0.is_some())
+        }
+        async fn bars(&self, _: &str, _: BarInterval, _: NaiveDate, _: NaiveDate) -> Result<Fetched, SourceError> {
+            match &self.0 {
+                None => Err(SourceError::NoSession { vendor: "keyed" }),
+                Some(_) => Ok(Fetched::default()),
+            }
+        }
+    }
+
+    /// The credential pattern end to end: the host's granter decides what a
+    /// call carries, the plugin builds the source from exactly that, and a
+    /// call with nothing is no session on both sides.
+    #[tokio::test]
+    async fn a_grant_crosses_per_call_and_its_absence_is_no_session() {
+        let addr: SocketAddr = "127.0.0.1:50072".parse().expect("an address");
+        let plugin = Served::with_grants("keyed", "Keyed Plugin", "0.0.0", |grant| {
+            vec![Box::new(Keyed(grant.map(|g| g.key_id.clone()).filter(|k| !k.is_empty())))]
+        });
+        tokio::spawn(serve(addr, plugin));
+        wait_until_serving("http://127.0.0.1:50072").await;
+        let day = NaiveDate::from_ymd_opt(2026, 1, 30).expect("a date");
+
+        // The host holds nothing: not connected, without asking; and a fetch
+        // is refused by the plugin as no session.
+        let empty = GrpcSource::discover_with("http://127.0.0.1:50072", no_grants()).await.expect("discovered");
+        assert_eq!(empty[0].credential(), Credential::Keys);
+        assert!(!empty[0].connected().await.expect("asked"));
+        let refused = empty[0].bars("SPY", BarInterval::DAILY, day, day).await.expect_err("nothing to sign with");
+        assert!(refused.needs_sign_in(), "{refused:?}");
+
+        // The host holds a key for this vendor: it crosses with the call and
+        // the plugin is connected for exactly that call.
+        let granter: Granter = Arc::new(|vendor| {
+            (vendor == "keyed").then(|| v1::Grant { key_id: "k".into(), secret: "s".into(), bearer: String::new() })
+        });
+        let keyed = GrpcSource::discover_with("http://127.0.0.1:50072", granter).await.expect("discovered");
+        assert!(keyed[0].connected().await.expect("asked"));
+        assert!(keyed[0].bars("SPY", BarInterval::DAILY, day, day).await.is_ok());
+    }
+
     async fn wait_until_serving(address: &str) {
         for _ in 0..50 {
             if SourceClient::connect(address.to_owned()).await.is_ok() {
@@ -722,7 +897,10 @@ mod tests {
         tokio::spawn(serve(addr, plugin));
         wait_until_serving("http://127.0.0.1:50071").await;
 
-        let found = GrpcSource::discover("http://127.0.0.1:50071").await.expect("discovered");
+        // Fake declares Keys, so without a grant the host would not even ask.
+        let granter: Granter =
+            Arc::new(|_| Some(v1::Grant { key_id: "k".into(), secret: "s".into(), bearer: String::new() }));
+        let found = GrpcSource::discover_with("http://127.0.0.1:50071", granter).await.expect("discovered");
         assert_eq!(found.len(), 1);
         let source = &found[0];
         assert_eq!(source.id(), "fake-tr");

@@ -192,8 +192,26 @@ mod tests {
 
 /// One authenticated GET with the data keys (paper first, then live).
 pub(crate) async fn get(url: &str) -> Result<Value, SourceError> {
-    let response = authorized(reqwest::Client::new().get(url), keys()?).await?;
+    get_with(keys()?, url).await
+}
+
+/// One authenticated GET with exactly `keys`, which may be none: a call that
+/// arrived with no keys is a call with no session, and nothing here goes
+/// looking for a pair the caller did not hand over.
+pub(crate) async fn get_with(keys: Option<Keys>, url: &str) -> Result<Value, SourceError> {
+    let response = authorized(reqwest::Client::new().get(url), keys).await?;
     response.json().await.map_err(transport)
+}
+
+/// The key pair a data call would use, from the keychain (paper first, then
+/// live) or the environment. What the app reads to hand a plugin its grant
+/// (ADR-0022 point 4): the app reads the keychain, the plugin never does.
+///
+/// # Errors
+///
+/// Returns [`SourceError::Credential`] if the keychain cannot be read.
+pub fn stored_keys() -> Result<Option<Keys>, SourceError> {
+    keys()
 }
 
 /// One authenticated GET with a specific environment's keys, for execution:

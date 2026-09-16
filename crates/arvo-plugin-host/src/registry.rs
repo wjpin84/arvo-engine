@@ -1,6 +1,6 @@
 use crate::plugin::plugin_client::PluginClient;
 use crate::plugin::{GetManifestRequest, Manifest};
-use crate::source::{GrpcSource, SERVICE};
+use crate::source::{no_grants, GrpcSource, Granter, SERVICE};
 use arvo_core::config::PluginsConfig;
 use arvo_core::events::{Event, StatusKind};
 use tokio::sync::{broadcast, RwLock};
@@ -39,6 +39,8 @@ pub struct PluginEntry {
 pub struct PluginRegistry {
     entries: RwLock<Vec<PluginEntry>>,
     events: broadcast::Sender<Event>,
+    /// What a plugin-served source may use per call (ADR-0022 point 4).
+    granter: Granter,
 }
 
 fn status_kind(status: &PluginStatus) -> StatusKind {
@@ -50,6 +52,13 @@ fn status_kind(status: &PluginStatus) -> StatusKind {
 
 impl PluginRegistry {
     pub async fn connect(config: &PluginsConfig) -> Self {
+        Self::connect_with(config, no_grants()).await
+    }
+
+    /// [`Self::connect`], with the granter every plugin-served source asks
+    /// for what its calls may use. The app installs one that reads the
+    /// keychain; a host with no keychain, or a test, installs none.
+    pub async fn connect_with(config: &PluginsConfig, granter: Granter) -> Self {
         let (events, _) = broadcast::channel(16);
 
         // No events published here — there's no prior state for anything to
@@ -57,7 +66,7 @@ impl PluginRegistry {
         // meaningful status change. See ticket 02 of the arvo-core map.
         let mut entries = Vec::with_capacity(config.plugin.len());
         for plugin in &config.plugin {
-            let (status, sources) = probe(&plugin.address).await;
+            let (status, sources) = probe(&plugin.address, &granter).await;
             entries.push(PluginEntry {
                 id: plugin.id.clone(),
                 address: plugin.address.clone(),
@@ -69,6 +78,7 @@ impl PluginRegistry {
         Self {
             entries: RwLock::new(entries),
             events,
+            granter,
         }
     }
 
@@ -92,7 +102,7 @@ impl PluginRegistry {
 
         let mut refreshed = Vec::with_capacity(known.len());
         for old in known {
-            let (new_status, sources) = probe(&old.address).await;
+            let (new_status, sources) = probe(&old.address, &self.granter).await;
 
             if status_kind(&new_status) != status_kind(&old.status) {
                 let _ = self.events.send(Event::PluginStatusChanged {
@@ -130,7 +140,7 @@ impl PluginRegistry {
 /// is reported as reachable with no sources, and logged, rather than hidden
 /// behind an Unreachable that would send someone to check a process that is
 /// running.
-async fn probe(address: &str) -> (PluginStatus, Vec<GrpcSource>) {
+async fn probe(address: &str, granter: &Granter) -> (PluginStatus, Vec<GrpcSource>) {
     let mut client = match PluginClient::connect(address.to_string()).await {
         Ok(client) => client,
         Err(err) => return (PluginStatus::Unreachable(err.to_string()), Vec::new()),
@@ -142,7 +152,7 @@ async fn probe(address: &str) -> (PluginStatus, Vec<GrpcSource>) {
     };
 
     let sources = if manifest.capabilities.iter().any(|capability| capability.name == SERVICE) {
-        match GrpcSource::discover(address).await {
+        match GrpcSource::discover_with(address, granter.clone()).await {
             Ok(sources) => sources,
             Err(why) => {
                 eprintln!("plugin {} names {SERVICE} but could not describe it: {why}", manifest.id);
