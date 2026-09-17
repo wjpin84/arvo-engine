@@ -24,7 +24,7 @@
 
 use crate::plugin::plugin_client::PluginClient;
 use crate::plugin::{GetManifestRequest, Manifest};
-use crate::source::{no_grants, GrpcSource, Granter, SERVICE};
+use crate::source::{no_grants, with_token, GrpcSource, Granter, Token, SERVICE};
 use arvo_core::config::PluginsConfig;
 use arvo_core::events::{Event, StatusKind};
 use tokio::sync::{broadcast, RwLock};
@@ -57,6 +57,9 @@ pub struct PluginEntry {
     /// reachable and its manifest named the service (ADR-0022 point 2). Empty
     /// for a plugin that serves something else, or is down.
     pub sources: Vec<GrpcSource>,
+    /// The token the supervisor started it with, sent on every call. `None`
+    /// for a plugin a person started, which answers everyone.
+    pub token: Option<Token>,
 }
 
 /// The one tier of plugins: processes speaking gRPC.
@@ -93,8 +96,8 @@ impl PluginRegistry {
             // A `command` entry is the supervisor's to start; it registers
             // itself here once it has said where it listens.
             let Some(address) = plugin.address.clone() else { continue };
-            let (status, sources) = probe(&address, &granter).await;
-            entries.push(PluginEntry { id: plugin.id.clone(), address, status, sources });
+            let (status, sources) = probe(&address, &granter, None).await;
+            entries.push(PluginEntry { id: plugin.id.clone(), address, status, sources, token: None });
         }
         Self { entries: RwLock::new(entries), events, granter }
     }
@@ -117,9 +120,9 @@ impl PluginRegistry {
                 refreshed.push(old);
                 continue;
             }
-            let (status, sources) = probe(&old.address, &self.granter).await;
+            let (status, sources) = probe(&old.address, &self.granter, old.token.as_ref()).await;
             self.announce(&old.id, Some(old.status.kind()), status.kind());
-            refreshed.push(PluginEntry { id: old.id, address: old.address, status, sources });
+            refreshed.push(PluginEntry { id: old.id, address: old.address, status, sources, token: old.token });
         }
         *self.entries.write().await = refreshed;
     }
@@ -135,14 +138,14 @@ impl PluginRegistry {
         self.entries.read().await.iter().flat_map(|entry| entry.sources.iter().cloned()).collect()
     }
 
-    /// Registers a plugin that has just said where it listens, probing it.
-    /// Replaces an entry of that id: a supervised plugin restarted lands on a
-    /// new port and is the same plugin.
-    pub async fn add(&self, id: &str, address: String) {
-        let (status, sources) = probe(&address, &self.granter).await;
+    /// Registers a plugin that has just said where it listens, probing it
+    /// with the token it was started with. Replaces an entry of that id: a
+    /// supervised plugin restarted lands on a new port and is the same plugin.
+    pub async fn add(&self, id: &str, address: String, token: Option<Token>) {
+        let (status, sources) = probe(&address, &self.granter, token.as_ref()).await;
         let now = status.kind();
         let mut entries = self.entries.write().await;
-        let entry = PluginEntry { id: id.to_owned(), address, status, sources };
+        let entry = PluginEntry { id: id.to_owned(), address, status, sources, token };
         let was = match entries.iter().position(|entry| entry.id == id) {
             Some(at) => Some(std::mem::replace(&mut entries[at], entry).status.kind()),
             None => {
@@ -177,7 +180,7 @@ impl PluginRegistry {
                 Some(was)
             }
             None => {
-                entries.push(PluginEntry { id: id.to_owned(), address: String::new(), status, sources: Vec::new() });
+                entries.push(PluginEntry { id: id.to_owned(), address: String::new(), status, sources: Vec::new(), token: None });
                 None
             }
         };
@@ -206,17 +209,17 @@ impl PluginRegistry {
 /// is reported as reachable with no sources, and logged, rather than hidden
 /// behind an Unreachable that would send someone to check a process that is
 /// running.
-async fn probe(address: &str, granter: &Granter) -> (PluginStatus, Vec<GrpcSource>) {
+async fn probe(address: &str, granter: &Granter, token: Option<&Token>) -> (PluginStatus, Vec<GrpcSource>) {
     let mut client = match PluginClient::connect(address.to_string()).await {
         Ok(client) => client,
         Err(err) => return (PluginStatus::Unreachable(err.to_string()), Vec::new()),
     };
-    let manifest = match client.get_manifest(GetManifestRequest {}).await {
+    let manifest = match client.get_manifest(with_token(GetManifestRequest {}, token)).await {
         Ok(response) => response.into_inner(),
         Err(status) => return (PluginStatus::Unreachable(status.to_string()), Vec::new()),
     };
     let sources = if manifest.capabilities.iter().any(|capability| capability.name == SERVICE) {
-        match GrpcSource::discover_with(address, granter.clone()).await {
+        match GrpcSource::discover_as(address, granter.clone(), token.cloned()).await {
             Ok(sources) => sources,
             Err(why) => {
                 tracing::warn!(plugin = %manifest.id, why, "names {SERVICE} but could not describe it");
@@ -331,7 +334,7 @@ mod tests {
         assert_eq!(registry.snapshot().await[0].address, "", "no address until it says so");
 
         let _serving = manifest_only(50064).await;
-        registry.add("mine", "http://127.0.0.1:50064".into()).await;
+        registry.add("mine", "http://127.0.0.1:50064".into(), None).await;
         assert!(matches!(events.try_recv(), Ok(Event::PluginStatusChanged { status: StatusKind::Reachable, .. })));
 
         registry.set_unreachable("mine", "exited".into()).await;

@@ -15,6 +15,14 @@
 //! The supervisor reads stdout until that line appears; everything after it,
 //! and everything on stderr, goes to the log under the child's id.
 //!
+//! # A child answers only the Arvo that started it
+//!
+//! The port is loopback and chosen by the OS, and anything on the machine
+//! could still connect to it. So every spawn is handed a fresh [`Token`] in
+//! its environment, the registry sends it on every call, and the child
+//! refuses a call without it. A restart is a new token: nothing that learned
+//! the old one keeps a way in.
+//!
 //! # Restart is a policy, not a default
 //!
 //! [`Restart::UpTo`] restarts a child that exits, with a doubling pause, and
@@ -33,6 +41,7 @@ use tokio::sync::{Mutex, Notify};
 use tokio::task::JoinHandle;
 
 use crate::registry::PluginRegistry;
+use crate::source::{Token, TOKEN_ENV};
 
 /// The variable a supervised child reads its address from.
 pub const ADDRESS_ENV: &str = "ARVO_PLUGIN_ADDR";
@@ -154,11 +163,13 @@ async fn halt(running: Running) {
 async fn run(id: String, launch: Launch, registry: Arc<PluginRegistry>, stop: Arc<Notify>) {
     let mut exits = 0u32;
     loop {
+        let token = Token::fresh();
         let mut command = Command::new(&launch.program);
         command
             .args(&launch.args)
             .current_dir(&launch.cwd)
             .env(ADDRESS_ENV, "127.0.0.1:0")
+            .env(TOKEN_ENV, token.expose())
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -193,7 +204,7 @@ async fn run(id: String, launch: Launch, registry: Arc<PluginRegistry>, stop: Ar
             () = tokio::time::sleep(HANDSHAKE_WAIT) => None,
         };
         match address {
-            Some(address) => registry.add(&id, address).await,
+            Some(address) => registry.add(&id, address, Some(token)).await,
             None => {
                 registry.set_unreachable(&id, format!("never said its address ({HANDSHAKE}...) on stdout")).await;
                 let _ = child.kill().await;

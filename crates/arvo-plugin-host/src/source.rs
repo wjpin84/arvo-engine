@@ -29,6 +29,14 @@
 //! with no grant is a call with no session whatever the plugin's own machine
 //! holds.
 //!
+//! # A supervised plugin answers only the Arvo that started it
+//!
+//! The port is loopback and chosen by the OS, and anything on the machine
+//! could still connect to it. So the supervisor mints a [`Token`] per spawn,
+//! hands it to the child in its environment, and sends it with every call;
+//! the child refuses a call without it. A plugin a person starts by hand has
+//! no token and answers everyone, which is what starting it by hand means.
+//!
 //! # `&'static str` across a wire
 //!
 //! The trait names a source with `&'static str` because a compiled-in source
@@ -62,6 +70,76 @@ use v1::source_server::{Source as SourceService, SourceServer};
 /// The service name a manifest lists to say it serves sources (ADR-0022
 /// point 2). A manifest naming it is one the registry may call `Describe` on.
 pub const SERVICE: &str = "arvo.source.v1.Source";
+
+/// The variable a supervised plugin reads its token from.
+pub const TOKEN_ENV: &str = "ARVO_PLUGIN_TOKEN";
+/// The metadata key a call carries the token under.
+const TOKEN_KEY: &str = "arvo-token";
+
+/// What a supervised plugin requires on every call: a secret shared with
+/// the Arvo that started it and nothing else on the machine. Never printed.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Token(String);
+
+impl Token {
+    /// A fresh one, from the OS's randomness.
+    #[must_use]
+    pub fn fresh() -> Self {
+        let bytes: [u8; 32] = rand::random();
+        Self(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+    }
+
+    /// The one a supervised plugin was handed, if it was.
+    #[must_use]
+    pub fn from_env() -> Option<Self> {
+        std::env::var(TOKEN_ENV).ok().filter(|text| !text.is_empty()).map(Self)
+    }
+
+    /// The text to hand a child. It is a secret; hand it, do not log it.
+    #[must_use]
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+
+    /// Whether `presented` is this token, in time that does not depend on
+    /// where they first differ.
+    fn matches(&self, presented: &str) -> bool {
+        let (mine, theirs) = (self.0.as_bytes(), presented.as_bytes());
+        mine.len() == theirs.len() && mine.iter().zip(theirs).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
+    }
+}
+
+impl std::fmt::Debug for Token {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Token(..)")
+    }
+}
+
+/// A request carrying `token`, when there is one.
+pub(crate) fn with_token<T>(message: T, token: Option<&Token>) -> Request<T> {
+    let mut request = Request::new(message);
+    if let Some(token) = token {
+        if let Ok(value) = tonic::metadata::MetadataValue::try_from(token.expose()) {
+            request.metadata_mut().insert(TOKEN_KEY, value);
+        }
+    }
+    request
+}
+
+/// The check a supervised plugin runs on every call: the token, or nothing.
+fn gate(token: Option<Token>) -> impl Fn(Request<()>) -> Result<Request<()>, Status> + Clone {
+    move |request| match &token {
+        None => Ok(request),
+        Some(expected) => {
+            let presented = request.metadata().get(TOKEN_KEY).and_then(|value| value.to_str().ok());
+            if presented.is_some_and(|presented| expected.matches(presented)) {
+                Ok(request)
+            } else {
+                Err(Status::unauthenticated("this plugin answers only the Arvo that started it"))
+            }
+        }
+    }
+}
 
 /// What the host hands a plugin for one call, by vendor. `None` when the host
 /// holds nothing for that vendor, which for a source that needs a credential
@@ -237,6 +315,7 @@ fn error_from(status: &Status, vendor: &'static str, id: &'static str, asked: Op
 pub struct GrpcSource {
     client: SourceClient<Channel>,
     granter: Granter,
+    token: Option<Token>,
     id: &'static str,
     label: &'static str,
     venue: &'static str,
@@ -273,23 +352,38 @@ impl GrpcSource {
     ///
     /// As [`Self::discover`].
     pub async fn discover_with(address: &str, granter: Granter) -> Result<Vec<Self>, String> {
+        Self::discover_as(address, granter, None).await
+    }
+
+    /// [`Self::discover_with`], presenting `token` on this and every later
+    /// call: how the supervisor's registry reaches a plugin it started.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::discover`], and a plugin that refuses the token.
+    pub async fn discover_as(address: &str, granter: Granter, token: Option<Token>) -> Result<Vec<Self>, String> {
         let channel = Channel::from_shared(address.to_owned())
             .map_err(|err| format!("{address:?} is not a plugin address: {err}"))?
             .connect_lazy();
         let mut client = SourceClient::new(channel.clone());
         let described = client
-            .describe(v1::Empty {})
+            .describe(with_token(v1::Empty {}, token.as_ref()))
             .await
             .map_err(|status| format!("{address}: {}", status.message()))?
             .into_inner();
         described
             .sources
             .into_iter()
-            .map(|description| Self::from_description(channel.clone(), description, granter.clone()))
+            .map(|description| Self::from_description(channel.clone(), description, granter.clone(), token.clone()))
             .collect()
     }
 
-    fn from_description(channel: Channel, description: v1::Description, granter: Granter) -> Result<Self, String> {
+    fn from_description(
+        channel: Channel,
+        description: v1::Description,
+        granter: Granter,
+        token: Option<Token>,
+    ) -> Result<Self, String> {
         if description.id.is_empty() {
             return Err("a source with no id".to_owned());
         }
@@ -330,6 +424,7 @@ impl GrpcSource {
         Ok(Self {
             client: SourceClient::new(channel),
             granter,
+            token,
             id,
             label,
             venue: intern(&description.venue),
@@ -352,6 +447,11 @@ impl GrpcSource {
     /// last call is usable on this one.
     fn grant(&self) -> Option<v1::Grant> {
         (self.granter)(self.vendor)
+    }
+
+    /// `message`, carrying this plugin's token when it has one.
+    fn request<T>(&self, message: T) -> Request<T> {
+        with_token(message, self.token.as_ref())
     }
 }
 
@@ -403,7 +503,7 @@ impl Source for GrpcSource {
         }
         let mut client = self.client.clone();
         client
-            .connected(v1::SourceId { id: self.id.to_owned(), grant })
+            .connected(self.request(v1::SourceId { id: self.id.to_owned(), grant }))
             .await
             .map(|reply| reply.into_inner().connected)
             .map_err(|status| self.error(&status, None))
@@ -418,14 +518,14 @@ impl Source for GrpcSource {
     ) -> Result<Fetched, SourceError> {
         let mut client = self.client.clone();
         let reply = client
-            .bars(v1::BarsRequest {
+            .bars(self.request(v1::BarsRequest {
                 id: self.id.to_owned(),
                 symbol: symbol.to_owned(),
                 interval: interval.to_string(),
                 from: from.format(DATE).to_string(),
                 to: to.format(DATE).to_string(),
                 grant: self.grant(),
-            })
+            }))
             .await
             .map_err(|status| self.error(&status, Some((symbol, interval))))?
             .into_inner();
@@ -436,13 +536,13 @@ impl Source for GrpcSource {
     async fn dividends(&self, symbol: &str, from: NaiveDate, to: NaiveDate) -> Result<Vec<Dividend>, SourceError> {
         let mut client = self.client.clone();
         let reply = client
-            .dividends(v1::DividendsRequest {
+            .dividends(self.request(v1::DividendsRequest {
                 id: self.id.to_owned(),
                 symbol: symbol.to_owned(),
                 from: from.format(DATE).to_string(),
                 to: to.format(DATE).to_string(),
                 grant: self.grant(),
-            })
+            }))
             .await
             .map_err(|status| self.error(&status, None))?
             .into_inner();
@@ -462,13 +562,13 @@ impl Source for GrpcSource {
     async fn search(&self, root: &Path, query: &str, limit: usize) -> Result<Vec<Match>, SourceError> {
         let mut client = self.client.clone();
         let reply = client
-            .search(v1::SearchRequest {
+            .search(self.request(v1::SearchRequest {
                 id: self.id.to_owned(),
                 library_root: root.to_string_lossy().into_owned(),
                 query: query.to_owned(),
                 limit: u32::try_from(limit).unwrap_or(u32::MAX),
                 grant: self.grant(),
-            })
+            }))
             .await
             .map_err(|status| self.error(&status, None))?
             .into_inner();
@@ -488,7 +588,7 @@ impl Source for GrpcSource {
     async fn quotes(&self, instruments: &[String]) -> Result<Vec<Quote>, SourceError> {
         let mut client = self.client.clone();
         let reply = client
-            .quotes(v1::QuotesRequest { id: self.id.to_owned(), instruments: instruments.to_vec(), grant: self.grant() })
+            .quotes(self.request(v1::QuotesRequest { id: self.id.to_owned(), instruments: instruments.to_vec(), grant: self.grant() }))
             .await
             .map_err(|status| self.error(&status, None))?
             .into_inner();
@@ -704,11 +804,27 @@ impl SourceService for Served {
 ///
 /// The address cannot be bound, or the server fails while running.
 pub async fn serve(addr: SocketAddr, plugin: Served) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // A supervised plugin was handed a token and requires it; one started by
+    // hand was not, and answers everyone, which is what that means.
+    serve_as(addr, plugin, Token::from_env()).await
+}
+
+/// [`serve`], requiring `token` on every call when there is one. What
+/// [`serve`] does with the token from the environment; a test hands one in.
+///
+/// # Errors
+///
+/// As [`serve`].
+pub async fn serve_as(
+    addr: SocketAddr,
+    plugin: Served,
+    token: Option<Token>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     println!("{HANDSHAKE}{}", listener.local_addr()?);
     Server::builder()
-        .add_service(PluginServer::new(plugin.clone()))
-        .add_service(SourceServer::new(plugin))
+        .add_service(PluginServer::with_interceptor(plugin.clone(), gate(token.clone())))
+        .add_service(SourceServer::with_interceptor(plugin, gate(token)))
         .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
         .await?;
     Ok(())
@@ -777,7 +893,7 @@ mod tests {
     // `connect_lazy` still wants a reactor to hand the channel to.
     #[tokio::test]
     async fn a_description_keeps_every_declaration_through_the_wire() {
-        let source = GrpcSource::from_description(lazy(), describe(&Fake), no_grants()).expect("a described source");
+        let source = GrpcSource::from_description(lazy(), describe(&Fake), no_grants(), None).expect("a described source");
         assert_eq!(source.id(), "fake-tr");
         assert_eq!(source.label(), "Fake (total return)");
         assert_eq!(source.venue(), "FAKETR");
@@ -795,7 +911,7 @@ mod tests {
     async fn a_source_without_a_basis_is_refused_not_defaulted() {
         let mut description = describe(&Fake);
         description.basis = None;
-        assert!(GrpcSource::from_description(lazy(), description, no_grants()).is_err());
+        assert!(GrpcSource::from_description(lazy(), description, no_grants(), None).is_err());
     }
 
     #[test]
@@ -887,6 +1003,35 @@ mod tests {
         let keyed = GrpcSource::discover_with("http://127.0.0.1:50072", granter).await.expect("discovered");
         assert!(keyed[0].connected().await.expect("asked"));
         assert!(keyed[0].bars("SPY", BarInterval::DAILY, day, day).await.is_ok());
+    }
+
+    /// A supervised plugin refuses everyone but the Arvo that started it,
+    /// on every service, and the token never shows in a debug print.
+    #[tokio::test]
+    async fn a_plugin_started_with_a_token_answers_only_calls_that_carry_it() {
+        let addr: SocketAddr = "127.0.0.1:50073".parse().expect("an address");
+        let token = Token::fresh();
+        assert_eq!(format!("{token:?}"), "Token(..)");
+        assert_ne!(Token::fresh(), token, "fresh means fresh");
+        tokio::spawn(serve_as(addr, Served::new("guarded", "Guarded", "0.0.0", vec![Box::new(Fake)]), Some(token.clone())));
+        wait_until_serving("http://127.0.0.1:50073").await;
+
+        let refused = GrpcSource::discover_with("http://127.0.0.1:50073", no_grants()).await.expect_err("no token");
+        assert!(refused.contains("only the Arvo that started it"), "{refused}");
+        let wrong = GrpcSource::discover_as("http://127.0.0.1:50073", no_grants(), Some(Token::fresh())).await;
+        assert!(wrong.is_err(), "a different token is no token");
+
+        // The manifest is guarded the same way.
+        let mut plugin = crate::plugin::plugin_client::PluginClient::connect("http://127.0.0.1:50073".to_owned())
+            .await
+            .expect("connect");
+        assert_eq!(plugin.get_manifest(GetManifestRequest {}).await.expect_err("no token").code(), Code::Unauthenticated);
+        assert!(plugin.get_manifest(with_token(GetManifestRequest {}, Some(&token))).await.is_ok());
+
+        let granter: Granter =
+            Arc::new(|_| Some(v1::Grant { key_id: "k".into(), secret: "s".into(), bearer: String::new() }));
+        let found = GrpcSource::discover_as("http://127.0.0.1:50073", granter, Some(token)).await.expect("the right token");
+        assert!(found[0].connected().await.expect("asked"), "and every later call carries it");
     }
 
     async fn wait_until_serving(address: &str) {

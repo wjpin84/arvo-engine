@@ -23,6 +23,8 @@ tokio-stream = { version = "0.1", features = ["net"] }
 tonic.workspace = true
 tonic-prost.workspace = true
 tracing = "0.1"
+# The per-spawn token a supervised plugin requires on every call.
+rand = "0.8"
 
 [build-dependencies]
 protoc-bin-vendored.workspace = true
