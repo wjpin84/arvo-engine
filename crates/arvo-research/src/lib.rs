@@ -41,6 +41,7 @@ pub mod psr;
 pub mod reconcile;
 pub mod regime;
 pub mod replay;
+pub mod reported;
 pub mod share;
 mod simulation;
 pub mod stress;
@@ -73,7 +74,8 @@ pub use risk::{
     Decision, Position, Proposal, Rejection, RiskGate, RiskModel, SectorCap, PDT_DAY_TRADES,
     PDT_EQUITY_FLOOR, PDT_WINDOW_DAYS,
 };
-pub use panel::{run_panel, InstrumentOutcome, PanelEvidence, PanelStudy, PooledOutcome};
+pub use panel::{run_panel, InstrumentOutcome, KeptEvidence, PanelEvidence, PanelStudy, PooledOutcome};
+pub use reported::{judge, Judgement, Reported};
 pub use trade::{Direction, ExitReason, Trade, TradeStats};
 pub use walk_forward::{run_walk_forward, AxisStability, WalkForward, WalkForwardEvidence};
 
