@@ -25,6 +25,7 @@ pub mod interval;
 pub mod option;
 pub mod quality;
 pub mod session;
+pub mod signal;
 
 mod csv;
 mod in_memory;
@@ -32,6 +33,7 @@ mod in_memory;
 pub use crate::csv::CsvBars;
 pub use crate::in_memory::InMemoryBars;
 pub use crate::interval::{BarInterval, IntervalUnit};
+pub use crate::signal::{Signal, SignalName, Signals};
 
 use chrono::{NaiveDate, NaiveDateTime};
 use serde::{Deserialize, Serialize};
