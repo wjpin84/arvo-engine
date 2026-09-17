@@ -14,15 +14,19 @@ pub mod proto {
 
 use proto::research_server::{self, ResearchServer};
 use proto::{
-    Advice, Empty, Finding, FindingId, FindingSummary, Findings, Instrument, Instruments, Point,
-    ReportRequest, RunRequest, Strategies, Strategy,
+    Advice, AttachRequest, Attachment, Attachments, Empty, Finding, FindingId, FindingSummary, Findings,
+    Instrument, Instruments, Point, ReportRequest, RunRequest, Strategies, Strategy,
 };
 
 /// The keys of a summary that have their own fields; everything else is
 /// `detail_json`.
 const TYPED: &[&str] = &[
-    "id", "kind", "subject", "verdict", "recorded_at", "read_this_first", "reasons", "advice",
+    "id", "kind", "subject", "verdict", "recorded_at", "read_this_first", "reasons", "advice", "attachments",
 ];
+
+/// The largest message either side accepts: a figure or a trades table
+/// attached to a finding, with room. tonic's default is 4 MB.
+pub const MAX_MESSAGE_BYTES: usize = 64 << 20;
 
 struct Service {
     research: Research,
@@ -44,7 +48,8 @@ pub async fn serve(
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), tonic::transport::Error> {
     let expected = format!("Bearer {token}");
-    let service = ResearchServer::with_interceptor(Service { research }, move |request: Request<()>| {
+    let server = ResearchServer::new(Service { research }).max_decoding_message_size(MAX_MESSAGE_BYTES);
+    let service = tonic::service::interceptor::InterceptedService::new(server, move |request: Request<()>| {
         match request.metadata().get("authorization").and_then(|value| value.to_str().ok()) {
             Some(given) if given == expected => Ok(request),
             _ => Err(Status::unauthenticated(
@@ -119,8 +124,27 @@ fn finding(summary: &Value) -> Finding {
                     .collect()
             })
             .unwrap_or_default(),
+        attachments: attachments(summary.get("attachments")),
         detail_json: Value::Object(detail).to_string(),
     }
+}
+
+fn attachments(listed: Option<&Value>) -> Vec<Attachment> {
+    listed
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .map(|item| Attachment {
+                    name: text(item.get("name")),
+                    media_type: text(item.get("media_type")),
+                    hash: text(item.get("hash")),
+                    bytes: item.get("bytes").and_then(Value::as_u64).unwrap_or(0),
+                    added_at: text(item.get("added_at")),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 impl Service {
@@ -230,6 +254,22 @@ impl research_server::Research for Service {
         request: Request<RunRequest>,
     ) -> Result<Response<Finding>, Status> {
         self.run(request.into_inner(), true).await
+    }
+
+    async fn attach_file(&self, request: Request<AttachRequest>) -> Result<Response<Attachments>, Status> {
+        let request = request.into_inner();
+        let id = required(&request.finding_id, "finding_id")?.to_owned();
+        let name = required(&request.name, "name")?.to_owned();
+        if request.data.is_empty() {
+            return Err(Status::invalid_argument("data is empty"));
+        }
+        let media_type = if request.media_type.trim().is_empty() { "application/octet-stream".to_owned() } else { request.media_type.clone() };
+        let research = self.research.clone();
+        let kept = tokio::task::spawn_blocking(move || research.attach(&id, &name, &media_type, &request.data))
+            .await
+            .map_err(|err| Status::internal(format!("the attach did not finish: {err}")))?
+            .map_err(Status::not_found)?;
+        Ok(Response::new(Attachments { attachments: attachments(Some(&kept)) }))
     }
 
     async fn record_finding(&self, request: Request<ReportRequest>) -> Result<Response<Finding>, Status> {
@@ -542,6 +582,26 @@ mod tests {
 
         let audit = std::fs::read_to_string(dir.path().join(crate::research::AUDIT_FILE)).expect("audited");
         assert!(audit.contains("record_finding"));
+
+        // A file kept with it: listed on the finding, stored once however
+        // often the same bytes arrive under the same name.
+        let attach = |name: &str, data: &[u8]| AttachRequest {
+            finding_id: summary.id.clone(),
+            name: name.to_owned(),
+            media_type: "text/csv".to_owned(),
+            data: data.to_vec(),
+        };
+        let kept = client.attach_file(with_token(attach("trades.csv", b"a,b\n1,2\n"), TOKEN)).await.expect("kept").into_inner();
+        assert_eq!(kept.attachments.len(), 1);
+        assert_eq!(kept.attachments[0].bytes, 8);
+        let again = client.attach_file(with_token(attach("trades.csv", b"a,b\n1,2\n"), TOKEN)).await.expect("kept").into_inner();
+        assert_eq!(again.attachments.len(), 1, "same name, same bytes: one entry");
+        let more = client.attach_file(with_token(attach("report.md", b"# ok"), TOKEN)).await.expect("kept").into_inner();
+        assert_eq!(more.attachments.len(), 2);
+        let opened = client.open_finding(with_token(FindingId { id: summary.id.clone() }, TOKEN)).await.expect("opens").into_inner();
+        assert_eq!(opened.attachments.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(), ["trades.csv", "report.md"]);
+        let empty = client.attach_file(with_token(attach("empty.txt", b""), TOKEN)).await.unwrap_err();
+        assert_eq!(empty.code(), tonic::Code::InvalidArgument);
     }
 
     #[test]
@@ -556,9 +616,10 @@ mod tests {
             .collect();
         // RecordFinding takes evidence in; it fetches nothing, shares nothing
         // and trades nothing, and the type has no field for a verdict.
+        // AttachFile keeps bytes with a finding the caller already owns.
         assert_eq!(
             calls,
-            ["ListStrategies", "ListInstruments", "ListFindings", "OpenFinding", "RunStudy", "RunWalkForward", "RecordFinding"]
+            ["ListStrategies", "ListInstruments", "ListFindings", "OpenFinding", "RunStudy", "RunWalkForward", "RecordFinding", "AttachFile"]
         );
         for forbidden in ["Fetch", "Order", "Trade", "Share", "Import", "Key", "Sign", "Session", "Halt"] {
             assert!(!calls.iter().any(|call| call.contains(forbidden)), "{forbidden}");

@@ -209,6 +209,17 @@ impl Research {
         Ok(summarize(&stored))
     }
 
+    /// Keeps a file with a finding (#157): bytes stored once by hash, the
+    /// record listing it. Returns every attachment the finding now has.
+    ///
+    /// # Errors
+    ///
+    /// No such finding, or the store cannot be written.
+    pub fn attach(&self, id: &str, name: &str, media_type: &str, data: &[u8]) -> Result<Value, String> {
+        let kept = self.store().attach(id, name, media_type, data).map_err(|err| err.to_string())?;
+        Ok(json!(kept))
+    }
+
     /// Appends one line to the audit trail. Best effort, loudly: a trail that
     /// cannot be written is said on stderr and never fails the call — the
     /// finding, which is the durable record, is already saved.
@@ -254,6 +265,7 @@ pub fn summarize(stored: &StoredRecord) -> Value {
         "verdict": record.verdict(),
         "recorded_at": stored.recorded_at.to_rfc3339(),
         "author": stored.author,
+        "attachments": stored.attachments,
         "read_this_first": match record.verdict() {
             Verdict::Supported => "Supported is the one verdict worth acting on, and only as far as the advice below allows.",
             Verdict::NotSupported => "Not supported: the numbers below describe a rule that did not clear its bar. Do not report them as an edge.",

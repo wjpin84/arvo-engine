@@ -142,6 +142,25 @@ impl Record {
     }
 }
 
+/// One file kept with a finding. The bytes live under the store by content
+/// hash, the way fetched bars are pinned (ADR-0008), so two findings that
+/// attach the same report share one copy and a file cannot change under
+/// its record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Attachment {
+    /// As the author named it: `report.md`, `equity.png`.
+    pub name: String,
+    /// `text/markdown`, `image/png`, `text/csv`; whatever the author said.
+    pub media_type: String,
+    /// blake3 of the bytes, hex. What the file is stored under.
+    pub hash: String,
+    pub bytes: u64,
+    pub added_at: DateTime<Utc>,
+}
+
+/// The folder under a store where attachment bytes live, by hash.
+pub const ATTACHMENTS_SUBDIR: &str = "attachments";
+
 /// Who ran a finding.
 ///
 /// Recorded on every finding from the first one an agent could write, because
@@ -215,6 +234,12 @@ pub const SCHEMA: u32 = 1;
 pub struct StoredRecord {
     pub id: String,
     pub recorded_at: DateTime<Utc>,
+    /// Files kept with the finding (#157): a report, a figure, a trades
+    /// table, whatever the author or the workbench added. Each is bytes
+    /// stored once by content hash under the store; the record lists them.
+    /// `default` because every finding before this had none.
+    #[serde(default)]
+    pub attachments: Vec<Attachment>,
     /// Which build's format this is. `0` for anything written before the
     /// version existed — which is exactly the set of findings that cannot be
     /// read any more, so it is a useful thing to be able to say.
@@ -242,6 +267,9 @@ pub struct Summary {
     pub kind: String,
     pub subject: String,
     pub verdict: Verdict,
+    /// How many files are kept with it, for a list that shows a clip.
+    #[serde(default)]
+    pub attachments: usize,
     pub hypothesis: HypothesisId,
     pub dataset_version: String,
     /// The instrument and resolution the finding was produced at, so
@@ -311,6 +339,7 @@ impl StoredRecord {
             id,
             recorded_at,
             schema: SCHEMA,
+            attachments: Vec::new(),
             author: Author::Person,
             record,
         }
@@ -379,6 +408,7 @@ impl StoredRecord {
             kind: self.record.kind().to_owned(),
             subject: self.record.subject(),
             verdict: self.record.verdict(),
+            attachments: self.attachments.len(),
             hypothesis: self.record.hypothesis().clone(),
             dataset_version: self.record.dataset_version().to_owned(),
             instrument,
@@ -601,6 +631,46 @@ impl EvidenceStore {
             path: path.clone(),
             source: std::io::Error::new(std::io::ErrorKind::InvalidData, reason),
         })
+    }
+
+    /// Keeps `data` with finding `id` under `name` (#157). The bytes are
+    /// written once, under their hash; the record gains an entry, or keeps
+    /// the one it has when the same name with the same bytes is attached
+    /// again. Returns every attachment the record now lists.
+    ///
+    /// # Errors
+    ///
+    /// No such finding, or the bytes or the record cannot be written.
+    pub fn attach(&self, id: &str, name: &str, media_type: &str, data: &[u8]) -> Result<Vec<Attachment>, MemoryError> {
+        let mut stored = self.open(id)?;
+        let hash = blake3::hash(data).to_hex().to_string();
+        let folder = self.root.join(ATTACHMENTS_SUBDIR);
+        std::fs::create_dir_all(&folder).map_err(|source| MemoryError::Write { path: folder.clone(), source })?;
+        let file = folder.join(&hash);
+        if !file.is_file() {
+            std::fs::write(&file, data).map_err(|source| MemoryError::Write { path: file.clone(), source })?;
+        }
+        let name = name.trim();
+        let name = if name.is_empty() { hash.clone() } else { name.to_owned() };
+        if !stored.attachments.iter().any(|kept| kept.hash == hash && kept.name == name) {
+            stored.attachments.push(Attachment {
+                name,
+                media_type: media_type.trim().to_owned(),
+                hash,
+                bytes: data.len() as u64,
+                added_at: Utc::now(),
+            });
+            self.save(&stored)?;
+        }
+        Ok(stored.attachments)
+    }
+
+    /// Where an attachment's bytes are. `None` for a hash that is not one:
+    /// a name from outside must not become a path under the store.
+    #[must_use]
+    pub fn attachment_path(&self, hash: &str) -> Option<PathBuf> {
+        (hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit()))
+            .then(|| self.root.join(ATTACHMENTS_SUBDIR).join(hash))
     }
 
     fn finding_paths(&self) -> Result<Vec<PathBuf>, MemoryError> {
@@ -933,6 +1003,35 @@ pub(crate) mod tests {
         Utc.with_ymd_and_hms(2026, 3, 4, 12, 0, second)
             .single()
             .expect("valid instant")
+    }
+
+    /// A file kept with a finding (#157): stored once by content, listed on
+    /// the record, back after a reopen, and never reachable by a hash that
+    /// is not one.
+    #[test]
+    fn an_attachment_is_stored_once_by_content_and_listed_on_the_record() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = EvidenceStore::new(dir.path());
+        let stored = StoredRecord::new(study("AAPL.NASDAQ", "hash-a"), at(1));
+        store.save(&stored).expect("saved");
+
+        let kept = store.attach(&stored.id, "report.md", "text/markdown", b"# one").expect("kept");
+        assert_eq!(kept.len(), 1);
+        let hash = kept[0].hash.clone();
+        assert_eq!(hash.len(), 64);
+        assert!(store.attachment_path(&hash).expect("a hash").is_file(), "the bytes, under their hash");
+
+        let same = store.attach(&stored.id, "report.md", "text/markdown", b"# one").expect("kept");
+        assert_eq!(same.len(), 1, "same name, same bytes: nothing new");
+        let renamed = store.attach(&stored.id, "copy.md", "text/markdown", b"# one").expect("kept");
+        assert_eq!(renamed.len(), 2, "a second name for the same bytes is a second entry");
+        assert_eq!(renamed[1].hash, hash, "and the same one file");
+
+        let reopened = store.open(&stored.id).expect("opens");
+        assert_eq!(reopened.attachments.len(), 2);
+        assert_eq!(reopened.summary().attachments, 2);
+        assert!(store.attachment_path("../engine.json").is_none(), "a path is not a hash");
+        assert!(store.attach("nope", "x", "text/plain", b"x").is_err(), "no such finding");
     }
 
     #[test]
