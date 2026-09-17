@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 
 use arvo_data::{BarProvider, CsvBars};
 use arvo_nautilus::NautilusSimulation;
-use arvo_research::{EvaluationCriteria, EvidenceStore, Record, StoredRecord, Verdict};
+use arvo_research::{EvaluationCriteria, EvidenceStore, Record, StoredRecord};
 use arvo_runtime_lib::research::{study_data, study_for, walk_forward_for, StrategyPlan};
 use serde_json::{json, Value};
 
@@ -266,11 +266,7 @@ pub fn summarize(stored: &StoredRecord) -> Value {
         "recorded_at": stored.recorded_at.to_rfc3339(),
         "author": stored.author,
         "attachments": stored.attachments,
-        "read_this_first": match record.verdict() {
-            Verdict::Supported => "Supported is the one verdict worth acting on, and only as far as the advice below allows.",
-            Verdict::NotSupported => "Not supported: the numbers below describe a rule that did not clear its bar. Do not report them as an edge.",
-            Verdict::Inconclusive => "Inconclusive: too little evidence to say either way. Do not report the numbers below as a result.",
-        },
+        "read_this_first": record.verdict().read_this_first(),
     });
     match record {
         Record::Study(found) => {
