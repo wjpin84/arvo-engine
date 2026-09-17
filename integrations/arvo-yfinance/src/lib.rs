@@ -114,6 +114,10 @@ impl Source for Yahoo {
         }
     }
 
+    fn vendor_label(&self) -> &'static str {
+        "Yahoo Finance"
+    }
+
     fn venue(&self) -> &'static str {
         if self.total_return {
             TOTAL_RETURN_VENUE

@@ -6,6 +6,8 @@
 //! that grants no imports cannot host the thing plugins are now for.
 
 pub mod registry;
+pub mod source;
+pub mod supervisor;
 
 /// Generated from `protos/arvo/plugin/v1/plugin.proto`.
 pub mod plugin {

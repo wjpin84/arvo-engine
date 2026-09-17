@@ -149,6 +149,7 @@ impl Research {
         strategy: &str,
         rolling: bool,
         author: &str,
+        origin: Option<&str>,
     ) -> Result<Value, String> {
         let plan = StrategyPlan::find(strategy)
             .ok_or_else(|| format!("no strategy {strategy:?}; list_strategies says what there is"))?;
@@ -178,7 +179,8 @@ impl Research {
 
         let store = self.store();
         let history = store.load().map_err(|err| err.to_string())?.records;
-        let stored = StoredRecord::by_agent(record, author, &history, chrono::Utc::now());
+        let stored = StoredRecord::by_agent(record, author, &history, chrono::Utc::now())
+            .with_origin(origin.map(ToOwned::to_owned));
         store.save(&stored).map_err(|err| err.to_string())?;
         Ok(summarize(&stored))
     }

@@ -16,4 +16,6 @@ fn main() {
 
     tonic_prost_build::compile_protos("../../protos/arvo/plugin/v1/plugin.proto")
         .expect("failed to compile plugin.proto");
+    tonic_prost_build::compile_protos("../../protos/arvo/source/v1/source.proto")
+        .expect("failed to compile source.proto");
 }

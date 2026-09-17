@@ -74,6 +74,9 @@ pub const DEFAULT_MAX_ORDER_AGE_SECS: i64 = 120;
 pub struct AlpacaExecutor {
     api: &'static str,
     venue: &'static str,
+    /// Which key pair signs this executor's calls: the pair for the endpoint
+    /// it points at, never whichever a data call would prefer.
+    env: crate::auth::Env,
     max_order_age: chrono::Duration,
     outstanding: Outstanding,
 }
@@ -91,7 +94,7 @@ impl AlpacaExecutor {
     /// Simulated money against the real API. Start here.
     #[must_use]
     pub fn paper() -> Self {
-        Self::at(PAPER, "ALPACA-PAPER")
+        Self::at(PAPER, "ALPACA-PAPER", crate::auth::Env::Paper)
     }
 
     /// Real money.
@@ -101,13 +104,14 @@ impl AlpacaExecutor {
     /// and `AlpacaExecutor::new(false)` does not.
     #[must_use]
     pub fn live() -> Self {
-        Self::at(LIVE, "ALPACA")
+        Self::at(LIVE, "ALPACA", crate::auth::Env::Live)
     }
 
-    fn at(api: &'static str, venue: &'static str) -> Self {
+    fn at(api: &'static str, venue: &'static str, env: crate::auth::Env) -> Self {
         Self {
             api,
             venue,
+            env,
             max_order_age: chrono::Duration::seconds(DEFAULT_MAX_ORDER_AGE_SECS),
             outstanding: Outstanding::new(),
         }
@@ -145,7 +149,7 @@ impl Executor for AlpacaExecutor {
 
     async fn submit(&self, order: &Order) -> Result<OrderId, ExecutionError> {
         let body = order_body(order);
-        let id = match auth::post(&format!("{}/v2/orders", self.api), &body).await {
+        let id = match auth::post_env(self.env, &format!("{}/v2/orders", self.api), &body).await {
             Ok(response) => placed_id(self.venue, &response)?,
             // Refused — but a refusal is not proof the order is absent, so ask.
             Err(refusal) => self.adopt(&body, &refusal).await?,
@@ -163,7 +167,7 @@ impl Executor for AlpacaExecutor {
         // `status=all` because a filled or cancelled order is no longer open,
         // and asking only for open ones would leave every resolved order
         // outstanding forever — reported as unfilled on every later drain.
-        let response = auth::get(&format!(
+        let response = auth::get_env(self.env, &format!(
             "{}/v2/orders?status=all&limit=500&direction=desc",
             self.api
         ))
@@ -195,10 +199,10 @@ impl Executor for AlpacaExecutor {
         // either is acted on: a reconciliation that cancelled orders and then
         // failed to read the positions would leave the account changed and the
         // gate still ignorant.
-        let held = auth::get(&format!("{}/v2/positions", self.api))
+        let held = auth::get_env(self.env, &format!("{}/v2/positions", self.api))
             .await
             .map_err(|err| transport(self.venue, &err))?;
-        let working = auth::get(&format!("{}/v2/orders?status=open&limit=500", self.api))
+        let working = auth::get_env(self.env, &format!("{}/v2/orders?status=open&limit=500", self.api))
             .await
             .map_err(|err| transport(self.venue, &err))?;
 
@@ -212,13 +216,13 @@ impl Executor for AlpacaExecutor {
     }
 
     async fn cancel(&self, order: &OrderId) -> Result<(), ExecutionError> {
-        auth::delete(&format!("{}/v2/orders/{order}", self.api))
+        auth::delete_env(self.env, &format!("{}/v2/orders/{order}", self.api))
             .await
             .map_err(|err| rejected(self.venue, &err))
     }
 
     async fn buying_power(&self) -> Result<Option<f64>, ExecutionError> {
-        let account = auth::get(&format!("{}/v2/account", self.api))
+        let account = auth::get_env(self.env, &format!("{}/v2/account", self.api))
             .await
             .map_err(|err| transport(self.venue, &err))?;
         buying_power(self.venue, &account).map(Some)
@@ -338,7 +342,7 @@ impl AlpacaExecutor {
         // The refusal is the news, not this lookup's own failure: if the venue
         // cannot be asked, the caller still needs to hear why the submit was
         // refused rather than why the question could not be put.
-        let Ok(found) = auth::get(&format!(
+        let Ok(found) = auth::get_env(self.env, &format!(
             "{}/v2/orders:by_client_order_id?client_order_id={key}",
             self.api
         ))

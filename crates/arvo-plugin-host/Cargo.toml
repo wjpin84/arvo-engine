@@ -7,15 +7,30 @@ license.workspace = true
 
 [dependencies]
 arvo-core.workspace = true
+# The Source trait, so a plugin-served source is a `dyn Source` like any other.
+arvo-data.workspace = true
 anyhow.workspace = true
+# Dyn-compatible async trait methods, the way `arvo_data::Source` is declared.
+async-trait = "0.1.92"
+chrono.workspace = true
 prost.workspace = true
-tokio.workspace = true
+# process, io-util and net for the supervisor, which spawns and reads a child
+# and binds the port a served plugin hands back.
+tokio = { workspace = true, features = ["process", "io-util", "net", "time", "sync"] }
+# Serving on a listener bound first, so the port can be said before the
+# first request (the handshake).
+tokio-stream = { version = "0.1", features = ["net"] }
 tonic.workspace = true
 tonic-prost.workspace = true
+tracing = "0.1"
+# The per-spawn token a supervised plugin requires on every call.
+rand = "0.8"
 
 [build-dependencies]
 protoc-bin-vendored.workspace = true
 tonic-prost-build.workspace = true
 
 [dev-dependencies]
-arvo-plugin-stub = { path = "../../plugins/stub" }
+# For the ignored end-to-end test that clones and builds a real plugin.
+serde_json = "1"
+tempfile = "3"

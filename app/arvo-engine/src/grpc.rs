@@ -128,11 +128,12 @@ impl Service {
         let instrument = required(&request.instrument, "instrument")?.to_owned();
         let strategy = required(&request.strategy, "strategy")?.to_owned();
         let author = required(&request.author, "author")?.to_owned();
+        let origin = Some(request.origin.trim().to_owned()).filter(|origin| !origin.is_empty());
         let research = self.research.clone();
         // A study is seconds to a minute of engine work; off the async threads.
         let outcome = tokio::task::spawn_blocking(move || {
             let call = if rolling { "run_walk_forward" } else { "run_study" };
-            let outcome = research.run(&instrument, &strategy, rolling, &author);
+            let outcome = research.run(&instrument, &strategy, rolling, &author, origin.as_deref());
             let arguments = serde_json::json!({ "instrument": instrument, "strategy": strategy });
             research.audit("grpc", &author, call, &arguments, &outcome);
             outcome
@@ -308,6 +309,7 @@ mod tests {
             instrument: "AAPL.RH".to_owned(),
             strategy: "sma_cross".to_owned(),
             author: String::new(),
+            origin: String::new(),
         };
         let refused = client.run_study(with_token(anonymous, TOKEN)).await.unwrap_err();
         assert_eq!(refused.code(), tonic::Code::InvalidArgument);
@@ -317,6 +319,7 @@ mod tests {
             instrument: "AAPL.RH".to_owned(),
             strategy: "sma_cross".to_owned(),
             author: "script:test".to_owned(),
+            origin: "C:/proj/scan.py:1".to_owned(),
         };
         let failed = client.run_study(with_token(no_data, TOKEN)).await.unwrap_err();
         assert_eq!(failed.code(), tonic::Code::FailedPrecondition);

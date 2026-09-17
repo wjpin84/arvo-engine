@@ -130,11 +130,11 @@ impl Server {
             "open_finding" => self.research.open_finding(&text("id")?),
             "run_study" => {
                 self.research
-                    .run(&text("instrument")?, &text("strategy")?, false, &self.agent())
+                    .run(&text("instrument")?, &text("strategy")?, false, &self.agent(), None)
             }
             "run_walk_forward" => {
                 self.research
-                    .run(&text("instrument")?, &text("strategy")?, true, &self.agent())
+                    .run(&text("instrument")?, &text("strategy")?, true, &self.agent(), None)
             }
             other => Err(format!("no tool {other:?}; tools/list says what there is")),
         }

@@ -144,7 +144,16 @@ pub enum Author {
     /// An agent, with the bar its whole search held this finding to. The bar
     /// is kept rather than recomputed: the history it was measured over
     /// changes as findings are added and deleted.
-    Agent { id: String, search: AgentSearch },
+    Agent {
+        id: String,
+        search: AgentSearch,
+        /// Where in the agent's own code the run was asked for, as
+        /// `path:line`, when the caller said. A script's finding can then
+        /// be shown against the line that produced it. `default` because
+        /// every agent finding before this existed has none.
+        #[serde(default)]
+        origin: Option<String>,
+    },
 }
 
 impl Author {
@@ -154,6 +163,25 @@ impl Author {
         match self {
             Self::Person => None,
             Self::Agent { id, .. } => Some(id),
+        }
+    }
+
+    /// Where the agent's code asked for the run, when it said.
+    #[must_use]
+    pub fn origin(&self) -> Option<&str> {
+        match self {
+            Self::Agent { origin, .. } => origin.as_deref(),
+            Self::Person => None,
+        }
+    }
+
+    /// How many configurations the agent's whole search had tried by this
+    /// finding: the number a person should read before the verdict.
+    #[must_use]
+    pub fn trials(&self) -> Option<usize> {
+        match self {
+            Self::Agent { search, .. } => Some(search.trials),
+            Self::Person => None,
         }
     }
 }
@@ -227,6 +255,14 @@ pub struct Summary {
     /// person produced (#33). Required, like `alongside`, so an index written
     /// before it is rebuilt rather than read as "all by people".
     pub agent: Option<String>,
+    /// Where the agent's code asked for it, as `path:line`. `default`: an
+    /// index from before this existed is right to say none, since no finding
+    /// it lists carried one.
+    #[serde(default)]
+    pub origin: Option<String>,
+    /// The size of the search this finding was held to, for an agent's.
+    #[serde(default)]
+    pub trials: Option<usize>,
 }
 
 /// A finding that could not be read, and why.
@@ -287,9 +323,19 @@ impl StoredRecord {
             author: Author::Agent {
                 id: agent.to_owned(),
                 search,
+                origin: None,
             },
             ..Self::new(record, recorded_at)
         }
+    }
+
+    /// Records where the agent's code asked for this. Nothing for a person.
+    #[must_use]
+    pub fn with_origin(mut self, origin: Option<String>) -> Self {
+        if let Author::Agent { origin: slot, .. } = &mut self.author {
+            *slot = origin;
+        }
+        self
     }
 
     /// What the history list needs, without the finding itself.
@@ -320,6 +366,8 @@ impl StoredRecord {
             interval,
             alongside,
             agent: self.author.agent().map(ToOwned::to_owned),
+            origin: self.author.origin().map(ToOwned::to_owned),
+            trials: self.author.trials(),
         }
     }
 }

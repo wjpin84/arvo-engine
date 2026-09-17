@@ -365,6 +365,26 @@ pub trait Source: Send + Sync {
         Credential::None
     }
 
+    /// The vendor this source belongs to: the id up to the first `-`, so
+    /// `alpaca-iex` and `alpaca-sip` share one account and one credential.
+    /// What an Account is grouped by.
+    fn vendor(&self) -> &'static str {
+        self.id().split('-').next().unwrap_or(self.id())
+    }
+
+    /// The vendor's name as the Accounts view shows it. The label, unless a
+    /// vendor with several venues says otherwise.
+    fn vendor_label(&self) -> &'static str {
+        self.label()
+    }
+
+    /// What an account with this vendor gives a person, in words: `bars`
+    /// for every source; a vendor adds `quotes`, `holdings` or `option
+    /// quotes` as it does.
+    fn provides(&self) -> &'static [&'static str] {
+        &["bars"]
+    }
+
     /// What this source's prices actually are.
     ///
     /// No default. A default would be "consolidated, split-adjusted", which is

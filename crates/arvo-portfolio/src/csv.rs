@@ -75,6 +75,9 @@ pub struct ImportReport {
 pub struct Imported {
     pub portfolio: Portfolio,
     pub report: ImportReport,
+    /// The file it was read from: what a refresh replaces, and whose
+    /// modified time says when it was last refreshed.
+    pub path: PathBuf,
 }
 
 /// Column aliases, lowercased. Order matters: earlier is preferred.
@@ -476,6 +479,7 @@ fn read_file(path: &Path, as_of: NaiveDate) -> Result<Vec<Imported>, CsvError> {
         // a word; an empty portfolio carrying the report at least says that
         // it was read and that every row was rejected, and why.
         return Ok(vec![Imported {
+            path: path.to_path_buf(),
             portfolio: Portfolio {
                 name: stem,
                 as_of,
@@ -488,6 +492,7 @@ fn read_file(path: &Path, as_of: NaiveDate) -> Result<Vec<Imported>, CsvError> {
     Ok(grouped
         .into_iter()
         .map(|(name, holdings)| Imported {
+            path: path.to_path_buf(),
             portfolio: Portfolio {
                 name,
                 as_of,

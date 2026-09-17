@@ -7,7 +7,7 @@ use arvo_data::source::{Adjustment, Basis, Credential, Feed, Fetched, Source, So
 use arvo_data::{BarInterval, Dividend, IntervalUnit};
 use serde_json::Value;
 
-use crate::auth::{get, keys};
+use crate::auth::{get_with, keys, Keys};
 use crate::parse::{parse_bars, parse_dividends};
 
 const DATA: &str = "https://data.alpaca.markets";
@@ -41,6 +41,19 @@ pub struct Alpaca {
     id: &'static str,
     venue: &'static str,
     label: &'static str,
+    keys: KeySource,
+}
+
+/// Where a data call's key pair comes from.
+#[derive(Clone)]
+enum KeySource {
+    /// The keychain, paper first, then the environment. The compiled-in
+    /// source.
+    Keychain,
+    /// Exactly what the caller handed over, and nothing else. The plugin: a
+    /// call that arrived with no grant is a call with no session, whatever
+    /// the machine the plugin runs on might hold (ADR-0022 point 4).
+    Given(Option<Keys>),
 }
 
 impl Alpaca {
@@ -53,6 +66,7 @@ impl Alpaca {
             id: IEX_SOURCE_ID,
             venue: IEX_VENUE,
             label: "Alpaca (IEX, free)",
+            keys: KeySource::Keychain,
         }
     }
 
@@ -65,6 +79,7 @@ impl Alpaca {
             id: SIP_SOURCE_ID,
             venue: SIP_VENUE,
             label: "Alpaca (all exchanges)",
+            keys: KeySource::Keychain,
         }
     }
 
@@ -77,6 +92,7 @@ impl Alpaca {
             id: IEX_TOTAL_RETURN_SOURCE_ID,
             venue: IEX_TOTAL_RETURN_VENUE,
             label: "Alpaca (IEX, free, total return)",
+            keys: KeySource::Keychain,
         }
     }
 
@@ -89,6 +105,25 @@ impl Alpaca {
             id: SIP_TOTAL_RETURN_SOURCE_ID,
             venue: SIP_TOTAL_RETURN_VENUE,
             label: "Alpaca (all exchanges, total return)",
+            keys: KeySource::Keychain,
+        }
+    }
+
+    /// The same source, using only `keys` and never the keychain. What a
+    /// plugin builds per call from the grant it was handed: `None` is a call
+    /// with no session, not an invitation to look elsewhere.
+    #[must_use]
+    pub fn with_keys(mut self, keys: Option<Keys>) -> Self {
+        self.keys = KeySource::Given(keys);
+        self
+    }
+
+    /// The pair this call signs with, from wherever this source was told to
+    /// look.
+    fn keys(&self) -> Result<Option<Keys>, SourceError> {
+        match &self.keys {
+            KeySource::Keychain => keys(),
+            KeySource::Given(given) => Ok(given.clone()),
         }
     }
 }
@@ -110,6 +145,14 @@ impl Source for Alpaca {
 
     fn label(&self) -> &'static str {
         self.label
+    }
+
+    fn vendor_label(&self) -> &'static str {
+        "Alpaca"
+    }
+
+    fn provides(&self) -> &'static [&'static str] {
+        &["bars", "option quotes", "holdings"]
     }
 
     fn venue(&self) -> &'static str {
@@ -139,7 +182,7 @@ impl Source for Alpaca {
     }
 
     async fn connected(&self) -> Result<bool, SourceError> {
-        Ok(keys()?.is_some())
+        Ok(self.keys()?.is_some())
     }
 
     async fn bars(
@@ -168,7 +211,7 @@ impl Source for Alpaca {
                 url.push_str(&format!("&page_token={token}"));
             }
 
-            let body = get(&url).await?;
+            let body = get_with(self.keys()?, &url).await?;
             bars.extend(parse_bars(&body, symbol)?);
 
             page = body
@@ -216,7 +259,7 @@ impl Source for Alpaca {
                 url.push_str(&format!("&page_token={token}"));
             }
 
-            let body = get(&url).await?;
+            let body = get_with(self.keys()?, &url).await?;
             paid.extend(parse_dividends(&body));
 
             page = body
@@ -302,6 +345,23 @@ mod tests {
             Alpaca::sip_total_return().basis().feed,
             Alpaca::sip().basis().feed
         );
+    }
+
+    /// A source handed its keys never looks past them: with none it is not
+    /// connected whatever the keychain or the environment holds, and a fetch
+    /// is refused as no session before any request is made.
+    #[tokio::test]
+    async fn a_source_given_its_keys_uses_only_those() {
+        let none = Alpaca::iex().with_keys(None);
+        assert!(!none.connected().await.expect("asked"));
+        let refused = none
+            .bars("SPY", BarInterval::DAILY, chrono::NaiveDate::MIN, chrono::NaiveDate::MIN)
+            .await
+            .expect_err("no keys, no call");
+        assert!(refused.needs_sign_in(), "{refused:?}");
+
+        let given = Alpaca::sip().with_keys(Some(Keys { key_id: "k".into(), secret: "s".into() }));
+        assert!(given.connected().await.expect("asked"));
     }
 
     #[test]
