@@ -35,7 +35,13 @@ board; the decisions they carried are in `docs/adr/`.
 ```
 cargo test --workspace        # the suite
 cargo tauri dev               # the app
+cargo tauri build             # an installer, engine included
 ```
+
+`cargo tauri build` builds `arvo-engine` first and ships it beside the window
+as a sidecar (#32), so an installed Arvo starts its own engine and a script
+run from the editor works without a terminal. In a `cargo build` tree the two
+are already side by side and nothing is staged.
 
 Headless examples, useful without the window:
 
