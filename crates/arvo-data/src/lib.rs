@@ -33,6 +33,7 @@ mod in_memory;
 pub use crate::csv::CsvBars;
 pub use crate::in_memory::InMemoryBars;
 pub use crate::interval::{BarInterval, IntervalUnit};
+pub use crate::signal::series::{Causality, History, SignalPoint, SignalSeries, SignalStore};
 pub use crate::signal::{Signal, SignalName, Signals};
 
 use chrono::{NaiveDate, NaiveDateTime};

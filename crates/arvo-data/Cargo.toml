@@ -19,6 +19,9 @@ tracing = "0.1.44"
 blake3 = "1.8.7"
 chrono.workspace = true
 serde.workspace = true
+# A signal series is metadata plus points in one file (#164); JSON is
+# the shape serde already writes, and already compiled in this graph.
+serde_json = "1"
 thiserror.workspace = true
 
 [dev-dependencies]

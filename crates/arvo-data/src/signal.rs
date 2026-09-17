@@ -28,6 +28,8 @@
 //! caller's, and #164's), and any rule model over several signals — that is
 //! a strategy document (#161), which is built on this.
 
+pub mod series;
+
 use std::collections::BTreeMap;
 use std::fmt;
 
