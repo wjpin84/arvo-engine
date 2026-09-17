@@ -285,6 +285,52 @@ fn date_of(at: UnixNanos) -> Option<NaiveDate> {
 mod tests {
     use super::*;
 
+    /// #160: an indicator that is not ready yet says so in the one way a
+    /// rule cannot mistake for a number.
+    ///
+    /// Every one of them is fed one observation short of its window and
+    /// published as a [`arvo_data::Signal`], which is how a provider (#163)
+    /// and a stored series (#164) will publish theirs. The assertion is the
+    /// invariant itself: a predicate over what came out is false. It would
+    /// fail the moment any of these started returning `Some(0.0)` while
+    /// warming up — the quiet failure the signal type exists to stop, since
+    /// `0.0` is a value every threshold below zero happily matches.
+    #[test]
+    fn no_indicator_reports_a_zero_where_it_means_it_does_not_know() {
+        use arvo_data::{Signal, SignalName};
+
+        let at = "2024-01-02T14:30:00".parse().expect("a timestamp");
+        let mut sma = Sma::new(3);
+        let mut momentum = Momentum::new(3);
+        let mut atr = Atr::new(3);
+        let mut donchian = Donchian::new(3);
+        let mut vwap = SessionVwap::default();
+
+        // Two bars, where each of these needs at least three — and five for
+        // the session deviation, which is the rules module's own guard.
+        let mut warming = Vec::new();
+        for (high, low, close) in [(11.0, 9.0, 10.0), (12.0, 10.0, 11.0)] {
+            donchian.push(high, low);
+            vwap.push(high, low, close, 100.0);
+            warming.push(("arvo.sma.3", sma.update(close)));
+            warming.push(("arvo.momentum.3", momentum.update(close)));
+            warming.push(("arvo.atr.3", atr.update(high, low, close)));
+            warming.push(("arvo.donchian.3.high", donchian.channel().map(|(high, _)| high)));
+            warming.push(("arvo.vwap.deviation", vwap.deviation(5)));
+        }
+
+        for (name, value) in warming {
+            let signal = Signal::new(SignalName::new(name).expect("a name"), at, value);
+            assert_eq!(signal.value, None, "{name} answered before its window was full");
+            assert!(!signal.at_most(0.0), "{name} would satisfy a rule meaning 'at or below zero'");
+            assert!(!signal.satisfies(|_| true), "{name} satisfies nothing while it is absent");
+        }
+
+        // And once it is full, the same signal answers.
+        let ready = Signal::new(SignalName::new("arvo.sma.3").expect("a name"), at, sma.update(12.0));
+        assert!(ready.at_least(10.0), "a full window is a value like any other");
+    }
+
     #[test]
     fn momentum_is_withheld_until_the_lookback_is_covered() {
         // A return over five bars needs six observations, and reporting one
