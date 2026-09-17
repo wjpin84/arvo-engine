@@ -29,6 +29,7 @@ pub mod agent_search;
 pub mod book;
 pub mod breadth;
 pub mod correlation;
+pub mod document;
 pub mod dividend;
 pub mod evaluation;
 mod experiment;
@@ -55,6 +56,7 @@ pub use agent_search::AgentSearch;
 pub use book::combine;
 pub use breadth::Breadth;
 pub use correlation::RollingCorrelations;
+pub use document::{Combine, Grid, Rule, RuleSet, Rules, StrategyDocument, StrategyKind};
 pub use dividend::{measure_dividend_gap, DividendGap};
 pub use evaluation::{
     evaluate_against_benchmark, Evaluation, EvaluationCriteria, Evidence, Metrics, Verdict,
