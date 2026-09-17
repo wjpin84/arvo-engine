@@ -119,6 +119,13 @@ pub fn replay(
         Record::WalkForward(evidence) => {
             return replay_walk_forward(provider, evidence, current_dataset_version)
         }
+        Record::Reported(_) => {
+            return Replay::NotReplayable {
+                why: "a reported finding was computed by an engine Arvo cannot run again; it can be \
+                      judged, not replayed"
+                    .to_owned(),
+            }
+        }
         Record::Study(_) => {}
     }
 
@@ -412,7 +419,7 @@ fn data_or_engine_changed(
 fn replayable(record: &Record) -> Option<&Evidence> {
     match record {
         Record::Study(evidence) => Some(&evidence.out_of_sample_evidence),
-        Record::Panel(_) | Record::WalkForward(_) => None,
+        Record::Panel(_) | Record::WalkForward(_) | Record::Reported(_) => None,
     }
 }
 

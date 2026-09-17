@@ -90,6 +90,12 @@ pub fn deflate_for_agent(
             found.selection.best_sharpe,
             tighter(found.selection.expected_best_under_null),
         ),
+        // A reported finding declares its trials and nothing it scored, so
+        // its own bar is none and the agent's history sets the whole of it.
+        Record::Reported(found) => clears(
+            found.selection.best_sharpe,
+            tighter(found.selection.expected_best_under_null),
+        ),
         Record::WalkForward(found) => {
             // The same margin test the walk-forward was judged by, with each
             // fold's bar raised to the agent's. A fold with no bar of its own

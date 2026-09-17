@@ -185,6 +185,30 @@ impl Research {
         Ok(summarize(&stored))
     }
 
+    /// Records evidence an engine Arvo did not run computed, judged here by
+    /// the criteria a study uses, under `author`, held to the author's whole
+    /// search (ADR-0026).
+    ///
+    /// # Errors
+    ///
+    /// The store cannot be read or written.
+    pub fn record(
+        &self,
+        reported: arvo_research::Reported,
+        claim: String,
+        author: &str,
+        origin: Option<&str>,
+    ) -> Result<Value, String> {
+        let evidence = arvo_research::reported::record(reported, claim, &EvaluationCriteria::default());
+        let record = Record::Reported(Box::new(evidence));
+        let store = self.store();
+        let history = store.load().map_err(|err| err.to_string())?.records;
+        let stored = StoredRecord::by_agent(record, author, &history, chrono::Utc::now())
+            .with_origin(origin.map(ToOwned::to_owned));
+        store.save(&stored).map_err(|err| err.to_string())?;
+        Ok(summarize(&stored))
+    }
+
     /// Appends one line to the audit trail. Best effort, loudly: a trail that
     /// cannot be written is said on stderr and never fails the call — the
     /// finding, which is the durable record, is already saved.
@@ -279,6 +303,31 @@ pub fn summarize(stored: &StoredRecord) -> Value {
                 "instruments": found.pooled.instruments,
                 "trades": found.pooled.total_trades,
                 "mean_excess_return": found.pooled.mean_excess_return,
+            });
+        }
+        Record::Reported(found) => {
+            let evaluated = match &found.judgement {
+                arvo_research::Judgement::Evaluated(evaluation) => Some(evaluation.as_ref()),
+                arvo_research::Judgement::Inconclusive { .. } => None,
+            };
+            let experiment = &found.reported.experiment;
+            out["reasons"] = json!(found.reasons);
+            // No advice: the recommendations read a study's selection, and
+            // a reported finding has none. What it has is the verdict.
+            out["advice"] = json!([]);
+            out["reported"] = json!({
+                "engine": found.reported.engine,
+                "claim": found.claim,
+                "instrument": experiment.instrument,
+                "from": experiment.window.from.to_string(),
+                "to": experiment.window.to.to_string(),
+                "dataset": format!("{}@{}", experiment.dataset.id, experiment.dataset.version),
+                "trials": found.reported.trials,
+                "trades": arvo_research::TradeStats::from_ledger(&found.reported.strategy_ledger).closed,
+                "total_return": evaluated.map(|e| e.strategy.total_return),
+                "excess_return": evaluated.map(|e| e.excess_return),
+                "sharpe": evaluated.and_then(|e| e.strategy.sharpe),
+                "max_drawdown": evaluated.map(|e| e.strategy.max_drawdown),
             });
         }
     }

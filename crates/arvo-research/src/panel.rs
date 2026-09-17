@@ -74,6 +74,23 @@ pub struct InstrumentOutcome {
     pub strategy: Metrics,
     pub benchmark: Metrics,
     pub excess_return: f64,
+    /// The run these numbers came from, kept so the member can be handed
+    /// back as the contract of ADR-0026 and judged again. `None` for a panel
+    /// recorded before this was kept, which is a true statement about that
+    /// record; `default` so such a record still opens.
+    #[serde(default)]
+    pub kept: Option<KeptEvidence>,
+}
+
+/// What one panel member's out-of-sample run produced, before its metrics
+/// were taken from it: the evidence a verdict is computed from.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct KeptEvidence {
+    pub experiment: Experiment,
+    pub engine: String,
+    pub strategy_curve: Vec<crate::EquityPoint>,
+    pub benchmark_curve: Vec<crate::EquityPoint>,
+    pub ledger: Vec<crate::Trade>,
 }
 
 /// The panel's evidence, summarised across instruments.
@@ -385,6 +402,15 @@ pub fn run_panel(
                         excess_return: strategy.total_return - benchmark.total_return,
                         strategy,
                         benchmark,
+                        // Kept from now on, so this member can be judged
+                        // again from what its numbers came from (ADR-0026).
+                        kept: Some(KeptEvidence {
+                            experiment: experiment.clone(),
+                            engine: strategy_result.engine.clone(),
+                            strategy_curve: strategy_result.equity_curve.clone(),
+                            benchmark_curve: benchmark_result.equity_curve,
+                            ledger: strategy_result.ledger.clone(),
+                        }),
                     },
                     strategy_result.equity_curve,
                 )),
@@ -678,6 +704,7 @@ mod tests {
             strategy: metrics(excess),
             benchmark: metrics(0.0),
             excess_return: excess,
+            kept: None,
         }
     }
 

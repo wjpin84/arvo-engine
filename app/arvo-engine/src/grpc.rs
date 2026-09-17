@@ -14,8 +14,8 @@ pub mod proto {
 
 use proto::research_server::{self, ResearchServer};
 use proto::{
-    Advice, Empty, Finding, FindingId, FindingSummary, Findings, Instrument, Instruments,
-    RunRequest, Strategies, Strategy,
+    Advice, Empty, Finding, FindingId, FindingSummary, Findings, Instrument, Instruments, Point,
+    ReportRequest, RunRequest, Strategies, Strategy,
 };
 
 /// The keys of a summary that have their own fields; everything else is
@@ -231,6 +231,145 @@ impl research_server::Research for Service {
     ) -> Result<Response<Finding>, Status> {
         self.run(request.into_inner(), true).await
     }
+
+    async fn record_finding(&self, request: Request<ReportRequest>) -> Result<Response<Finding>, Status> {
+        let request = request.into_inner();
+        let author = required(&request.author, "author")?.to_owned();
+        let origin = Some(request.origin.trim().to_owned()).filter(|origin| !origin.is_empty());
+        let (reported, claim) = reported_from(&request).map_err(Status::invalid_argument)?;
+        let research = self.research.clone();
+        let outcome = tokio::task::spawn_blocking(move || {
+            let arguments = serde_json::json!({
+                "instrument": reported.experiment.instrument,
+                "engine": reported.engine,
+                "points": reported.strategy_curve.len(),
+                "trades": reported.strategy_ledger.len(),
+            });
+            let outcome = research.record(reported, claim, &author, origin.as_deref());
+            research.audit("grpc", &author, "record_finding", &arguments, &outcome);
+            outcome
+        })
+        .await
+        .map_err(|err| Status::internal(format!("the record did not finish: {err}")))?;
+        outcome
+            .map(|summary| Response::new(finding(&summary)))
+            .map_err(Status::failed_precondition)
+    }
+}
+
+/// The wire's report as the contract, or what is wrong with it. Everything
+/// ADR-0026 requires is checked here, so a script hears about a missing
+/// field by name rather than getting an `Inconclusive` it cannot explain.
+fn reported_from(request: &ReportRequest) -> Result<(arvo_research::Reported, String), String> {
+    use arvo_research::{trade::Direction, trade::ExitReason, CostModel, DatasetRef, DateRange, Experiment, ExperimentId, HypothesisId, RiskModel, StrategySpec, Trade};
+    use chrono::{NaiveDate, NaiveDateTime};
+
+    let text = |value: &str, name: &str| -> Result<String, String> {
+        let value = value.trim();
+        if value.is_empty() { Err(format!("{name} is required")) } else { Ok(value.to_owned()) }
+    };
+    let date = |value: &str, name: &str| -> Result<NaiveDate, String> {
+        NaiveDate::parse_from_str(value.trim(), "%Y-%m-%d").map_err(|_| format!("{name} {value:?} is not a date like 2026-01-31"))
+    };
+    let instant = |value: &str, name: &str| -> Result<NaiveDateTime, String> {
+        NaiveDateTime::parse_from_str(value.trim(), "%Y-%m-%dT%H:%M:%S")
+            .or_else(|_| date(value, name).map(|day| day.and_hms_opt(0, 0, 0).expect("midnight")))
+            .map_err(|_| format!("{name} {value:?} is not a time like 2026-01-31T09:30:00"))
+    };
+    let points = |points: &[Point], name: &str| -> Result<Vec<arvo_research::EquityPoint>, String> {
+        points
+            .iter()
+            .map(|point| Ok(arvo_research::EquityPoint { at: instant(&point.at, name)?, equity: point.equity }))
+            .collect()
+    };
+
+    let instrument = text(&request.instrument, "instrument")?;
+    let engine = text(&request.engine, "engine")?;
+    let hypothesis = text(&request.hypothesis_id, "hypothesis_id")?;
+    let strategy = text(&request.strategy, "strategy")?;
+    let window = DateRange::new(date(&request.from, "from")?, date(&request.to, "to")?).map_err(|err| err.to_string())?;
+    let interval: arvo_data::BarInterval =
+        request.interval.parse().map_err(|_| format!("interval {:?} is not one like 5minute or 1day", request.interval))?;
+    let adjustment = match request.adjustment.trim() {
+        "" | "split" => arvo_data::source::Adjustment::Split,
+        "total_return" => arvo_data::source::Adjustment::TotalReturn,
+        other => return Err(format!("adjustment {other:?} is neither split nor total_return")),
+    };
+    let dataset = DatasetRef {
+        id: text(&request.dataset_id, "dataset_id")?,
+        version: text(&request.dataset_version, "dataset_version")?,
+        adjustment,
+    };
+    let strategy_curve = points(&request.strategy_curve, "strategy_curve")?;
+    if strategy_curve.is_empty() {
+        return Err("strategy_curve is required".to_owned());
+    }
+    let benchmark_curve = if request.benchmark_curve.is_empty() { None } else { Some(points(&request.benchmark_curve, "benchmark_curve")?) };
+    let ledger = request
+        .ledger
+        .iter()
+        .map(|trade| {
+            Ok(Trade {
+                instrument: trade.instrument.clone(),
+                opened: instant(&trade.opened, "opened")?,
+                closed: if trade.closed.trim().is_empty() { None } else { Some(instant(&trade.closed, "closed")?) },
+                direction: match trade.direction.trim().to_ascii_lowercase().as_str() {
+                    "" | "long" => Direction::Long,
+                    "short" => Direction::Short,
+                    other => return Err(format!("direction {other:?} is neither long nor short")),
+                },
+                quantity: trade.quantity,
+                entry: trade.entry,
+                exit: trade.exit,
+                pnl: trade.pnl,
+                commission: trade.commission,
+                exit_reason: match trade.exit_reason.trim().to_ascii_lowercase().as_str() {
+                    "" | "signal" => ExitReason::Signal,
+                    "stop" => ExitReason::Stop,
+                    "halted" => ExitReason::Halted,
+                    "expired" => ExitReason::Expired,
+                    "still_open" | "open" => ExitReason::StillOpen,
+                    other => return Err(format!("exit_reason {other:?} is not one this knows (signal, stop, halted, expired, still_open)")),
+                },
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+
+    let experiment = Experiment {
+        id: ExperimentId::from(format!("reported-{engine}-{instrument}-{}-{}", window.from, window.to).as_str()),
+        hypothesis: HypothesisId::from(hypothesis.as_str()),
+        instrument,
+        alongside: Vec::new(),
+        underlying: None,
+        window,
+        interval,
+        dataset,
+        strategy: StrategySpec { name: strategy, params: request.params.iter().map(|(k, v)| (k.clone(), *v)).collect() },
+        costs: {
+            // The three the wire carries; the rest are what a run assumes
+            // when it says nothing, exactly as a study's would.
+            let mut costs = CostModel::proportional(0.0, 0.0);
+            costs.commission_bps = request.commission_bps;
+            costs.slippage_bps = request.slippage_bps;
+            costs.per_fill = request.per_fill;
+            costs
+        },
+        risk: RiskModel { stop_atr_multiple: request.stop_atr_multiple, ..RiskModel::default() },
+        starting_cash: if request.starting_cash > 0.0 { request.starting_cash } else { strategy_curve[0].equity },
+        seed: 0,
+    };
+    Ok((
+        arvo_research::Reported {
+            hypothesis: experiment.hypothesis.clone(),
+            experiment,
+            engine,
+            strategy_curve,
+            strategy_ledger: ledger,
+            benchmark_curve,
+            trials: request.trials.map(|trials| trials as usize),
+        },
+        request.claim.trim().to_owned(),
+    ))
 }
 
 #[cfg(test)]
@@ -331,6 +470,80 @@ mod tests {
         assert_eq!(line["ok"], serde_json::json!(false));
     }
 
+    /// ADR-0026 over the wire: evidence in, Arvo's verdict out, saved as
+    /// the author's finding; what is missing is named; no benchmark is
+    /// Inconclusive rather than a guess.
+    #[tokio::test]
+    async fn a_script_records_evidence_and_arvo_judges_it() {
+        let (dir, address, _stop) = engine().await;
+        let mut client = ResearchClient::connect(address).await.expect("connects");
+        let curve = |step: f64| -> Vec<Point> {
+            (0..300u32)
+                .map(|n| Point {
+                    at: (chrono::NaiveDate::from_ymd_opt(2024, 1, 1).expect("date") + chrono::Duration::days(i64::from(n)))
+                        .format("%Y-%m-%d")
+                        .to_string(),
+                    equity: 100_000.0 * (1.0 + step).powi(n as i32),
+                })
+                .collect()
+        };
+        let ledger: Vec<proto::LedgerTrade> = (0..40u32)
+            .map(|n| proto::LedgerTrade {
+                opened: format!("2024-{:02}-{:02}", 1 + n / 28, 1 + n % 28),
+                closed: format!("2024-{:02}-{:02}T16:00:00", 1 + n / 28, 1 + n % 28),
+                entry: 100.0,
+                exit: Some(101.0),
+                pnl: 1.0,
+                ..Default::default()
+            })
+            .collect();
+        let request = |benchmark: bool| ReportRequest {
+            author: "script:their-engine".to_owned(),
+            origin: "C:/proj/their.py:7".to_owned(),
+            hypothesis_id: "h-momentum".to_owned(),
+            claim: "momentum persists".to_owned(),
+            instrument: "SPY.THEIRS".to_owned(),
+            from: "2024-01-01".to_owned(),
+            to: "2024-10-26".to_owned(),
+            interval: "1day".to_owned(),
+            dataset_id: "theirs:SPY".to_owned(),
+            dataset_version: "sha256-of-inputs".to_owned(),
+            strategy: "rsi2-pullback".to_owned(),
+            engine: "their-engine 0.2".to_owned(),
+            strategy_curve: curve(0.002),
+            ledger: ledger.clone(),
+            benchmark_curve: if benchmark { curve(0.0005) } else { Vec::new() },
+            trials: Some(12),
+            ..Default::default()
+        };
+
+        let found = client.record_finding(with_token(request(true), TOKEN)).await.expect("recorded").into_inner();
+        let summary = found.summary.expect("a summary");
+        assert_eq!(summary.kind, "reported");
+        assert_eq!(summary.author, "script:their-engine");
+        assert!(["Supported", "NotSupported", "Inconclusive"].contains(&summary.verdict.as_str()), "{}", summary.verdict);
+        let detail: Value = serde_json::from_str(&found.detail_json).expect("json");
+        assert_eq!(detail["reported"]["engine"], "their-engine 0.2");
+        assert_eq!(detail["reported"]["trades"], 40);
+        assert_eq!(detail["reported"]["trials"], 12);
+        let listed = client.list_findings(with_token(Empty {}, TOKEN)).await.expect("lists").into_inner();
+        assert_eq!(listed.findings.len(), 1);
+        assert_eq!(listed.findings[0].id, summary.id);
+
+        let alone = client.record_finding(with_token(request(false), TOKEN)).await.expect("recorded").into_inner();
+        assert_eq!(alone.summary.expect("a summary").verdict, "Inconclusive");
+        assert!(alone.reasons.iter().any(|reason| reason.contains("benchmark")), "{:?}", alone.reasons);
+
+        let mut nameless = request(true);
+        nameless.instrument = String::new();
+        let refused = client.record_finding(with_token(nameless, TOKEN)).await.unwrap_err();
+        assert_eq!(refused.code(), tonic::Code::InvalidArgument);
+        assert!(refused.message().contains("instrument"), "{}", refused.message());
+
+        let audit = std::fs::read_to_string(dir.path().join(crate::research::AUDIT_FILE)).expect("audited");
+        assert!(audit.contains("record_finding"));
+    }
+
     #[test]
     fn nothing_in_the_research_service_can_fetch_share_or_trade() {
         // The boundary is what is offered. A call that named a source, a key
@@ -341,9 +554,11 @@ mod tests {
             .filter_map(|line| line.trim().strip_prefix("rpc "))
             .filter_map(|rest| rest.split('(').next())
             .collect();
+        // RecordFinding takes evidence in; it fetches nothing, shares nothing
+        // and trades nothing, and the type has no field for a verdict.
         assert_eq!(
             calls,
-            ["ListStrategies", "ListInstruments", "ListFindings", "OpenFinding", "RunStudy", "RunWalkForward"]
+            ["ListStrategies", "ListInstruments", "ListFindings", "OpenFinding", "RunStudy", "RunWalkForward", "RecordFinding"]
         );
         for forbidden in ["Fetch", "Order", "Trade", "Share", "Import", "Key", "Sign", "Session", "Halt"] {
             assert!(!calls.iter().any(|call| call.contains(forbidden)), "{forbidden}");
