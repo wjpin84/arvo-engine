@@ -336,6 +336,23 @@ pub enum Verdict {
     Inconclusive,
 }
 
+impl Verdict {
+    /// The plain instruction on how far this verdict may be read, before any
+    /// number under it.
+    ///
+    /// One wording, here rather than at each place a finding is presented:
+    /// the engine's summary and the composed report (#159) are the same
+    /// sentence, and a reader who has seen one has seen the other.
+    #[must_use]
+    pub const fn read_this_first(self) -> &'static str {
+        match self {
+            Self::Supported => "Supported is the one verdict worth acting on, and only as far as the advice below allows.",
+            Self::NotSupported => "Not supported: the numbers below describe a rule that did not clear its bar. Do not report them as an edge.",
+            Self::Inconclusive => "Inconclusive: too little evidence to say either way. Do not report the numbers below as a result.",
+        }
+    }
+}
+
 /// A result, its benchmark, and what the comparison supports.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Evaluation {
