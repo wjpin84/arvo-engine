@@ -37,7 +37,7 @@ const OPTION_SUBDIR: &str = "options";
 ///
 /// Returns [`DataError::UnsafeInstrument`] for an empty name, one containing
 /// anything but alphanumerics, `.`, `-` and `_`, or one containing `..`.
-fn safe_name(instrument: &str) -> Result<&str, DataError> {
+pub(crate) fn safe_name(instrument: &str) -> Result<&str, DataError> {
     let safe = !instrument.is_empty()
         && instrument
             .chars()

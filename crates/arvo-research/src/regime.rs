@@ -260,6 +260,76 @@ pub fn attribute(strategy: &[EquityPoint], benchmark: &[EquityPoint]) -> Option<
     })
 }
 
+/// What this module calls itself when it writes a series.
+pub const ENGINE: &str = "arvo.regime 1";
+
+/// The name these labels are published under (#160's namespace).
+pub const SERIES: &str = "regime.trend";
+
+/// Why a study may never gate on them. The module's own argument, carried
+/// with the series so a refusal can say it rather than referring to a doc
+/// comment nobody reading a verdict will open.
+pub const NOT_CAUSAL_BECAUSE: &str = "the labels are computed after the fact, over a completed run's     benchmark curve; a backtest filtered by them would be look-ahead of the most flattering kind";
+
+impl Regime {
+    /// As a signal value: the direction, so that the ordering means
+    /// something and a rule reading it reads a number rather than an
+    /// arbitrary index.
+    ///
+    /// A regime is a category and a signal is a number, which is a real
+    /// mismatch and not one worth a second type yet — there is one
+    /// categorical producer in the codebase. When there are two, ADR-0005
+    /// says what to do about it.
+    #[must_use]
+    pub const fn as_signal(self) -> f64 {
+        match self {
+            Self::TrendingUp => 1.0,
+            Self::Ranging => 0.0,
+            Self::TrendingDown => -1.0,
+        }
+    }
+}
+
+/// The labels as a series for the library (#164), flagged non-causal.
+///
+/// The second implementation of a stored signal series, and the reason the
+/// causal flag exists. Arvo does not gain a real-time regime detector from
+/// this — it gains the place these labels go, and the rule that keeps them
+/// out of a backtest. [`attribute`] goes on reading the curves directly for
+/// the breakdown it already produces; nothing about that changes.
+///
+/// A period before the lookback has filled carries no label, and is stored
+/// as a point with no value rather than left out: the series says "I was
+/// running and had nothing to say", which is not the same as "no data".
+#[must_use]
+pub fn series(
+    benchmark: &[EquityPoint],
+    instrument: &str,
+    interval: arvo_data::BarInterval,
+) -> arvo_data::SignalSeries {
+    let labels = label(benchmark, LOOKBACK);
+    arvo_data::SignalSeries {
+        name: arvo_data::SignalName::new(SERIES).unwrap_or_else(|err| unreachable!("{err}")),
+        instrument: instrument.to_owned(),
+        interval,
+        engine: ENGINE.to_owned(),
+        causality: arvo_data::Causality::NotCausal {
+            because: NOT_CAUSAL_BECAUSE.to_owned(),
+        },
+        // The whole curve is labelled in one pass, so the series covers
+        // every period the run did.
+        history: arvo_data::History::Replayed,
+        points: benchmark
+            .iter()
+            .zip(labels)
+            .map(|(point, regime)| arvo_data::SignalPoint {
+                at: point.at,
+                value: regime.map(Regime::as_signal),
+            })
+            .collect(),
+    }
+}
+
 /// One period's return, guarding a zero or negative starting equity.
 fn period_return(curve: &[EquityPoint], index: usize) -> f64 {
     let previous = curve[index - 1].equity;
@@ -304,6 +374,50 @@ mod tests {
         (0..periods)
             .map(|i| if i % 2 == 0 { 100.0 } else { 103.0 })
             .collect()
+    }
+
+    /// #164: these labels are stored, read, and refused as a filter.
+    ///
+    /// The refusal is the ticket. Nothing prevented it before — a backtest
+    /// that gated on a label computed over the whole window would have run
+    /// and produced a flattering number with no warning anywhere.
+    #[test]
+    fn the_labels_are_a_series_a_study_may_read_but_never_gate_on() {
+        let benchmark = curve(&climbing(40));
+        let series = series(&benchmark, "SPY.RH", arvo_data::BarInterval::DAILY);
+
+        let refused = series.as_filter().expect_err("a study may not gate on a description");
+        assert!(
+            refused.to_string().contains("look-ahead"),
+            "the refusal says why, in the module's own words: {refused}"
+        );
+
+        // Every period the run had, with the warm-up stored as points that
+        // have no value rather than as no points at all.
+        assert_eq!(series.points.len(), benchmark.len());
+        assert_eq!(series.at(at(0)).value, None, "before the lookback filled");
+        assert_eq!(series.at(at(39)).value, Some(Regime::TrendingUp.as_signal()));
+        assert!(!series.at(at(0)).at_most(0.0), "and an unlabelled period satisfies nothing");
+
+        // Describing a result with them is what they are for, and that is
+        // untouched: `attribute` reads the curves, not the series.
+        let strategy = curve(&chopping(40));
+        assert!(attribute(&strategy, &benchmark).is_some());
+    }
+
+    #[test]
+    fn a_stored_series_reads_back_as_the_same_refusal() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = arvo_data::SignalStore::new(root.path());
+        let written = series(&curve(&climbing(40)), "SPY.RH", arvo_data::BarInterval::DAILY);
+        let (_, version) = store.write(&written).expect("writes");
+
+        let read = store
+            .read(&written.name, "SPY.RH", arvo_data::BarInterval::DAILY)
+            .expect("reads")
+            .expect("it is there");
+        assert_eq!(read.version(), version, "the same series, by content");
+        assert!(read.as_filter().is_err(), "and still not something to trade on");
     }
 
     #[test]
