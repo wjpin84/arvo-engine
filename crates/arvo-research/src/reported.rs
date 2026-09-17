@@ -22,6 +22,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::evaluation::{Evaluation, EvaluationCriteria, Metrics, Verdict};
+use crate::family::Selection;
 use crate::{
     EquityPoint, Experiment, FamilyEvidence, HypothesisId, InstrumentOutcome, PanelEvidence, Trade,
     TradeStats, WalkForwardEvidence,
@@ -50,7 +51,7 @@ pub struct Reported {
 }
 
 /// What Arvo made of reported evidence.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Judgement {
     /// Both curves were there and long enough: the full evaluation, verdict
     /// and reasons included, exactly as a Study carries.
@@ -110,6 +111,53 @@ pub fn judge(reported: &Reported, criteria: &EvaluationCriteria) -> Judgement {
     let evaluation = Evaluation::new(strategy, benchmark, reported.strategy_curve.clone(), benchmark_curve.clone(), criteria)
         .with_trades(reported.strategy_ledger.clone());
     Judgement::Evaluated(Box::new(evaluation))
+}
+
+/// A reported finding as the ledger holds it: the evidence, the criteria it
+/// was judged by, and what Arvo made of it. The fourth kind of record.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReportedEvidence {
+    pub reported: Reported,
+    /// The claim in prose, as the submitter stated it.
+    pub claim: String,
+    pub criteria: EvaluationCriteria,
+    pub judgement: Judgement,
+    /// The search this finding declares, in the shape every other record's
+    /// search takes, so the author's bar counts it (ADR-0014). No scored
+    /// trials: an outside engine reports how many it ran, not what each
+    /// scored, and the bar is raised by the count alone.
+    pub selection: Selection,
+    pub verdict: Verdict,
+    pub reasons: Vec<String>,
+}
+
+/// Judges reported evidence and keeps the judgement with it. The verdict
+/// and reasons are copied out where every other record keeps them, so a
+/// later refusal can mark this one the same way.
+#[must_use]
+pub fn record(reported: Reported, claim: String, criteria: &EvaluationCriteria) -> ReportedEvidence {
+    let judgement = judge(&reported, criteria);
+    let best_sharpe = match &judgement {
+        Judgement::Evaluated(evaluation) => evaluation.strategy.sharpe.unwrap_or(0.0),
+        Judgement::Inconclusive { .. } => 0.0,
+    };
+    let selection = Selection {
+        trials: reported.trials.unwrap_or(0),
+        best_sharpe,
+        expected_best_under_null: None,
+        survived_deflation: true,
+        prior_trials: 0,
+        scored: Vec::new(),
+    };
+    ReportedEvidence {
+        verdict: judgement.verdict(),
+        reasons: judgement.reasons().to_vec(),
+        reported,
+        claim,
+        criteria: *criteria,
+        judgement,
+        selection,
+    }
 }
 
 impl FamilyEvidence {
@@ -293,6 +341,33 @@ mod tests {
             assert_eq!(evaluation.excess_return, stored.out_of_sample_evidence.evaluation.excess_return, "{what}");
             assert_eq!(stored.reported().trials, Some(12), "the whole search, prior trials included");
         }
+    }
+
+    /// The record kind: judged once, stored with its judgement, and it comes
+    /// back from JSON as the same thing, including the search the bar counts.
+    #[test]
+    fn a_reported_finding_is_recorded_with_its_judgement_and_survives_a_round_trip() {
+        let stored = study(0.002, 0.0005, 40);
+        let mut reported = stored.reported();
+        reported.trials = Some(7);
+        let evidence = record(reported, "momentum persists".to_owned(), &EvaluationCriteria::default());
+        assert_eq!(evidence.verdict, stored.verdict, "Arvo's verdict, not the submitter's");
+        assert_eq!(evidence.selection.trials, 7, "the declared search, where the bar reads it");
+        assert!(evidence.selection.scored.is_empty());
+        let text = serde_json::to_string(&evidence).expect("encodes");
+        let back: ReportedEvidence = serde_json::from_str(&text).expect("decodes");
+        // Field by field rather than whole: a curve's equity is written to
+        // the stored format's precision, so the points are not bit-identical
+        // after a round trip and were never meant to be.
+        assert_eq!(back.verdict, evidence.verdict);
+        assert_eq!(back.reasons, evidence.reasons);
+        assert_eq!(back.selection, evidence.selection);
+        assert_eq!(back.claim, evidence.claim);
+        assert_eq!(back.reported.engine, evidence.reported.engine);
+        assert_eq!(back.reported.experiment.dataset, evidence.reported.experiment.dataset);
+        assert_eq!(back.reported.strategy_curve.len(), evidence.reported.strategy_curve.len());
+        assert_eq!(back.reported.strategy_ledger.len(), evidence.reported.strategy_ledger.len());
+        assert_eq!(back.judgement.verdict(), evidence.judgement.verdict());
     }
 
     /// What a submitter cannot leave out, and what happens when they do.

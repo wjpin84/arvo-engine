@@ -47,6 +47,10 @@ pub enum Record {
     Study(Box<FamilyEvidence>),
     Panel(Box<PanelEvidence>),
     WalkForward(Box<WalkForwardEvidence>),
+    /// Evidence an engine Arvo did not run computed, judged by Arvo
+    /// (ADR-0026). Cannot be replayed or shared as an experiment: its
+    /// question is one Arvo cannot run.
+    Reported(Box<crate::reported::ReportedEvidence>),
 }
 
 impl Record {
@@ -57,6 +61,7 @@ impl Record {
             Self::Study(_) => "study",
             Self::Panel(_) => "panel",
             Self::WalkForward(_) => "walk-forward",
+            Self::Reported(_) => "reported",
         }
     }
 
@@ -71,6 +76,9 @@ impl Record {
             Self::WalkForward(evidence) => {
                 format!("{} walk-forward", evidence.template.instrument)
             }
+            Self::Reported(evidence) => {
+                format!("{} reported by {}", evidence.reported.experiment.instrument, evidence.reported.engine)
+            }
         }
     }
 
@@ -82,6 +90,8 @@ impl Record {
             Self::Study(evidence) => &evidence.selected.dataset.version,
             Self::Panel(evidence) => &evidence.dataset.version,
             Self::WalkForward(evidence) => &evidence.template.dataset.version,
+            // The engine's own hash of what it read; not in Arvo's library.
+            Self::Reported(evidence) => &evidence.reported.experiment.dataset.version,
         }
     }
 
@@ -91,6 +101,7 @@ impl Record {
             Self::Study(evidence) => evidence.verdict,
             Self::Panel(evidence) => evidence.verdict,
             Self::WalkForward(evidence) => evidence.verdict,
+            Self::Reported(evidence) => evidence.verdict,
         }
     }
 
@@ -100,6 +111,7 @@ impl Record {
             Self::Study(evidence) => &evidence.hypothesis,
             Self::Panel(evidence) => &evidence.hypothesis,
             Self::WalkForward(evidence) => &evidence.hypothesis,
+            Self::Reported(evidence) => &evidence.reported.hypothesis,
         }
     }
 
@@ -113,6 +125,7 @@ impl Record {
             Self::WalkForward(evidence) => {
                 evidence.folds.iter().map(|fold| &fold.selection).collect()
             }
+            Self::Reported(evidence) => vec![&evidence.selection],
         }
     }
 
@@ -122,6 +135,7 @@ impl Record {
             Self::Study(evidence) => (&mut evidence.verdict, &mut evidence.reasons),
             Self::Panel(evidence) => (&mut evidence.verdict, &mut evidence.reasons),
             Self::WalkForward(evidence) => (&mut evidence.verdict, &mut evidence.reasons),
+            Self::Reported(evidence) => (&mut evidence.verdict, &mut evidence.reasons),
         };
         *verdict = Verdict::NotSupported;
         reasons.push(reason);
@@ -351,6 +365,11 @@ impl StoredRecord {
                 Some(evidence.template.instrument.clone()),
                 Some(evidence.template.interval),
                 evidence.template.alongside.clone(),
+            ),
+            Record::Reported(evidence) => (
+                Some(evidence.reported.experiment.instrument.clone()),
+                Some(evidence.reported.experiment.interval),
+                Vec::new(),
             ),
             Record::Panel(_) => (None, None, Vec::new()),
         };

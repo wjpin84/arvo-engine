@@ -75,7 +75,7 @@ pub use risk::{
     PDT_EQUITY_FLOOR, PDT_WINDOW_DAYS,
 };
 pub use panel::{run_panel, InstrumentOutcome, KeptEvidence, PanelEvidence, PanelStudy, PooledOutcome};
-pub use reported::{judge, Judgement, Reported};
+pub use reported::{judge, Judgement, Reported, ReportedEvidence};
 pub use trade::{Direction, ExitReason, Trade, TradeStats};
 pub use walk_forward::{run_walk_forward, AxisStability, WalkForward, WalkForwardEvidence};
 
