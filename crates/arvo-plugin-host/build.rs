@@ -18,4 +18,6 @@ fn main() {
         .expect("failed to compile plugin.proto");
     tonic_prost_build::compile_protos("../../protos/arvo/source/v1/source.proto")
         .expect("failed to compile source.proto");
+    tonic_prost_build::compile_protos("../../protos/arvo/signal/v1/signal.proto")
+        .expect("failed to compile signal.proto");
 }

@@ -850,15 +850,35 @@ mod tests {
     fn a_change_to_the_proto_is_a_change_to_the_published_copy() {
         use sha2::Digest as _;
 
-        const PUBLISHED: &str = "7640bb5886708ec5902ae0c67928e4513575663d8309a5eb21aca77f0430f06e";
+        // All three, because all three are what a provider has to serve: the
+        // manifest it answers with, the source service, and the signals it
+        // publishes (#163).
+        let published = [
+            (
+                "plugin/v1/plugin.proto",
+                include_str!("../../../protos/arvo/plugin/v1/plugin.proto"),
+                "4b5092432ec8080f0fcedc8d74f5bfa1ce8c402a0c253e2af2bb2161814a6c86",
+            ),
+            (
+                "source/v1/source.proto",
+                include_str!("../../../protos/arvo/source/v1/source.proto"),
+                "7640bb5886708ec5902ae0c67928e4513575663d8309a5eb21aca77f0430f06e",
+            ),
+            (
+                "signal/v1/signal.proto",
+                include_str!("../../../protos/arvo/signal/v1/signal.proto"),
+                "6e793cc2cdfc57e9718eacc6a9438f13646e38c3345d9e3752839fe0ab032d20",
+            ),
+        ];
 
-        let proto = include_str!("../../../protos/arvo/source/v1/source.proto");
-        let hash = format!("{:x}", sha2::Sha256::digest(proto.replace("\r\n", "\n").as_bytes()));
-        assert_eq!(
-            hash, PUBLISHED,
-            "the proto moved. Copy it to arvo-extension-api/proto/arvo/source/v1/source.proto, \
-             open a pull request there, and put the new hash here: {hash}"
-        );
+        for (name, proto, expected) in published {
+            let hash = format!("{:x}", sha2::Sha256::digest(proto.replace("\r\n", "\n").as_bytes()));
+            assert_eq!(
+                hash, expected,
+                "{name} moved. Copy it to arvo-extension-api/proto/arvo/{name}, open a pull \
+                 request there, and put the new hash here: {hash}"
+            );
+        }
     }
 
     use super::*;

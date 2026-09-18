@@ -24,6 +24,7 @@
 
 use crate::plugin::plugin_client::PluginClient;
 use crate::plugin::{GetManifestRequest, Manifest};
+use crate::signal::{GrpcSignals, SERVICE as SIGNAL_SERVICE};
 use crate::source::{no_grants, with_token, GrpcSource, Granter, Token, SERVICE};
 use arvo_core::config::PluginsConfig;
 use arvo_core::events::{Event, StatusKind};
@@ -57,6 +58,10 @@ pub struct PluginEntry {
     /// reachable and its manifest named the service (ADR-0022 point 2). Empty
     /// for a plugin that serves something else, or is down.
     pub sources: Vec<GrpcSource>,
+    /// What it publishes behind `arvo.signal.v1.Signals` (#163), on the same
+    /// terms: read when it was last reachable and its manifest named the
+    /// service. A plugin may serve both, one, or neither.
+    pub signals: Vec<GrpcSignals>,
     /// The token the supervisor started it with, sent on every call. `None`
     /// for a plugin a person started, which answers everyone.
     pub token: Option<Token>,
@@ -96,8 +101,8 @@ impl PluginRegistry {
             // A `command` entry is the supervisor's to start; it registers
             // itself here once it has said where it listens.
             let Some(address) = plugin.address.clone() else { continue };
-            let (status, sources) = probe(&address, &granter, None).await;
-            entries.push(PluginEntry { id: plugin.id.clone(), address, status, sources, token: None });
+            let Served { status, sources, signals } = probe(&address, &granter, None).await;
+            entries.push(PluginEntry { id: plugin.id.clone(), address, status, sources, signals, token: None });
         }
         Self { entries: RwLock::new(entries), events, granter }
     }
@@ -120,9 +125,17 @@ impl PluginRegistry {
                 refreshed.push(old);
                 continue;
             }
-            let (status, sources) = probe(&old.address, &self.granter, old.token.as_ref()).await;
+            let Served { status, sources, signals } =
+                probe(&old.address, &self.granter, old.token.as_ref()).await;
             self.announce(&old.id, Some(old.status.kind()), status.kind());
-            refreshed.push(PluginEntry { id: old.id, address: old.address, status, sources, token: old.token });
+            refreshed.push(PluginEntry {
+                id: old.id,
+                address: old.address,
+                status,
+                sources,
+                signals,
+                token: old.token,
+            });
         }
         *self.entries.write().await = refreshed;
     }
@@ -138,14 +151,24 @@ impl PluginRegistry {
         self.entries.read().await.iter().flat_map(|entry| entry.sources.iter().cloned()).collect()
     }
 
+    /// Every signal publisher every reachable plugin serves (#163).
+    ///
+    /// A plugin that has gone unreachable is not in this list, which is how
+    /// the missing-value invariant survives a process dying: its names are
+    /// not published, so every rule over them reads absent rather than the
+    /// last thing it said.
+    pub async fn served_signals(&self) -> Vec<GrpcSignals> {
+        self.entries.read().await.iter().flat_map(|entry| entry.signals.iter().cloned()).collect()
+    }
+
     /// Registers a plugin that has just said where it listens, probing it
     /// with the token it was started with. Replaces an entry of that id: a
     /// supervised plugin restarted lands on a new port and is the same plugin.
     pub async fn add(&self, id: &str, address: String, token: Option<Token>) {
-        let (status, sources) = probe(&address, &self.granter, token.as_ref()).await;
+        let Served { status, sources, signals } = probe(&address, &self.granter, token.as_ref()).await;
         let now = status.kind();
         let mut entries = self.entries.write().await;
-        let entry = PluginEntry { id: id.to_owned(), address, status, sources, token };
+        let entry = PluginEntry { id: id.to_owned(), address, status, sources, signals, token };
         let was = match entries.iter().position(|entry| entry.id == id) {
             Some(at) => Some(std::mem::replace(&mut entries[at], entry).status.kind()),
             None => {
@@ -177,10 +200,21 @@ impl PluginRegistry {
                 let was = entry.status.kind();
                 entry.status = status;
                 entry.sources.clear();
+                // And its signals. A rule gated on a classifier that has
+                // just died must read absent, not the last thing it said
+                // (#163).
+                entry.signals.clear();
                 Some(was)
             }
             None => {
-                entries.push(PluginEntry { id: id.to_owned(), address: String::new(), status, sources: Vec::new(), token: None });
+                entries.push(PluginEntry {
+                    id: id.to_owned(),
+                    address: String::new(),
+                    status,
+                    sources: Vec::new(),
+                    signals: Vec::new(),
+                    token: None,
+                });
                 None
             }
         };
@@ -209,14 +243,19 @@ impl PluginRegistry {
 /// is reported as reachable with no sources, and logged, rather than hidden
 /// behind an Unreachable that would send someone to check a process that is
 /// running.
-async fn probe(address: &str, granter: &Granter, token: Option<&Token>) -> (PluginStatus, Vec<GrpcSource>) {
+async fn probe(address: &str, granter: &Granter, token: Option<&Token>) -> Served {
+    let down = |why: String| Served {
+        status: PluginStatus::Unreachable(why),
+        sources: Vec::new(),
+        signals: Vec::new(),
+    };
     let mut client = match PluginClient::connect(address.to_string()).await {
         Ok(client) => client,
-        Err(err) => return (PluginStatus::Unreachable(err.to_string()), Vec::new()),
+        Err(err) => return down(err.to_string()),
     };
     let manifest = match client.get_manifest(with_token(GetManifestRequest {}, token)).await {
         Ok(response) => response.into_inner(),
-        Err(status) => return (PluginStatus::Unreachable(status.to_string()), Vec::new()),
+        Err(status) => return down(status.to_string()),
     };
     let sources = if manifest.capabilities.iter().any(|capability| capability.name == SERVICE) {
         match GrpcSource::discover_as(address, granter.clone(), token.cloned()).await {
@@ -229,7 +268,29 @@ async fn probe(address: &str, granter: &Granter, token: Option<&Token>) -> (Plug
     } else {
         Vec::new()
     };
-    (PluginStatus::Reachable(manifest), sources)
+    let signals = if manifest.capabilities.iter().any(|capability| capability.name == SIGNAL_SERVICE) {
+        match GrpcSignals::discover(address, token.cloned()).await {
+            Ok(signals) => vec![signals],
+            Err(why) => {
+                tracing::warn!(plugin = %manifest.id, why, "names {SIGNAL_SERVICE} but could not describe it");
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    Served {
+        status: PluginStatus::Reachable(manifest),
+        sources,
+        signals,
+    }
+}
+
+/// What a probe found: whether the plugin answered, and what it serves.
+struct Served {
+    status: PluginStatus,
+    sources: Vec<GrpcSource>,
+    signals: Vec<GrpcSignals>,
 }
 
 #[cfg(test)]
