@@ -832,6 +832,35 @@ pub async fn serve_as(
 
 #[cfg(test)]
 mod tests {
+    /// The proto is published, at `wjpin84/arvo-extension-api`, because a
+    /// boundary the people who implement it cannot read is not one. A copy
+    /// outside this repository can fall behind the one in it, silently, and
+    /// a plugin author would find out by generating stubs for a service
+    /// that has moved.
+    ///
+    /// So: a tripwire, not a comparison. Nothing here can reach the other
+    /// repository, and a test that needed the network would be a test that
+    /// fails on a train. Changing the proto changes this hash, and the
+    /// failure says what else the change has to touch.
+    ///
+    /// Line endings are normalised first: git hands this file back with the
+    /// platform's, and the proto did not change because Windows checked it
+    /// out.
+    #[test]
+    fn a_change_to_the_proto_is_a_change_to_the_published_copy() {
+        use sha2::Digest as _;
+
+        const PUBLISHED: &str = "7640bb5886708ec5902ae0c67928e4513575663d8309a5eb21aca77f0430f06e";
+
+        let proto = include_str!("../../../protos/arvo/source/v1/source.proto");
+        let hash = format!("{:x}", sha2::Sha256::digest(proto.replace("\r\n", "\n").as_bytes()));
+        assert_eq!(
+            hash, PUBLISHED,
+            "the proto moved. Copy it to arvo-extension-api/proto/arvo/source/v1/source.proto, \
+             open a pull request there, and put the new hash here: {hash}"
+        );
+    }
+
     use super::*;
     use std::time::Duration;
 
