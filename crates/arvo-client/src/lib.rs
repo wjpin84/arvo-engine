@@ -5,6 +5,10 @@
 //! generated from `engine.proto`, the wire format the workbench's views
 //! travel in, and the error every command answers with.
 //!
+//! It also holds [`discovery`]: where the engine is and which tokens it serves
+//! behind. That is the contract's other half — a front end cannot call an
+//! engine it cannot find — and the engine writes the same file this reads.
+//!
 //! It depends on `arvo-views` and the gRPC stack, and on no engine crate.
 //! That is the point: when the window depends on this crate and `arvo-views`
 //! alone, the window and the engine can live in different repositories
@@ -17,6 +21,7 @@ pub mod proto {
     tonic::include_proto!("arvo.engine.v1");
 }
 
+pub mod discovery;
 pub mod wire;
 
 mod error;

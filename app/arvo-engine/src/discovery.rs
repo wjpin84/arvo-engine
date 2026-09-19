@@ -1,8 +1,8 @@
 //! How a front end finds the engine. The file itself is defined in
-//! [`arvo_core::engine`], which the window reads too; the token is made here,
+//! [`arvo_client::discovery`], which the window reads too; the token is made here,
 //! because only the engine writes one.
 
-pub use arvo_core::engine::{
+pub use arvo_client::discovery::{
     read, read_control, remove_if_ours, running, write, write_control, Discovery, CONTROL_FILE, FILE,
 };
 
