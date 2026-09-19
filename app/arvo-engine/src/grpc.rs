@@ -9,7 +9,7 @@ use tonic::{Request, Response, Status};
 use crate::research::Research;
 use crate::session::Sessions;
 
-pub use arvo_plugin_host::engine as proto;
+pub use arvo_client::proto as proto;
 
 use proto::research_server::{self, ResearchServer};
 use proto::sessions_server::{self, SessionsServer};
@@ -18,7 +18,7 @@ use proto::{
     BookRequest, FindingIds, Instrument, Instruments, Point, ReportRequest, RiskModel, Rules, RulesetForm, RulesetPath,
     Rulesets, Ruleset, RunRequest, StudyRequest, View, SessionId, SessionList, SessionStatus, StartRequest, Strategies,
 };
-use arvo_service::wire;
+use arvo_client::wire;
 
 /// The keys of a summary that have their own fields; everything else is
 /// `detail_json`.
@@ -28,7 +28,7 @@ const TYPED: &[&str] = &[
 
 /// The largest message either side accepts: a figure or a trades table
 /// attached to a finding, with room. tonic's default is 4 MB.
-pub use arvo_service::wire::MAX_MESSAGE_BYTES;
+pub use arvo_client::wire::MAX_MESSAGE_BYTES;
 
 struct Service {
     research: Research,

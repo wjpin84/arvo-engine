@@ -6,7 +6,7 @@
 //! shapes meet, and the engine and the window both call them, so neither can
 //! drift from the other.
 
-use arvo_plugin_host::engine as proto;
+use crate::proto;
 use arvo_views::{AttachmentView, RiskModelView, RuleView, RulesetFormView, RulesetView, StrategyView};
 
 /// The most a message may carry, both ways. A study view holds curves,

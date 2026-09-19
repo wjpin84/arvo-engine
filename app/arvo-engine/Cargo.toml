@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 arvo-alpaca.workspace = true
+arvo-client.workspace = true
 arvo-core.workspace = true
 arvo-data.workspace = true
 arvo-execution.workspace = true

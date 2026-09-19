@@ -7,6 +7,7 @@ members = [
     "crates/arvo-risk",
     "crates/arvo-plugin-host",
     "crates/arvo-service",
+    "crates/arvo-client",
     "crates/arvo-mcp",
     "crates/arvo-oauth",
     "app/arvo-views",
@@ -45,6 +46,7 @@ arvo-research = { path = "crates/arvo-research" }
 arvo-risk = { path = "crates/arvo-risk" }
 arvo-plugin-host = { path = "crates/arvo-plugin-host" }
 arvo-service = { path = "crates/arvo-service" }
+arvo-client = { path = "crates/arvo-client" }
 
 anyhow = "1.0.104"
 # Already in the graph via Nautilus; sharing the version keeps one copy.

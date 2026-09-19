@@ -1,0 +1,19 @@
+[package]
+name = "arvo-client"
+description = "What a front end needs to talk to the engine: the generated engine API, the view wire format and the command error. No engine crate depends on this being anything more."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+arvo-views.workspace = true
+prost.workspace = true
+serde.workspace = true
+serde_json = "1"
+thiserror.workspace = true
+tonic.workspace = true
+tonic-prost.workspace = true
+
+[build-dependencies]
+protoc-bin-vendored.workspace = true
+tonic-prost-build.workspace = true
