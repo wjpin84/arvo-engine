@@ -151,6 +151,25 @@ fn plural(count: usize, one: &str, many: &str) -> String {
     format!("{count} {}", if count == 1 { one } else { many })
 }
 
+/// A trading session changed state.
+///
+/// Halted and failed are worth interrupting someone for: money that was
+/// being managed is not, any more, and nobody clicked anything. The rest
+/// is information.
+#[must_use]
+pub fn session(id: &str, state: &str, detail: Option<&str>) -> EventView {
+    let alarming = matches!(state, "halted" | "failed");
+    EventView {
+        kind: EventKindView::Session { id: id.to_owned(), state: state.to_owned() },
+        title: format!("Session {state}"),
+        detail: match detail {
+            Some(why) => format!("{id}: {why}"),
+            None => id.to_owned(),
+        },
+        severity: if alarming { SeverityView::Warning } else { SeverityView::Info },
+    }
+}
+
 /// Live prices came back.
 pub fn stream_live() -> EventView {
     EventView {

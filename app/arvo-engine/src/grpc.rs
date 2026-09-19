@@ -32,6 +32,9 @@ pub use arvo_client::wire::MAX_MESSAGE_BYTES;
 
 struct Service {
     research: Research,
+    /// For [`Research::subscribe`]: the sessions are the first thing that
+    /// raises events.
+    sessions: std::sync::Arc<Sessions>,
     /// The workbench's runs and memory over the same folder: what the window
     /// renders, served here so the window need not run them itself.
     workbench: std::sync::Arc<arvo_service::research::ResearchService>,
@@ -71,7 +74,8 @@ pub async fn serve(
         research.root().join(arvo_service::research::EVIDENCE_SUBDIR),
     ));
     let research_tier = tonic::service::interceptor::InterceptedService::new(
-        ResearchServer::new(Service { research, workbench }).max_decoding_message_size(MAX_MESSAGE_BYTES),
+        ResearchServer::new(Service { research, sessions: sessions.clone(), workbench })
+            .max_decoding_message_size(MAX_MESSAGE_BYTES),
         bearer(&tokens.research, "engine.json"),
     );
     let control_tier = tonic::service::interceptor::InterceptedService::new(
@@ -282,6 +286,18 @@ impl Service {
 
 #[tonic::async_trait]
 impl research_server::Research for Service {
+    type SubscribeStream = std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<View, Status>> + Send>>;
+
+    async fn subscribe(&self, _: Request<Empty>) -> Result<Response<Self::SubscribeStream>, Status> {
+        use tokio_stream::StreamExt as _;
+        // A receiver that lagged gets the events after the gap, not an error:
+        // what it missed is in the session record.
+        let stream = tokio_stream::wrappers::BroadcastStream::new(self.sessions.subscribe())
+            .filter_map(|item| item.ok())
+            .map(|event| wire::view("EventView", &event).map_err(Status::internal));
+        Ok(Response::new(Box::pin(stream)))
+    }
+
     async fn list_strategies(&self, _: Request<Empty>) -> Result<Response<Strategies>, Status> {
         let plans = arvo_service::research::list_strategies().map_err(|err| Status::internal(err.to_string()))?;
         Ok(Response::new(Strategies {
@@ -776,6 +792,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_session_that_fails_is_announced_to_a_subscriber() {
+        use tokio_stream::StreamExt as _;
+        let (_dir, address, _stop) = engine().await;
+        let mut client = ResearchClient::connect(address.clone()).await.expect("connects");
+        let mut events = client.subscribe(with_token(Empty {}, TOKEN)).await.expect("subscribed").into_inner();
+
+        let mut control = super::proto::sessions_client::SessionsClient::connect(address).await.expect("connects");
+        // A finding that does not exist: the session thread fails before it
+        // builds an executor, so nothing here reaches a venue.
+        control
+            .start_session(with_token(StartRequest { finding: "nope".to_owned(), executor: "alpaca-paper".to_owned() }, CONTROL))
+            .await
+            .expect("starts");
+
+        let first = tokio::time::timeout(std::time::Duration::from_secs(10), events.next())
+            .await
+            .expect("an event within ten seconds")
+            .expect("the stream is open")
+            .expect("ok");
+        assert_eq!(first.kind, "EventView");
+        let event: arvo_service::research::EventView = wire::decode(first).expect("decodes");
+        assert_eq!(
+            event.kind,
+            arvo_service::research::EventKindView::Session { id: "nope@alpaca-paper".to_owned(), state: "failed".to_owned() },
+            "{event:?}"
+        );
+        assert_eq!(event.severity, arvo_service::research::SeverityView::Warning);
+    }
+
+    #[tokio::test]
     async fn an_empty_memory_lists_nothing_and_a_missing_finding_is_not_found() {
         let (_dir, address, _stop) = engine().await;
         let mut client = ResearchClient::connect(address).await.expect("connects");
@@ -943,14 +989,14 @@ mod tests {
         // of the same runs and the same memory RunStudy and ListFindings
         // reach; ViewBook takes instruments and caps, and its sector labels
         // come from a session this machine already holds, never from the
-        // caller.
+        // caller. Subscribe only listens.
         assert_eq!(
             calls,
             [
                 "ListStrategies", "ListInstruments", "ListFindings", "OpenFinding", "RunStudy", "RunWalkForward",
                 "RecordFinding", "AttachFile", "ListRulesets", "ReadRuleset", "WriteRuleset", "ListRules", "GetRiskModel",
                 "ViewStudy", "ViewWalkForward", "ViewPanel", "ViewBook", "ViewHistory", "ViewRecord", "ViewReplay",
-                "ViewComparison", "ViewProblems", "ListAttachments",
+                "ViewComparison", "ViewProblems", "ListAttachments", "Subscribe",
             ]
         );
         for forbidden in ["Fetch", "Order", "Trade", "Share", "Import", "Key", "Sign", "Session", "Halt"] {

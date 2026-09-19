@@ -43,7 +43,9 @@ use arvo_execution::{Executor, Session};
 use arvo_nautilus::{NautilusSimulation, Shadow, Side, Signal};
 use arvo_research::{DateRange, EvidenceStore, Experiment, Record, RiskGate};
 use arvo_risk::Proposal;
+use arvo_views::EventView;
 use serde::Serialize;
+use tokio::sync::broadcast;
 
 /// Where a session's record goes, under the data root: one JSON line per
 /// event, which is what a later view of "what did the system do" reads.
@@ -106,6 +108,9 @@ struct Running {
 pub struct Sessions {
     data: PathBuf,
     running: Mutex<BTreeMap<String, Running>>,
+    /// Every state change, for whoever is listening (#150). Sent, never
+    /// awaited: a session does not wait for the window.
+    events: broadcast::Sender<EventView>,
 }
 
 impl std::fmt::Debug for Sessions {
@@ -117,7 +122,15 @@ impl std::fmt::Debug for Sessions {
 impl Sessions {
     #[must_use]
     pub fn new(data: &Path) -> Self {
-        Self { data: data.to_path_buf(), running: Mutex::new(BTreeMap::new()) }
+        let (events, _) = broadcast::channel(256);
+        Self { data: data.to_path_buf(), running: Mutex::new(BTreeMap::new()), events }
+    }
+
+    /// Every session state change from now on. A receiver that falls behind
+    /// misses events rather than stalling a session.
+    #[must_use]
+    pub fn subscribe(&self) -> broadcast::Receiver<EventView> {
+        self.events.subscribe()
     }
 
     /// Starts a session for `finding` against `executor`.
@@ -166,13 +179,14 @@ impl Sessions {
             let executor = executor.to_owned();
             let status = status.clone();
             let stop = stop.clone();
+            let events = self.events.clone();
             // Its own thread: the shadow's message bus is thread-local
             // (ADR-0001), and a session is a loop that sleeps.
             std::thread::Builder::new()
                 .name(id.clone())
                 .spawn(move || {
                     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        run(&data, &finding, &executor, &status, &stop)
+                        run(&data, &finding, &executor, &status, &stop, &events)
                     }));
                     let mut status = status.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                     match outcome {
@@ -190,6 +204,7 @@ impl Sessions {
                             status.last_error = Some("the session thread panicked".to_owned());
                         }
                     }
+                    announce(&events, &status);
                 })
                 .map_err(|err| format!("starting the session thread: {err}"))?
         };
@@ -239,7 +254,14 @@ fn experiment_of(store: &EvidenceStore, finding: &str) -> Result<Experiment, Str
     }
 }
 
-fn run(data: &Path, finding: &str, executor: &str, status: &Mutex<Status>, stop: &AtomicBool) -> Result<(), String> {
+fn run(
+    data: &Path,
+    finding: &str,
+    executor: &str,
+    status: &Mutex<Status>,
+    stop: &AtomicBool,
+    events: &broadcast::Sender<EventView>,
+) -> Result<(), String> {
     let store = EvidenceStore::new(&data.join("evidence"));
     let mut experiment = experiment_of(&store, finding)?;
     if experiment.instruments().len() != 1 {
@@ -291,6 +313,7 @@ fn run(data: &Path, finding: &str, executor: &str, status: &Mutex<Status>, stop:
             &record,
             status,
             stop,
+            events,
         )),
         "alpaca-live" => runtime.block_on(drive(
             arvo_alpaca::AlpacaExecutor::live(),
@@ -303,6 +326,7 @@ fn run(data: &Path, finding: &str, executor: &str, status: &Mutex<Status>, stop:
             &record,
             status,
             stop,
+            events,
         )),
         robinhood if robinhood.starts_with("robinhood-") => {
             let last4 = &robinhood["robinhood-".len()..];
@@ -324,6 +348,7 @@ fn run(data: &Path, finding: &str, executor: &str, status: &Mutex<Status>, stop:
                 &record,
                 status,
                 stop,
+                events,
             ))
         }
         other => Err(format!("no executor {other:?}")),
@@ -343,6 +368,7 @@ async fn drive<E: Executor>(
     record: &Recorder,
     status: &Mutex<Status>,
     stop: &AtomicBool,
+    events: &broadcast::Sender<EventView>,
 ) -> Result<(), String> {
     let now = || chrono::Utc::now().naive_utc();
     let instrument = experiment.instrument.clone();
@@ -367,10 +393,14 @@ async fn drive<E: Executor>(
         );
     }
     if let Some(why) = session.gate().halted() {
-        halt(status, record, why);
+        halt(status, record, events, why);
         return Ok(());
     }
-    status.lock().unwrap_or_else(std::sync::PoisonError::into_inner).state = "running".to_owned();
+    {
+        let mut status = status.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        status.state = "running".to_owned();
+        announce(events, &status);
+    }
 
     while !stop.load(Ordering::SeqCst) {
         let today = now().date();
@@ -406,7 +436,7 @@ async fn drive<E: Executor>(
                 act(&mut session, &signal, &proposer, now(), record, status).await?;
             }
             if let Some(why) = session.gate().halted() {
-                halt(status, record, why);
+                halt(status, record, events, why);
                 return Ok(());
             }
         }
@@ -500,11 +530,19 @@ async fn act<E: Executor>(
     Ok(())
 }
 
-fn halt(status: &Mutex<Status>, record: &Recorder, why: &str) {
+fn halt(status: &Mutex<Status>, record: &Recorder, events: &broadcast::Sender<EventView>, why: &str) {
     let mut status = status.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     status.state = "halted".to_owned();
     status.halted = Some(why.to_owned());
     record.write("halted", Some(serde_json::json!(why)));
+    announce(events, &status);
+}
+
+/// Tells whoever is listening what state a session is in now. A send with
+/// no receiver is fine: the engine runs with the window closed.
+fn announce(events: &broadcast::Sender<EventView>, status: &Status) {
+    let why = status.last_error.as_deref().or(status.halted.as_deref());
+    let _ = events.send(arvo_service::events::session(&status.id, &status.state, why));
 }
 
 /// Appends a session's events to its file.
