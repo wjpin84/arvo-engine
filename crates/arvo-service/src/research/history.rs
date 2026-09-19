@@ -779,3 +779,171 @@ mod staleness_tests {
         assert!(export_name("..").is_err(), "a name that is only dots is refused");
     }
 }
+
+/// Everything in research memory, newest first, from the store's summaries:
+/// a stored finding is around 400 KB and this renders a column of names.
+/// Findings that could not be read come back too, rather than as a log line.
+///
+/// # Errors
+///
+/// The directory cannot be listed.
+pub fn list_history(service: &ResearchService) -> Result<HistoryView, CommandError> {
+    let (summaries, unreadable) = service.memory.summaries().map_err(|err| CommandError::Failed(err.to_string()))?;
+    Ok(HistoryView {
+        entries: summaries
+            .iter()
+            .map(|summary| {
+                let live = live_version(service, summary);
+                HistoryEntryView {
+                    id: summary.id.clone(),
+                    kind: summary.kind.clone(),
+                    subject: summary.subject.clone(),
+                    verdict: verdict_label(summary.verdict).to_owned(),
+                    recorded_at: summary.recorded_at.format("%Y-%m-%d %H:%M").to_string(),
+                    stale: live.map(|live| live != summary.dataset_version),
+                    agent: summary.agent.clone(),
+                    origin: summary.origin.clone(),
+                    trials: summary.trials,
+                    attachments: summary.attachments,
+                }
+            })
+            .collect(),
+        unreadable: unreadable.into_iter().map(|item| UnreadableView { id: item.id, reason: item.reason }).collect(),
+    })
+}
+
+/// The files kept with a finding (#157).
+///
+/// # Errors
+///
+/// No such finding.
+pub fn list_attachments(service: &ResearchService, id: &str) -> Result<Vec<arvo_views::AttachmentView>, CommandError> {
+    let stored = service.memory.open(id).map_err(|err| CommandError::Failed(err.to_string()))?;
+    Ok(stored.attachments.iter().map(attachment_view).collect())
+}
+
+/// The caveats of the latest finding at every script line under `root` that
+/// asked for a run, for the Problems panel. Nothing for findings whose origin
+/// is elsewhere or unknown.
+///
+/// # Errors
+///
+/// The findings store cannot be read.
+pub fn list_research_problems(
+    service: &ResearchService,
+    root: &std::path::Path,
+) -> Result<Vec<arvo_views::ResearchProblemView>, CommandError> {
+    let (summaries, _) = service.memory.summaries().map_err(|err| CommandError::Failed(err.to_string()))?;
+    // The latest finding per call site: a line re-run replaces what it said.
+    let mut latest: std::collections::HashMap<(String, u32), &arvo_research::Summary> = std::collections::HashMap::new();
+    for summary in &summaries {
+        let Some(site) = summary.origin.as_deref().and_then(|origin| origin_in(origin, root)) else { continue };
+        let slot = latest.entry(site).or_insert(summary);
+        if summary.recorded_at > slot.recorded_at {
+            *slot = summary;
+        }
+    }
+    if latest.is_empty() {
+        return Ok(Vec::new());
+    }
+    let loaded = service.memory.load().map_err(|err| CommandError::Failed(err.to_string()))?;
+    let mut out = Vec::new();
+    for ((path, line), summary) in latest {
+        let Some(stored) = loaded.records.iter().find(|stored| stored.id == summary.id) else { continue };
+        let view = record_view(service, stored.clone());
+        out.extend(caveats(&view).into_iter().map(|(severity, message)| arvo_views::ResearchProblemView {
+            path: path.clone(),
+            line,
+            severity,
+            message,
+            finding: summary.id.clone(),
+        }));
+    }
+    out.sort_by(|a, b| a.path.cmp(&b.path).then(a.line.cmp(&b.line)));
+    Ok(out)
+}
+
+/// Reopens one stored finding.
+///
+/// # Errors
+///
+/// The store cannot be read, or no such finding.
+pub fn open_record(service: &ResearchService, id: &str) -> Result<RecordView, CommandError> {
+    let loaded = service.memory.load().map_err(|err| CommandError::Failed(err.to_string()))?;
+    let stored = loaded
+        .records
+        .into_iter()
+        .find(|stored| stored.id == id)
+        .ok_or_else(|| CommandError::Failed(format!("no stored finding {id:?}")))?;
+    Ok(record_view(service, stored))
+}
+
+/// Runs a stored finding again and reports whether it still comes out the
+/// same. Blocking: one engine run. A finding whose numbers cannot be
+/// regenerated is not evidence; it is a screenshot of a number.
+///
+/// # Errors
+///
+/// No such finding.
+pub fn replay_record(service: &ResearchService, id: &str) -> Result<ReplayView, CommandError> {
+    let stored = service.memory.open(id).map_err(|err| CommandError::Failed(err.to_string()))?;
+    // Hashed here rather than inside the replay: what the data is now is a
+    // question about this machine, and the research crate has no filesystem.
+    let live = live_version(service, &stored.summary());
+    let outcome = arvo_research::replay(service.simulation.as_ref(), &stored.record, live.as_deref());
+    Ok(replay_view(&outcome))
+}
+
+/// Reads several stored findings against each other, and counts the choice
+/// among them as the search it is: the best of six no-skill searches still
+/// looks better than the average of them.
+///
+/// # Errors
+///
+/// A named finding cannot be read.
+pub fn compare_records(service: &ResearchService, ids: &[String]) -> Result<ComparisonView, CommandError> {
+    let mut rows = Vec::with_capacity(ids.len());
+    let mut curves = Vec::with_capacity(ids.len());
+    let mut notes = Vec::new();
+    for id in ids {
+        let stored = service.memory.open(id).map_err(|err| CommandError::Failed(err.to_string()))?;
+        let summary = stored.summary();
+        let Some((evaluation, strategy_name)) = comparable(&stored.record) else {
+            // A panel is one configuration across many instruments; a study
+            // is one instrument. The same table would invite reading one
+            // number against the other, and they are not the same number.
+            notes.push(format!("{} is a panel and is not comparable row-for-row with a single study", summary.subject));
+            continue;
+        };
+        let live = live_version(service, &summary);
+        rows.push(ComparisonRowView {
+            id: id.clone(),
+            subject: summary.subject.clone(),
+            kind: summary.kind.clone(),
+            strategy_name,
+            verdict: verdict_label(summary.verdict).to_owned(),
+            recorded_at: summary.recorded_at.format("%Y-%m-%d %H:%M").to_string(),
+            total_return: evaluation.strategy.total_return,
+            excess_return: evaluation.excess_return,
+            sharpe: evaluation.strategy.sharpe,
+            max_drawdown: evaluation.strategy.max_drawdown,
+            trades: evaluation.strategy.trades,
+            win_rate: evaluation.strategy_trades.win_rate,
+            profit_factor: evaluation.strategy_trades.profit_factor,
+            stale: live.map(|live| live != summary.dataset_version),
+        });
+        curves.push(NamedCurveView {
+            name: format!("{} · {}", summary.subject, summary.kind),
+            points: curve_points(&evaluation.strategy_curve),
+        });
+    }
+    let judged = judge_comparison(&rows, notes);
+    Ok(ComparisonView {
+        rows,
+        curves,
+        best_sharpe: judged.best,
+        expected_best_under_null: judged.bar,
+        survived_deflation: judged.survived,
+        notes: judged.notes,
+    })
+}

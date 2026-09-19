@@ -15,8 +15,8 @@ use proto::research_server::{self, ResearchServer};
 use proto::sessions_server::{self, SessionsServer};
 use proto::{
     Advice, AttachRequest, Attachment, Attachments, Empty, Finding, FindingId, FindingSummary, Findings,
-    Instrument, Instruments, Point, ReportRequest, RiskModel, Rules, RulesetForm, RulesetPath, Rulesets,
-    Ruleset, RunRequest, SessionId, SessionList, SessionStatus, StartRequest, Strategies,
+    BookRequest, FindingIds, Instrument, Instruments, Point, ReportRequest, RiskModel, Rules, RulesetForm, RulesetPath,
+    Rulesets, Ruleset, RunRequest, StudyRequest, View, SessionId, SessionList, SessionStatus, StartRequest, Strategies,
 };
 use arvo_service::wire;
 
@@ -28,10 +28,13 @@ const TYPED: &[&str] = &[
 
 /// The largest message either side accepts: a figure or a trades table
 /// attached to a finding, with room. tonic's default is 4 MB.
-pub const MAX_MESSAGE_BYTES: usize = 64 << 20;
+pub use arvo_service::wire::MAX_MESSAGE_BYTES;
 
 struct Service {
     research: Research,
+    /// The workbench's runs and memory over the same folder: what the window
+    /// renders, served here so the window need not run them itself.
+    workbench: std::sync::Arc<arvo_service::research::ResearchService>,
 }
 
 struct Control {
@@ -63,8 +66,12 @@ pub async fn serve(
     tokens: &Tokens,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), tonic::transport::Error> {
+    let workbench = std::sync::Arc::new(arvo_service::research::ResearchService::new(
+        research.root().join(arvo_service::research::DATA_SUBDIR),
+        research.root().join(arvo_service::research::EVIDENCE_SUBDIR),
+    ));
     let research_tier = tonic::service::interceptor::InterceptedService::new(
-        ResearchServer::new(Service { research }).max_decoding_message_size(MAX_MESSAGE_BYTES),
+        ResearchServer::new(Service { research, workbench }).max_decoding_message_size(MAX_MESSAGE_BYTES),
         bearer(&tokens.research, "engine.json"),
     );
     let control_tier = tonic::service::interceptor::InterceptedService::new(
@@ -140,6 +147,34 @@ impl sessions_server::Sessions for Control {
 
 /// A JSON value as text: a string as itself, null as empty, anything else as
 /// its JSON.
+/// The workbench's refusal, as the caller's mistake: a rule that does not
+/// exist, an instrument without bars, a finding that is not there.
+fn refused(err: arvo_service::CommandError) -> Status {
+    Status::invalid_argument(err.to_string())
+}
+
+/// A view, serialised for the wire.
+fn viewed<T: serde::Serialize>(kind: &str, value: &T) -> Result<Response<View>, Status> {
+    wire::view(kind, value).map(Response::new).map_err(Status::internal)
+}
+
+/// Runs `work` on a blocking thread with the workbench: studies are backtests,
+/// and the async runtime is not where they belong.
+async fn blocking<T: Send + 'static>(
+    workbench: &std::sync::Arc<arvo_service::research::ResearchService>,
+    work: impl FnOnce(&arvo_service::research::ResearchService) -> Result<T, arvo_service::CommandError> + Send + 'static,
+) -> Result<T, Status> {
+    let workbench = workbench.clone();
+    tokio::task::spawn_blocking(move || work(&workbench))
+        .await
+        .map_err(|err| Status::internal(format!("the run did not finish: {err}")))?
+        .map_err(refused)
+}
+
+fn size(value: u32) -> usize {
+    usize::try_from(value).unwrap_or(usize::MAX)
+}
+
 fn text(value: Option<&Value>) -> String {
     match value {
         Some(Value::String(text)) => text.clone(),
@@ -286,6 +321,85 @@ impl research_server::Research for Service {
 
     async fn get_risk_model(&self, _: Request<Empty>) -> Result<Response<RiskModel>, Status> {
         Ok(Response::new(wire::risk_model(arvo_service::risk::view(self.research.root()))))
+    }
+
+    async fn view_study(&self, request: Request<StudyRequest>) -> Result<Response<View>, Status> {
+        let StudyRequest { instrument, strategy } = request.into_inner();
+        let view = blocking(&self.workbench, move |workbench| {
+            arvo_service::research::study::run_study(workbench, &instrument, strategy.as_deref())
+        })
+        .await?;
+        viewed("StudyView", &view)
+    }
+
+    async fn view_walk_forward(&self, request: Request<StudyRequest>) -> Result<Response<View>, Status> {
+        let StudyRequest { instrument, strategy } = request.into_inner();
+        let view = blocking(&self.workbench, move |workbench| {
+            arvo_service::research::study::run_walk_forward(workbench, &instrument, strategy.as_deref())
+        })
+        .await?;
+        viewed("WalkForwardView", &view)
+    }
+
+    async fn view_panel(&self, _: Request<Empty>) -> Result<Response<View>, Status> {
+        let view = blocking(&self.workbench, arvo_service::research::study::run_panel).await?;
+        viewed("PanelView", &view)
+    }
+
+    async fn view_book(&self, request: Request<BookRequest>) -> Result<Response<View>, Status> {
+        let BookRequest { instruments, strategy, max_concurrent_positions, max_per_sector } = request.into_inner();
+        let sector_cap = arvo_service::research::study::book_sector_cap(max_per_sector.map(size), &instruments)
+            .await
+            .map_err(refused)?;
+        let view = blocking(&self.workbench, move |workbench| {
+            arvo_service::research::study::run_book(
+                workbench,
+                instruments,
+                strategy.as_deref(),
+                max_concurrent_positions.map(size),
+                sector_cap,
+            )
+        })
+        .await?;
+        viewed("StudyView", &view)
+    }
+
+    async fn view_history(&self, _: Request<Empty>) -> Result<Response<View>, Status> {
+        let view = arvo_service::research::history::list_history(&self.workbench).map_err(refused)?;
+        viewed("HistoryView", &view)
+    }
+
+    async fn view_record(&self, request: Request<FindingId>) -> Result<Response<View>, Status> {
+        let id = required(&request.get_ref().id, "id")?;
+        let view = arvo_service::research::history::open_record(&self.workbench, id).map_err(refused)?;
+        viewed("RecordView", &view)
+    }
+
+    async fn view_replay(&self, request: Request<FindingId>) -> Result<Response<View>, Status> {
+        let id = required(&request.get_ref().id, "id")?.to_owned();
+        let view = blocking(&self.workbench, move |workbench| {
+            arvo_service::research::history::replay_record(workbench, &id)
+        })
+        .await?;
+        viewed("ReplayView", &view)
+    }
+
+    async fn view_comparison(&self, request: Request<FindingIds>) -> Result<Response<View>, Status> {
+        let view = arvo_service::research::history::compare_records(&self.workbench, &request.get_ref().ids)
+            .map_err(refused)?;
+        viewed("ComparisonView", &view)
+    }
+
+    async fn view_problems(&self, _: Request<Empty>) -> Result<Response<View>, Status> {
+        let view = arvo_service::research::history::list_research_problems(&self.workbench, self.research.root())
+            .map_err(refused)?;
+        viewed("Vec<ResearchProblemView>", &view)
+    }
+
+    async fn list_attachments(&self, request: Request<FindingId>) -> Result<Response<Attachments>, Status> {
+        let id = required(&request.get_ref().id, "id")?;
+        let kept = arvo_service::research::history::list_attachments(&self.workbench, id).map_err(refused)?;
+        Ok(Response::new(Attachments { attachments: kept.into_iter().map(wire::attachment).collect() }))
     }
 
     async fn list_instruments(&self, _: Request<Empty>) -> Result<Response<Instruments>, Status> {
@@ -623,6 +737,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_workbench_views_come_over_the_wire_and_a_study_without_bars_is_refused() {
+        let (_dir, address, _stop) = engine().await;
+        let mut client = ResearchClient::connect(address).await.expect("connects");
+
+        let history = client.view_history(with_token(Empty {}, TOKEN)).await.expect("ok").into_inner();
+        assert_eq!(history.kind, "HistoryView");
+        let decoded: arvo_service::research::HistoryView = wire::decode(history).expect("decodes");
+        assert!(decoded.entries.is_empty() && decoded.unreadable.is_empty());
+
+        let problems = client.view_problems(with_token(Empty {}, TOKEN)).await.expect("ok").into_inner();
+        let decoded: Vec<arvo_service::research::ResearchProblemView> = wire::decode(problems).expect("decodes");
+        assert!(decoded.is_empty());
+
+        let no_bars = client
+            .view_study(with_token(StudyRequest { instrument: "NOPE.YF".to_owned(), strategy: None }, TOKEN))
+            .await
+            .unwrap_err();
+        assert_eq!(no_bars.code(), tonic::Code::InvalidArgument, "{no_bars:?}");
+        let no_rule = client
+            .view_walk_forward(with_token(
+                StudyRequest { instrument: "NOPE.YF".to_owned(), strategy: Some("nothing".to_owned()) },
+                TOKEN,
+            ))
+            .await
+            .unwrap_err();
+        assert!(no_rule.message().contains("nothing"), "{no_rule:?}");
+        let one = client
+            .view_book(with_token(
+                BookRequest { instruments: vec!["A.YF".to_owned()], strategy: None, max_concurrent_positions: None, max_per_sector: None },
+                TOKEN,
+            ))
+            .await
+            .unwrap_err();
+        assert!(one.message().contains("two instruments"), "{one:?}");
+        let gone = client.view_record(with_token(FindingId { id: "nope".to_owned() }, TOKEN)).await.unwrap_err();
+        assert_eq!(gone.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
     async fn an_empty_memory_lists_nothing_and_a_missing_finding_is_not_found() {
         let (_dir, address, _stop) = engine().await;
         let mut client = ResearchClient::connect(address).await.expect("connects");
@@ -786,12 +939,18 @@ mod tests {
         // The ruleset calls read and write files under the project's own
         // rulesets folder, validated by `offerable` before they are written,
         // and GetRiskModel reads the risk file: what a study will run under,
-        // never a way to change it.
+        // never a way to change it. The View calls are the window's renderings
+        // of the same runs and the same memory RunStudy and ListFindings
+        // reach; ViewBook takes instruments and caps, and its sector labels
+        // come from a session this machine already holds, never from the
+        // caller.
         assert_eq!(
             calls,
             [
                 "ListStrategies", "ListInstruments", "ListFindings", "OpenFinding", "RunStudy", "RunWalkForward",
                 "RecordFinding", "AttachFile", "ListRulesets", "ReadRuleset", "WriteRuleset", "ListRules", "GetRiskModel",
+                "ViewStudy", "ViewWalkForward", "ViewPanel", "ViewBook", "ViewHistory", "ViewRecord", "ViewReplay",
+                "ViewComparison", "ViewProblems", "ListAttachments",
             ]
         );
         for forbidden in ["Fetch", "Order", "Trade", "Share", "Import", "Key", "Sign", "Session", "Halt"] {

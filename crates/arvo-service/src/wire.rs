@@ -7,7 +7,56 @@
 //! drift from the other.
 
 use arvo_plugin_host::engine as proto;
-use arvo_views::{RiskModelView, RuleView, RulesetFormView, RulesetView, StrategyView};
+use arvo_views::{AttachmentView, RiskModelView, RuleView, RulesetFormView, RulesetView, StrategyView};
+
+/// The most a message may carry, both ways. A study view holds curves,
+/// ledgers and a search surface; tonic's default of four megabytes is not a
+/// fit for a finding.
+pub const MAX_MESSAGE_BYTES: usize = 64 << 20;
+
+/// A workbench view on the wire: `kind` names the `arvo_views` type, `json`
+/// is how that type serialises. The window decodes it with [`decode`].
+///
+/// # Errors
+///
+/// The view does not serialise, which no `arvo_views` type fails to do.
+pub fn view<T: serde::Serialize>(kind: &str, value: &T) -> Result<proto::View, String> {
+    Ok(proto::View { kind: kind.to_owned(), json: serde_json::to_string(value).map_err(|err| err.to_string())? })
+}
+
+/// A view back from the wire, as the type the caller expects.
+///
+/// # Errors
+///
+/// The engine answered with another type or another version of this one;
+/// the message names both kinds.
+pub fn decode<T: serde::de::DeserializeOwned>(wire: proto::View) -> Result<T, String> {
+    serde_json::from_str(&wire.json).map_err(|err| {
+        format!("the engine answered with a {} this build cannot read ({err}); are the two the same version?", wire.kind)
+    })
+}
+
+#[must_use]
+pub fn attachment(view: AttachmentView) -> proto::Attachment {
+    proto::Attachment {
+        name: view.name,
+        media_type: view.media_type,
+        hash: view.hash,
+        bytes: view.bytes,
+        added_at: view.added_at,
+    }
+}
+
+#[must_use]
+pub fn attachment_view(wire: proto::Attachment) -> AttachmentView {
+    AttachmentView {
+        name: wire.name,
+        media_type: wire.media_type,
+        hash: wire.hash,
+        bytes: wire.bytes,
+        added_at: wire.added_at,
+    }
+}
 
 fn count(value: usize) -> u32 {
     u32::try_from(value).unwrap_or(u32::MAX)
@@ -147,6 +196,17 @@ pub fn risk_model_view(wire: proto::RiskModel) -> RiskModelView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_view_round_trips_and_a_foreign_kind_is_named_in_the_refusal() {
+        let sent = RiskModelView { path: "p".into(), exists: false, model: serde_json::json!({"a": 1}), error: None };
+        let wire = view("RiskModelView", &sent).expect("serialises");
+        assert_eq!(wire.kind, "RiskModelView");
+        assert_eq!(decode::<RiskModelView>(wire).expect("decodes"), sent);
+        let wrong = proto::View { kind: "SomethingElse".into(), json: "[]".into() };
+        let refused = decode::<RiskModelView>(wrong).unwrap_err();
+        assert!(refused.contains("SomethingElse"), "{refused}");
+    }
 
     #[test]
     fn a_form_and_a_rule_survive_the_round_trip() {

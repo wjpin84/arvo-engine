@@ -413,6 +413,204 @@ pub fn study_for(
     )
 }
 
+/// Runs a parameter study on one instrument, records it and reports what
+/// survives. Blocking: a family is `trials + 2` backtests of CPU-bound work,
+/// and every caller puts it on a blocking thread.
+///
+/// # Errors
+///
+/// An unknown rule, a ranking rule (which needs a book), an instrument
+/// without bars at the rule's resolution, or a failed run.
+pub fn run_study(service: &ResearchService, instrument: &str, strategy: Option<&str>) -> Result<StudyView, CommandError> {
+    service.load_risk()?;
+    let name = strategy.unwrap_or(STRATEGY);
+    let plan = StrategyPlan::find(name)
+        .ok_or_else(|| CommandError::Failed(format!("no rule or ruleset called {name:?}")))?;
+    if plan.ranks_a_set() {
+        // It would run. It would produce a curve, a verdict and no
+        // information: a ranking with a field of one holds that one whatever
+        // it did, so the result describes the instrument and not the rule.
+        return Err(CommandError::Failed(format!(
+            "{} ranks instruments against each other and needs more than one; run it as a book",
+            plan.label
+        )));
+    }
+    let (window, fingerprint) = study_data(&service.bars, instrument, plan).map_err(CommandError::Failed)?;
+    let family = study_for(instrument, plan, window, &fingerprint);
+    let found = arvo_research::run_family(
+        service.simulation.as_ref(),
+        &family,
+        &arvo_research::EvaluationCriteria::default(),
+    )
+    .map_err(|err| CommandError::Failed(err.to_string()))?;
+    let view = study_view(&found, &service.bars, service.simulation.engine());
+    remember(service, (view, Record::Study(Box::new(found))))
+}
+
+/// Runs a rolling re-selection over an instrument's whole history and records
+/// it. Blocking, and slower than a study by roughly the number of folds.
+///
+/// # Errors
+///
+/// An unknown rule, no bars at its resolution, or a span too short to roll.
+pub fn run_walk_forward(
+    service: &ResearchService,
+    instrument: &str,
+    strategy: Option<&str>,
+) -> Result<WalkForwardView, CommandError> {
+    service.load_risk()?;
+    let name = strategy.unwrap_or(STRATEGY);
+    let plan = StrategyPlan::find(name)
+        .ok_or_else(|| CommandError::Failed(format!("no rule or ruleset called {name:?}")))?;
+    let (window, fingerprint) = study_data(&service.bars, instrument, plan).map_err(CommandError::Failed)?;
+    let procedure = walk_forward_for(instrument, plan, window, &fingerprint);
+    let found = arvo_research::run_walk_forward(
+        service.simulation.as_ref(),
+        &procedure,
+        &arvo_research::EvaluationCriteria::default(),
+    )
+    .map_err(|err| CommandError::Failed(err.to_string()))?;
+    let view = walk_forward_view(&found, &service.bars, service.simulation.engine());
+    remember(service, (view, Record::WalkForward(Box::new(found))))
+}
+
+/// Runs one configuration across every instrument that has data and records
+/// it. Blocking.
+///
+/// # Errors
+///
+/// No instruments with usable data, or a failed run.
+pub fn run_panel(service: &ResearchService) -> Result<PanelView, CommandError> {
+    service.load_risk()?;
+    let (dataset, instruments, from, to) = panel_dataset_version(&service.bars)
+        .ok_or_else(|| CommandError::Failed("no instruments with usable data".to_owned()))?;
+    let window = DateRange::new(from, to).map_err(|err| CommandError::Failed(err.to_string()))?;
+    let study = panel_for(instruments, window, &dataset);
+    let found = arvo_research::run_panel(
+        service.simulation.as_ref(),
+        &study,
+        &arvo_research::EvaluationCriteria::default(),
+    )
+    .map_err(|err| CommandError::Failed(err.to_string()))?;
+    let view = panel_view(&found, service.simulation.engine());
+    remember(service, (view, Record::Panel(Box::new(found))))
+}
+
+/// The sector cap a book asked for, labelled from Robinhood before the run:
+/// a cap that cannot be labelled is a run that cannot happen, and finding
+/// out before any bars are read wastes nothing.
+///
+/// # Errors
+///
+/// Robinhood could not classify every member.
+pub async fn book_sector_cap(
+    max_per_sector: Option<usize>,
+    instruments: &[String],
+) -> Result<Option<arvo_research::SectorCap>, CommandError> {
+    let Some(max_positions) = max_per_sector else { return Ok(None) };
+    let tickers: Vec<&str> = instruments.iter().map(|id| arvo_data::source::symbol_of(id)).collect();
+    let labels = crate::source::robinhood::Robinhood.sectors(&tickers).await.map_err(|err| {
+        CommandError::Failed(format!(
+            "a sector cap needs each member's sector from Robinhood, and asking failed: {err}. Sign in to \
+             Robinhood, or run the book without the cap"
+        ))
+    })?;
+    sector_cap(max_positions, instruments, labels).map(Some).map_err(CommandError::Failed)
+}
+
+/// Studies one rule across several instruments sharing one account, and
+/// records it. Blocking. `sector_cap` comes from [`book_sector_cap`], which
+/// is the part that talks to a venue.
+///
+/// # Errors
+///
+/// Fewer than two instruments, a ranking rule on too few, a member without
+/// bars at the rule's resolution, no period in common, or a failed run.
+pub fn run_book(
+    service: &ResearchService,
+    instruments: Vec<String>,
+    strategy: Option<&str>,
+    max_concurrent_positions: Option<usize>,
+    sector_cap: Option<arvo_research::SectorCap>,
+) -> Result<StudyView, CommandError> {
+    service.load_risk()?;
+    if instruments.len() < 2 {
+        return Err(CommandError::Failed("a book needs at least two instruments; one is a study".to_owned()));
+    }
+    let name = strategy.unwrap_or(STRATEGY);
+    let plan = StrategyPlan::find(name)
+        .ok_or_else(|| CommandError::Failed(format!("no rule or ruleset called {name:?}")))?;
+    // A ranking rule holding the top few of two is holding one of them, which
+    // is a coin toss the rest of the machinery would dutifully evaluate.
+    if plan.ranks_a_set() && instruments.len() < MIN_RANKED {
+        return Err(CommandError::Failed(format!(
+            "{} ranks instruments against each other; {MIN_RANKED} is the fewest a ranking says anything \
+             about, and this has {}",
+            plan.label,
+            instruments.len()
+        )));
+    }
+    let interval = plan.interval();
+    // The window every member can be held over, and one hash covering all of
+    // them: a dataset version naming only the head would call a book stale
+    // when the head changed and fresh when any other member did.
+    let mut from = chrono::NaiveDate::MIN;
+    let mut to = chrono::NaiveDate::MAX;
+    let mut fingerprints = Vec::with_capacity(instruments.len());
+    for instrument in &instruments {
+        let missing = || {
+            CommandError::Failed(format!(
+                "{instrument} holds no {interval} bars; {} is defined at that resolution",
+                plan.label
+            ))
+        };
+        let coverage = service
+            .bars
+            .coverage(instrument, interval)
+            .map_err(|err| CommandError::Failed(format!("reading {instrument}: {err}")))?
+            .ok_or_else(missing)?;
+        let fingerprint = service
+            .bars
+            .fingerprint(instrument, interval)
+            .map_err(|err| CommandError::Failed(format!("hashing {instrument}: {err}")))?
+            .ok_or_else(missing)?;
+        fingerprints.push(fingerprint);
+        from = from.max(coverage.0);
+        to = to.min(coverage.1);
+    }
+    let window = DateRange::new(from, to).map_err(|_| {
+        CommandError::Failed(format!(
+            "these {} instruments have no period in common: the latest start is {from} and the earliest end is {to}",
+            instruments.len(),
+        ))
+    })?;
+    let dataset_version = book_dataset_version(&instruments, &fingerprints);
+
+    let head = instruments[0].clone();
+    let mut family = study_for(&head, plan, window, &dataset_version);
+    // The head stays the experiment's identity; the rest are what it is held
+    // alongside. `ExperimentFamily` varies parameters, not instruments, so
+    // setting this on the template sets it for every trial.
+    family.template.alongside = instruments[1..].to_vec();
+    family.template.risk.max_concurrent_positions = max_concurrent_positions;
+    family.template.risk.sector_cap = sector_cap;
+    family.template.risk.check().map_err(CommandError::Failed)?;
+    family.template.id = ExperimentId(format!("book-{}", instruments.join("+")));
+    family.template.hypothesis = HypothesisId(format!(
+        "{} predicts returns across {} instruments sharing one account",
+        plan.label,
+        instruments.len(),
+    ));
+    let found = arvo_research::run_family(
+        service.simulation.as_ref(),
+        &family,
+        &arvo_research::EvaluationCriteria::default(),
+    )
+    .map_err(|err| CommandError::Failed(err.to_string()))?;
+    let view = study_view(&found, &service.bars, service.simulation.engine());
+    remember(service, (view, Record::Study(Box::new(found))))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
