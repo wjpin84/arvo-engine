@@ -51,6 +51,34 @@ Hence the sequencing rule that orders the roadmap:
   framework, and systematic is the only form the benchmark discipline can
   evaluate.
 
+## Protocol boundary
+
+Extensions integrate against the published protocol, not against this
+repository. The protobuf definitions and `PROTOCOL.md` in
+[`arvo-extension-api`](https://github.com/wjpin84/arvo-extension-api) are
+the compatibility boundary; the engine is an implementation of them. Internal
+types, services, storage and layout stay private unless promoted into that
+API on purpose.
+
+There are two directions across the boundary, and they are different
+contracts:
+
+- **Arvo calls a provider.** A provider serves `arvo.source.v1.Source` or
+  `arvo.signal.v1.Signals`; Arvo spawns it, hands it a token per spawn and a
+  `Grant` per call, and asks nothing of a service it did not claim
+  ([ADR-0022](adr/0022-a-plugin-serves-an-earned-trait-and-the-sources-go-first.md),
+  [ADR-0023](adr/0023-arvo-owns-the-lifecycle-of-what-it-spawns.md)). The
+  provider authenticates with its vendor; that is what the grant is for.
+- **Something calls Arvo.** An agent over MCP, a script or the window over
+  the engine's gRPC. Arvo is the authenticated service, behind the research
+  token and the control token, and the tool list is the boundary
+  ([ADR-0016](adr/0016-an-agent-reaches-arvo-through-a-tool-list-that-cannot-trade.md),
+  [ADR-0018](adr/0018-arvo-keeps-running-when-the-window-closes.md)).
+
+Neither direction gets a generic identity, credential-reference or capability
+protocol until a second-party caller needs one. What an outside developer
+needs today is to build a provider without this repository, which is #181.
+
 ## Layout
 
 Four groups, one rule each.
