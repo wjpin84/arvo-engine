@@ -94,9 +94,16 @@ async fn run() -> Result<(), String> {
         .await
     };
     let stopping = plugins.clone();
-    let engine = grpc::Engine { research: research::Research::new(&data), sessions, events, jobs, plugins };
+    // Two ways to stop: a signal, or a front end asking over the control tier.
+    // The second exists because a killed process runs no destructors, so the
+    // providers this supervises would outlive it (ADR-0029).
+    let (stop, asked) = tokio::sync::oneshot::channel();
+    let engine = grpc::Engine { research: research::Research::new(&data), sessions, events, jobs, plugins, stop };
     let served = grpc::serve(listener, engine, &tokens, async {
-        let _ = tokio::signal::ctrl_c().await;
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = asked => {}
+        }
     })
     .await;
     // Nothing this started lingers (ADR-0023 point 5), now that this is what

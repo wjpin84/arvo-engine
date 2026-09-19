@@ -45,6 +45,9 @@ struct Service {
 
 struct Control {
     sessions: std::sync::Arc<Sessions>,
+    /// Fires the server's shutdown future. Taken once: a second `Shutdown`
+    /// while the first is in flight is answered and ignored.
+    stop: std::sync::Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
 }
 
 /// The data tier, behind the control token: the library, the sources, and
@@ -77,6 +80,9 @@ pub struct Engine {
     pub events: tokio::sync::broadcast::Sender<EventView>,
     pub jobs: arvo_service::scheduler::Jobs,
     pub plugins: arvo_service::plugins::Plugins,
+    /// Sent when a front end asks this engine to stop. `serve` waits on the
+    /// other half alongside whatever `shutdown` it was given.
+    pub stop: tokio::sync::oneshot::Sender<()>,
 }
 
 pub struct Tokens {
@@ -101,7 +107,8 @@ pub async fn serve(
     tokens: &Tokens,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), tonic::transport::Error> {
-    let Engine { research, sessions, events, jobs, plugins } = engine;
+    let Engine { research, sessions, events, jobs, plugins, stop } = engine;
+    let stop = std::sync::Arc::new(std::sync::Mutex::new(Some(stop)));
     let workbench = std::sync::Arc::new(arvo_service::research::ResearchService::new(
         research.root().join(arvo_service::research::DATA_SUBDIR),
         research.root().join(arvo_service::research::EVIDENCE_SUBDIR),
@@ -117,7 +124,7 @@ pub async fn serve(
         bearer(&tokens.research, "engine.json"),
     );
     let control_tier = tonic::service::interceptor::InterceptedService::new(
-        SessionsServer::new(Control { sessions }),
+        SessionsServer::new(Control { sessions, stop }),
         bearer(&tokens.control, "control.json"),
     );
     let data_tier = tonic::service::interceptor::InterceptedService::new(
@@ -342,6 +349,17 @@ impl data_server::Data for Library {
 
 #[tonic::async_trait]
 impl sessions_server::Sessions for Control {
+    async fn shutdown(&self, _: Request<Empty>) -> Result<Response<Empty>, Status> {
+        // Answered first, then acted on: the caller needs the reply before the
+        // transport goes away.
+        if let Ok(mut stop) = self.stop.lock() {
+            if let Some(stop) = stop.take() {
+                let _ = stop.send(());
+            }
+        }
+        Ok(Response::new(Empty {}))
+    }
+
     async fn start_session(&self, request: Request<StartRequest>) -> Result<Response<SessionStatus>, Status> {
         let request = request.into_inner();
         let finding = required(&request.finding, "finding")?;
@@ -890,13 +908,26 @@ mod tests {
             // No plugins.toml in the temporary directory, so this is a registry
             // over nothing — which is what these tests want.
             let plugins = arvo_service::plugins::Plugins::start(&root, &jobs, |_| {}).await;
-            serve(listener, Engine { research, sessions, events, jobs, plugins }, &tokens, async {
+            let (stop_tx, _stop_rx) = tokio::sync::oneshot::channel();
+            serve(listener, Engine { research, sessions, events, jobs, plugins, stop: stop_tx }, &tokens, async {
                 let _ = stopped.await;
             })
             .await
             .expect("serves");
         });
         (dir, address, stop)
+    }
+
+    /// Stopping the engine is a control action, and it exists because a
+    /// killed process runs no destructors: the window asks rather than kills,
+    /// so the providers the engine supervises stop with it (ADR-0029).
+    #[tokio::test]
+    async fn only_the_control_token_can_stop_the_engine() {
+        let (_dir, address, _stop) = engine().await;
+        let mut control = super::proto::sessions_client::SessionsClient::connect(address).await.expect("connects");
+        let refused = control.shutdown(with_token(Empty {}, TOKEN)).await.unwrap_err();
+        assert_eq!(refused.code(), tonic::Code::Unauthenticated);
+        control.shutdown(with_token(Empty {}, CONTROL)).await.expect("asked");
     }
 
     /// The boundary ADR-0016 draws: the research token opens nothing that
