@@ -83,10 +83,25 @@ async fn run() -> Result<(), String> {
             let _ = raising.send(event);
         });
     }
-    let served = grpc::serve(listener, research::Research::new(&data), sessions, events, jobs, &tokens, async {
+    // The plugins, and what they serve, in the process that outlives the
+    // window (ADR-0029). `root` is the app data directory, where plugins.toml
+    // and the extensions folder live.
+    let plugins = {
+        let raising = events.clone();
+        arvo_service::plugins::Plugins::start(&root, &jobs, move |event| {
+            let _ = raising.send(event);
+        })
+        .await
+    };
+    let stopping = plugins.clone();
+    let engine = grpc::Engine { research: research::Research::new(&data), sessions, events, jobs, plugins };
+    let served = grpc::serve(listener, engine, &tokens, async {
         let _ = tokio::signal::ctrl_c().await;
     })
     .await;
+    // Nothing this started lingers (ADR-0023 point 5), now that this is what
+    // started it.
+    stopping.stop_all().await;
     discovery::remove_if_ours(&root, pid);
     served.map_err(|err| format!("serving: {err}"))
 }

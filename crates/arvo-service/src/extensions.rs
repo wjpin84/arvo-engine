@@ -30,12 +30,35 @@ struct Manifest {
 struct Contributes {
     #[serde(default)]
     strategies: Vec<serde_json::Value>,
+    #[serde(default)]
+    providers: Vec<ProviderContribution>,
+}
+
+/// A process the supervisor may run. Only the parts needed to launch one: the
+/// window reads the rest of this shape when it installs and builds.
+#[derive(Debug, Clone, Deserialize)]
+struct ProviderContribution {
+    id: String,
+    #[serde(default)]
+    run: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
 struct Lock {
     #[serde(default)]
     disabled: BTreeSet<String>,
+    #[serde(default)]
+    built: std::collections::BTreeMap<String, Built>,
+}
+
+/// What a build produced, as the window recorded it (ADR-0025). Read here so
+/// the supervisor runs the artifact rather than the recipe's bare program name.
+#[derive(Debug, Clone, Deserialize)]
+struct Built {
+    #[serde(default)]
+    ok: bool,
+    #[serde(default)]
+    artifacts: std::collections::BTreeMap<String, String>,
 }
 
 /// A contributed strategy's name in the picker: the extension's id first, so
@@ -121,4 +144,58 @@ pub fn strategy_view(extension: &str, value: &serde_json::Value) -> arvo_views::
         configurations,
         problem: crate::research::offerable(&document).err(),
     }
+}
+
+/// The extensions directory, under the app data directory.
+///
+/// # Errors
+///
+/// `APPDATA` is not set.
+pub fn root() -> Result<std::path::PathBuf, String> {
+    crate::project::app_data_root().map(|root| root.join(SUBDIR))
+}
+
+/// Splits a recipe into a program and its arguments.
+///
+/// Whitespace, and no shell: a manifest can name a program and its arguments
+/// and cannot smuggle a second command through a semicolon.
+fn argv(recipe: &str) -> Option<(String, Vec<String>)> {
+    let mut words = recipe.split_whitespace().map(ToOwned::to_owned);
+    let program = words.next()?;
+    Some((program, words.collect()))
+}
+
+/// Every provider that should be running: installed, enabled, built, with an
+/// artifact to run.
+///
+/// Read from disk on every call rather than cached, because the window writes
+/// this directory while the engine is up.
+#[must_use]
+pub fn launches() -> Vec<(String, arvo_plugin_host::supervisor::Launch)> {
+    use arvo_plugin_host::supervisor::{Launch, Restart};
+
+    let mut wanted = Vec::new();
+    let Ok(dir) = root() else { return wanted };
+    let lock: Lock = std::fs::read_to_string(dir.join(LOCKFILE))
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default();
+    let Ok(entries) = std::fs::read_dir(&dir) else { return wanted };
+    for folder in entries.flatten().map(|entry| entry.path()).filter(|path| path.is_dir()) {
+        let Ok(text) = std::fs::read_to_string(folder.join(MANIFEST)) else { continue };
+        let Ok(manifest) = serde_json::from_str::<Manifest>(&text) else { continue };
+        if lock.disabled.contains(&manifest.id) {
+            continue;
+        }
+        let Some(built) = lock.built.get(&manifest.id).filter(|built| built.ok) else { continue };
+        for provider in &manifest.contributes.providers {
+            let Some((program, args)) = argv(&provider.run) else { continue };
+            let program = built.artifacts.get(&provider.id).cloned().unwrap_or(program);
+            wanted.push((
+                format!("{}/{}", manifest.id, provider.id),
+                Launch { program, args, cwd: folder.clone(), restart: Restart::UpTo(3) },
+            ));
+        }
+    }
+    wanted
 }

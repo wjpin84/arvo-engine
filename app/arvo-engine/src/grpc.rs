@@ -55,6 +55,7 @@ struct Library {
     portfolios: std::sync::Arc<arvo_service::portfolio::PortfolioService>,
     events: tokio::sync::broadcast::Sender<EventView>,
     jobs: arvo_service::scheduler::Jobs,
+    plugins: arvo_service::plugins::Plugins,
 }
 
 impl Library {
@@ -68,6 +69,16 @@ impl Library {
 
 /// The two tokens the engine serves behind: research for every front end,
 /// control for the ones allowed to reach an executor (ADR-0018 point 4).
+/// Everything the three tiers are served over: one bundle, because they are
+/// built together in `main` and handed over together.
+pub struct Engine {
+    pub research: Research,
+    pub sessions: std::sync::Arc<Sessions>,
+    pub events: tokio::sync::broadcast::Sender<EventView>,
+    pub jobs: arvo_service::scheduler::Jobs,
+    pub plugins: arvo_service::plugins::Plugins,
+}
+
 pub struct Tokens {
     pub research: String,
     pub control: String,
@@ -86,13 +97,11 @@ pub struct Tokens {
 /// When the transport fails.
 pub async fn serve(
     listener: TcpListener,
-    research: Research,
-    sessions: std::sync::Arc<Sessions>,
-    events: tokio::sync::broadcast::Sender<EventView>,
-    jobs: arvo_service::scheduler::Jobs,
+    engine: Engine,
     tokens: &Tokens,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), tonic::transport::Error> {
+    let Engine { research, sessions, events, jobs, plugins } = engine;
     let workbench = std::sync::Arc::new(arvo_service::research::ResearchService::new(
         research.root().join(arvo_service::research::DATA_SUBDIR),
         research.root().join(arvo_service::research::EVIDENCE_SUBDIR),
@@ -112,7 +121,7 @@ pub async fn serve(
         bearer(&tokens.control, "control.json"),
     );
     let data_tier = tonic::service::interceptor::InterceptedService::new(
-        DataServer::new(Library { workbench, portfolios, events, jobs }).max_decoding_message_size(MAX_MESSAGE_BYTES),
+        DataServer::new(Library { workbench, portfolios, events, jobs, plugins }).max_decoding_message_size(MAX_MESSAGE_BYTES),
         bearer(&tokens.control, "control.json"),
     );
     tonic::transport::Server::builder()
@@ -227,6 +236,23 @@ impl data_server::Data for Library {
         )
         .map_err(refused)?;
         Ok(Response::new(ExportedPath { path }))
+    }
+
+    async fn list_plugins(&self, _: Request<Empty>) -> Result<Response<View>, Status> {
+        viewed("Vec<PluginView>", &self.plugins.snapshot().await)
+    }
+
+    async fn refresh_plugins(&self, _: Request<Empty>) -> Result<Response<View>, Status> {
+        viewed("Vec<PluginView>", &self.plugins.refresh().await)
+    }
+
+    async fn list_signals(&self, _: Request<Empty>) -> Result<Response<View>, Status> {
+        viewed("Vec<SignalView>", &self.plugins.signals().await)
+    }
+
+    async fn reconcile_providers(&self, _: Request<Empty>) -> Result<Response<Empty>, Status> {
+        self.plugins.reconcile().await;
+        Ok(Response::new(Empty {}))
     }
 
     async fn list_jobs(&self, _: Request<Empty>) -> Result<Response<View>, Status> {
@@ -853,12 +879,18 @@ mod tests {
         let events = tokio::sync::broadcast::channel(256).0;
         let sessions = std::sync::Arc::new(Sessions::new(dir.path(), events.clone()));
         let tokens = Tokens { research: TOKEN.to_owned(), control: CONTROL.to_owned() };
+        // The path, not the handle: `dir` is returned to the test so the
+        // directory outlives the server.
+        let root = dir.path().to_path_buf();
         tokio::spawn(async move {
             let jobs = arvo_service::scheduler::Jobs::new(std::sync::Arc::new(|future| {
                 let handle = tokio::spawn(future);
                 Box::new(move || handle.abort())
             }));
-            serve(listener, research, sessions, events, jobs, &tokens, async {
+            // No plugins.toml in the temporary directory, so this is a registry
+            // over nothing — which is what these tests want.
+            let plugins = arvo_service::plugins::Plugins::start(&root, &jobs, |_| {}).await;
+            serve(listener, Engine { research, sessions, events, jobs, plugins }, &tokens, async {
                 let _ = stopped.await;
             })
             .await

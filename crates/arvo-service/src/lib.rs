@@ -12,6 +12,7 @@
 pub mod accounts;
 pub mod events;
 pub mod extensions;
+pub mod plugins;
 pub mod portfolio;
 pub mod jobs;
 pub mod project;

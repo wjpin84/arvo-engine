@@ -1,3 +1,4 @@
+
 //! The window's views on the wire.
 //!
 //! The engine answers in `engine.proto` messages and the window renders
