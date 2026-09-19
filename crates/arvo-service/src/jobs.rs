@@ -21,6 +21,31 @@ use crate::scheduler::Jobs;
 /// Under the data root: one file of option quotes per day.
 pub const OPTION_QUOTES_SUBDIR: &str = "option-quotes";
 
+/// Makes the project's own files exist before anything reads them: the
+/// `.gitignore` that keeps personal data out of git, and the risk model as a
+/// file the person can open.
+///
+/// Only for a project, never the app data directory, and only warnings if it
+/// cannot: a folder Arvo cannot write to is a problem to report, not a reason
+/// to refuse to start.
+pub fn prepare(root: &Path) {
+    // The library first, and for the app data directory too: an empty folder
+    // that exists is a clearer instruction than a path in an error message.
+    let data = root.join(crate::research::DATA_SUBDIR);
+    if let Err(err) = std::fs::create_dir_all(&data) {
+        eprintln!("arvo-engine: could not create {}; studies will find no instruments: {err}", data.display());
+    }
+    if crate::project::remembered().is_none() {
+        return;
+    }
+    if let Err(err) = crate::project::ensure_gitignore(root) {
+        eprintln!("arvo-engine: could not write {}/.gitignore: {err}", root.display());
+    }
+    if let Err(err) = crate::risk::ensure(root) {
+        eprintln!("arvo-engine: could not write the project risk model in {}: {err}", root.display());
+    }
+}
+
 /// Registers the staleness check and the option-chain recorder on `jobs`.
 ///
 /// `raise` is how a job tells someone: the engine broadcasts, so a stale

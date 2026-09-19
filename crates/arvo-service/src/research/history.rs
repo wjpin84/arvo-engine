@@ -409,35 +409,6 @@ pub fn trades_csv(rows: &[TradeRowExport]) -> String {
     out
 }
 
-/// A row as it comes back from the view.
-///
-/// Deserialized rather than re-derived from the stored finding: the table
-/// exports what is on screen, including whatever sort the reader applied. An
-/// export that silently differed from the table above it would be worse than
-/// none.
-#[derive(serde::Deserialize, serde::Serialize)]
-pub struct TradeRowExport {
-    /// Which instrument the round trip was in.
-    ///
-    /// `default` because an ordinary study's rows do not carry one: the
-    /// subject line already says it, and a column repeating the same name on
-    /// every line is noise. On a book it is the difference between a usable
-    /// export and a list of trades from three instruments with no way to tell
-    /// them apart.
-    #[serde(default)]
-    pub instrument: String,
-    pub opened: String,
-    pub closed: String,
-    pub direction: String,
-    pub quantity: f64,
-    pub entry: f64,
-    pub exit: Option<f64>,
-    pub pnl: f64,
-    pub commission: f64,
-    pub held_days: Option<f64>,
-    pub exit_reason: String,
-}
-
 #[cfg(test)]
 mod comparison_tests {
     use super::*;

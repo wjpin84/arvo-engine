@@ -218,7 +218,7 @@ impl data_server::Data for Library {
 
     async fn export_trades(&self, request: Request<TradeExport>) -> Result<Response<ExportedPath>, Status> {
         let TradeExport { name, rows_json } = request.into_inner();
-        let rows: Vec<arvo_service::research::history::TradeRowExport> =
+        let rows: Vec<arvo_views::TradeRowExport> =
             serde_json::from_str(&rows_json).map_err(|err| Status::invalid_argument(format!("rows_json: {err}")))?;
         let path = arvo_service::research::history::export_trades(&self.workbench, &name, &rows).map_err(refused)?;
         Ok(Response::new(ExportedPath { path }))

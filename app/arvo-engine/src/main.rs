@@ -67,6 +67,8 @@ async fn run() -> Result<(), String> {
     // data tier and handed out by Subscribe (#150).
     let events = tokio::sync::broadcast::channel(256).0;
     let sessions = std::sync::Arc::new(session::Sessions::new(&data, events.clone()));
+    arvo_service::jobs::prepare(&data);
+
     // The engine's own jobs, on its own runtime: this is `#[tokio::main]`, so
     // `tokio::spawn` is what puts a loop on a reactor here.
     let jobs = arvo_service::scheduler::Jobs::new(std::sync::Arc::new(|future| {
