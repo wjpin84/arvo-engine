@@ -9,6 +9,7 @@
 //! Nothing here names a Tauri type. That is the boundary, and the build
 //! enforces it: this crate has no `tauri` dependency.
 
+pub mod accounts;
 pub mod events;
 pub mod extensions;
 pub mod project;

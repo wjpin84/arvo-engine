@@ -11,6 +11,8 @@ arvo-client.workspace = true
 arvo-core.workspace = true
 arvo-data.workspace = true
 arvo-nautilus.workspace = true
+# The sign-in flow itself: ADR-0028 puts it on this side of the wire.
+arvo-oauth.workspace = true
 arvo-plugin-host.workspace = true
 arvo-research.workspace = true
 arvo-robinhood.workspace = true

@@ -16,7 +16,8 @@ use proto::data_server::{self, DataServer};
 use proto::sessions_server::{self, SessionsServer};
 use proto::{
     Advice, AttachRequest, Attachment, Attachments, Empty, Finding, FindingId, FindingSummary, Findings,
-    BookRequest, CompareRequest, FetchRequest, FindingIds, InstrumentSearch, Instrument, Instruments, Point, ReportRequest, RiskModel, Rules, RulesetForm, RulesetPath,
+    AccountKeys, BookRequest, CompareRequest, FetchRequest, FindingIds, InstrumentSearch, SignIn, VendorId,
+    VendorProfile, Instrument, Instruments, Point, ReportRequest, RiskModel, Rules, RulesetForm, RulesetPath,
     Rulesets, Ruleset, RunRequest, StudyRequest, View, SessionId, SessionList, SessionStatus, StartRequest, Strategies,
 };
 use arvo_client::wire;
@@ -175,6 +176,46 @@ impl data_server::Data for Library {
         .await
         .map_err(refused)?;
         viewed("FetchView", &view)
+    }
+
+    async fn list_accounts(&self, _: Request<Empty>) -> Result<Response<View>, Status> {
+        viewed("Vec<AccountView>", &arvo_service::accounts::list().await)
+    }
+
+    async fn begin_sign_in(&self, request: Request<VendorId>) -> Result<Response<SignIn>, Status> {
+        let vendor = required(&request.get_ref().vendor, "vendor")?.to_owned();
+        let pending = arvo_service::accounts::begin_sign_in(&vendor).await.map_err(refused)?;
+        let url = pending.url.clone();
+        // The person takes as long as they take. Finishing happens here rather
+        // than in the caller's request, and the outcome is an event
+        // (ADR-0028 point 4), so the CLI and the window learn it the same way.
+        let events = self.events.clone();
+        tokio::spawn(async move {
+            let event = match arvo_service::accounts::finish_sign_in(pending).await {
+                Ok(()) => arvo_service::events::feed_connected(&vendor),
+                Err(err) => {
+                    eprintln!("arvo-engine: the {vendor} sign-in did not complete: {err}");
+                    arvo_service::events::feed_disconnected(&vendor, &err.to_string(), false)
+                }
+            };
+            let _ = events.send(event);
+        });
+        Ok(Response::new(SignIn { url }))
+    }
+
+    async fn disconnect_account(&self, request: Request<VendorProfile>) -> Result<Response<Empty>, Status> {
+        let VendorProfile { vendor, profile } = request.into_inner();
+        arvo_service::accounts::disconnect(&vendor, profile.as_deref()).map_err(refused)?;
+        let why = if vendor == "alpaca" { "you removed the keys" } else { "you signed out" };
+        let _ = self.events.send(arvo_service::events::feed_disconnected(&vendor, why, true));
+        Ok(Response::new(Empty {}))
+    }
+
+    async fn store_account_keys(&self, request: Request<AccountKeys>) -> Result<Response<Empty>, Status> {
+        let AccountKeys { vendor, profile, key_id, secret } = request.into_inner();
+        arvo_service::accounts::store_keys(&vendor, profile.as_deref(), &key_id, &secret).map_err(refused)?;
+        let _ = self.events.send(arvo_service::events::feed_connected(&vendor));
+        Ok(Response::new(Empty {}))
     }
 
     async fn compare_sources(&self, request: Request<CompareRequest>) -> Result<Response<View>, Status> {
@@ -891,6 +932,21 @@ mod tests {
         let sources = data.list_sources(with_token(Empty {}, CONTROL)).await.expect("ok").into_inner();
         let decoded: Vec<arvo_service::research::SourceView> = wire::decode(sources).expect("decodes");
         assert!(decoded.iter().any(|source| source.venue == "YF"), "{decoded:?}");
+
+        // A credential is the engine's alone (ADR-0028), so it sits behind the
+        // control token with the rest of the data tier.
+        let refused = data.list_accounts(with_token(Empty {}, TOKEN)).await.unwrap_err();
+        assert_eq!(refused.code(), tonic::Code::Unauthenticated);
+        let accounts = data.list_accounts(with_token(Empty {}, CONTROL)).await.expect("ok").into_inner();
+        let decoded: Vec<arvo_views::AccountView> = wire::decode(accounts).expect("decodes");
+        assert!(decoded.iter().any(|account| account.id == "alpaca"), "{decoded:?}");
+
+        // Refused before any browser could open, so this stays offline.
+        let refused = data
+            .begin_sign_in(with_token(VendorId { vendor: "yahoo".to_owned() }, CONTROL))
+            .await
+            .unwrap_err();
+        assert!(refused.message().contains("no sign-in"), "{refused:?}");
 
         // An empty query asks no vendor anything, so this stays offline.
         let found = data
