@@ -44,11 +44,14 @@ pub struct ReportMeta {
 #[must_use]
 pub fn compose(view: &RecordView, meta: &ReportMeta) -> String {
     let mut out = String::new();
-    match view {
-        RecordView::Study(study) => study_report(&mut out, study, meta),
-        RecordView::WalkForward(walk) => walk_report(&mut out, walk, meta),
-        RecordView::Panel(panel) => panel_report(&mut out, panel, meta),
-        RecordView::Reported(reported) => reported_report(&mut out, reported, meta),
+    match view.of.as_ref() {
+        Some(arvo_views::record_view::Of::Study(study)) => study_report(&mut out, study, meta),
+        Some(arvo_views::record_view::Of::Walkforward(walk)) => walk_report(&mut out, walk, meta),
+        Some(arvo_views::record_view::Of::Panel(panel)) => panel_report(&mut out, panel, meta),
+        Some(arvo_views::record_view::Of::Reported(reported)) => reported_report(&mut out, reported, meta),
+        // A kind this build does not know: say so rather than render nothing.
+        None => out.push_str("This finding is of a kind this build cannot read.
+"),
     }
     out
 }
@@ -88,7 +91,7 @@ fn study_report(out: &mut String, study: &StudyView, meta: &ReportMeta) {
     params(out, &study.selected_params);
 
     figure(out, meta);
-    metrics(out, &study.strategy, &study.benchmark, study.excess_return);
+    metrics(out, study.strategy(), study.benchmark(), study.excess_return);
     assumptions(
         out,
         &study.dataset_version,
@@ -97,7 +100,7 @@ fn study_report(out: &mut String, study: &StudyView, meta: &ReportMeta) {
         study.slippage_bps,
         &study.engine,
     );
-    trades(out, &study.trades, &study.trades_detail);
+    trades(out, &study.trades, study.trades_detail());
     advice(out, &study.recommendations);
 }
 
@@ -156,7 +159,7 @@ fn walk_report(out: &mut String, walk: &WalkForwardView, meta: &ReportMeta) {
     }
 
     figure(out, meta);
-    metrics(out, &walk.strategy, &walk.benchmark, walk.excess_return);
+    metrics(out, walk.strategy(), walk.benchmark(), walk.excess_return);
     assumptions(
         out,
         &walk.dataset_version,
@@ -165,7 +168,7 @@ fn walk_report(out: &mut String, walk: &WalkForwardView, meta: &ReportMeta) {
         walk.slippage_bps,
         &walk.engine,
     );
-    trades(out, &walk.trades, &walk.trades_detail);
+    trades(out, &walk.trades, walk.trades_detail());
     advice(out, &walk.recommendations);
 }
 
@@ -317,14 +320,14 @@ fn figure(out: &mut String, meta: &ReportMeta) {
     }
 }
 
-fn params(out: &mut String, chosen: &[(String, f64)]) {
+fn params(out: &mut String, chosen: &[arvo_views::NamedNumber]) {
     if chosen.is_empty() {
         return;
     }
     let _ = writeln!(
         out,
         "Chosen configuration: {}.\n",
-        chosen.iter().map(|(k, v)| format!("`{k}` {}", trim(*v))).collect::<Vec<_>>().join(", ")
+        chosen.iter().map(|chose| format!("`{}` {}", chose.name, trim(chose.value))).collect::<Vec<_>>().join(", ")
     );
 }
 
@@ -506,9 +509,12 @@ mod tests {
             surface: None,
             in_sample: "2020-01-01 to 2022-12-31".to_owned(),
             out_of_sample: "2023-01-01 to 2023-12-31".to_owned(),
-            selected_params: vec![("fast".to_owned(), 20.0), ("slow".to_owned(), 50.5)],
-            strategy: metrics_view(0.12),
-            benchmark: metrics_view(0.20),
+            selected_params: vec![
+                arvo_views::NamedNumber { name: "fast".to_owned(), value: 20.0 },
+                arvo_views::NamedNumber { name: "slow".to_owned(), value: 50.5 },
+            ],
+            strategy: Some(metrics_view(0.12)),
+            benchmark: Some(metrics_view(0.20)),
             excess_return: -0.08,
             dividend_gap: None,
             after_tax: None,
@@ -533,7 +539,7 @@ mod tests {
                 exit_reason: "signal".to_owned(),
             }],
             monthly: vec![],
-            trades_detail: TradesView {
+            trades_detail: Some(TradesView {
                 closed: 1,
                 still_open: 0,
                 win_rate: Some(1.0),
@@ -546,7 +552,7 @@ mod tests {
                 fees_fraction: 0.0001,
                 signal_exits: 1,
                 stop_exits: 0,
-            },
+            }),
             recommendations: vec![RecommendationView {
                 severity: "Blocking".to_owned(),
                 finding: "the search was not beaten".to_owned(),
@@ -572,7 +578,7 @@ mod tests {
             read_this_first: "Not supported: do not report them as an edge.".to_owned(),
             figure: Some("figure.png".to_owned()),
         };
-        let markdown = compose(&RecordView::Study(Box::new(a_study())), &meta);
+        let markdown = compose(&RecordView::study(a_study()), &meta);
 
         let verdict = markdown.find("## Not supported").expect("the verdict");
         let search = markdown.find("## The search").expect("the search");
@@ -625,7 +631,7 @@ mod tests {
             read_this_first: "Inconclusive: do not report the numbers below as a result.".to_owned(),
             figure: None,
         };
-        let markdown = compose(&RecordView::Reported(Box::new(view)), &meta);
+        let markdown = compose(&RecordView::reported(view), &meta);
 
         assert!(markdown.contains("computed by their-engine 0.2, not by Arvo"));
         assert!(markdown.contains("> momentum persists for a month"));

@@ -436,8 +436,8 @@ pub fn study_view(
         members: members(&found.selected, &evaluation.strategy_ledger),
         verdict: verdict_label(found.verdict).to_owned(),
         reasons: found.reasons.clone(),
-        trials: found.selection.trials,
-        prior_trials: found.selection.prior_trials,
+        trials: arvo_views::count(found.selection.trials),
+        prior_trials: arvo_views::count(found.selection.prior_trials),
         best_sharpe: found.selection.best_sharpe,
         expected_best_under_null: found.selection.expected_best_under_null,
         survived_deflation: found.selection.survived_deflation,
@@ -449,10 +449,10 @@ pub fn study_view(
             .strategy
             .params
             .iter()
-            .map(|(name, value)| (name.clone(), *value))
+            .map(|(name, value)| arvo_views::NamedNumber { name: name.clone(), value: *value })
             .collect(),
-        strategy: metrics_view(&evaluation.strategy),
-        benchmark: metrics_view(&evaluation.benchmark),
+        strategy: Some(metrics_view(&evaluation.strategy)),
+        benchmark: Some(metrics_view(&evaluation.benchmark)),
         excess_return: evaluation.excess_return,
         dividend_gap: dividend_gap_view(
             evaluation.dividend_gap.as_ref(),
@@ -514,10 +514,10 @@ pub fn study_view(
                 value: month.value,
             })
             .collect(),
-        trades_detail: trades_view(
+        trades_detail: Some(trades_view(
             &evaluation.strategy_trades,
             found.selected.starting_cash,
-        ),
+        )),
         recommendations: advice(arvo_research::recommend(found)),
         dataset_version: found.selected.dataset.version.clone(),
         strategy_name: found.selected.strategy.name.clone(),
@@ -563,7 +563,7 @@ pub fn walk_forward_view(
                         .filter(|(name, _)| {
                             found.stability.iter().any(|axis| &axis.axis == *name)
                         })
-                        .map(|(name, value)| (name.clone(), *value))
+                        .map(|(name, value)| arvo_views::NamedNumber { name: name.clone(), value: *value })
                         .collect(),
                     strategy_return: evaluation.strategy.total_return,
                     benchmark_return: evaluation.benchmark.total_return,
@@ -572,20 +572,20 @@ pub fn walk_forward_view(
                 }
             })
             .collect(),
-        folds_surviving_deflation: found.folds_surviving_deflation,
-        folds_without_trades: found.folds_without_trades,
+        folds_surviving_deflation: arvo_views::count(found.folds_surviving_deflation),
+        folds_without_trades: arvo_views::count(found.folds_without_trades),
         stability: found
             .stability
             .iter()
             .map(|axis| StabilityView {
                 axis: axis.axis.clone(),
-                distinct: axis.distinct,
+                distinct: arvo_views::count(axis.distinct),
                 modal: axis.modal,
                 modal_share: axis.modal_share,
             })
             .collect(),
-        strategy: metrics_view(&found.combined),
-        benchmark: metrics_view(&found.benchmark),
+        strategy: Some(metrics_view(&found.combined)),
+        benchmark: Some(metrics_view(&found.benchmark)),
         excess_return: found.excess_return,
         strategy_curve: curve_points(&found.combined_curve),
         benchmark_curve: curve_points(&found.benchmark_curve),
@@ -647,7 +647,7 @@ pub fn walk_forward_view(
                 })
                 .collect::<Vec<_>>(),
         ),
-        trades_detail: trades_view(&found.combined_trades, template.starting_cash),
+        trades_detail: Some(trades_view(&found.combined_trades, template.starting_cash)),
         in_sample_days: found.in_sample_days,
         step_days: found.step_days,
         anchored: found.anchored,
@@ -691,14 +691,14 @@ pub fn dividend_gap_view(
     excess_return: f64,
 ) -> Option<DividendGapView> {
     gap.map(|gap| DividendGapView {
-        events: gap.events,
+        events: arvo_views::count(gap.events),
         strategy_income: gap.strategy_income,
         benchmark_income: gap.benchmark_income,
         overstatement: gap.overstatement,
         corrected_excess: gap.corrected_excess(excess_return),
         complete: gap.complete(),
-        covered: gap.covered,
-        instruments: gap.instruments,
+        covered: arvo_views::count(gap.covered),
+        instruments: arvo_views::count(gap.instruments),
     })
 }
 
@@ -726,13 +726,13 @@ pub fn panel_view(found: &arvo_research::PanelEvidence, engine: &str) -> PanelVi
             found,
             &arvo_research::EvaluationCriteria::default(),
         )),
-        instruments: found.pooled.instruments,
+        instruments: arvo_views::count(found.pooled.instruments),
         total_trades: found.pooled.total_trades,
         mean_excess_return: found.pooled.mean_excess_return,
-        beat_benchmark: found.pooled.beat_benchmark,
+        beat_benchmark: arvo_views::count(found.pooled.beat_benchmark),
         mean_max_drawdown: found.pooled.mean_max_drawdown,
         book: found.book.as_ref().map(|metrics| BookView {
-            metrics: metrics_view(metrics),
+            metrics: Some(metrics_view(metrics)),
             diversification: arvo_research::book::diversification(
                 metrics.max_drawdown,
                 found.pooled.mean_max_drawdown,
@@ -740,13 +740,19 @@ pub fn panel_view(found: &arvo_research::PanelEvidence, engine: &str) -> PanelVi
         }),
         breadth: found.breadth.as_ref().map(|breadth| BreadthView {
             instruments: breadth.instruments.clone(),
-            correlations: breadth.correlations.clone(),
+            correlations: breadth
+                .correlations
+                .iter()
+                .map(|row| arvo_views::CorrelationRow {
+                    cells: row.iter().map(|cell| arvo_views::OptionalDouble { value: *cell }).collect(),
+                })
+                .collect(),
             mean_correlation: breadth.mean_correlation,
             effective: breadth.effective,
             overstatement: breadth.overstatement(),
         }),
         worst_max_drawdown: found.pooled.worst_max_drawdown,
-        trials: found.selection.trials,
+        trials: arvo_views::count(found.selection.trials),
         best_sharpe: found.selection.best_sharpe,
         expected_best_under_null: found.selection.expected_best_under_null,
         survived_deflation: found.selection.survived_deflation,
@@ -755,7 +761,7 @@ pub fn panel_view(found: &arvo_research::PanelEvidence, engine: &str) -> PanelVi
         selected_params: found
             .selected_params
             .iter()
-            .map(|(name, value)| (name.clone(), *value))
+            .map(|(name, value)| arvo_views::NamedNumber { name: name.clone(), value: *value })
             .collect(),
         per_instrument: found
             .per_instrument

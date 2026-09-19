@@ -141,7 +141,7 @@ pub fn strategy_view(extension: &str, value: &serde_json::Value) -> arvo_views::
         premise: document.premise.clone(),
         kind: kind.to_owned(),
         interval: document.interval.to_string(),
-        configurations,
+        configurations: arvo_views::count(configurations),
         problem: crate::research::offerable(&document).err(),
     }
 }

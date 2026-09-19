@@ -413,7 +413,7 @@ fn view_of(
         total_cost: valued.total_cost,
         unrealized: valued.unrealized,
         unrealized_pct: valued.unrealized_pct,
-        without_cost_basis: valued.without_cost_basis,
+        without_cost_basis: arvo_views::count(valued.without_cost_basis),
         cash: valued.cash,
         holdings: valued
             .holdings
@@ -453,13 +453,17 @@ fn view_of(
             absolute: change.absolute,
             percent: change.percent,
         }),
-        import: ImportView {
-            columns: report.columns.clone(),
+        import: Some(ImportView {
+            columns: report
+                .columns
+                .iter()
+                .map(|(name, value)| arvo_views::NamedText { name: name.clone(), value: value.clone() })
+                .collect(),
             ignored: report.ignored.clone(),
-            rows_imported: report.rows_imported,
+            rows_imported: arvo_views::count(report.rows_imported),
             rows_skipped: report.rows_skipped.clone(),
             cost_basis_derived: report.cost_basis_derived,
-        },
+        }),
         source: None,
         paper: false,
         refreshed_at: None,

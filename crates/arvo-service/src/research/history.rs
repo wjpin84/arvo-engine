@@ -62,17 +62,17 @@ pub fn record_view(service: &ResearchService, stored: arvo_research::StoredRecor
         Record::Study(evidence) => {
             let mut view = study_view(&evidence, &service.bars, engine);
             view.id = id;
-            RecordView::Study(Box::new(view))
+            RecordView::study(view)
         }
         Record::Panel(evidence) => {
             let mut view = panel_view(&evidence, engine);
             view.id = id;
-            RecordView::Panel(Box::new(view))
+            RecordView::panel(view)
         }
         Record::WalkForward(evidence) => {
             let mut view = walk_forward_view(&evidence, &service.bars, engine);
             view.id = id;
-            RecordView::WalkForward(Box::new(view))
+            RecordView::walk_forward(view)
         }
         Record::Reported(evidence) => {
             use arvo_research::Judgement;
@@ -81,7 +81,7 @@ pub fn record_view(service: &ResearchService, stored: arvo_research::StoredRecor
                 Judgement::Evaluated(evaluation) => Some(evaluation.as_ref()),
                 Judgement::Inconclusive { .. } => None,
             };
-            RecordView::Reported(Box::new(arvo_views::ReportedView {
+            RecordView::reported(arvo_views::ReportedView {
                 id,
                 hypothesis: evidence.reported.hypothesis.to_string(),
                 claim: evidence.claim.clone(),
@@ -95,7 +95,7 @@ pub fn record_view(service: &ResearchService, stored: arvo_research::StoredRecor
                 verdict: format!("{:?}", evidence.verdict),
                 reasons: evidence.reasons.clone(),
                 trades: arvo_research::TradeStats::from_ledger(&evidence.reported.strategy_ledger).closed,
-                trials: evidence.reported.trials,
+                trials: evidence.reported.trials.map(arvo_views::count),
                 total_return: evaluated.map(|e| e.strategy.total_return),
                 excess_return: evaluated.map(|e| e.excess_return),
                 sharpe: evaluated.and_then(|e| e.strategy.sharpe),
@@ -103,7 +103,7 @@ pub fn record_view(service: &ResearchService, stored: arvo_research::StoredRecor
                 recorded_at,
                 author,
                 attachments,
-            }))
+            })
         }
     }
 }
@@ -143,13 +143,18 @@ pub fn origin_in(origin: &str, root: &std::path::Path) -> Option<(String, u32)> 
 /// the verdict, then every warning and recommendation, each with the
 /// severity the Problems panel understands.
 pub fn caveats(view: &RecordView) -> Vec<(String, String)> {
-    let (verdict, reasons, recommendations): (&str, &[String], &[RecommendationView]) = match view {
-        RecordView::Study(study) => (&study.verdict, &study.reasons, &study.recommendations),
-        RecordView::WalkForward(walk) => (&walk.verdict, &[], &walk.recommendations),
-        RecordView::Panel(panel) => (&panel.verdict, &[], &panel.recommendations),
+    use arvo_views::record_view::Of;
+
+    let (verdict, reasons, recommendations): (&str, &[String], &[RecommendationView]) = match view.of.as_ref() {
+        Some(Of::Study(study)) => (&study.verdict, &study.reasons, &study.recommendations),
+        Some(Of::Walkforward(walk)) => (&walk.verdict, &[], &walk.recommendations),
+        Some(Of::Panel(panel)) => (&panel.verdict, &[], &panel.recommendations),
         // No recommendations: those read a study's selection, and a reported
         // finding has none. The verdict and its reasons are the caveats.
-        RecordView::Reported(reported) => (&reported.verdict, &reported.reasons, &[]),
+        Some(Of::Reported(reported)) => (&reported.verdict, &reported.reasons, &[]),
+        // A record carrying nothing is a record from a build that knew a kind
+        // this one does not. It has no caveats to give.
+        None => return Vec::new(),
     };
     let mut out = vec![("info".to_owned(), format!("Verdict: {verdict}"))];
     out.extend(reasons.iter().map(|reason| ("info".to_owned(), reason.clone())));
@@ -774,8 +779,8 @@ pub fn list_history(service: &ResearchService) -> Result<HistoryView, CommandErr
                     stale: live.map(|live| live != summary.dataset_version),
                     agent: summary.agent.clone(),
                     origin: summary.origin.clone(),
-                    trials: summary.trials,
-                    attachments: summary.attachments,
+                    trials: summary.trials.map(arvo_views::count),
+                    attachments: arvo_views::count(summary.attachments),
                 }
             })
             .collect(),

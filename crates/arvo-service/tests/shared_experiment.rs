@@ -86,7 +86,7 @@ fn a_shared_study_run_again_is_held_to_its_whole_search() {
 
     let view = study_view(&again, &library, "test");
     assert_eq!(
-        view.prior_trials, original.selection.trials,
+        view.prior_trials, arvo_views::count(original.selection.trials),
         "and the report says so"
     );
 }

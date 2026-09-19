@@ -108,7 +108,7 @@ impl Plugins {
                 let all = plugins.refresh().await;
                 let reachable = all
                     .iter()
-                    .filter(|view| matches!(view.status, arvo_views::PluginStatusView::Reachable { .. }))
+                    .filter(|view| view.reachable())
                     .count();
                 Ok(format!("{reachable} of {} reachable", all.len()))
             }
@@ -193,12 +193,8 @@ impl Plugins {
 /// orphan rule forbids the impl. That is the rule doing its job.
 fn view_of(entry: &arvo_plugin_host::registry::PluginEntry) -> arvo_views::PluginView {
     let status = match &entry.status {
-        PluginStatus::Reachable(manifest) => arvo_views::PluginStatusView::Reachable {
-            name: manifest.name.clone(),
-            version: manifest.version.clone(),
-            capabilities: manifest.capabilities.iter().map(|capability| capability.name.clone()).collect(),
-        },
-        PluginStatus::Unreachable(reason) => arvo_views::PluginStatusView::Unreachable { reason: reason.clone() },
+        PluginStatus::Reachable(manifest) => arvo_views::PluginStatusView::reachable(manifest.name.clone(), manifest.version.clone(), manifest.capabilities.iter().map(|capability| capability.name.clone()).collect()),
+        PluginStatus::Unreachable(reason) => arvo_views::PluginStatusView::unreachable(reason.clone()),
     };
-    arvo_views::PluginView { id: entry.id.clone(), address: entry.address.clone(), status }
+    arvo_views::PluginView { id: entry.id.clone(), address: entry.address.clone(), status: Some(status) }
 }

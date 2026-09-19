@@ -69,7 +69,7 @@ pub fn library(service: &ResearchService) -> Result<DataLibraryView, CommandErro
                 id,
                 from: coverage.map(|(from, _)| from.to_string()),
                 to: coverage.map(|(_, to)| to.to_string()),
-                bars,
+                bars: arvo_views::count(bars),
                 fingerprint,
             }
         })
