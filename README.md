@@ -63,7 +63,7 @@ cargo build --release -p arvo-mcp-server
 claude mcp add arvo -- <path-to>/target/release/arvo-mcp-server
 ```
 
-With no argument it uses `%APPDATA%/com.arvo.desktop`; pass a directory to use
+With no argument it uses the open project folder (`%APPDATA%/com.arvo.desktop` until one is chosen); pass a directory to use
 another. Runs are saved as the agent's findings, deflated against everything
 that agent has run, and every call is appended to `agent-audit.jsonl`.
 

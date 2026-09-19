@@ -33,6 +33,26 @@ use serde_json::{json, Value};
 /// The protocol revision this speaks, the one `arvo-mcp` speaks as a client.
 const PROTOCOL_VERSION: &str = "2025-06-18";
 
+/// How to do research here, given to the client at `initialize`. The loop
+/// an agent runs, and the two facts that make it honest: most results are
+/// noise, and every run counts against you.
+const INSTRUCTIONS: &str = "\
+Arvo's research memory and research runs. Nothing here fetches data or trades.
+
+The loop: read list_findings and open_finding before proposing anything, so you \
+do not re-run what is already known. State a hypothesis in one sentence. Write it \
+as a ruleset with write_ruleset (one of Arvo's rules, the parameters you fix, the \
+axes you search - keep the search small, a dozen configurations is plenty). Run it \
+with run_study on one instrument, then open_finding and read the verdict, the \
+reasons and the advice before any number. NotSupported and Inconclusive are the \
+ordinary outcomes and are evidence: say what the run ruled out. Change one thing \
+at a time and say why.
+
+Every run is saved as your finding and deflated against everything you have run, \
+so running until something passes does not make it pass; a Supported verdict that \
+survives that is worth reporting, and one that does not is not. Report what you \
+found, what you ruled out, and what you would try next.";
+
 pub struct Server {
     research: Research,
     /// Who is running, once known.
@@ -79,7 +99,7 @@ impl Server {
                         "protocolVersion": PROTOCOL_VERSION,
                         "capabilities": { "tools": {} },
                         "serverInfo": { "name": "arvo", "version": env!("CARGO_PKG_VERSION") },
-                        "instructions": "Arvo's research memory and research runs. Runs are saved as your findings and deflated against everything you have run; a verdict that did not survive that is not evidence. Nothing here fetches data or trades.",
+                        "instructions": INSTRUCTIONS,
                     }),
                 )
             }
@@ -126,6 +146,33 @@ impl Server {
                 .map_err(|err| err.to_string())
                 .and_then(|plans| serde_json::to_value(plans).map_err(|err| err.to_string())),
             "list_instruments" => self.research.list_instruments(),
+            "list_rulesets" => serde_json::to_value(arvo_runtime_lib::rulesets::list(self.research.root()))
+                .map_err(|err| err.to_string()),
+            "write_ruleset" => {
+                let numbers = |key: &str| -> Result<std::collections::BTreeMap<String, f64>, String> {
+                    match arguments.get(key) {
+                        None | Some(Value::Null) => Ok(Default::default()),
+                        Some(value) => serde_json::from_value(value.clone())
+                            .map_err(|err| format!("{key} is an object of parameter name to number: {err}")),
+                    }
+                };
+                let axes: std::collections::BTreeMap<String, Vec<f64>> = match arguments.get("axes") {
+                    None | Some(Value::Null) => Default::default(),
+                    Some(value) => serde_json::from_value(value.clone())
+                        .map_err(|err| format!("axes is an object of parameter name to a list of numbers: {err}"))?,
+                };
+                let optional = |key: &str| arguments.get(key).and_then(Value::as_str).map(ToOwned::to_owned);
+                arvo_runtime_lib::rulesets::write(
+                    self.research.root(),
+                    &text("name")?,
+                    &text("rule")?,
+                    numbers("fixed")?,
+                    axes,
+                    optional("label"),
+                    optional("premise"),
+                )
+                .and_then(|view| serde_json::to_value(view).map_err(|err| err.to_string()))
+            }
             "list_findings" => self.research.list_findings(),
             "open_finding" => self.research.open_finding(&text("id")?),
             "run_study" => {
@@ -146,7 +193,7 @@ fn tools() -> Value {
         "type": "object",
         "properties": {
             "instrument": { "type": "string", "description": "An instrument id from list_instruments, e.g. AAPL.RH" },
-            "strategy": { "type": "string", "description": "A strategy name from list_strategies, e.g. sma_cross" },
+            "strategy": { "type": "string", "description": "A strategy name from list_strategies, or a ruleset name from list_rulesets" },
         },
         "required": ["instrument", "strategy"],
     });
@@ -156,6 +203,27 @@ fn tools() -> Value {
             "name": "list_strategies",
             "description": "The rules Arvo can test, each with the resolution it runs at and what it claims.",
             "inputSchema": none,
+        },
+        {
+            "name": "list_rulesets",
+            "description": "The rulesets in the project: a rule with its fixed parameters and the axes a study searches, as files. Each says whether it can run and why not.",
+            "inputSchema": { "type": "object", "properties": {} },
+        },
+        {
+            "name": "write_ruleset",
+            "description": "Writes a ruleset the project can study and a person can open in the editor: one of Arvo's rules from list_strategies, the parameters fixed, the axes searched. Refuses anything the engine would not run and says why. Replaces a ruleset of the same name. Then run_study with strategy set to the ruleset's name.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "Letters, digits, _ and -; not one of Arvo's own rule names" },
+                    "rule": { "type": "string", "description": "One of Arvo's rules, e.g. sma_cross" },
+                    "fixed": { "type": "object", "description": "Parameters every trial shares, name to number", "additionalProperties": { "type": "number" } },
+                    "axes": { "type": "object", "description": "Parameters the study searches, name to the values tried. Keep it small.", "additionalProperties": { "type": "array", "items": { "type": "number" } } },
+                    "label": { "type": "string", "description": "What to call it in a menu" },
+                    "premise": { "type": "string", "description": "One line: the hypothesis this ruleset tests" }
+                },
+                "required": ["name", "rule"]
+            },
         },
         {
             "name": "list_instruments",
@@ -260,13 +328,55 @@ mod tests {
             .iter()
             .map(|tool| tool["name"].as_str().expect("name"))
             .collect();
+        // write_ruleset writes a file the engine has already agreed to run —
+        // a study's inputs, in the project, where a person can open it. It
+        // reaches no source, no credential and no venue.
         assert_eq!(
             names,
-            ["list_strategies", "list_instruments", "list_findings", "open_finding", "run_study", "run_walk_forward"]
+            [
+                "list_strategies",
+                "list_rulesets",
+                "write_ruleset",
+                "list_instruments",
+                "list_findings",
+                "open_finding",
+                "run_study",
+                "run_walk_forward"
+            ]
         );
         for forbidden in ["fetch", "order", "trade", "share", "import", "key", "sign"] {
             assert!(!names.iter().any(|name| name.contains(forbidden)), "{forbidden}");
         }
+    }
+
+    #[test]
+    fn an_agent_can_write_a_ruleset_it_can_then_study_and_a_bad_one_is_refused() {
+        let (dir, mut server) = server();
+        let written = call(
+            &mut server,
+            json!({ "jsonrpc": "2.0", "id": 5, "method": "tools/call",
+                    "params": { "name": "write_ruleset", "arguments": {
+                        "name": "agent_cross", "rule": "sma_cross",
+                        "fixed": { "trade_size": 10 }, "axes": { "fast": [5, 10], "slow": [50] },
+                        "premise": "a fast cross on a slow base" } } }),
+        );
+        assert_eq!(written["result"]["isError"], json!(false), "{written}");
+        assert_eq!(written["result"]["structuredContent"]["searches"], json!(2));
+        assert!(dir.path().join("rulesets/agent_cross.json").exists());
+
+        let listed = call(&mut server, json!({ "jsonrpc": "2.0", "id": 6, "method": "tools/call",
+                                               "params": { "name": "list_rulesets", "arguments": {} } }));
+        assert_eq!(listed["result"]["structuredContent"][0]["name"], json!("agent_cross"));
+
+        let refused = call(
+            &mut server,
+            json!({ "jsonrpc": "2.0", "id": 7, "method": "tools/call",
+                    "params": { "name": "write_ruleset", "arguments": {
+                        "name": "nothing", "rule": "sma_cross", "axes": { "fast": [] } } } }),
+        );
+        assert_eq!(refused["result"]["isError"], json!(true));
+        assert!(refused["result"]["content"][0]["text"].as_str().expect("text").contains("searches nothing"));
+        assert!(!dir.path().join("rulesets/nothing.json").exists());
     }
 
     #[test]

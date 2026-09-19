@@ -44,6 +44,7 @@ mod fee;
 mod fill;
 mod ledger;
 mod plan;
+mod shadow;
 mod strategy;
 
 use std::str::FromStr;
@@ -56,6 +57,7 @@ use nautilus_model::identifiers::InstrumentId;
 
 use backtest::run_backtest;
 use plan::Plan;
+pub use shadow::{Shadow, Side, Signal};
 
 /// The Nautilus version this crate is pinned to, recorded on every result.
 ///
@@ -180,6 +182,49 @@ impl<P: BarProvider> SimulationProvider for NautilusSimulation<P> {
     }
 
     fn run(&self, experiment: &Experiment) -> Result<SimulationResult, SimulationError> {
+        let (plan, book, settlement) = match self.prepare(experiment)? {
+            Prepared::Chain(plan) => return self.run_put_spread(experiment, &plan),
+            Prepared::Book { plan, book, settlement } => (plan, book, settlement),
+        };
+        run_backtest(experiment, &plan, &book, settlement.as_ref())
+    }
+}
+
+/// A run checked and loaded, before anything is simulated.
+enum Prepared {
+    /// An option-chain rule, which builds its own book from the chain.
+    Chain(Plan),
+    Book {
+        plan: Plan,
+        book: Vec<(InstrumentId, String, Vec<arvo_data::Bar>)>,
+        settlement: Option<chain::Settlement>,
+    },
+}
+
+impl<P: BarProvider> NautilusSimulation<P> {
+    /// The same rule as `run`, kept alive beside a session and fed each bar as
+    /// it arrives — see [`Shadow`]. `experiment.window` is the history it
+    /// warms up on.
+    ///
+    /// # Errors
+    ///
+    /// Whatever `run` would refuse, plus a chain rule: a shadow needs the day's
+    /// chain as well as its bars, and nothing serves one live yet.
+    pub fn shadow(&self, experiment: &Experiment) -> Result<Shadow, SimulationError> {
+        match self.prepare(experiment)? {
+            // ponytail: chain rules need a live option chain to choose from;
+            // add when a source serves one intraday.
+            Prepared::Chain(_) => Err(SimulationError::Rejected(
+                "a chain rule cannot run beside a live session yet".to_owned(),
+            )),
+            Prepared::Book { plan, book, settlement } => {
+                Shadow::start(experiment, &plan, &book, settlement.as_ref())
+            }
+        }
+    }
+
+    /// Everything `run` checks and loads before it simulates.
+    fn prepare(&self, experiment: &Experiment) -> Result<Prepared, SimulationError> {
         let plan = Plan::from_spec(&experiment.strategy, experiment.interval)?;
         experiment
             .risk
@@ -195,7 +240,7 @@ impl<P: BarProvider> SimulationProvider for NautilusSimulation<P> {
             .map_err(SimulationError::Rejected)?;
 
         if matches!(plan, Plan::PutSpread { .. } | Plan::ZeroDteBreakout { .. }) {
-            return self.run_put_spread(experiment, &plan);
+            return Ok(Prepared::Chain(plan));
         }
 
         // An option run is priced by the option spread, and only by it. With no
@@ -288,7 +333,7 @@ impl<P: BarProvider> SimulationProvider for NautilusSimulation<P> {
             )));
         }
 
-        run_backtest(experiment, &plan, &book, settlement.as_ref())
+        Ok(Prepared::Book { plan, book, settlement })
     }
 }
 

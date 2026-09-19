@@ -7,15 +7,16 @@ use tokio::net::TcpListener;
 use tonic::{Request, Response, Status};
 
 use crate::research::Research;
+use crate::session::Sessions;
 
-pub mod proto {
-    tonic::include_proto!("arvo.engine.v1");
-}
+pub use arvo_plugin_host::engine as proto;
 
 use proto::research_server::{self, ResearchServer};
+use proto::sessions_server::{self, SessionsServer};
 use proto::{
     Advice, AttachRequest, Attachment, Attachments, Empty, Finding, FindingId, FindingSummary, Findings,
-    Instrument, Instruments, Point, ReportRequest, RunRequest, Strategies, Strategy,
+    Instrument, Instruments, Point, ReportRequest, RunRequest, SessionId, SessionList, SessionStatus,
+    StartRequest, Strategies, Strategy,
 };
 
 /// The keys of a summary that have their own fields; everything else is
@@ -32,11 +33,24 @@ struct Service {
     research: Research,
 }
 
-/// Serves the research tier on `listener` until `shutdown` resolves.
+struct Control {
+    sessions: std::sync::Arc<Sessions>,
+}
+
+/// The two tokens the engine serves behind: research for every front end,
+/// control for the ones allowed to reach an executor (ADR-0018 point 4).
+pub struct Tokens {
+    pub research: String,
+    pub control: String,
+}
+
+/// Serves the research tier and the control tier on `listener` until
+/// `shutdown` resolves.
 ///
 /// Every call must carry `authorization: Bearer <token>`. The engine's own
 /// listener is loopback-only; the token is what stops another local program
-/// that has not read the user's `engine.json`.
+/// that has not read the user's `engine.json` — or, for a session, its
+/// `control.json`.
 ///
 /// # Errors
 ///
@@ -44,23 +58,83 @@ struct Service {
 pub async fn serve(
     listener: TcpListener,
     research: Research,
-    token: &str,
+    sessions: std::sync::Arc<Sessions>,
+    tokens: &Tokens,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), tonic::transport::Error> {
-    let expected = format!("Bearer {token}");
-    let server = ResearchServer::new(Service { research }).max_decoding_message_size(MAX_MESSAGE_BYTES);
-    let service = tonic::service::interceptor::InterceptedService::new(server, move |request: Request<()>| {
-        match request.metadata().get("authorization").and_then(|value| value.to_str().ok()) {
-            Some(given) if given == expected => Ok(request),
-            _ => Err(Status::unauthenticated(
-                "missing or wrong token; read it from engine.json in the Arvo app data directory",
-            )),
-        }
-    });
+    let research_tier = tonic::service::interceptor::InterceptedService::new(
+        ResearchServer::new(Service { research }).max_decoding_message_size(MAX_MESSAGE_BYTES),
+        bearer(&tokens.research, "engine.json"),
+    );
+    let control_tier = tonic::service::interceptor::InterceptedService::new(
+        SessionsServer::new(Control { sessions }),
+        bearer(&tokens.control, "control.json"),
+    );
     tonic::transport::Server::builder()
-        .add_service(service)
+        .add_service(research_tier)
+        .add_service(control_tier)
         .serve_with_incoming_shutdown(tokio_stream::wrappers::TcpListenerStream::new(listener), shutdown)
         .await
+}
+
+/// An interceptor admitting only `Bearer <token>`.
+fn bearer(token: &str, file: &'static str) -> impl Fn(Request<()>) -> Result<Request<()>, Status> + Clone {
+    let expected = format!("Bearer {token}");
+    move |request: Request<()>| match request.metadata().get("authorization").and_then(|value| value.to_str().ok()) {
+        Some(given) if given == expected => Ok(request),
+        _ => Err(Status::unauthenticated(format!(
+            "missing or wrong token; read it from {file} in the Arvo app data directory"
+        ))),
+    }
+}
+
+fn session_status(status: crate::session::Status) -> SessionStatus {
+    SessionStatus {
+        id: status.id,
+        finding: status.finding,
+        executor: status.executor,
+        instrument: status.instrument,
+        strategy: status.strategy,
+        started_at: status.started_at,
+        state: status.state,
+        signals: status.signals,
+        submitted: status.submitted,
+        refused: status.refused,
+        fills: status.fills,
+        halted: status.halted,
+        last_error: status.last_error,
+        last_bar: status.last_bar,
+    }
+}
+
+#[tonic::async_trait]
+impl sessions_server::Sessions for Control {
+    async fn start_session(&self, request: Request<StartRequest>) -> Result<Response<SessionStatus>, Status> {
+        let request = request.into_inner();
+        let finding = required(&request.finding, "finding")?;
+        let executor = required(&request.executor, "executor")?;
+        self.sessions
+            .start(finding, executor)
+            .map(|status| Response::new(session_status(status)))
+            .map_err(Status::failed_precondition)
+    }
+
+    async fn stop_session(&self, request: Request<SessionId>) -> Result<Response<SessionStatus>, Status> {
+        let id = request.into_inner().id;
+        let sessions = self.sessions.clone();
+        // Joins the session thread, which can take a poll step.
+        tokio::task::spawn_blocking(move || sessions.stop(&id))
+            .await
+            .map_err(|err| Status::internal(err.to_string()))?
+            .map(|status| Response::new(session_status(status)))
+            .map_err(Status::not_found)
+    }
+
+    async fn list_sessions(&self, _: Request<Empty>) -> Result<Response<SessionList>, Status> {
+        Ok(Response::new(SessionList {
+            sessions: self.sessions.list().into_iter().map(session_status).collect(),
+        }))
+    }
 }
 
 /// A JSON value as text: a string as itself, null as empty, anything else as
@@ -418,6 +492,7 @@ mod tests {
     use super::*;
 
     const TOKEN: &str = "test-token";
+    const CONTROL: &str = "control-token";
 
     /// A served engine over an empty app data directory, and a way to stop it.
     async fn engine() -> (tempfile::TempDir, String, tokio::sync::oneshot::Sender<()>) {
@@ -426,14 +501,35 @@ mod tests {
         let address = format!("http://{}", listener.local_addr().expect("address"));
         let (stop, stopped) = tokio::sync::oneshot::channel();
         let research = Research::new(dir.path());
+        let sessions = std::sync::Arc::new(Sessions::new(dir.path()));
+        let tokens = Tokens { research: TOKEN.to_owned(), control: CONTROL.to_owned() };
         tokio::spawn(async move {
-            serve(listener, research, TOKEN, async {
+            serve(listener, research, sessions, &tokens, async {
                 let _ = stopped.await;
             })
             .await
             .expect("serves");
         });
         (dir, address, stop)
+    }
+
+    /// The boundary ADR-0016 draws: the research token opens nothing that
+    /// reaches an executor.
+    #[tokio::test]
+    async fn the_research_token_cannot_reach_a_session() {
+        let (_dir, address, _stop) = engine().await;
+        let mut control = proto::sessions_client::SessionsClient::connect(address).await.expect("connects");
+        let refused = control.list_sessions(with_token(Empty {}, TOKEN)).await.unwrap_err();
+        assert_eq!(refused.code(), tonic::Code::Unauthenticated);
+        assert!(refused.message().contains("control.json"), "{}", refused.message());
+
+        let listed = control.list_sessions(with_token(Empty {}, CONTROL)).await.expect("ok").into_inner();
+        assert!(listed.sessions.is_empty());
+        let refused = control
+            .start_session(with_token(StartRequest { finding: "f".to_owned(), executor: "etrade".to_owned() }, CONTROL))
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
     }
 
     fn with_token<T>(message: T, token: &str) -> Request<T> {
@@ -609,7 +705,14 @@ mod tests {
         // The boundary is what is offered. A call that named a source, a key
         // or an order would be a way past it no argument check could close.
         let proto = include_str!("../../../protos/arvo/engine/v1/engine.proto");
-        let calls: Vec<&str> = proto
+        // The research service's block alone: the control tier is a second
+        // service behind a second token, and its calls are the point of it.
+        let research = proto
+            .split("service Research {")
+            .nth(1)
+            .and_then(|rest| rest.split('}').next())
+            .expect("the research service is declared");
+        let calls: Vec<&str> = research
             .lines()
             .filter_map(|line| line.trim().strip_prefix("rpc "))
             .filter_map(|rest| rest.split('(').next())

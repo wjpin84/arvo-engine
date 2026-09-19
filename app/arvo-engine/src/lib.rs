@@ -8,3 +8,4 @@
 pub mod discovery;
 pub mod grpc;
 pub mod research;
+pub mod session;

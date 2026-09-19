@@ -34,15 +34,18 @@ use serde_json::{json, Value};
 /// Where calls are recorded, in the app data directory.
 pub const AUDIT_FILE: &str = "agent-audit.jsonl";
 
-/// The window's own app data directory, `%APPDATA%/com.arvo.desktop`.
+/// Where the window keeps its data: the open project folder, else its app
+/// data directory — the same choice `arvo_runtime_lib::project::data_root`
+/// makes, so a script and the window read one library.
 ///
 /// # Errors
 ///
-/// When `APPDATA` is not set.
+/// When no project is open and `APPDATA` is not set.
 pub fn default_root() -> Result<PathBuf, String> {
-    std::env::var_os("APPDATA")
-        .map(|appdata| PathBuf::from(appdata).join("com.arvo.desktop"))
-        .ok_or_else(|| "no app data directory given and APPDATA is not set".to_owned())
+    match arvo_runtime_lib::project::remembered() {
+        Some(folder) => Ok(folder),
+        None => arvo_runtime_lib::project::app_data_root().map_err(|err| format!("no data directory given and {err}")),
+    }
 }
 
 /// Research over one app data directory. Cheap to clone: it holds paths.
@@ -65,6 +68,12 @@ impl Research {
 
     fn store(&self) -> EvidenceStore {
         EvidenceStore::new(&self.evidence)
+    }
+
+    /// The project folder this research runs over.
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        self.data.parent().unwrap_or(&self.data)
     }
 
     /// Every instrument with data, by resolution and date range.
@@ -151,6 +160,12 @@ impl Research {
         author: &str,
         origin: Option<&str>,
     ) -> Result<Value, String> {
+        // The project's risk model, the same one the window's studies run
+        // under; a bad file refuses the run rather than defaulting. And its
+        // rulesets, so a strategy can be one an agent wrote a moment ago.
+        let root = self.data.parent().unwrap_or(&self.data);
+        arvo_runtime_lib::risk::load(root)?;
+        arvo_runtime_lib::rulesets::refresh_at(root);
         let plan = StrategyPlan::find(strategy)
             .ok_or_else(|| format!("no strategy {strategy:?}; list_strategies says what there is"))?;
         if plan.ranks_a_set() {

@@ -46,6 +46,31 @@ pub fn write(root: &Path, found: &Discovery) -> std::io::Result<()> {
     std::fs::rename(&partial, &path)
 }
 
+/// Where the control token goes: beside `engine.json`, in a file of its own,
+/// so a client that reads only `engine.json` — the Python package, the MCP
+/// server — never holds it (ADR-0018 point 4).
+pub const CONTROL_FILE: &str = "control.json";
+
+/// Writes the control token whole or not at all, as [`write`] does.
+///
+/// # Errors
+///
+/// When the file cannot be written.
+pub fn write_control(root: &Path, token: &str) -> std::io::Result<()> {
+    let path = root.join(CONTROL_FILE);
+    let partial = root.join(format!("{CONTROL_FILE}.partial"));
+    std::fs::write(&partial, json!({ "token": token }).to_string())?;
+    std::fs::rename(&partial, &path)
+}
+
+/// The control token, or `None` when the file is absent or unreadable.
+#[must_use]
+pub fn read_control(root: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(root.join(CONTROL_FILE)).ok()?;
+    let value: Value = serde_json::from_str(&text).ok()?;
+    Some(value.get("token")?.as_str()?.to_owned())
+}
+
 /// The file's contents, or `None` when it is absent or unreadable.
 #[must_use]
 pub fn read(root: &Path) -> Option<Discovery> {

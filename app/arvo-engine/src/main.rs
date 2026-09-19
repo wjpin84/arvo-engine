@@ -1,16 +1,24 @@
 //! The Arvo engine (ADR-0018).
 //!
-//!     arvo-engine [<app-data-dir>]
+//!     arvo-engine [<dir>]
+//!     arvo-engine session list
+//!     arvo-engine session start <finding> <alpaca-paper|alpaca-live|robinhood-1234>
+//!     arvo-engine session stop <id>
+//!
+//! The `session` form is a client of the running engine, over its control
+//! token (`control.json`); the rest starts one.
 //!
 //! Serves the research tier on a free loopback port and writes the address
-//! and a fresh token to `engine.json` in the app data directory, which
-//! defaults to the window's own. A second engine for the same directory finds
-//! the first answering and leaves it running. Ctrl-C stops it and removes the
-//! file.
+//! and a fresh token to `engine.json` in the app data directory, where the
+//! window and the Python client look for it. Data — the library, the
+//! evidence store — is read from the open project folder. With `<dir>`, both
+//! are that directory: a test or a script running over a folder of its own.
+//! A second engine for the same directory finds the first answering and
+//! leaves it running. Ctrl-C stops it and removes the file.
 
 use std::path::PathBuf;
 
-use arvo_engine::{discovery, grpc, research};
+use arvo_engine::{discovery, grpc, research, session};
 
 #[tokio::main]
 async fn main() {
@@ -21,9 +29,16 @@ async fn main() {
 }
 
 async fn run() -> Result<(), String> {
-    let root = match std::env::args().nth(1) {
-        Some(dir) => PathBuf::from(dir),
-        None => research::default_root()?,
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("session") {
+        return session_command(&args[1..]).await;
+    }
+    let (root, data) = match args.first() {
+        Some(dir) => (PathBuf::from(&dir), PathBuf::from(dir)),
+        None => (
+            arvo_runtime_lib::project::app_data_root().map_err(|err| format!("no app data directory: {err}"))?,
+            research::default_root()?,
+        ),
     };
 
     if let Some(found) = discovery::running(&root) {
@@ -40,16 +55,80 @@ async fn run() -> Result<(), String> {
     let address = listener
         .local_addr()
         .map_err(|err| format!("reading the bound address: {err}"))?;
-    let token = discovery::new_token();
+    let tokens = grpc::Tokens { research: discovery::new_token(), control: discovery::new_token() };
     let pid = std::process::id();
-    discovery::write(&root, &discovery::Discovery { address, token: token.clone(), pid })
+    discovery::write(&root, &discovery::Discovery { address, token: tokens.research.clone(), pid })
         .map_err(|err| format!("writing {}: {err}", discovery::FILE))?;
-    eprintln!("arvo-engine: serving research on {address} for {}", root.display());
+    discovery::write_control(&root, &tokens.control)
+        .map_err(|err| format!("writing {}: {err}", discovery::CONTROL_FILE))?;
+    eprintln!("arvo-engine: serving research and sessions on {address} for {}", data.display());
 
-    let served = grpc::serve(listener, research::Research::new(&root), &token, async {
+    let sessions = std::sync::Arc::new(session::Sessions::new(&data));
+    let served = grpc::serve(listener, research::Research::new(&data), sessions, &tokens, async {
         let _ = tokio::signal::ctrl_c().await;
     })
     .await;
     discovery::remove_if_ours(&root, pid);
     served.map_err(|err| format!("serving: {err}"))
+}
+
+/// `session list|start|stop`, against the engine `engine.json` names.
+async fn session_command(args: &[String]) -> Result<(), String> {
+    use arvo_engine::grpc::proto::{sessions_client::SessionsClient, Empty, SessionId, SessionStatus, StartRequest};
+
+    let root = arvo_runtime_lib::project::app_data_root().map_err(|err| format!("no app data directory: {err}"))?;
+    let found = discovery::running(&root).ok_or("no engine is running; open Arvo or start arvo-engine")?;
+    let token = discovery::read_control(&root).ok_or("no control.json beside engine.json")?;
+    let mut client = SessionsClient::connect(format!("http://{}", found.address))
+        .await
+        .map_err(|err| format!("connecting to the engine: {err}"))?;
+    fn bearer<T>(message: T, token: &str) -> tonic::Request<T> {
+        let mut request = tonic::Request::new(message);
+        request
+            .metadata_mut()
+            .insert("authorization", format!("Bearer {token}").parse().expect("hex is ascii"));
+        request
+    }
+    let show = |status: &SessionStatus| {
+        println!(
+            "{}  {}  {} {}  signals {}  submitted {}  refused {}  fills {}{}{}{}",
+            status.id,
+            status.state,
+            status.instrument,
+            status.strategy,
+            status.signals,
+            status.submitted,
+            status.refused,
+            status.fills,
+            status.last_bar.as_ref().map_or(String::new(), |at| format!("  last bar {at}")),
+            status.halted.as_ref().map_or(String::new(), |why| format!("  HALTED: {why}")),
+            status.last_error.as_ref().map_or(String::new(), |err| format!("  error: {err}")),
+        );
+    };
+    match args {
+        [verb] if verb == "list" => {
+            let listed = client.list_sessions(bearer(Empty {}, &token)).await.map_err(|err| err.message().to_owned())?;
+            let sessions = listed.into_inner().sessions;
+            if sessions.is_empty() {
+                println!("no sessions");
+            }
+            sessions.iter().for_each(show);
+        }
+        [verb, finding, executor] if verb == "start" => {
+            let started = client
+                .start_session(bearer(StartRequest { finding: finding.clone(), executor: executor.clone() }, &token))
+                .await
+                .map_err(|err| err.message().to_owned())?;
+            show(&started.into_inner());
+        }
+        [verb, id] if verb == "stop" => {
+            let stopped = client
+                .stop_session(bearer(SessionId { id: id.clone() }, &token))
+                .await
+                .map_err(|err| err.message().to_owned())?;
+            show(&stopped.into_inner());
+        }
+        _ => return Err("usage: arvo-engine session list | start <finding> <executor> | stop <id>".to_owned()),
+    }
+    Ok(())
 }

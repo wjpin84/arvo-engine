@@ -7,7 +7,7 @@
 //! broker: no tool here names a credential, a source or an order. See
 //! [`server`] for what is offered and why.
 //!
-//! `<app-data-dir>` defaults to `%APPDATA%/com.arvo.desktop`, the window's own.
+//! `<data-dir>` defaults to the open project folder, else `%APPDATA%/com.arvo.desktop`.
 //! `--agent` names who is running, for attribution and deflation; without it
 //! the client's own name from `initialize` is used.
 //!

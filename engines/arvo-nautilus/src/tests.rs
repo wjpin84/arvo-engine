@@ -376,6 +376,48 @@ fn the_same_experiment_twice_gives_the_same_answer() {
 }
 
 #[test]
+fn a_shadow_signals_every_entry_the_backtest_took() {
+    let bars = sawtooth(200);
+    let (history, live) = bars.split_at(150);
+    let whole = provider(bars.clone())
+        .run(&experiment(params(10.0, 30.0), &bars))
+        .expect("the backtest should run");
+
+    // Warmed on the history alone; then each later bar arrives on its own.
+    let mut shadow = provider(bars.clone())
+        .shadow(&experiment(params(10.0, 30.0), history))
+        .expect("the shadow should start");
+    let mut signals = Vec::new();
+    for bar in live {
+        signals.extend(shadow.push(&[("AAPL.NASDAQ".to_owned(), bar.clone())]).expect("push"));
+    }
+
+    // A fill lands at the next bar's open (ADR-0010), so the backtest's entry
+    // is the bar after the one the shadow signalled on.
+    let split_at = live[0].at;
+    let entries: Vec<_> = whole
+        .ledger
+        .iter()
+        .filter(|trade| trade.opened > split_at)
+        .map(|trade| {
+            let filled = bars.iter().position(|bar| bar.at == trade.opened).expect("fill is on a bar");
+            (bars[filled - 1].at, trade.quantity)
+        })
+        .collect();
+    let buys: Vec<_> = signals
+        .iter()
+        .filter(|signal| signal.side == Side::Buy && signal.exit.is_none())
+        .map(|signal| (signal.signalled_at, signal.quantity))
+        .collect();
+    assert!(!entries.is_empty(), "the fixture must trade after the split");
+    assert_eq!(buys, entries, "same rule, same bars, same decisions");
+    assert!(
+        signals.iter().any(|signal| signal.exit.is_some()),
+        "a sawtooth closes what it opened"
+    );
+}
+
+#[test]
 fn every_advertised_strategy_can_actually_be_planned() {
     // `STRATEGIES` is what a caller offers in a menu. A name in it that no
     // arm of `from_spec` matches is a rejection the user only discovers

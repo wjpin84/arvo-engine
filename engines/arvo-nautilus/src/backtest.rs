@@ -60,6 +60,31 @@ pub(crate) fn run_backtest(
     book: &[(InstrumentId, String, Vec<arvo_data::Bar>)],
     settlement: Option<&Settlement>,
 ) -> Result<SimulationResult, SimulationError> {
+    let built = build(experiment, plan, book, settlement)?;
+    finish_marked(built.engine, experiment, book, built.clock)
+}
+
+/// An engine with everything added and nothing run yet.
+///
+/// Shared by a backtest, which runs it to the end, and a shadow
+/// (`crate::shadow`), which runs it to now and then a bar at a time — so the
+/// two cannot come to differ in what a rule is given.
+pub(crate) struct Built<'a> {
+    pub(crate) engine: BacktestEngine,
+    /// Each book member's bar type, in book order: what a later bar for that
+    /// member must be stamped with.
+    pub(crate) bar_types: Vec<BarType>,
+    /// The underlying's name and bars, when a chain run marks its curve by
+    /// them rather than by every contract.
+    clock: Option<(String, &'a [arvo_data::Bar])>,
+}
+
+pub(crate) fn build<'a>(
+    experiment: &Experiment,
+    plan: &Plan,
+    book: &[(InstrumentId, String, Vec<arvo_data::Bar>)],
+    settlement: Option<&'a Settlement>,
+) -> Result<Built<'a>, SimulationError> {
     silence_nautilus_logging();
 
     // Checked by the caller, which will not build an empty book.
@@ -160,7 +185,7 @@ pub(crate) fn run_backtest(
         let clock = settlement.map(|settlement| {
             (format!("{}.{venue}", settlement.symbol), settlement.drive.as_slice())
         });
-        return finish_marked(engine, experiment, book, clock);
+        return Ok(Built { engine, bar_types, clock });
     }
 
     if let (Plan::PutSpread { rule, .. }, Some(driver)) = (plan, driver) {
@@ -178,7 +203,7 @@ pub(crate) fn run_backtest(
         let clock = settlement.map(|settlement| {
             (format!("{}.{venue}", settlement.symbol), settlement.drive.as_slice())
         });
-        return finish_marked(engine, experiment, book, clock);
+        return Ok(Built { engine, bar_types, clock });
     }
 
     if let Plan::CrossSectionalMomentum {
@@ -197,7 +222,7 @@ pub(crate) fn run_backtest(
                 correlations.clone(),
             ))
             .map_err(|err| rejected("adding the strategy", &err))?;
-        return finish(engine, experiment, book);
+        return Ok(Built { engine, bar_types, clock: None });
     }
 
     // One strategy instance per instrument, all settling against the one
@@ -212,7 +237,7 @@ pub(crate) fn run_backtest(
     // instrument; sharing is the account's job, not theirs.
     add_each(&mut engine, experiment, plan, &bar_types, trade_size, risk, &correlations)?;
 
-    finish(engine, experiment, book)
+    Ok(Built { engine, bar_types, clock: None })
 }
 
 fn rejected(context: &str, err: &dyn std::fmt::Display) -> SimulationError {
@@ -538,21 +563,9 @@ fn add_each(
     Ok(())
 }
 
-/// Runs the engine and reads the result back.
-///
-/// Shared by the two ways strategies get added — one per instrument, or one
-/// across all of them — so a ranking rule and an ordinary one cannot come to
-/// differ in how their results are collected.
-fn finish(
-    engine: BacktestEngine,
-    experiment: &Experiment,
-    book: &[(InstrumentId, String, Vec<arvo_data::Bar>)],
-) -> Result<SimulationResult, SimulationError> {
-    finish_marked(engine, experiment, book, None)
-}
-
-/// As [`finish`], with the curve's clock taken from `driver` and only the
-/// instruments the ledger holds marked (#87).
+/// Runs the engine to the end and reads the result back, with the curve's
+/// clock taken from `driver` and only the instruments the ledger holds marked
+/// (#87).
 ///
 /// A chain run holds tens of thousands of contracts it never trades. Marking
 /// the curve against every one of them at every bar is instants times

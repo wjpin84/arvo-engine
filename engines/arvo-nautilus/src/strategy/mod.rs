@@ -66,6 +66,10 @@ pub(crate) use rules::{
 pub(crate) const EXIT_STOP: &str = "arvo:exit=stop";
 pub(crate) const EXIT_SIGNAL: &str = "arvo:exit=signal";
 pub(crate) const EXIT_HALT: &str = "arvo:exit=halt";
+/// Stamped on an entry with the stop distance it was sized against, so a
+/// live gate re-deciding the same entry has the number it needs
+/// (`shadow`). `arvo:stop=<price distance>`.
+pub(crate) const ENTRY_STOP: &str = "arvo:stop=";
 
 /// What the engine's own rules call themselves when they propose a trade.
 ///
@@ -480,7 +484,11 @@ pub(crate) trait Managed: Strategy + StrategyNative + DataActorNative {
             position.target = target;
             position.hold(size);
         }
-        self.send(OrderSide::Buy, size, None)?;
+        self.send(
+            OrderSide::Buy,
+            size,
+            stop_distance.map(|distance| format!("{ENTRY_STOP}{distance}")),
+        )?;
         Ok(true)
     }
 
@@ -601,7 +609,7 @@ pub(crate) trait Managed: Strategy + StrategyNative + DataActorNative {
         let Some(size) = size else {
             return Ok(());
         };
-        self.send(side, size, Some(reason))
+        self.send(side, size, Some(reason.to_owned()))
     }
 
     /// Squares what this strategy believes it holds with the venue, after the
@@ -685,12 +693,7 @@ pub(crate) trait Managed: Strategy + StrategyNative + DataActorNative {
         Ok(true)
     }
 
-    fn send(
-        &mut self,
-        side: OrderSide,
-        size: Quantity,
-        reason: Option<&'static str>,
-    ) -> anyhow::Result<()> {
+    fn send(&mut self, side: OrderSide, size: Quantity, tag: Option<String>) -> anyhow::Result<()> {
         let instrument = self.instrument();
         let order = self.order().market(
             instrument,
@@ -701,7 +704,7 @@ pub(crate) trait Managed: Strategy + StrategyNative + DataActorNative {
             None, // quote_quantity
             None, // exec_algorithm_id
             None, // exec_algorithm_params
-            reason.map(|reason| vec![ustr::Ustr::from(reason)]),
+            tag.map(|tag| vec![ustr::Ustr::from(&tag)]),
             None, // client_order_id
         );
         self.submit_order(order, None, None, None)

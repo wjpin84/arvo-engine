@@ -2,7 +2,9 @@
 //! [`arvo_core::engine`], which the window reads too; the token is made here,
 //! because only the engine writes one.
 
-pub use arvo_core::engine::{read, remove_if_ours, running, write, Discovery, FILE};
+pub use arvo_core::engine::{
+    read, read_control, remove_if_ours, running, write, write_control, Discovery, CONTROL_FILE, FILE,
+};
 
 /// A fresh token: 32 random bytes, as hex.
 #[must_use]

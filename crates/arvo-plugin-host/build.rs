@@ -20,4 +20,9 @@ fn main() {
         .expect("failed to compile source.proto");
     tonic_prost_build::compile_protos("../../protos/arvo/signal/v1/signal.proto")
         .expect("failed to compile signal.proto");
+    // The engine's own API (ADR-0018): compiled here, where both the engine
+    // and the window can reach it, since the engine depends on the window's
+    // crate and not the reverse.
+    tonic_prost_build::compile_protos("../../protos/arvo/engine/v1/engine.proto")
+        .expect("failed to compile engine.proto");
 }

@@ -14,3 +14,9 @@ pub mod supervisor;
 pub mod plugin {
     tonic::include_proto!("arvo.plugin.v1");
 }
+
+/// Generated from `protos/arvo/engine/v1/engine.proto`: the engine's local
+/// API, served by `arvo-engine` and called by the window (ADR-0018).
+pub mod engine {
+    tonic::include_proto!("arvo.engine.v1");
+}
