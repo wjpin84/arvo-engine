@@ -110,6 +110,126 @@ pub fn describe_revision(agreement: &arvo_data::agreement::Agreement) -> String 
     }
 }
 
+/// Searches a source for instruments, marking the ones already held.
+///
+/// # Errors
+///
+/// No such source, or the search failed.
+pub async fn search(
+    service: &ResearchService,
+    query: &str,
+    source: Option<&str>,
+    report: super::Report<'_>,
+) -> Result<Vec<MatchView>, CommandError> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Ok(Vec::new());
+    }
+    let source = super::resolve(source)?;
+    let held: std::collections::HashSet<String> =
+        service.bars.instruments().unwrap_or_default().into_iter().collect();
+    Ok(source
+        .search(&service.data_dir, query, 10)
+        .await
+        .map_err(|err| super::failed(report, &err))?
+        .into_iter()
+        .map(|found| MatchView {
+            held: held.contains(&found.instrument),
+            instrument: found.instrument,
+            symbol: found.symbol,
+            name: found.name,
+            price: found.price,
+            change: found.change,
+        })
+        .collect())
+}
+
+/// Fetches bars into the library and reports what arrived (ADR-0008).
+///
+/// # Errors
+///
+/// An interval that does not parse, no such source, or the fetch failed.
+pub async fn bars(
+    service: &ResearchService,
+    instrument: &str,
+    interval: &str,
+    days: Option<u32>,
+    source: Option<&str>,
+    report: super::Report<'_>,
+) -> Result<FetchView, CommandError> {
+    let parsed: arvo_data::BarInterval =
+        interval.parse().map_err(|err| CommandError::Failed(format!("{interval:?}: {err}")))?;
+    let source = super::resolve(source)?;
+    let days = days.unwrap_or_else(|| source::default_days(&[source.as_ref()], parsed));
+    let to = chrono::Utc::now().date_naive();
+    let from = to - chrono::Duration::days(i64::from(days));
+    let report_out = source::ingest(&service.data_dir, source.as_ref(), instrument, parsed, from, to)
+        .await
+        .map_err(|err| super::failed(report, &err))?;
+    Ok(FetchView {
+        instrument: report_out.instrument,
+        source: report_out.source.to_owned(),
+        interval: report_out.interval.to_string(),
+        bars: report_out.bars,
+        interpolated: report_out.interpolated,
+        dividends: report_out.dividends,
+        revision: report_out.revision.as_ref().map(describe_revision),
+        revised: matches!(report_out.revision, Some(arvo_data::agreement::Agreement::Diverged { .. })),
+        from: report_out.from.map(|at| at.to_string()),
+        to: report_out.to.map(|at| at.to_string()),
+        data_findings: report_out
+            .quality
+            .findings
+            .into_iter()
+            .map(|finding| DataFindingView {
+                severity: match finding.severity {
+                    arvo_data::quality::Severity::Fault => "fault",
+                    arvo_data::quality::Severity::Suspect => "suspect",
+                }
+                .to_owned(),
+                kind: finding.kind.to_owned(),
+                at: finding.at.map(|at| at.format("%Y-%m-%d %H:%M").to_string()),
+                detail: finding.detail,
+            })
+            .collect(),
+    })
+}
+
+/// Reads one instrument from two sources and says where they disagree.
+///
+/// # Errors
+///
+/// An interval that does not parse, a source compared against itself, or
+/// either read failed.
+pub async fn compare_two(
+    instrument: &str,
+    interval: &str,
+    first: Option<&str>,
+    second: Option<&str>,
+    days: Option<u32>,
+    report: super::Report<'_>,
+) -> Result<SourceComparisonView, CommandError> {
+    let parsed: arvo_data::BarInterval =
+        interval.parse().map_err(|err| CommandError::Failed(format!("{interval:?}: {err}")))?;
+    let first = super::resolve(first)?;
+    let second = super::resolve(second.or(Some(source::yahoo::SOURCE_ID)))?;
+    if first.id() == second.id() {
+        return Err(CommandError::Failed(format!(
+            "{} cannot be its own second opinion — a series compared against itself agrees by construction",
+            first.id()
+        )));
+    }
+    // Within both sources' limits: a window one of them refuses compares
+    // nothing.
+    let days = days.unwrap_or_else(|| source::default_days(&[first.as_ref(), second.as_ref()], parsed));
+    let to = chrono::Utc::now().date_naive();
+    let from = to - chrono::Duration::days(i64::from(days));
+    let outcome = source::compare(first.as_ref(), second.as_ref(), instrument, parsed, from, to)
+        .await
+        .map_err(|err| super::failed(report, &err))?;
+    Ok(source_comparison_view(&outcome))
+}
+
 #[cfg(test)]
 mod comparison_view_tests {
     use super::source_comparison_view;

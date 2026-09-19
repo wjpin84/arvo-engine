@@ -108,7 +108,7 @@ struct Running {
 pub struct Sessions {
     data: PathBuf,
     running: Mutex<BTreeMap<String, Running>>,
-    /// Every state change, for whoever is listening (#150). Sent, never
+    /// Where state changes go, for whoever is listening (#150). Sent, never
     /// awaited: a session does not wait for the window.
     events: broadcast::Sender<EventView>,
 }
@@ -121,16 +121,8 @@ impl std::fmt::Debug for Sessions {
 
 impl Sessions {
     #[must_use]
-    pub fn new(data: &Path) -> Self {
-        let (events, _) = broadcast::channel(256);
+    pub fn new(data: &Path, events: broadcast::Sender<EventView>) -> Self {
         Self { data: data.to_path_buf(), running: Mutex::new(BTreeMap::new()), events }
-    }
-
-    /// Every session state change from now on. A receiver that falls behind
-    /// misses events rather than stalling a session.
-    #[must_use]
-    pub fn subscribe(&self) -> broadcast::Receiver<EventView> {
-        self.events.subscribe()
     }
 
     /// Starts a session for `finding` against `executor`.
@@ -576,7 +568,7 @@ mod tests {
     #[test]
     fn an_unknown_executor_is_refused_before_a_thread_starts() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let sessions = Sessions::new(dir.path());
+        let sessions = Sessions::new(dir.path(), broadcast::channel(16).0);
         let refused = sessions.start("f-1", "etrade").expect_err("not an executor");
         assert!(refused.contains("alpaca-paper"), "{refused}");
         assert!(sessions.list().is_empty());
@@ -587,7 +579,7 @@ mod tests {
     #[test]
     fn a_missing_finding_fails_the_session_rather_than_the_call() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let sessions = Sessions::new(dir.path());
+        let sessions = Sessions::new(dir.path(), broadcast::channel(16).0);
         let started = sessions.start("nope", "alpaca-paper").expect("starts");
         assert_eq!(started.state, "starting");
         let stopped = sessions.stop(&started.id).expect("joins");

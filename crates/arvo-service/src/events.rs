@@ -170,6 +170,22 @@ pub fn session(id: &str, state: &str, detail: Option<&str>) -> EventView {
     }
 }
 
+/// A source failure worth announcing, if it is one.
+///
+/// A session can expire between any two calls, and the call that happens to
+/// discover it is not the one a person is looking at. Both the engine and the
+/// window map the failure through here, so a dead broker session reaches the
+/// alerts list whichever of them found it.
+#[must_use]
+pub fn disconnected(err: &crate::source::SourceError) -> Option<EventView> {
+    match err {
+        crate::source::SourceError::NoSession { vendor } => {
+            Some(feed_disconnected(vendor, &err.to_string(), false))
+        }
+        _ => None,
+    }
+}
+
 /// Live prices came back.
 pub fn stream_live() -> EventView {
     EventView {

@@ -63,8 +63,11 @@ async fn run() -> Result<(), String> {
         .map_err(|err| format!("writing {}: {err}", discovery::CONTROL_FILE))?;
     eprintln!("arvo-engine: serving research and sessions on {address} for {}", data.display());
 
-    let sessions = std::sync::Arc::new(session::Sessions::new(&data));
-    let served = grpc::serve(listener, research::Research::new(&data), sessions, &tokens, async {
+    // One hub for everything the engine raises, shared by the sessions and the
+    // data tier and handed out by Subscribe (#150).
+    let events = tokio::sync::broadcast::channel(256).0;
+    let sessions = std::sync::Arc::new(session::Sessions::new(&data, events.clone()));
+    let served = grpc::serve(listener, research::Research::new(&data), sessions, events, &tokens, async {
         let _ = tokio::signal::ctrl_c().await;
     })
     .await;

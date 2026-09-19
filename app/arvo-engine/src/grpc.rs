@@ -12,13 +12,15 @@ use crate::session::Sessions;
 pub use arvo_client::proto as proto;
 
 use proto::research_server::{self, ResearchServer};
+use proto::data_server::{self, DataServer};
 use proto::sessions_server::{self, SessionsServer};
 use proto::{
     Advice, AttachRequest, Attachment, Attachments, Empty, Finding, FindingId, FindingSummary, Findings,
-    BookRequest, FindingIds, Instrument, Instruments, Point, ReportRequest, RiskModel, Rules, RulesetForm, RulesetPath,
+    BookRequest, CompareRequest, FetchRequest, FindingIds, InstrumentSearch, Instrument, Instruments, Point, ReportRequest, RiskModel, Rules, RulesetForm, RulesetPath,
     Rulesets, Ruleset, RunRequest, StudyRequest, View, SessionId, SessionList, SessionStatus, StartRequest, Strategies,
 };
 use arvo_client::wire;
+use arvo_views::EventView;
 
 /// The keys of a summary that have their own fields; everything else is
 /// `detail_json`.
@@ -32,9 +34,8 @@ pub use arvo_client::wire::MAX_MESSAGE_BYTES;
 
 struct Service {
     research: Research,
-    /// For [`Research::subscribe`]: the sessions are the first thing that
-    /// raises events.
-    sessions: std::sync::Arc<Sessions>,
+    /// What `Subscribe` hands out: every event any part of the engine raises.
+    events: tokio::sync::broadcast::Sender<EventView>,
     /// The workbench's runs and memory over the same folder: what the window
     /// renders, served here so the window need not run them itself.
     workbench: std::sync::Arc<arvo_service::research::ResearchService>,
@@ -42,6 +43,23 @@ struct Service {
 
 struct Control {
     sessions: std::sync::Arc<Sessions>,
+}
+
+/// The data tier, behind the control token: the library, the sources, and
+/// pulling more in. Not the research token, because fetching changes the
+/// library and stales existing findings (ADR-0016).
+struct Library {
+    workbench: std::sync::Arc<arvo_service::research::ResearchService>,
+    events: tokio::sync::broadcast::Sender<EventView>,
+}
+
+impl Library {
+    /// Broadcasts whatever a data call wants to announce.
+    fn report(&self) -> impl Fn(EventView) + Send + Sync + use<'_> {
+        move |event| {
+            let _ = self.events.send(event);
+        }
+    }
 }
 
 /// The two tokens the engine serves behind: research for every front end,
@@ -66,6 +84,7 @@ pub async fn serve(
     listener: TcpListener,
     research: Research,
     sessions: std::sync::Arc<Sessions>,
+    events: tokio::sync::broadcast::Sender<EventView>,
     tokens: &Tokens,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), tonic::transport::Error> {
@@ -74,7 +93,7 @@ pub async fn serve(
         research.root().join(arvo_service::research::EVIDENCE_SUBDIR),
     ));
     let research_tier = tonic::service::interceptor::InterceptedService::new(
-        ResearchServer::new(Service { research, sessions: sessions.clone(), workbench })
+        ResearchServer::new(Service { research, events: events.clone(), workbench: workbench.clone() })
             .max_decoding_message_size(MAX_MESSAGE_BYTES),
         bearer(&tokens.research, "engine.json"),
     );
@@ -82,9 +101,14 @@ pub async fn serve(
         SessionsServer::new(Control { sessions }),
         bearer(&tokens.control, "control.json"),
     );
+    let data_tier = tonic::service::interceptor::InterceptedService::new(
+        DataServer::new(Library { workbench, events }).max_decoding_message_size(MAX_MESSAGE_BYTES),
+        bearer(&tokens.control, "control.json"),
+    );
     tonic::transport::Server::builder()
         .add_service(research_tier)
         .add_service(control_tier)
+        .add_service(data_tier)
         .serve_with_incoming_shutdown(tokio_stream::wrappers::TcpListenerStream::new(listener), shutdown)
         .await
 }
@@ -116,6 +140,56 @@ fn session_status(status: crate::session::Status) -> SessionStatus {
         halted: status.halted,
         last_error: status.last_error,
         last_bar: status.last_bar,
+    }
+}
+
+#[tonic::async_trait]
+impl data_server::Data for Library {
+    async fn view_library(&self, _: Request<Empty>) -> Result<Response<View>, Status> {
+        let view = arvo_service::research::data::library(&self.workbench).map_err(refused)?;
+        viewed("DataLibraryView", &view)
+    }
+
+    async fn list_sources(&self, _: Request<Empty>) -> Result<Response<View>, Status> {
+        viewed("Vec<SourceView>", &arvo_service::research::data::list_sources().await)
+    }
+
+    async fn search_instruments(&self, request: Request<InstrumentSearch>) -> Result<Response<View>, Status> {
+        let InstrumentSearch { query, source } = request.into_inner();
+        let view = arvo_service::research::data::fetch::search(&self.workbench, &query, source.as_deref(), &self.report())
+            .await
+            .map_err(refused)?;
+        viewed("Vec<MatchView>", &view)
+    }
+
+    async fn fetch_bars(&self, request: Request<FetchRequest>) -> Result<Response<View>, Status> {
+        let FetchRequest { instrument, interval, days, source } = request.into_inner();
+        let view = arvo_service::research::data::fetch::bars(
+            &self.workbench,
+            &instrument,
+            &interval,
+            days,
+            source.as_deref(),
+            &self.report(),
+        )
+        .await
+        .map_err(refused)?;
+        viewed("FetchView", &view)
+    }
+
+    async fn compare_sources(&self, request: Request<CompareRequest>) -> Result<Response<View>, Status> {
+        let CompareRequest { instrument, interval, first, second, days } = request.into_inner();
+        let view = arvo_service::research::data::fetch::compare_two(
+            &instrument,
+            &interval,
+            first.as_deref(),
+            second.as_deref(),
+            days,
+            &self.report(),
+        )
+        .await
+        .map_err(refused)?;
+        viewed("SourceComparisonView", &view)
     }
 }
 
@@ -292,7 +366,7 @@ impl research_server::Research for Service {
         use tokio_stream::StreamExt as _;
         // A receiver that lagged gets the events after the gap, not an error:
         // what it missed is in the session record.
-        let stream = tokio_stream::wrappers::BroadcastStream::new(self.sessions.subscribe())
+        let stream = tokio_stream::wrappers::BroadcastStream::new(self.events.subscribe())
             .filter_map(|item| item.ok())
             .map(|event| wire::view("EventView", &event).map_err(Status::internal));
         Ok(Response::new(Box::pin(stream)))
@@ -655,10 +729,11 @@ mod tests {
         let address = format!("http://{}", listener.local_addr().expect("address"));
         let (stop, stopped) = tokio::sync::oneshot::channel();
         let research = Research::new(dir.path());
-        let sessions = std::sync::Arc::new(Sessions::new(dir.path()));
+        let events = tokio::sync::broadcast::channel(256).0;
+        let sessions = std::sync::Arc::new(Sessions::new(dir.path(), events.clone()));
         let tokens = Tokens { research: TOKEN.to_owned(), control: CONTROL.to_owned() };
         tokio::spawn(async move {
-            serve(listener, research, sessions, &tokens, async {
+            serve(listener, research, sessions, events, &tokens, async {
                 let _ = stopped.await;
             })
             .await
@@ -789,6 +864,42 @@ mod tests {
         assert!(one.message().contains("two instruments"), "{one:?}");
         let gone = client.view_record(with_token(FindingId { id: "nope".to_owned() }, TOKEN)).await.unwrap_err();
         assert_eq!(gone.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn the_research_token_cannot_fetch_and_the_control_token_reads_the_library() {
+        let (_dir, address, _stop) = engine().await;
+        let mut data = super::proto::data_client::DataClient::connect(address).await.expect("connects");
+
+        // ADR-0016: fetching changes the library and stales findings, so it is
+        // a person's decision. An agent holds engine.json and nothing else.
+        let refused = data.view_library(with_token(Empty {}, TOKEN)).await.unwrap_err();
+        assert_eq!(refused.code(), tonic::Code::Unauthenticated);
+        let refused = data
+            .fetch_bars(with_token(
+                FetchRequest { instrument: "AAPL.YF".to_owned(), interval: "1d".to_owned(), days: None, source: None },
+                TOKEN,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code(), tonic::Code::Unauthenticated);
+
+        let library = data.view_library(with_token(Empty {}, CONTROL)).await.expect("ok").into_inner();
+        let decoded: arvo_service::research::DataLibraryView = wire::decode(library).expect("decodes");
+        assert!(decoded.instruments.is_empty(), "{decoded:?}");
+
+        let sources = data.list_sources(with_token(Empty {}, CONTROL)).await.expect("ok").into_inner();
+        let decoded: Vec<arvo_service::research::SourceView> = wire::decode(sources).expect("decodes");
+        assert!(decoded.iter().any(|source| source.venue == "YF"), "{decoded:?}");
+
+        // An empty query asks no vendor anything, so this stays offline.
+        let found = data
+            .search_instruments(with_token(InstrumentSearch { query: "  ".to_owned(), source: None }, CONTROL))
+            .await
+            .expect("ok")
+            .into_inner();
+        let decoded: Vec<arvo_service::research::MatchView> = wire::decode(found).expect("decodes");
+        assert!(decoded.is_empty());
     }
 
     #[tokio::test]
@@ -969,6 +1080,12 @@ mod tests {
         let proto = include_str!("../../../protos/arvo/engine/v1/engine.proto");
         // The research service's block alone: the control tier is a second
         // service behind a second token, and its calls are the point of it.
+        let data = proto
+            .split("service Data {")
+            .nth(1)
+            .and_then(|rest| rest.split('}').next())
+            .expect("the data service is declared");
+        assert!(data.contains("rpc FetchBars"), "fetching lives on the control tier, not the research one");
         let research = proto
             .split("service Research {")
             .nth(1)
