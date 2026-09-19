@@ -28,23 +28,23 @@ use std::path::{Path, PathBuf};
 use arvo_data::{BarProvider, CsvBars};
 use arvo_nautilus::NautilusSimulation;
 use arvo_research::{EvaluationCriteria, EvidenceStore, Record, StoredRecord};
-use arvo_runtime_lib::research::{study_data, study_for, walk_forward_for, StrategyPlan};
+use arvo_service::research::{study_data, study_for, walk_forward_for, StrategyPlan};
 use serde_json::{json, Value};
 
 /// Where calls are recorded, in the app data directory.
 pub const AUDIT_FILE: &str = "agent-audit.jsonl";
 
 /// Where the window keeps its data: the open project folder, else its app
-/// data directory — the same choice `arvo_runtime_lib::project::data_root`
+/// data directory — the same choice `arvo_service::project::data_root`
 /// makes, so a script and the window read one library.
 ///
 /// # Errors
 ///
 /// When no project is open and `APPDATA` is not set.
 pub fn default_root() -> Result<PathBuf, String> {
-    match arvo_runtime_lib::project::remembered() {
+    match arvo_service::project::remembered() {
         Some(folder) => Ok(folder),
-        None => arvo_runtime_lib::project::app_data_root().map_err(|err| format!("no data directory given and {err}")),
+        None => arvo_service::project::app_data_root().map_err(|err| format!("no data directory given and {err}")),
     }
 }
 
@@ -164,8 +164,8 @@ impl Research {
         // under; a bad file refuses the run rather than defaulting. And its
         // rulesets, so a strategy can be one an agent wrote a moment ago.
         let root = self.data.parent().unwrap_or(&self.data);
-        arvo_runtime_lib::risk::load(root)?;
-        arvo_runtime_lib::rulesets::refresh_at(root);
+        arvo_service::risk::load(root)?;
+        arvo_service::rulesets::refresh_at(root);
         let plan = StrategyPlan::find(strategy)
             .ok_or_else(|| format!("no strategy {strategy:?}; list_strategies says what there is"))?;
         if plan.ranks_a_set() {

@@ -142,11 +142,11 @@ impl Server {
                 .ok_or_else(|| format!("{name} needs a string argument {key:?}"))
         };
         match name {
-            "list_strategies" => arvo_runtime_lib::research::list_strategies()
+            "list_strategies" => arvo_service::research::list_strategies()
                 .map_err(|err| err.to_string())
                 .and_then(|plans| serde_json::to_value(plans).map_err(|err| err.to_string())),
             "list_instruments" => self.research.list_instruments(),
-            "list_rulesets" => serde_json::to_value(arvo_runtime_lib::rulesets::list(self.research.root()))
+            "list_rulesets" => serde_json::to_value(arvo_service::rulesets::list(self.research.root()))
                 .map_err(|err| err.to_string()),
             "write_ruleset" => {
                 let numbers = |key: &str| -> Result<std::collections::BTreeMap<String, f64>, String> {
@@ -162,7 +162,7 @@ impl Server {
                         .map_err(|err| format!("axes is an object of parameter name to a list of numbers: {err}"))?,
                 };
                 let optional = |key: &str| arguments.get(key).and_then(Value::as_str).map(ToOwned::to_owned);
-                arvo_runtime_lib::rulesets::write(
+                arvo_service::rulesets::write(
                     self.research.root(),
                     &text("name")?,
                     &text("rule")?,

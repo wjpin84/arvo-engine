@@ -36,7 +36,7 @@ async fn run() -> Result<(), String> {
     let (root, data) = match args.first() {
         Some(dir) => (PathBuf::from(&dir), PathBuf::from(dir)),
         None => (
-            arvo_runtime_lib::project::app_data_root().map_err(|err| format!("no app data directory: {err}"))?,
+            arvo_service::project::app_data_root().map_err(|err| format!("no app data directory: {err}"))?,
             research::default_root()?,
         ),
     };
@@ -76,7 +76,7 @@ async fn run() -> Result<(), String> {
 async fn session_command(args: &[String]) -> Result<(), String> {
     use arvo_engine::grpc::proto::{sessions_client::SessionsClient, Empty, SessionId, SessionStatus, StartRequest};
 
-    let root = arvo_runtime_lib::project::app_data_root().map_err(|err| format!("no app data directory: {err}"))?;
+    let root = arvo_service::project::app_data_root().map_err(|err| format!("no app data directory: {err}"))?;
     let found = discovery::running(&root).ok_or("no engine is running; open Arvo or start arvo-engine")?;
     let token = discovery::read_control(&root).ok_or("no control.json beside engine.json")?;
     let mut client = SessionsClient::connect(format!("http://{}", found.address))

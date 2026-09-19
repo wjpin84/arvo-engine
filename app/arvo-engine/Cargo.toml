@@ -19,11 +19,7 @@ arvo-plugin-host.workspace = true
 arvo-research.workspace = true
 arvo-risk.workspace = true
 arvo-robinhood.workspace = true
-# The research entry points the window calls — the grid, the split, the cost
-# and risk assumptions — so a script's study is the study a person runs.
-# ponytail: they live in the Tauri crate today; move them out when the window
-# becomes a client of this engine (ADR-0018 stage 2).
-arvo-runtime = { path = "../arvo-runtime" }
+arvo-service.workspace = true
 chrono.workspace = true
 prost.workspace = true
 rand = "0.8"

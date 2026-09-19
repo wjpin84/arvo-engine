@@ -260,7 +260,7 @@ fn run(data: &Path, finding: &str, executor: &str, status: &Mutex<Status>, stop:
         status.strategy = experiment.strategy.name.clone();
     }
 
-    let source = arvo_runtime_lib::source::all()
+    let source = arvo_service::source::all()
         .into_iter()
         .find(|source| source.venue() == venue)
         .ok_or_else(|| format!("no source serves venue {venue}"))?;

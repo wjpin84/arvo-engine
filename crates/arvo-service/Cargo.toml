@@ -1,0 +1,31 @@
+[package]
+name = "arvo-service"
+description = "What Arvo does without a window: research, project, sources, rulesets and risk, shared by the Tauri host, the engine and the MCP server (#146)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+arvo-alpaca.workspace = true
+arvo-core.workspace = true
+arvo-data.workspace = true
+arvo-nautilus.workspace = true
+arvo-plugin-host.workspace = true
+arvo-research.workspace = true
+arvo-robinhood.workspace = true
+arvo-views.workspace = true
+arvo-yfinance.workspace = true
+async-trait = "0.1.92"
+base64 = "0.22"
+blake3 = "1.8.7"
+chrono.workspace = true
+dunce = "1"
+trash = "5"
+serde.workspace = true
+serde_json = "1"
+thiserror.workspace = true
+tracing = "0.1.44"
+walkdir = "2"
+
+[dev-dependencies]
+tempfile = "3.27.0"

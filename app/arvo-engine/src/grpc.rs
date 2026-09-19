@@ -247,13 +247,13 @@ impl Service {
 #[tonic::async_trait]
 impl research_server::Research for Service {
     async fn list_strategies(&self, _: Request<Empty>) -> Result<Response<Strategies>, Status> {
-        let plans = arvo_runtime_lib::research::list_strategies()
+        let plans = arvo_service::research::list_strategies()
             .map_err(|err| Status::internal(err.to_string()))?;
         Ok(Response::new(Strategies {
             strategies: plans
                 .into_iter()
                 .map(|plan| Strategy {
-                    ranks_a_set: arvo_runtime_lib::research::StrategyPlan::find(&plan.name)
+                    ranks_a_set: arvo_service::research::StrategyPlan::find(&plan.name)
                         .is_some_and(|found| found.ranks_a_set()),
                     name: plan.name,
                     label: plan.label,
