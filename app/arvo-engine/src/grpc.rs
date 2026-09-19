@@ -266,6 +266,10 @@ impl data_server::Data for Library {
         Ok(Response::new(Empty {}))
     }
 
+    async fn extension_strategies(&self, _: Request<Empty>) -> Result<Response<View>, Status> {
+        viewed("BTreeMap<String, Vec<StrategyContributionView>>", &arvo_service::extensions::contributed_views())
+    }
+
     async fn watchlist(&self, _: Request<Empty>) -> Result<Response<View>, Status> {
         use arvo_service::research::data::watchlist;
 

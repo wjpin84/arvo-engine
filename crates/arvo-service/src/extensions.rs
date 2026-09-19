@@ -199,3 +199,32 @@ pub fn launches() -> Vec<(String, arvo_plugin_host::supervisor::Launch)> {
     }
     wanted
 }
+
+/// What each installed extension contributes to the picker, by extension id,
+/// with any reason this build cannot offer it.
+///
+/// Whether a document can be run is `offerable`'s answer, and that lives on
+/// this side of the wire. A front end renders the rows; it does not decide
+/// which of them work.
+#[must_use]
+pub fn contributed_views() -> std::collections::BTreeMap<String, Vec<arvo_views::StrategyContributionView>> {
+    let mut out = std::collections::BTreeMap::new();
+    let Ok(dir) = root() else { return out };
+    let Ok(entries) = std::fs::read_dir(&dir) else { return out };
+    for folder in entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir() && path.file_name().is_some_and(|name| name != CACHE))
+    {
+        let Ok(text) = std::fs::read_to_string(folder.join(MANIFEST)) else { continue };
+        let Ok(manifest) = serde_json::from_str::<Manifest>(&text) else { continue };
+        let views = manifest
+            .contributes
+            .strategies
+            .iter()
+            .map(|value| strategy_view(&manifest.id, value))
+            .collect();
+        out.insert(manifest.id, views);
+    }
+    out
+}
