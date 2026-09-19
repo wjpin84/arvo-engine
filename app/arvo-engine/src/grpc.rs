@@ -17,8 +17,8 @@ use proto::sessions_server::{self, SessionsServer};
 use proto::{
     Advice, AttachRequest, Attachment, Attachments, Empty, Finding, FindingId, FindingSummary, Findings,
     AccountKeys, AttachmentRef, BookRequest, CompareRequest, ExportedPath, FetchRequest, FindingIds,
-    InstrumentSearch, JobId, PortfolioName, ReportFigure, SharedExperiment, SignIn, TradeExport, VendorId,
-    VendorProfile, Instrument, Instruments, Point, ReportRequest, RiskModel, Rules, RulesetForm, RulesetPath,
+    InstrumentSearch, JobId, PortfolioName, QuoteTick, ReportFigure, SharedExperiment, SignIn, TradeExport,
+    VendorId, VendorProfile, Instrument, Instruments, Point, ReportRequest, RiskModel, Rules, RulesetForm, RulesetPath,
     Rulesets, Ruleset, RunRequest, StudyRequest, View, SessionId, SessionList, SessionStatus, StartRequest, Strategies,
 };
 use arvo_client::wire;
@@ -59,6 +59,8 @@ struct Library {
     events: tokio::sync::broadcast::Sender<EventView>,
     jobs: arvo_service::scheduler::Jobs,
     plugins: arvo_service::plugins::Plugins,
+    stream: std::sync::Arc<arvo_service::stream::Stream>,
+    ticks: tokio::sync::broadcast::Sender<arvo_views::QuoteTick>,
 }
 
 impl Library {
@@ -80,6 +82,8 @@ pub struct Engine {
     pub events: tokio::sync::broadcast::Sender<EventView>,
     pub jobs: arvo_service::scheduler::Jobs,
     pub plugins: arvo_service::plugins::Plugins,
+    pub stream: arvo_service::stream::Stream,
+    pub ticks: tokio::sync::broadcast::Sender<arvo_views::QuoteTick>,
     /// Sent when a front end asks this engine to stop. `serve` waits on the
     /// other half alongside whatever `shutdown` it was given.
     pub stop: tokio::sync::oneshot::Sender<()>,
@@ -107,7 +111,7 @@ pub async fn serve(
     tokens: &Tokens,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), tonic::transport::Error> {
-    let Engine { research, sessions, events, jobs, plugins, stop } = engine;
+    let Engine { research, sessions, events, jobs, plugins, stream, ticks, stop } = engine;
     let stop = std::sync::Arc::new(std::sync::Mutex::new(Some(stop)));
     let workbench = std::sync::Arc::new(arvo_service::research::ResearchService::new(
         research.root().join(arvo_service::research::DATA_SUBDIR),
@@ -128,7 +132,7 @@ pub async fn serve(
         bearer(&tokens.control, "control.json"),
     );
     let data_tier = tonic::service::interceptor::InterceptedService::new(
-        DataServer::new(Library { workbench, portfolios, events, jobs, plugins }).max_decoding_message_size(MAX_MESSAGE_BYTES),
+        DataServer::new(Library { workbench, portfolios, events, jobs, plugins, stream: std::sync::Arc::new(stream), ticks }).max_decoding_message_size(MAX_MESSAGE_BYTES),
         bearer(&tokens.control, "control.json"),
     );
     tonic::transport::Server::builder()
@@ -260,6 +264,33 @@ impl data_server::Data for Library {
     async fn reconcile_providers(&self, _: Request<Empty>) -> Result<Response<Empty>, Status> {
         self.plugins.reconcile().await;
         Ok(Response::new(Empty {}))
+    }
+
+    async fn watchlist(&self, _: Request<Empty>) -> Result<Response<View>, Status> {
+        use arvo_service::research::data::watchlist;
+
+        let held = self.portfolios.held();
+        let library = self.workbench.bars.instruments().unwrap_or_default();
+        let (chosen, priceable) = watchlist::symbols_for(&held, library);
+        // Before the quote call rather than after: if the broker session is
+        // dead the snapshot below fails, and the stream is the only thing that
+        // can still price these rows.
+        self.stream.watch(priceable.iter().map(|id| watchlist::symbol_only(id)).collect());
+        let rows = watchlist::priced(&held, chosen, &priceable, &self.report()).await;
+        viewed("Vec<QuoteView>", &rows)
+    }
+
+    type StreamQuotesStream = std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<QuoteTick, Status>> + Send>>;
+
+    async fn stream_quotes(&self, _: Request<Empty>) -> Result<Response<Self::StreamQuotesStream>, Status> {
+        use tokio_stream::StreamExt as _;
+
+        // A listener that falls behind drops ticks rather than stalling the
+        // socket: the next print is worth more than the one it missed.
+        let stream = tokio_stream::wrappers::BroadcastStream::new(self.ticks.subscribe())
+            .filter_map(|tick| tick.ok())
+            .map(|tick| Ok(arvo_client::wire::quote_tick(tick)));
+        Ok(Response::new(Box::pin(stream)))
     }
 
     async fn list_jobs(&self, _: Request<Empty>) -> Result<Response<View>, Status> {
@@ -909,7 +940,13 @@ mod tests {
             // over nothing — which is what these tests want.
             let plugins = arvo_service::plugins::Plugins::start(&root, &jobs, |_| {}).await;
             let (stop_tx, _stop_rx) = tokio::sync::oneshot::channel();
-            serve(listener, Engine { research, sessions, events, jobs, plugins, stop: stop_tx }, &tokens, async {
+            let ticks = tokio::sync::broadcast::channel(16).0;
+            let (stream, streaming) = arvo_service::stream::start(ticks.clone(), |_| {});
+            // Driven, so the handle is live; with no symbols it connects and
+            // waits, and the test never asks for a watchlist.
+            tokio::spawn(streaming);
+            let engine = Engine { research, sessions, events, jobs, plugins, stream, ticks, stop: stop_tx };
+            serve(listener, engine, &tokens, async {
                 let _ = stopped.await;
             })
             .await

@@ -72,6 +72,57 @@ pub fn symbol_only(instrument: &str) -> String {
     instrument.split('.').next().unwrap_or(instrument).to_owned()
 }
 
+/// The watchlist: what is held, plus what the library has data for, priced
+/// where a price can honestly be claimed.
+///
+/// The symbols are handed to the price stream before the quote call rather
+/// than after: if the broker session is dead the snapshot below fails, and the
+/// stream — which needs no broker at all — is the only thing that can still
+/// price these rows.
+pub fn symbols_for(held: &std::collections::BTreeSet<String>, library: Vec<String>) -> (Vec<String>, Vec<String>) {
+    let chosen = watchlist_symbols(held, library);
+    // Only the rows there is any reason to think name a real security. The
+    // rest still appear — they are what you have data for — they simply are
+    // never claimed to have a market price. See `is_priceable`.
+    let priceable = chosen.iter().filter(|id| is_priceable(id, held)).cloned().collect();
+    (chosen, priceable)
+}
+
+/// Prices the priceable rows from the broker, and answers with every row.
+///
+/// The broker specifically: it is the source that prices, and the only one
+/// with a session that can have died. A `quotes` call on a source that does
+/// not offer them reports `Unoffered` and lands in the same branch — the row
+/// still renders, and the stream prices it within a tick.
+pub async fn priced(
+    held: &std::collections::BTreeSet<String>,
+    chosen: Vec<String>,
+    priceable: &[String],
+    report: super::Report<'_>,
+) -> Vec<QuoteView> {
+    use crate::source::Source as _;
+
+    let broker = crate::source::robinhood::Robinhood;
+    let quotes: std::collections::HashMap<String, crate::source::Quote> = match broker.quotes(priceable).await {
+        Ok(quotes) => quotes.into_iter().map(|quote| (quote.instrument.clone(), quote)).collect(),
+        Err(err) => {
+            // Announced, then dropped.
+            super::failed(report, &err);
+            std::collections::HashMap::new()
+        }
+    };
+    chosen
+        .into_iter()
+        .map(|instrument| QuoteView {
+            symbol: symbol_only(&instrument),
+            held: held.contains(&instrument),
+            price: quotes.get(&instrument).map(|quote| quote.price),
+            change: quotes.get(&instrument).and_then(|quote| quote.change),
+            instrument,
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod watchlist_tests {
     use super::{is_priceable, symbol_only, watchlist_symbols, WATCHLIST_LIMIT};

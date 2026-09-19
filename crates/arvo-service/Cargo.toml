@@ -26,6 +26,14 @@ chrono.workspace = true
 # The scheduler's cron expressions and its timers; `spawn_blocking` for the
 # staleness check, which hashes files.
 cron = "0.17.0"
+# The live price stream: one websocket, rustls with the platform's own roots,
+# and Yahoo's base64 protobuf frames (base64 is already above).
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+prost.workspace = true
+tokio-tungstenite = { version = "0.30", default-features = false, features = [
+    "connect",
+    "rustls-tls-native-roots",
+] }
 dunce = "1"
 trash = "5"
 serde.workspace = true

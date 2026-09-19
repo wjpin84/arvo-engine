@@ -98,7 +98,19 @@ async fn run() -> Result<(), String> {
     // The second exists because a killed process runs no destructors, so the
     // providers this supervises would outlive it (ADR-0029).
     let (stop, asked) = tokio::sync::oneshot::channel();
-    let engine = grpc::Engine { research: research::Research::new(&data), sessions, events, jobs, plugins, stop };
+    // The live price stream: one socket for the whole machine, held open
+    // whether or not a window is watching.
+    let ticks = tokio::sync::broadcast::channel(1024).0;
+    let (stream, streaming) = {
+        let raising = events.clone();
+        arvo_service::stream::start(ticks.clone(), move |event| {
+            let _ = raising.send(event);
+        })
+    };
+    tokio::spawn(streaming);
+
+    let engine =
+        grpc::Engine { research: research::Research::new(&data), sessions, events, jobs, plugins, stream, ticks, stop };
     let served = grpc::serve(listener, engine, &tokens, async {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {}

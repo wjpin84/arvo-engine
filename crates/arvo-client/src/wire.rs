@@ -8,7 +8,7 @@
 //! drift from the other.
 
 use crate::proto;
-use arvo_views::{AttachmentView, RiskModelView, RuleView, RulesetFormView, RulesetView, StrategyView};
+use arvo_views::{AttachmentView, QuoteTick, RiskModelView, RuleView, RulesetFormView, RulesetView, StrategyView};
 
 /// The most a message may carry, both ways. A study view holds curves,
 /// ledgers and a search surface; tonic's default of four megabytes is not a
@@ -35,6 +35,16 @@ pub fn decode<T: serde::de::DeserializeOwned>(wire: proto::View) -> Result<T, St
     serde_json::from_str(&wire.json).map_err(|err| {
         format!("the engine answered with a {} this build cannot read ({err}); are the two the same version?", wire.kind)
     })
+}
+
+#[must_use]
+pub fn quote_tick(view: QuoteTick) -> proto::QuoteTick {
+    proto::QuoteTick { symbol: view.symbol, price: view.price, change: view.change, regular: view.regular }
+}
+
+#[must_use]
+pub fn quote_tick_view(wire: proto::QuoteTick) -> QuoteTick {
+    QuoteTick { symbol: wire.symbol, price: wire.price, change: wire.change, regular: wire.regular }
 }
 
 #[must_use]

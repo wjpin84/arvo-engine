@@ -21,5 +21,6 @@ pub mod risk;
 pub mod scheduler;
 pub mod rulesets;
 pub mod source;
+pub mod stream;
 
 pub use arvo_client::CommandError;
