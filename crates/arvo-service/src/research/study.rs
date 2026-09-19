@@ -611,6 +611,72 @@ pub fn run_book(
     remember(service, (view, Record::Study(Box::new(found))))
 }
 
+/// Runs a shared experiment file against this machine's data for
+/// `instrument`, and records what it found. Blocking.
+///
+/// The file brings the question and how much searching produced it; the data,
+/// and therefore the answer, are this machine's. Its search is counted into
+/// the bar (`ExperimentFamily::prior_trials`), so a survivor of someone else's
+/// fifty-configuration grid is held to the best of fifty-plus, not of the
+/// handful run here.
+///
+/// Nothing is stored until it has run: an imported file is a question, and the
+/// finding that lands in research memory is the one produced here.
+///
+/// # Errors
+///
+/// The import's own reason — a newer format, a strategy this build lacks — a
+/// ranking rule, an option-chain experiment, or an instrument with no bars at
+/// the file's resolution.
+pub fn run_shared(service: &ResearchService, text: &str, instrument: &str) -> Result<StudyView, CommandError> {
+    let shared = arvo_research::share::import(text, arvo_nautilus::STRATEGIES)
+        .map_err(|err| CommandError::Failed(err.to_string()))?;
+    if arvo_nautilus::CROSS_SECTIONAL_STRATEGIES.contains(&shared.strategy.name.as_str()) {
+        return Err(CommandError::Failed(format!(
+            "{} ranks instruments against each other and cannot be run on one",
+            shared.strategy.name
+        )));
+    }
+    // A shared file carries a strategy and a resolution, not a chain: a
+    // finding on one would be versioned by the bars alone and never go stale
+    // when the chain it traded changed.
+    if shared.strategy.name == arvo_nautilus::PUT_SPREAD {
+        return Err(CommandError::Failed(
+            "an option-chain experiment cannot be run from a shared file yet; run it as a study".to_owned(),
+        ));
+    }
+    let interval = shared.interval;
+    let missing = || {
+        CommandError::Failed(format!(
+            "{instrument} holds no {interval} bars, which is the resolution this experiment is defined at"
+        ))
+    };
+    let coverage = service
+        .bars
+        .coverage(instrument, interval)
+        .map_err(|err| CommandError::Failed(format!("reading {instrument}: {err}")))?
+        .ok_or_else(missing)?;
+    let fingerprint = service
+        .bars
+        .fingerprint(instrument, interval)
+        .map_err(|err| CommandError::Failed(format!("hashing {instrument}: {err}")))?
+        .ok_or_else(missing)?;
+    let window = DateRange::new(coverage.0, coverage.1).map_err(|err| CommandError::Failed(err.to_string()))?;
+    let family = shared.family(
+        instrument,
+        window,
+        DatasetRef {
+            id: instrument.to_owned(),
+            version: fingerprint,
+            adjustment: crate::source::adjustment_across([instrument]),
+        },
+    );
+    let found = arvo_research::run_family(service.simulation.as_ref(), &family, &shared.criteria)
+        .map_err(|err| CommandError::Failed(err.to_string()))?;
+    let view = study_view(&found, &service.bars, service.simulation.engine());
+    remember(service, (view, Record::Study(Box::new(found))))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

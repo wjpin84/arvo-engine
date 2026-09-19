@@ -415,7 +415,7 @@ pub fn trades_csv(rows: &[TradeRowExport]) -> String {
 /// exports what is on screen, including whatever sort the reader applied. An
 /// export that silently differed from the table above it would be worse than
 /// none.
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, serde::Serialize)]
 pub struct TradeRowExport {
     /// Which instrument the round trip was in.
     ///
@@ -946,4 +946,130 @@ pub fn compare_records(service: &ResearchService, ids: &[String]) -> Result<Comp
         survived_deflation: judged.survived,
         notes: judged.notes,
     })
+}
+
+/// Writes `contents` to `name` in the exports directory and answers with the
+/// path.
+///
+/// Revealing it in a file manager is the window's half: this side knows where
+/// a file belongs and the other knows how to show it to a person
+/// (ADR-0028's shape, applied to files rather than credentials).
+///
+/// # Errors
+///
+/// The directory cannot be created, or the file cannot be written.
+pub fn write_export(service: &ResearchService, name: &str, contents: &str) -> Result<String, CommandError> {
+    let path = export_path(service, name)?;
+    std::fs::write(&path, contents)
+        .map_err(|err| CommandError::Failed(format!("writing {}: {err}", path.display())))?;
+    Ok(path.display().to_string())
+}
+
+/// A ledger as CSV, written to the exports directory.
+///
+/// The rows come from the caller rather than from the finding: the window
+/// exports what is on screen, in the order the person sorted it, and only the
+/// window knows that. The quoting is this side's, so there is one
+/// implementation of it.
+///
+/// # Errors
+///
+/// As [`write_export`].
+pub fn export_trades(service: &ResearchService, name: &str, rows: &[TradeRowExport]) -> Result<String, CommandError> {
+    write_export(service, &format!("{name}-trades.csv"), &trades_csv(rows))
+}
+
+/// Writes a stored study out as a shared experiment file, and keeps a copy
+/// with the finding (#157).
+///
+/// # Errors
+///
+/// No such finding, one that cannot be shared (a panel, a walk-forward, or a
+/// study recorded before its search surface was kept), or the file cannot be
+/// written.
+pub fn export_experiment(service: &ResearchService, id: &str) -> Result<String, CommandError> {
+    let stored = service.memory.open(id).map_err(|err| CommandError::Failed(err.to_string()))?;
+    let shared = arvo_research::share::export(&stored.record).map_err(|err| CommandError::Failed(err.to_string()))?;
+    let name = format!("{}-{}.experiment.json", shared.strategy.name, stored.record.subject());
+    let text = shared.to_json();
+    // Kept with the finding as well as written out (#157): the export is the
+    // first attachment, so the file travels with the record it came from.
+    service
+        .memory
+        .attach(id, &name, "application/json", text.as_bytes())
+        .map_err(|err| CommandError::Failed(err.to_string()))?;
+    write_export(service, &name, &text)
+}
+
+/// A finding as a document: Markdown with its figure, written out and kept
+/// with the finding (#159).
+///
+/// `figure` is the equity chart the window captured, base64 PNG, because only
+/// the window can draw one — the report is composed from the same view the
+/// window is showing, so nothing here is a second measurement of the run.
+/// Both files are attached to the finding as well as written to the exports
+/// directory: content-addressed, they travel with the record, and side by side
+/// on disk the Markdown's link to the figure resolves for anyone reading it
+/// without Arvo.
+///
+/// # Errors
+///
+/// No such finding, a figure that is not base64, or the files cannot be
+/// written.
+pub fn compose_report(service: &ResearchService, id: &str, figure: Option<&str>) -> Result<String, CommandError> {
+    let stored = service.memory.open(id).map_err(|err| CommandError::Failed(err.to_string()))?;
+    let meta = super::report::ReportMeta {
+        id: stored.id.clone(),
+        hypothesis: stored.record.hypothesis().to_string(),
+        recorded_at: stored.recorded_at.to_rfc3339(),
+        author: stored.author.agent().unwrap_or_default().to_owned(),
+        read_this_first: stored.record.verdict().read_this_first().to_owned(),
+        figure: None,
+    };
+    let stem = export_name(&format!("{}-{}", stored.record.kind(), stored.record.subject()))?;
+    // The figure first: the report links to it by name, so the name has to be
+    // settled before the Markdown is composed.
+    let figure_name = match figure {
+        Some(encoded) => {
+            let bytes = figure_bytes(encoded)?;
+            let name = format!("{stem}.figure.png");
+            service
+                .memory
+                .attach(id, &name, "image/png", &bytes)
+                .map_err(|err| CommandError::Failed(err.to_string()))?;
+            std::fs::write(export_path(service, &name)?, &bytes)
+                .map_err(|err| CommandError::Failed(format!("writing {name}: {err}")))?;
+            Some(name)
+        }
+        None => None,
+    };
+    let view = record_view(service, stored);
+    let markdown = super::report::compose(&view, &super::report::ReportMeta { figure: figure_name, ..meta });
+    let name = format!("{stem}.report.md");
+    service
+        .memory
+        .attach(id, &name, "text/markdown", markdown.as_bytes())
+        .map_err(|err| CommandError::Failed(err.to_string()))?;
+    write_export(service, &name, &markdown)
+}
+
+/// Where one of a finding's files is on disk.
+///
+/// The hash must be one the finding lists: a hash from a front end names a
+/// file only through a record that owns it.
+///
+/// # Errors
+///
+/// No such finding, a hash it does not list, or the file gone from the store.
+pub fn attachment_path(service: &ResearchService, id: &str, hash: &str) -> Result<String, CommandError> {
+    let stored = service.memory.open(id).map_err(|err| CommandError::Failed(err.to_string()))?;
+    if !stored.attachments.iter().any(|kept| kept.hash == hash) {
+        return Err(CommandError::Failed(format!("{id} has no attachment {hash}")));
+    }
+    service
+        .memory
+        .attachment_path(hash)
+        .filter(|path| path.is_file())
+        .map(|path| path.display().to_string())
+        .ok_or_else(|| CommandError::Failed(format!("the file for {hash} is not in the store any more")))
 }

@@ -82,3 +82,43 @@ fn contributed_in(dir: &Path, disabled: &BTreeSet<String>) -> Vec<(String, arvo_
     }
     found
 }
+
+/// One contributed strategy document, as the extensions page shows it (#162).
+///
+/// A document that cannot be parsed, or that this build cannot offer, is
+/// listed with the reason rather than dropped: a catalog one entry short with
+/// no explanation is the failure shape this project keeps paying for.
+///
+/// Here rather than in the window because the answer is `offerable`'s: what
+/// the picker can run is this side's question.
+#[must_use]
+pub fn strategy_view(extension: &str, value: &serde_json::Value) -> arvo_views::StrategyContributionView {
+    let unreadable = |reason: String| arvo_views::StrategyContributionView {
+        id: format!("{extension}.?"),
+        label: String::new(),
+        premise: String::new(),
+        kind: String::new(),
+        interval: String::new(),
+        configurations: 0,
+        problem: Some(reason),
+    };
+    let document: arvo_research::StrategyDocument = match serde_json::from_value(value.clone()) {
+        Ok(document) => document,
+        Err(err) => return unreadable(format!("not a strategy document: {err}")),
+    };
+    let (kind, configurations) = match &document.kind {
+        arvo_research::StrategyKind::Grid(grid) => ("grid", grid.configurations()),
+        arvo_research::StrategyKind::Rules(_) => ("rules", 0),
+    };
+    arvo_views::StrategyContributionView {
+        // Namespaced by its extension, as a theme is: two catalogs may both
+        // ship a `fast-cross`.
+        id: namespaced(extension, &document.name),
+        label: if document.label.is_empty() { document.name.clone() } else { document.label.clone() },
+        premise: document.premise.clone(),
+        kind: kind.to_owned(),
+        interval: document.interval.to_string(),
+        configurations,
+        problem: crate::research::offerable(&document).err(),
+    }
+}

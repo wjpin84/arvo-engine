@@ -16,8 +16,8 @@ use proto::data_server::{self, DataServer};
 use proto::sessions_server::{self, SessionsServer};
 use proto::{
     Advice, AttachRequest, Attachment, Attachments, Empty, Finding, FindingId, FindingSummary, Findings,
-    AccountKeys, BookRequest, CompareRequest, FetchRequest, FindingIds, InstrumentSearch, PortfolioName, SignIn,
-    VendorId, VendorProfile, Instrument, Instruments, Point, ReportRequest, RiskModel, Rules, RulesetForm, RulesetPath,
+    AccountKeys, AttachmentRef, BookRequest, CompareRequest, ExportedPath, FetchRequest, FindingIds,
+    InstrumentSearch, PortfolioName, ReportFigure, SharedExperiment, SignIn, TradeExport, VendorId, VendorProfile, Instrument, Instruments, Point, ReportRequest, RiskModel, Rules, RulesetForm, RulesetPath,
     Rulesets, Ruleset, RunRequest, StudyRequest, View, SessionId, SessionList, SessionStatus, StartRequest, Strategies,
 };
 use arvo_client::wire;
@@ -182,6 +182,48 @@ impl data_server::Data for Library {
         .await
         .map_err(refused)?;
         viewed("FetchView", &view)
+    }
+
+    async fn run_shared_experiment(&self, request: Request<SharedExperiment>) -> Result<Response<View>, Status> {
+        let SharedExperiment { text, instrument } = request.into_inner();
+        let view = blocking(&self.workbench, move |workbench| {
+            arvo_service::research::study::run_shared(workbench, &text, &instrument)
+        })
+        .await?;
+        viewed("StudyView", &view)
+    }
+
+    async fn export_trades(&self, request: Request<TradeExport>) -> Result<Response<ExportedPath>, Status> {
+        let TradeExport { name, rows_json } = request.into_inner();
+        let rows: Vec<arvo_service::research::history::TradeRowExport> =
+            serde_json::from_str(&rows_json).map_err(|err| Status::invalid_argument(format!("rows_json: {err}")))?;
+        let path = arvo_service::research::history::export_trades(&self.workbench, &name, &rows).map_err(refused)?;
+        Ok(Response::new(ExportedPath { path }))
+    }
+
+    async fn export_experiment(&self, request: Request<FindingId>) -> Result<Response<ExportedPath>, Status> {
+        let id = required(&request.get_ref().id, "id")?;
+        let path = arvo_service::research::history::export_experiment(&self.workbench, id).map_err(refused)?;
+        Ok(Response::new(ExportedPath { path }))
+    }
+
+    async fn compose_report(&self, request: Request<ReportFigure>) -> Result<Response<ExportedPath>, Status> {
+        let ReportFigure { finding_id, figure } = request.into_inner();
+        let id = required(&finding_id, "finding_id")?;
+        let path = arvo_service::research::history::compose_report(&self.workbench, id, figure.as_deref())
+            .map_err(refused)?;
+        Ok(Response::new(ExportedPath { path }))
+    }
+
+    async fn attachment_path(&self, request: Request<AttachmentRef>) -> Result<Response<ExportedPath>, Status> {
+        let AttachmentRef { finding_id, hash } = request.into_inner();
+        let path = arvo_service::research::history::attachment_path(
+            &self.workbench,
+            required(&finding_id, "finding_id")?,
+            required(&hash, "hash")?,
+        )
+        .map_err(refused)?;
+        Ok(Response::new(ExportedPath { path }))
     }
 
     async fn list_portfolios(&self, _: Request<Empty>) -> Result<Response<View>, Status> {
@@ -1164,6 +1206,12 @@ mod tests {
             .and_then(|rest| rest.split('}').next())
             .expect("the data service is declared");
         assert!(data.contains("rpc FetchBars"), "fetching lives on the control tier, not the research one");
+        // Import is on the forbidden list below: an agent may run what this
+        // build implements, not a file someone sent it.
+        assert!(
+            data.contains("rpc RunSharedExperiment"),
+            "importing lives on the control tier, not the research one"
+        );
         let research = proto
             .split("service Research {")
             .nth(1)
