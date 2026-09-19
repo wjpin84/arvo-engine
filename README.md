@@ -24,6 +24,7 @@ believing them. Hence the rule that orders everything else:
 | | |
 |---|---|
 | Architecture | [docs/architecture.md](docs/architecture.md) |
+| The engine's API | [arvo-engine-api](https://github.com/wjpin84/arvo-engine-api), checked out at `contract/` — clone with `--recurse-submodules` |
 | Decisions | [arvo-adrs](https://github.com/wjpin84/arvo-adrs) — one per file, superseded rather than edited, across every Arvo repository |
 | Roadmap | [GitHub Project](https://github.com/users/wjpin84/projects/4) — milestones and issues |
 

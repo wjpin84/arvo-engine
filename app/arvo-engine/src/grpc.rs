@@ -1321,7 +1321,7 @@ mod tests {
     fn nothing_in_the_research_service_can_fetch_share_or_trade() {
         // The boundary is what is offered. A call that named a source, a key
         // or an order would be a way past it no argument check could close.
-        let proto = include_str!("../../../protos/arvo/engine/v1/engine.proto");
+        let proto = include_str!("../../../contract/protos/arvo/engine/v1/engine.proto");
         // The research service's block alone: the control tier is a second
         // service behind a second token, and its calls are the point of it.
         let data = proto

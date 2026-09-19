@@ -15,7 +15,7 @@
 //! (#127). Anything that would make this crate need `arvo-research`,
 //! `arvo-data` or a venue belongs on the other side of the wire.
 
-/// Generated from `protos/arvo/engine/v1/engine.proto`: the engine's local
+/// Generated from `contract/protos/arvo/engine/v1/engine.proto`: the engine's local
 /// API, served by `arvo-engine`.
 pub mod proto {
     tonic::include_proto!("arvo.engine.v1");
