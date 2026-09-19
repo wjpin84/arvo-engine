@@ -16,6 +16,7 @@ arvo-oauth.workspace = true
 arvo-plugin-host.workspace = true
 arvo-portfolio.workspace = true
 arvo-research.workspace = true
+arvo-schedule.workspace = true
 arvo-robinhood.workspace = true
 arvo-views.workspace = true
 arvo-yfinance.workspace = true

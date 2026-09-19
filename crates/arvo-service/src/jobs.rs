@@ -16,7 +16,7 @@ use std::sync::Arc;
 use arvo_views::EventView;
 
 use crate::research::ResearchService;
-use crate::scheduler::Jobs;
+use arvo_schedule::Jobs;
 
 /// Under the data root: one file of option quotes per day.
 pub const OPTION_QUOTES_SUBDIR: &str = "option-quotes";

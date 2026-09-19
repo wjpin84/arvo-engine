@@ -1,0 +1,16 @@
+[package]
+name = "arvo-schedule"
+description = "What runs on a timer, and what each run said. Generic: it knows nothing about Arvo beyond the view a front end renders."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+arvo-views.workspace = true
+chrono.workspace = true
+cron = "0.17.0"
+tracing = "0.1"
+tokio = { workspace = true, features = ["time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }

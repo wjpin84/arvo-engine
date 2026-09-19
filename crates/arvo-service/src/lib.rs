@@ -18,9 +18,9 @@ pub mod jobs;
 pub mod project;
 pub mod research;
 pub mod risk;
-pub mod scheduler;
 pub mod rulesets;
 pub mod source;
 pub mod stream;
 
 pub use arvo_client::CommandError;
+

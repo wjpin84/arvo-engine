@@ -57,7 +57,7 @@ struct Library {
     workbench: std::sync::Arc<arvo_service::research::ResearchService>,
     portfolios: std::sync::Arc<arvo_service::portfolio::PortfolioService>,
     events: tokio::sync::broadcast::Sender<EventView>,
-    jobs: arvo_service::scheduler::Jobs,
+    jobs: arvo_schedule::Jobs,
     plugins: arvo_service::plugins::Plugins,
     stream: std::sync::Arc<arvo_service::stream::Stream>,
     ticks: tokio::sync::broadcast::Sender<arvo_views::QuoteTick>,
@@ -80,7 +80,7 @@ pub struct Engine {
     pub research: Research,
     pub sessions: std::sync::Arc<Sessions>,
     pub events: tokio::sync::broadcast::Sender<EventView>,
-    pub jobs: arvo_service::scheduler::Jobs,
+    pub jobs: arvo_schedule::Jobs,
     pub plugins: arvo_service::plugins::Plugins,
     pub stream: arvo_service::stream::Stream,
     pub ticks: tokio::sync::broadcast::Sender<arvo_views::QuoteTick>,
@@ -936,7 +936,7 @@ mod tests {
         // directory outlives the server.
         let root = dir.path().to_path_buf();
         tokio::spawn(async move {
-            let jobs = arvo_service::scheduler::Jobs::new(std::sync::Arc::new(|future| {
+            let jobs = arvo_schedule::Jobs::new(std::sync::Arc::new(|future| {
                 let handle = tokio::spawn(future);
                 Box::new(move || handle.abort())
             }));

@@ -18,7 +18,7 @@ use arvo_plugin_host::registry::{PluginRegistry, PluginStatus};
 use arvo_plugin_host::supervisor::{Launch, Restart, Supervisor};
 use arvo_views::EventView;
 
-use crate::scheduler::Jobs;
+use arvo_schedule::Jobs;
 
 /// The registry and the supervisor, held together because nothing wants one
 /// without the other.

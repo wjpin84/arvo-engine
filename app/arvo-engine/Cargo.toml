@@ -20,6 +20,7 @@ arvo-plugin-host.workspace = true
 arvo-research.workspace = true
 arvo-risk.workspace = true
 arvo-robinhood.workspace = true
+arvo-schedule.workspace = true
 arvo-service.workspace = true
 arvo-views.workspace = true
 chrono.workspace = true

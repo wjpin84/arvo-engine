@@ -71,7 +71,7 @@ async fn run() -> Result<(), String> {
 
     // The engine's own jobs, on its own runtime: this is `#[tokio::main]`, so
     // `tokio::spawn` is what puts a loop on a reactor here.
-    let jobs = arvo_service::scheduler::Jobs::new(std::sync::Arc::new(|future| {
+    let jobs = arvo_schedule::Jobs::new(std::sync::Arc::new(|future| {
         let handle = tokio::spawn(future);
         Box::new(move || handle.abort())
     }));
