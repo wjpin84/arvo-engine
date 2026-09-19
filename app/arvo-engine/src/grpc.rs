@@ -17,7 +17,8 @@ use proto::sessions_server::{self, SessionsServer};
 use proto::{
     Advice, AttachRequest, Attachment, Attachments, Empty, Finding, FindingId, FindingSummary, Findings,
     AccountKeys, AttachmentRef, BookRequest, CompareRequest, ExportedPath, FetchRequest, FindingIds,
-    InstrumentSearch, PortfolioName, ReportFigure, SharedExperiment, SignIn, TradeExport, VendorId, VendorProfile, Instrument, Instruments, Point, ReportRequest, RiskModel, Rules, RulesetForm, RulesetPath,
+    InstrumentSearch, JobId, PortfolioName, ReportFigure, SharedExperiment, SignIn, TradeExport, VendorId,
+    VendorProfile, Instrument, Instruments, Point, ReportRequest, RiskModel, Rules, RulesetForm, RulesetPath,
     Rulesets, Ruleset, RunRequest, StudyRequest, View, SessionId, SessionList, SessionStatus, StartRequest, Strategies,
 };
 use arvo_client::wire;
@@ -53,6 +54,7 @@ struct Library {
     workbench: std::sync::Arc<arvo_service::research::ResearchService>,
     portfolios: std::sync::Arc<arvo_service::portfolio::PortfolioService>,
     events: tokio::sync::broadcast::Sender<EventView>,
+    jobs: arvo_service::scheduler::Jobs,
 }
 
 impl Library {
@@ -87,6 +89,7 @@ pub async fn serve(
     research: Research,
     sessions: std::sync::Arc<Sessions>,
     events: tokio::sync::broadcast::Sender<EventView>,
+    jobs: arvo_service::scheduler::Jobs,
     tokens: &Tokens,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), tonic::transport::Error> {
@@ -109,7 +112,7 @@ pub async fn serve(
         bearer(&tokens.control, "control.json"),
     );
     let data_tier = tonic::service::interceptor::InterceptedService::new(
-        DataServer::new(Library { workbench, portfolios, events }).max_decoding_message_size(MAX_MESSAGE_BYTES),
+        DataServer::new(Library { workbench, portfolios, events, jobs }).max_decoding_message_size(MAX_MESSAGE_BYTES),
         bearer(&tokens.control, "control.json"),
     );
     tonic::transport::Server::builder()
@@ -224,6 +227,19 @@ impl data_server::Data for Library {
         )
         .map_err(refused)?;
         Ok(Response::new(ExportedPath { path }))
+    }
+
+    async fn list_jobs(&self, _: Request<Empty>) -> Result<Response<View>, Status> {
+        viewed("Vec<JobView>", &self.jobs.snapshot())
+    }
+
+    async fn run_job(&self, request: Request<JobId>) -> Result<Response<Empty>, Status> {
+        let id = required(&request.get_ref().id, "id")?;
+        if !self.jobs.snapshot().iter().any(|job| job.id == id) {
+            return Err(Status::not_found(format!("the engine has no job {id:?}")));
+        }
+        self.jobs.run_now(id.to_owned());
+        Ok(Response::new(Empty {}))
     }
 
     async fn list_portfolios(&self, _: Request<Empty>) -> Result<Response<View>, Status> {
@@ -838,7 +854,11 @@ mod tests {
         let sessions = std::sync::Arc::new(Sessions::new(dir.path(), events.clone()));
         let tokens = Tokens { research: TOKEN.to_owned(), control: CONTROL.to_owned() };
         tokio::spawn(async move {
-            serve(listener, research, sessions, events, &tokens, async {
+            let jobs = arvo_service::scheduler::Jobs::new(std::sync::Arc::new(|future| {
+                let handle = tokio::spawn(future);
+                Box::new(move || handle.abort())
+            }));
+            serve(listener, research, sessions, events, jobs, &tokens, async {
                 let _ = stopped.await;
             })
             .await

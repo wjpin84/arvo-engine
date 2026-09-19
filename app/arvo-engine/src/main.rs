@@ -67,7 +67,23 @@ async fn run() -> Result<(), String> {
     // data tier and handed out by Subscribe (#150).
     let events = tokio::sync::broadcast::channel(256).0;
     let sessions = std::sync::Arc::new(session::Sessions::new(&data, events.clone()));
-    let served = grpc::serve(listener, research::Research::new(&data), sessions, events, &tokens, async {
+    // The engine's own jobs, on its own runtime: this is `#[tokio::main]`, so
+    // `tokio::spawn` is what puts a loop on a reactor here.
+    let jobs = arvo_service::scheduler::Jobs::new(std::sync::Arc::new(|future| {
+        let handle = tokio::spawn(future);
+        Box::new(move || handle.abort())
+    }));
+    {
+        let research = std::sync::Arc::new(arvo_service::research::ResearchService::new(
+            data.join(arvo_service::research::DATA_SUBDIR),
+            data.join(arvo_service::research::EVIDENCE_SUBDIR),
+        ));
+        let raising = events.clone();
+        arvo_service::jobs::register(&jobs, &data, research, move |event| {
+            let _ = raising.send(event);
+        });
+    }
+    let served = grpc::serve(listener, research::Research::new(&data), sessions, events, jobs, &tokens, async {
         let _ = tokio::signal::ctrl_c().await;
     })
     .await;
