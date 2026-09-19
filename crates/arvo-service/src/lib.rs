@@ -12,6 +12,7 @@
 pub mod accounts;
 pub mod events;
 pub mod extensions;
+pub mod portfolio;
 pub mod project;
 pub mod research;
 pub mod risk;

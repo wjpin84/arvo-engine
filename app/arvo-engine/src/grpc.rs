@@ -16,8 +16,8 @@ use proto::data_server::{self, DataServer};
 use proto::sessions_server::{self, SessionsServer};
 use proto::{
     Advice, AttachRequest, Attachment, Attachments, Empty, Finding, FindingId, FindingSummary, Findings,
-    AccountKeys, BookRequest, CompareRequest, FetchRequest, FindingIds, InstrumentSearch, SignIn, VendorId,
-    VendorProfile, Instrument, Instruments, Point, ReportRequest, RiskModel, Rules, RulesetForm, RulesetPath,
+    AccountKeys, BookRequest, CompareRequest, FetchRequest, FindingIds, InstrumentSearch, PortfolioName, SignIn,
+    VendorId, VendorProfile, Instrument, Instruments, Point, ReportRequest, RiskModel, Rules, RulesetForm, RulesetPath,
     Rulesets, Ruleset, RunRequest, StudyRequest, View, SessionId, SessionList, SessionStatus, StartRequest, Strategies,
 };
 use arvo_client::wire;
@@ -51,6 +51,7 @@ struct Control {
 /// library and stales existing findings (ADR-0016).
 struct Library {
     workbench: std::sync::Arc<arvo_service::research::ResearchService>,
+    portfolios: std::sync::Arc<arvo_service::portfolio::PortfolioService>,
     events: tokio::sync::broadcast::Sender<EventView>,
 }
 
@@ -93,6 +94,11 @@ pub async fn serve(
         research.root().join(arvo_service::research::DATA_SUBDIR),
         research.root().join(arvo_service::research::EVIDENCE_SUBDIR),
     ));
+    let portfolios = std::sync::Arc::new(arvo_service::portfolio::PortfolioService::new(
+        research.root().join(arvo_service::portfolio::PORTFOLIO_SUBDIR),
+        research.root().join(arvo_service::research::DATA_SUBDIR),
+        research.root().join(arvo_service::portfolio::SNAPSHOT_SUBDIR),
+    ));
     let research_tier = tonic::service::interceptor::InterceptedService::new(
         ResearchServer::new(Service { research, events: events.clone(), workbench: workbench.clone() })
             .max_decoding_message_size(MAX_MESSAGE_BYTES),
@@ -103,7 +109,7 @@ pub async fn serve(
         bearer(&tokens.control, "control.json"),
     );
     let data_tier = tonic::service::interceptor::InterceptedService::new(
-        DataServer::new(Library { workbench, events }).max_decoding_message_size(MAX_MESSAGE_BYTES),
+        DataServer::new(Library { workbench, portfolios, events }).max_decoding_message_size(MAX_MESSAGE_BYTES),
         bearer(&tokens.control, "control.json"),
     );
     tonic::transport::Server::builder()
@@ -176,6 +182,22 @@ impl data_server::Data for Library {
         .await
         .map_err(refused)?;
         viewed("FetchView", &view)
+    }
+
+    async fn list_portfolios(&self, _: Request<Empty>) -> Result<Response<View>, Status> {
+        let view = arvo_service::portfolio::list(&self.portfolios).map_err(refused)?;
+        viewed("PortfolioLibraryView", &view)
+    }
+
+    async fn sync_accounts(&self, _: Request<Empty>) -> Result<Response<View>, Status> {
+        let view = arvo_service::portfolio::sync_accounts(&self.portfolios).await.map_err(refused)?;
+        viewed("PortfolioLibraryView", &view)
+    }
+
+    async fn sync_portfolio(&self, request: Request<PortfolioName>) -> Result<Response<View>, Status> {
+        let name = required(&request.get_ref().name, "name")?;
+        let view = arvo_service::portfolio::sync_one(&self.portfolios, name).await.map_err(refused)?;
+        viewed("PortfolioLibraryView", &view)
     }
 
     async fn list_accounts(&self, _: Request<Empty>) -> Result<Response<View>, Status> {
