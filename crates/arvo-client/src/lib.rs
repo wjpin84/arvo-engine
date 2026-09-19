@@ -15,10 +15,27 @@
 //! (#127). Anything that would make this crate need `arvo-research`,
 //! `arvo-data` or a venue belongs on the other side of the wire.
 
-/// Generated from `contract/protos/arvo/engine/v1/engine.proto`: the engine's local
-/// API, served by `arvo-engine`.
+/// Generated from the contract in `contract/protos`: the models where their
+/// subject lives, the services apart from them.
+///
+/// The module tree mirrors the package names, because that is how a type in
+/// one package refers to a type in another. The aliases below are what the
+/// rest of this workspace uses.
+///
+/// The lint allows are for generated code: a oneof over findings has one
+/// variant far larger than the others, and that is what the shape is.
+#[allow(clippy::large_enum_variant, clippy::doc_markdown, clippy::derive_partial_eq_without_eq)]
 pub mod proto {
-    tonic::include_proto!("arvo.engine.v1");
+    include!(concat!(env!("OUT_DIR"), "/arvo.rs"));
+
+    pub use arvo::common::v1 as common;
+    pub use arvo::market::v1 as market;
+    pub use arvo::platform::v1 as platform;
+    pub use arvo::portfolio::v1 as portfolio;
+    pub use arvo::research::v1 as research;
+    pub use arvo::services::v1 as services;
+    pub use arvo::session::v1 as session;
+    pub use arvo::views::v1 as views;
 }
 
 pub mod discovery;

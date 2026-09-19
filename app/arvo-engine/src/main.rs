@@ -129,7 +129,9 @@ async fn run() -> Result<(), String> {
 
 /// `session list|start|stop`, against the engine `engine.json` names.
 async fn session_command(args: &[String]) -> Result<(), String> {
-    use arvo_engine::grpc::proto::{sessions_client::SessionsClient, Empty, SessionId, SessionStatus, StartRequest};
+    use arvo_engine::grpc::proto::common::Empty;
+    use arvo_engine::grpc::proto::services::sessions_client::SessionsClient;
+    use arvo_engine::grpc::proto::session::{SessionId, SessionStatus, StartRequest};
 
     let root = arvo_service::project::app_data_root().map_err(|err| format!("no app data directory: {err}"))?;
     let found = discovery::running(&root).ok_or("no engine is running; open Arvo or start arvo-engine")?;

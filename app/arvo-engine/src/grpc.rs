@@ -11,16 +11,15 @@ use crate::session::Sessions;
 
 pub use arvo_client::proto as proto;
 
-use proto::research_server::{self, ResearchServer};
-use proto::data_server::{self, DataServer};
-use proto::sessions_server::{self, SessionsServer};
-use proto::{
-    Advice, AttachRequest, Attachment, Attachments, Empty, Finding, FindingId, FindingSummary, Findings,
-    AccountKeys, AttachmentRef, BookRequest, CompareRequest, ExportedPath, FetchRequest, FindingIds,
-    InstrumentSearch, JobId, PortfolioName, QuoteTick, ReportFigure, SharedExperiment, SignIn, TradeExport,
-    VendorId, VendorProfile, Instrument, Instruments, Point, ReportRequest, RiskModel, Rules, RulesetForm, RulesetPath,
-    Rulesets, Ruleset, RunRequest, StudyRequest, View, SessionId, SessionList, SessionStatus, StartRequest, Strategies,
-};
+use proto::services::research_server::{self, ResearchServer};
+use proto::services::data_server::{self, DataServer};
+use proto::services::sessions_server::{self, SessionsServer};
+use proto::common::{Empty, ExportedPath, View};
+use proto::market::{CompareRequest, FetchRequest, Instrument, InstrumentSearch, Instruments, QuoteTick};
+use proto::platform::{AccountKeys, JobId, SignIn, VendorId, VendorProfile};
+use proto::portfolio::{PortfolioName};
+use proto::research::{Advice, AttachRequest, Attachment, AttachmentRef, Attachments, BookRequest, Finding, FindingId, FindingIds, FindingSummary, Findings, Point, ReportFigure, ReportRequest, RiskModel, Rules, Ruleset, RulesetForm, RulesetPath, Rulesets, RunRequest, SharedExperiment, Strategies, StudyRequest, TradeExport};
+use proto::session::{SessionId, SessionList, SessionStatus, StartRequest};
 use arvo_client::wire;
 use arvo_views::EventView;
 
@@ -916,7 +915,7 @@ fn reported_from(request: &ReportRequest) -> Result<(arvo_research::Reported, St
 
 #[cfg(test)]
 mod tests {
-    use super::proto::research_client::ResearchClient;
+    use super::proto::services::research_client::ResearchClient;
     use super::*;
 
     const TOKEN: &str = "test-token";
@@ -965,7 +964,7 @@ mod tests {
     #[tokio::test]
     async fn only_the_control_token_can_stop_the_engine() {
         let (_dir, address, _stop) = engine().await;
-        let mut control = super::proto::sessions_client::SessionsClient::connect(address).await.expect("connects");
+        let mut control = super::proto::services::sessions_client::SessionsClient::connect(address).await.expect("connects");
         let refused = control.shutdown(with_token(Empty {}, TOKEN)).await.unwrap_err();
         assert_eq!(refused.code(), tonic::Code::Unauthenticated);
         control.shutdown(with_token(Empty {}, CONTROL)).await.expect("asked");
@@ -976,7 +975,7 @@ mod tests {
     #[tokio::test]
     async fn the_research_token_cannot_reach_a_session() {
         let (_dir, address, _stop) = engine().await;
-        let mut control = proto::sessions_client::SessionsClient::connect(address).await.expect("connects");
+        let mut control = proto::services::sessions_client::SessionsClient::connect(address).await.expect("connects");
         let refused = control.list_sessions(with_token(Empty {}, TOKEN)).await.unwrap_err();
         assert_eq!(refused.code(), tonic::Code::Unauthenticated);
         assert!(refused.message().contains("control.json"), "{}", refused.message());
@@ -1032,7 +1031,7 @@ mod tests {
             params: cross
                 .fixed
                 .iter()
-                .map(|fixed| proto::Param { name: fixed.name.clone(), values: vec![fixed.value] })
+                .map(|fixed| proto::research::Param { name: fixed.name.clone(), values: vec![fixed.value] })
                 .chain(cross.axes.iter().cloned())
                 .collect(),
         };
@@ -1098,7 +1097,7 @@ mod tests {
     #[tokio::test]
     async fn the_research_token_cannot_fetch_and_the_control_token_reads_the_library() {
         let (_dir, address, _stop) = engine().await;
-        let mut data = super::proto::data_client::DataClient::connect(address).await.expect("connects");
+        let mut data = super::proto::services::data_client::DataClient::connect(address).await.expect("connects");
 
         // ADR-0016: fetching changes the library and stales findings, so it is
         // a person's decision. An agent holds engine.json and nothing else.
@@ -1153,7 +1152,7 @@ mod tests {
         let mut client = ResearchClient::connect(address.clone()).await.expect("connects");
         let mut events = client.subscribe(with_token(Empty {}, TOKEN)).await.expect("subscribed").into_inner();
 
-        let mut control = super::proto::sessions_client::SessionsClient::connect(address).await.expect("connects");
+        let mut control = super::proto::services::sessions_client::SessionsClient::connect(address).await.expect("connects");
         // A finding that does not exist: the session thread fails before it
         // builds an executor, so nothing here reaches a venue.
         control
@@ -1240,8 +1239,8 @@ mod tests {
                 })
                 .collect()
         };
-        let ledger: Vec<proto::LedgerTrade> = (0..40u32)
-            .map(|n| proto::LedgerTrade {
+        let ledger: Vec<proto::research::LedgerTrade> = (0..40u32)
+            .map(|n| proto::research::LedgerTrade {
                 opened: format!("2024-{:02}-{:02}", 1 + n / 28, 1 + n % 28),
                 closed: format!("2024-{:02}-{:02}T16:00:00", 1 + n / 28, 1 + n % 28),
                 entry: 100.0,
@@ -1321,10 +1320,13 @@ mod tests {
     fn nothing_in_the_research_service_can_fetch_share_or_trade() {
         // The boundary is what is offered. A call that named a source, a key
         // or an order would be a way past it no argument check could close.
-        let proto = include_str!("../../../contract/protos/arvo/engine/v1/engine.proto");
+        // Each service is its own file in the contract now, which is the
+        // boundary this asserts made visible.
+        let proto = include_str!("../../../contract/protos/arvo/services/v1/research.proto");
+        let control = include_str!("../../../contract/protos/arvo/services/v1/data.proto");
         // The research service's block alone: the control tier is a second
         // service behind a second token, and its calls are the point of it.
-        let data = proto
+        let data = control
             .split("service Data {")
             .nth(1)
             .and_then(|rest| rest.split('}').next())

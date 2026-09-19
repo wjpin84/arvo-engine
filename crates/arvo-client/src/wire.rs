@@ -21,8 +21,8 @@ pub const MAX_MESSAGE_BYTES: usize = 64 << 20;
 /// # Errors
 ///
 /// The view does not serialise, which no `arvo_views` type fails to do.
-pub fn view<T: serde::Serialize>(kind: &str, value: &T) -> Result<proto::View, String> {
-    Ok(proto::View { kind: kind.to_owned(), json: serde_json::to_string(value).map_err(|err| err.to_string())? })
+pub fn view<T: serde::Serialize>(kind: &str, value: &T) -> Result<proto::common::View, String> {
+    Ok(proto::common::View { kind: kind.to_owned(), json: serde_json::to_string(value).map_err(|err| err.to_string())? })
 }
 
 /// A view back from the wire, as the type the caller expects.
@@ -31,25 +31,25 @@ pub fn view<T: serde::Serialize>(kind: &str, value: &T) -> Result<proto::View, S
 ///
 /// The engine answered with another type or another version of this one;
 /// the message names both kinds.
-pub fn decode<T: serde::de::DeserializeOwned>(wire: proto::View) -> Result<T, String> {
+pub fn decode<T: serde::de::DeserializeOwned>(wire: proto::common::View) -> Result<T, String> {
     serde_json::from_str(&wire.json).map_err(|err| {
         format!("the engine answered with a {} this build cannot read ({err}); are the two the same version?", wire.kind)
     })
 }
 
 #[must_use]
-pub fn quote_tick(view: QuoteTick) -> proto::QuoteTick {
-    proto::QuoteTick { symbol: view.symbol, price: view.price, change: view.change, regular: view.regular }
+pub fn quote_tick(view: QuoteTick) -> proto::market::QuoteTick {
+    proto::market::QuoteTick { symbol: view.symbol, price: view.price, change: view.change, regular: view.regular }
 }
 
 #[must_use]
-pub fn quote_tick_view(wire: proto::QuoteTick) -> QuoteTick {
+pub fn quote_tick_view(wire: proto::market::QuoteTick) -> QuoteTick {
     QuoteTick { symbol: wire.symbol, price: wire.price, change: wire.change, regular: wire.regular }
 }
 
 #[must_use]
-pub fn attachment(view: AttachmentView) -> proto::Attachment {
-    proto::Attachment {
+pub fn attachment(view: AttachmentView) -> proto::research::Attachment {
+    proto::research::Attachment {
         name: view.name,
         media_type: view.media_type,
         hash: view.hash,
@@ -59,7 +59,7 @@ pub fn attachment(view: AttachmentView) -> proto::Attachment {
 }
 
 #[must_use]
-pub fn attachment_view(wire: proto::Attachment) -> AttachmentView {
+pub fn attachment_view(wire: proto::research::Attachment) -> AttachmentView {
     AttachmentView {
         name: wire.name,
         media_type: wire.media_type,
@@ -77,17 +77,17 @@ fn size(value: u32) -> usize {
     usize::try_from(value).unwrap_or(usize::MAX)
 }
 
-fn params(pairs: Vec<(String, Vec<f64>)>) -> Vec<proto::Param> {
-    pairs.into_iter().map(|(name, values)| proto::Param { name, values }).collect()
+fn params(pairs: Vec<(String, Vec<f64>)>) -> Vec<proto::research::Param> {
+    pairs.into_iter().map(|(name, values)| proto::research::Param { name, values }).collect()
 }
 
-fn pairs(params: Vec<proto::Param>) -> Vec<(String, Vec<f64>)> {
+fn pairs(params: Vec<proto::research::Param>) -> Vec<(String, Vec<f64>)> {
     params.into_iter().map(|param| (param.name, param.values)).collect()
 }
 
 #[must_use]
-pub fn strategy(view: StrategyView, ranks_a_set: bool) -> proto::Strategy {
-    proto::Strategy {
+pub fn strategy(view: StrategyView, ranks_a_set: bool) -> proto::research::Strategy {
+    proto::research::Strategy {
         name: view.name,
         label: view.label,
         interval: view.interval,
@@ -98,7 +98,7 @@ pub fn strategy(view: StrategyView, ranks_a_set: bool) -> proto::Strategy {
 }
 
 #[must_use]
-pub fn strategy_view(wire: proto::Strategy) -> StrategyView {
+pub fn strategy_view(wire: proto::research::Strategy) -> StrategyView {
     StrategyView {
         name: wire.name,
         label: wire.label,
@@ -109,8 +109,8 @@ pub fn strategy_view(wire: proto::Strategy) -> StrategyView {
 }
 
 #[must_use]
-pub fn ruleset(view: RulesetView) -> proto::Ruleset {
-    proto::Ruleset {
+pub fn ruleset(view: RulesetView) -> proto::research::Ruleset {
+    proto::research::Ruleset {
         path: view.path,
         name: view.name,
         label: view.label,
@@ -122,7 +122,7 @@ pub fn ruleset(view: RulesetView) -> proto::Ruleset {
 }
 
 #[must_use]
-pub fn ruleset_view(wire: proto::Ruleset) -> RulesetView {
+pub fn ruleset_view(wire: proto::research::Ruleset) -> RulesetView {
     RulesetView {
         path: wire.path,
         name: wire.name,
@@ -135,8 +135,8 @@ pub fn ruleset_view(wire: proto::Ruleset) -> RulesetView {
 }
 
 #[must_use]
-pub fn ruleset_form(view: RulesetFormView) -> proto::RulesetForm {
-    proto::RulesetForm {
+pub fn ruleset_form(view: RulesetFormView) -> proto::research::RulesetForm {
+    proto::research::RulesetForm {
         name: view.name,
         rule: view.rule,
         label: view.label,
@@ -146,7 +146,7 @@ pub fn ruleset_form(view: RulesetFormView) -> proto::RulesetForm {
 }
 
 #[must_use]
-pub fn ruleset_form_view(wire: proto::RulesetForm) -> RulesetFormView {
+pub fn ruleset_form_view(wire: proto::research::RulesetForm) -> RulesetFormView {
     RulesetFormView {
         name: wire.name,
         rule: wire.rule,
@@ -157,13 +157,13 @@ pub fn ruleset_form_view(wire: proto::RulesetForm) -> RulesetFormView {
 }
 
 #[must_use]
-pub fn rule(view: RuleView) -> proto::Rule {
-    proto::Rule {
+pub fn rule(view: RuleView) -> proto::research::Rule {
+    proto::research::Rule {
         name: view.name,
         label: view.label,
         premise: view.premise,
         interval: view.interval,
-        fixed: view.fixed.into_iter().map(|(name, value)| proto::Fixed { name, value }).collect(),
+        fixed: view.fixed.into_iter().map(|(name, value)| proto::research::Fixed { name, value }).collect(),
         axes: params(view.axes),
         ranks_a_set: view.ranks_a_set,
         trades_options: view.trades_options,
@@ -171,7 +171,7 @@ pub fn rule(view: RuleView) -> proto::Rule {
 }
 
 #[must_use]
-pub fn rule_view(wire: proto::Rule) -> RuleView {
+pub fn rule_view(wire: proto::research::Rule) -> RuleView {
     RuleView {
         name: wire.name,
         label: wire.label,
@@ -185,8 +185,8 @@ pub fn rule_view(wire: proto::Rule) -> RuleView {
 }
 
 #[must_use]
-pub fn risk_model(view: RiskModelView) -> proto::RiskModel {
-    proto::RiskModel {
+pub fn risk_model(view: RiskModelView) -> proto::research::RiskModel {
+    proto::research::RiskModel {
         path: view.path,
         exists: view.exists,
         model_json: view.model.to_string(),
@@ -195,7 +195,7 @@ pub fn risk_model(view: RiskModelView) -> proto::RiskModel {
 }
 
 #[must_use]
-pub fn risk_model_view(wire: proto::RiskModel) -> RiskModelView {
+pub fn risk_model_view(wire: proto::research::RiskModel) -> RiskModelView {
     RiskModelView {
         path: wire.path,
         exists: wire.exists,
@@ -214,7 +214,7 @@ mod tests {
         let wire = view("RiskModelView", &sent).expect("serialises");
         assert_eq!(wire.kind, "RiskModelView");
         assert_eq!(decode::<RiskModelView>(wire).expect("decodes"), sent);
-        let wrong = proto::View { kind: "SomethingElse".into(), json: "[]".into() };
+        let wrong = proto::common::View { kind: "SomethingElse".into(), json: "[]".into() };
         let refused = decode::<RiskModelView>(wrong).unwrap_err();
         assert!(refused.contains("SomethingElse"), "{refused}");
     }
