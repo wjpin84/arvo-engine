@@ -1,7 +1,7 @@
 # Architecture
 
 Where Arvo is going and what shape it takes to get there. Decisions with
-consequences live in [`adr/`](adr/); this is the standing picture they add up to.
+consequences live in [arvo-adrs](https://github.com/wjpin84/arvo-adrs); this is the standing picture they add up to.
 
 ## Destination
 

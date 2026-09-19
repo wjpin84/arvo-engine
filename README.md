@@ -24,11 +24,11 @@ believing them. Hence the rule that orders everything else:
 | | |
 |---|---|
 | Architecture | [docs/architecture.md](docs/architecture.md) |
-| Decisions | [docs/adr/](docs/adr/) — one per file, superseded rather than edited |
+| Decisions | [arvo-adrs](https://github.com/wjpin84/arvo-adrs) — one per file, superseded rather than edited, across every Arvo repository |
 | Roadmap | [GitHub Project](https://github.com/users/wjpin84/projects/4) — milestones and issues |
 
 `ROADMAP.md` and `gap_analysis.md` used to live here. Both are now the project
-board; the decisions they carried are in `docs/adr/`.
+board; the decisions they carried are in [arvo-adrs](https://github.com/wjpin84/arvo-adrs).
 
 ## Building
 
