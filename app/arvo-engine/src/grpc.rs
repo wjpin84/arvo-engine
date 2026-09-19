@@ -12,7 +12,11 @@ use crate::session::Sessions;
 pub use arvo_client::proto as proto;
 
 use proto::services::research_server::{self, ResearchServer};
-use proto::services::data_server::{self, DataServer};
+use proto::services::accounts_server::{self, AccountsServer};
+use proto::services::market_server::{self, MarketServer};
+use proto::services::platform_server::{self, PlatformServer};
+use proto::services::portfolio_server::{self, PortfolioServer};
+use proto::services::research_files_server::{self, ResearchFilesServer};
 use proto::services::sessions_server::{self, SessionsServer};
 use proto::common::{Empty, ExportedPath, View};
 use proto::market::{CompareRequest, FetchRequest, Instrument, InstrumentSearch, Instruments, QuoteTick};
@@ -47,28 +51,6 @@ struct Control {
     /// Fires the server's shutdown future. Taken once: a second `Shutdown`
     /// while the first is in flight is answered and ignored.
     stop: std::sync::Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
-}
-
-/// The data tier, behind the control token: the library, the sources, and
-/// pulling more in. Not the research token, because fetching changes the
-/// library and stales existing findings (ADR-0016).
-struct Library {
-    workbench: std::sync::Arc<arvo_service::research::ResearchService>,
-    portfolios: std::sync::Arc<arvo_service::portfolio::PortfolioService>,
-    events: tokio::sync::broadcast::Sender<EventView>,
-    jobs: arvo_schedule::Jobs,
-    plugins: arvo_service::plugins::Plugins,
-    stream: std::sync::Arc<arvo_service::stream::Stream>,
-    ticks: tokio::sync::broadcast::Sender<arvo_views::QuoteTick>,
-}
-
-impl Library {
-    /// Broadcasts whatever a data call wants to announce.
-    fn report(&self) -> impl Fn(EventView) + Send + Sync + use<'_> {
-        move |event| {
-            let _ = self.events.send(event);
-        }
-    }
 }
 
 /// The two tokens the engine serves behind: research for every front end,
@@ -126,18 +108,46 @@ pub async fn serve(
             .max_decoding_message_size(MAX_MESSAGE_BYTES),
         bearer(&tokens.research, "engine.json"),
     );
-    let control_tier = tonic::service::interceptor::InterceptedService::new(
-        SessionsServer::new(Control { sessions, stop }),
-        bearer(&tokens.control, "control.json"),
+    // One interceptor, applied to each service a person drives. The token is a
+    // property of the service, not its name: what a service is *about* is its
+    // domain, and who may call it is this line.
+    let control = || bearer(&tokens.control, "control.json");
+    let stream = std::sync::Arc::new(stream);
+    let sessions_tier =
+        tonic::service::interceptor::InterceptedService::new(SessionsServer::new(Control { sessions, stop }), control());
+    let market_tier = tonic::service::interceptor::InterceptedService::new(
+        MarketServer::new(Market {
+            workbench: workbench.clone(),
+            portfolios: portfolios.clone(),
+            events: events.clone(),
+            stream,
+            ticks,
+        })
+        .max_decoding_message_size(MAX_MESSAGE_BYTES),
+        control(),
     );
-    let data_tier = tonic::service::interceptor::InterceptedService::new(
-        DataServer::new(Library { workbench, portfolios, events, jobs, plugins, stream: std::sync::Arc::new(stream), ticks }).max_decoding_message_size(MAX_MESSAGE_BYTES),
-        bearer(&tokens.control, "control.json"),
+    let accounts_tier =
+        tonic::service::interceptor::InterceptedService::new(AccountsServer::new(Accounts { events }), control());
+    let portfolio_tier = tonic::service::interceptor::InterceptedService::new(
+        PortfolioServer::new(Portfolio { portfolios }).max_decoding_message_size(MAX_MESSAGE_BYTES),
+        control(),
+    );
+    let platform_tier = tonic::service::interceptor::InterceptedService::new(
+        PlatformServer::new(Platform { jobs, plugins }).max_decoding_message_size(MAX_MESSAGE_BYTES),
+        control(),
+    );
+    let files_tier = tonic::service::interceptor::InterceptedService::new(
+        ResearchFilesServer::new(ResearchFiles { workbench }).max_decoding_message_size(MAX_MESSAGE_BYTES),
+        control(),
     );
     tonic::transport::Server::builder()
         .add_service(research_tier)
-        .add_service(control_tier)
-        .add_service(data_tier)
+        .add_service(sessions_tier)
+        .add_service(market_tier)
+        .add_service(accounts_tier)
+        .add_service(portfolio_tier)
+        .add_service(platform_tier)
+        .add_service(files_tier)
         .serve_with_incoming_shutdown(tokio_stream::wrappers::TcpListenerStream::new(listener), shutdown)
         .await
 }
@@ -172,8 +182,29 @@ fn session_status(status: crate::session::Status) -> SessionStatus {
     }
 }
 
+/// The data library, the sources that fill it, and prices.
+struct Market {
+    workbench: std::sync::Arc<arvo_service::research::ResearchService>,
+    /// The watchlist starts from what you hold.
+    portfolios: std::sync::Arc<arvo_service::portfolio::PortfolioService>,
+    events: tokio::sync::broadcast::Sender<EventView>,
+    stream: std::sync::Arc<arvo_service::stream::Stream>,
+    ticks: tokio::sync::broadcast::Sender<arvo_views::QuoteTick>,
+}
+
+impl Market {
+    /// Broadcasts whatever a data call wants to announce.
+    fn report(&self) -> impl Fn(EventView) + Send + Sync + use<'_> {
+        move |event| {
+            let _ = self.events.send(event);
+        }
+    }
+}
+
 #[tonic::async_trait]
-impl data_server::Data for Library {
+impl market_server::Market for Market {
+    type StreamQuotesStream = std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<QuoteTick, Status>> + Send>>;
+
     async fn view_library(&self, _: Request<Empty>) -> Result<Response<View>, Status> {
         let view = arvo_service::research::data::library(&self.workbench).map_err(refused)?;
         viewed("DataLibraryView", &view)
@@ -206,6 +237,171 @@ impl data_server::Data for Library {
         viewed("FetchView", &view)
     }
 
+    async fn compare_sources(&self, request: Request<CompareRequest>) -> Result<Response<View>, Status> {
+        let CompareRequest { instrument, interval, first, second, days } = request.into_inner();
+        let view = arvo_service::research::data::fetch::compare_two(
+            &instrument,
+            &interval,
+            first.as_deref(),
+            second.as_deref(),
+            days,
+            &self.report(),
+        )
+        .await
+        .map_err(refused)?;
+        viewed("SourceComparisonView", &view)
+    }
+
+    async fn watchlist(&self, _: Request<Empty>) -> Result<Response<View>, Status> {
+        use arvo_service::research::data::watchlist;
+
+        let held = self.portfolios.held();
+        let library = self.workbench.bars.instruments().unwrap_or_default();
+        let (chosen, priceable) = watchlist::symbols_for(&held, library);
+        // Before the quote call rather than after: if the broker session is
+        // dead the snapshot below fails, and the stream is the only thing that
+        // can still price these rows.
+        self.stream.watch(priceable.iter().map(|id| watchlist::symbol_only(id)).collect());
+        let rows = watchlist::priced(&held, chosen, &priceable, &self.report()).await;
+        viewed("Vec<QuoteView>", &rows)
+    }
+
+    async fn stream_quotes(&self, _: Request<Empty>) -> Result<Response<Self::StreamQuotesStream>, Status> {
+        use tokio_stream::StreamExt as _;
+
+        // A listener that falls behind drops ticks rather than stalling the
+        // socket: the next print is worth more than the one it missed.
+        let stream = tokio_stream::wrappers::BroadcastStream::new(self.ticks.subscribe())
+            .filter_map(|tick| tick.ok())
+            .map(|tick| Ok(arvo_client::wire::quote_tick(tick)));
+        Ok(Response::new(Box::pin(stream)))
+    }
+}
+
+/// A person's relationship with each vendor. The engine holds every
+/// credential (ADR-0028).
+struct Accounts {
+    events: tokio::sync::broadcast::Sender<EventView>,
+}
+
+#[tonic::async_trait]
+impl accounts_server::Accounts for Accounts {
+    async fn list_accounts(&self, _: Request<Empty>) -> Result<Response<View>, Status> {
+        viewed("Vec<AccountView>", &arvo_service::accounts::list().await)
+    }
+
+    async fn begin_sign_in(&self, request: Request<VendorId>) -> Result<Response<SignIn>, Status> {
+        let vendor = required(&request.get_ref().vendor, "vendor")?.to_owned();
+        let pending = arvo_service::accounts::begin_sign_in(&vendor).await.map_err(refused)?;
+        let url = pending.url.clone();
+        // The person takes as long as they take. Finishing happens here rather
+        // than in the caller's request, and the outcome is an event
+        // (ADR-0028 point 4), so the CLI and the window learn it the same way.
+        let events = self.events.clone();
+        tokio::spawn(async move {
+            let event = match arvo_service::accounts::finish_sign_in(pending).await {
+                Ok(()) => arvo_service::events::feed_connected(&vendor),
+                Err(err) => {
+                    eprintln!("arvo-engine: the {vendor} sign-in did not complete: {err}");
+                    arvo_service::events::feed_disconnected(&vendor, &err.to_string(), false)
+                }
+            };
+            let _ = events.send(event);
+        });
+        Ok(Response::new(SignIn { url }))
+    }
+
+    async fn disconnect_account(&self, request: Request<VendorProfile>) -> Result<Response<Empty>, Status> {
+        let VendorProfile { vendor, profile } = request.into_inner();
+        arvo_service::accounts::disconnect(&vendor, profile.as_deref()).map_err(refused)?;
+        let why = if vendor == "alpaca" { "you removed the keys" } else { "you signed out" };
+        let _ = self.events.send(arvo_service::events::feed_disconnected(&vendor, why, true));
+        Ok(Response::new(Empty {}))
+    }
+
+    async fn store_account_keys(&self, request: Request<AccountKeys>) -> Result<Response<Empty>, Status> {
+        let AccountKeys { vendor, profile, key_id, secret } = request.into_inner();
+        arvo_service::accounts::store_keys(&vendor, profile.as_deref(), &key_id, &secret).map_err(refused)?;
+        let _ = self.events.send(arvo_service::events::feed_connected(&vendor));
+        Ok(Response::new(Empty {}))
+    }
+}
+
+/// What is held, valued. Read-only: nothing here places an order.
+struct Portfolio {
+    portfolios: std::sync::Arc<arvo_service::portfolio::PortfolioService>,
+}
+
+#[tonic::async_trait]
+impl portfolio_server::Portfolio for Portfolio {
+    async fn list_portfolios(&self, _: Request<Empty>) -> Result<Response<View>, Status> {
+        let view = arvo_service::portfolio::list(&self.portfolios).map_err(refused)?;
+        viewed("PortfolioLibraryView", &view)
+    }
+
+    async fn sync_accounts(&self, _: Request<Empty>) -> Result<Response<View>, Status> {
+        let view = arvo_service::portfolio::sync_accounts(&self.portfolios).await.map_err(refused)?;
+        viewed("PortfolioLibraryView", &view)
+    }
+
+    async fn sync_portfolio(&self, request: Request<PortfolioName>) -> Result<Response<View>, Status> {
+        let name = required(&request.get_ref().name, "name")?;
+        let view = arvo_service::portfolio::sync_one(&self.portfolios, name).await.map_err(refused)?;
+        viewed("PortfolioLibraryView", &view)
+    }
+}
+
+/// The engine's own jobs, and the plugins it hosts (ADR-0029).
+struct Platform {
+    jobs: arvo_schedule::Jobs,
+    plugins: arvo_service::plugins::Plugins,
+}
+
+#[tonic::async_trait]
+impl platform_server::Platform for Platform {
+    async fn list_jobs(&self, _: Request<Empty>) -> Result<Response<View>, Status> {
+        viewed("Vec<JobView>", &self.jobs.snapshot())
+    }
+
+    async fn run_job(&self, request: Request<JobId>) -> Result<Response<Empty>, Status> {
+        let id = required(&request.get_ref().id, "id")?;
+        if !self.jobs.snapshot().iter().any(|job| job.id == id) {
+            return Err(Status::not_found(format!("the engine has no job {id:?}")));
+        }
+        self.jobs.run_now(id.to_owned());
+        Ok(Response::new(Empty {}))
+    }
+
+    async fn list_plugins(&self, _: Request<Empty>) -> Result<Response<View>, Status> {
+        viewed("Vec<PluginView>", &self.plugins.snapshot().await)
+    }
+
+    async fn refresh_plugins(&self, _: Request<Empty>) -> Result<Response<View>, Status> {
+        viewed("Vec<PluginView>", &self.plugins.refresh().await)
+    }
+
+    async fn list_signals(&self, _: Request<Empty>) -> Result<Response<View>, Status> {
+        viewed("Vec<SignalView>", &self.plugins.signals().await)
+    }
+
+    async fn reconcile_providers(&self, _: Request<Empty>) -> Result<Response<Empty>, Status> {
+        self.plugins.reconcile().await;
+        Ok(Response::new(Empty {}))
+    }
+
+    async fn extension_strategies(&self, _: Request<Empty>) -> Result<Response<View>, Status> {
+        viewed("BTreeMap<String, Vec<StrategyContributionView>>", &arvo_service::extensions::contributed_views())
+    }
+}
+
+/// The research files a person asks for: an experiment someone sent, and
+/// what a finding turns into on disk.
+struct ResearchFiles {
+    workbench: std::sync::Arc<arvo_service::research::ResearchService>,
+}
+
+#[tonic::async_trait]
+impl research_files_server::ResearchFiles for ResearchFiles {
     async fn run_shared_experiment(&self, request: Request<SharedExperiment>) -> Result<Response<View>, Status> {
         let SharedExperiment { text, instrument } = request.into_inner();
         let view = blocking(&self.workbench, move |workbench| {
@@ -247,139 +443,8 @@ impl data_server::Data for Library {
         .map_err(refused)?;
         Ok(Response::new(ExportedPath { path }))
     }
-
-    async fn list_plugins(&self, _: Request<Empty>) -> Result<Response<View>, Status> {
-        viewed("Vec<PluginView>", &self.plugins.snapshot().await)
-    }
-
-    async fn refresh_plugins(&self, _: Request<Empty>) -> Result<Response<View>, Status> {
-        viewed("Vec<PluginView>", &self.plugins.refresh().await)
-    }
-
-    async fn list_signals(&self, _: Request<Empty>) -> Result<Response<View>, Status> {
-        viewed("Vec<SignalView>", &self.plugins.signals().await)
-    }
-
-    async fn reconcile_providers(&self, _: Request<Empty>) -> Result<Response<Empty>, Status> {
-        self.plugins.reconcile().await;
-        Ok(Response::new(Empty {}))
-    }
-
-    async fn extension_strategies(&self, _: Request<Empty>) -> Result<Response<View>, Status> {
-        viewed("BTreeMap<String, Vec<StrategyContributionView>>", &arvo_service::extensions::contributed_views())
-    }
-
-    async fn watchlist(&self, _: Request<Empty>) -> Result<Response<View>, Status> {
-        use arvo_service::research::data::watchlist;
-
-        let held = self.portfolios.held();
-        let library = self.workbench.bars.instruments().unwrap_or_default();
-        let (chosen, priceable) = watchlist::symbols_for(&held, library);
-        // Before the quote call rather than after: if the broker session is
-        // dead the snapshot below fails, and the stream is the only thing that
-        // can still price these rows.
-        self.stream.watch(priceable.iter().map(|id| watchlist::symbol_only(id)).collect());
-        let rows = watchlist::priced(&held, chosen, &priceable, &self.report()).await;
-        viewed("Vec<QuoteView>", &rows)
-    }
-
-    type StreamQuotesStream = std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<QuoteTick, Status>> + Send>>;
-
-    async fn stream_quotes(&self, _: Request<Empty>) -> Result<Response<Self::StreamQuotesStream>, Status> {
-        use tokio_stream::StreamExt as _;
-
-        // A listener that falls behind drops ticks rather than stalling the
-        // socket: the next print is worth more than the one it missed.
-        let stream = tokio_stream::wrappers::BroadcastStream::new(self.ticks.subscribe())
-            .filter_map(|tick| tick.ok())
-            .map(|tick| Ok(arvo_client::wire::quote_tick(tick)));
-        Ok(Response::new(Box::pin(stream)))
-    }
-
-    async fn list_jobs(&self, _: Request<Empty>) -> Result<Response<View>, Status> {
-        viewed("Vec<JobView>", &self.jobs.snapshot())
-    }
-
-    async fn run_job(&self, request: Request<JobId>) -> Result<Response<Empty>, Status> {
-        let id = required(&request.get_ref().id, "id")?;
-        if !self.jobs.snapshot().iter().any(|job| job.id == id) {
-            return Err(Status::not_found(format!("the engine has no job {id:?}")));
-        }
-        self.jobs.run_now(id.to_owned());
-        Ok(Response::new(Empty {}))
-    }
-
-    async fn list_portfolios(&self, _: Request<Empty>) -> Result<Response<View>, Status> {
-        let view = arvo_service::portfolio::list(&self.portfolios).map_err(refused)?;
-        viewed("PortfolioLibraryView", &view)
-    }
-
-    async fn sync_accounts(&self, _: Request<Empty>) -> Result<Response<View>, Status> {
-        let view = arvo_service::portfolio::sync_accounts(&self.portfolios).await.map_err(refused)?;
-        viewed("PortfolioLibraryView", &view)
-    }
-
-    async fn sync_portfolio(&self, request: Request<PortfolioName>) -> Result<Response<View>, Status> {
-        let name = required(&request.get_ref().name, "name")?;
-        let view = arvo_service::portfolio::sync_one(&self.portfolios, name).await.map_err(refused)?;
-        viewed("PortfolioLibraryView", &view)
-    }
-
-    async fn list_accounts(&self, _: Request<Empty>) -> Result<Response<View>, Status> {
-        viewed("Vec<AccountView>", &arvo_service::accounts::list().await)
-    }
-
-    async fn begin_sign_in(&self, request: Request<VendorId>) -> Result<Response<SignIn>, Status> {
-        let vendor = required(&request.get_ref().vendor, "vendor")?.to_owned();
-        let pending = arvo_service::accounts::begin_sign_in(&vendor).await.map_err(refused)?;
-        let url = pending.url.clone();
-        // The person takes as long as they take. Finishing happens here rather
-        // than in the caller's request, and the outcome is an event
-        // (ADR-0028 point 4), so the CLI and the window learn it the same way.
-        let events = self.events.clone();
-        tokio::spawn(async move {
-            let event = match arvo_service::accounts::finish_sign_in(pending).await {
-                Ok(()) => arvo_service::events::feed_connected(&vendor),
-                Err(err) => {
-                    eprintln!("arvo-engine: the {vendor} sign-in did not complete: {err}");
-                    arvo_service::events::feed_disconnected(&vendor, &err.to_string(), false)
-                }
-            };
-            let _ = events.send(event);
-        });
-        Ok(Response::new(SignIn { url }))
-    }
-
-    async fn disconnect_account(&self, request: Request<VendorProfile>) -> Result<Response<Empty>, Status> {
-        let VendorProfile { vendor, profile } = request.into_inner();
-        arvo_service::accounts::disconnect(&vendor, profile.as_deref()).map_err(refused)?;
-        let why = if vendor == "alpaca" { "you removed the keys" } else { "you signed out" };
-        let _ = self.events.send(arvo_service::events::feed_disconnected(&vendor, why, true));
-        Ok(Response::new(Empty {}))
-    }
-
-    async fn store_account_keys(&self, request: Request<AccountKeys>) -> Result<Response<Empty>, Status> {
-        let AccountKeys { vendor, profile, key_id, secret } = request.into_inner();
-        arvo_service::accounts::store_keys(&vendor, profile.as_deref(), &key_id, &secret).map_err(refused)?;
-        let _ = self.events.send(arvo_service::events::feed_connected(&vendor));
-        Ok(Response::new(Empty {}))
-    }
-
-    async fn compare_sources(&self, request: Request<CompareRequest>) -> Result<Response<View>, Status> {
-        let CompareRequest { instrument, interval, first, second, days } = request.into_inner();
-        let view = arvo_service::research::data::fetch::compare_two(
-            &instrument,
-            &interval,
-            first.as_deref(),
-            second.as_deref(),
-            days,
-            &self.report(),
-        )
-        .await
-        .map_err(refused)?;
-        viewed("SourceComparisonView", &view)
-    }
 }
+
 
 #[tonic::async_trait]
 impl sessions_server::Sessions for Control {
@@ -1097,7 +1162,8 @@ mod tests {
     #[tokio::test]
     async fn the_research_token_cannot_fetch_and_the_control_token_reads_the_library() {
         let (_dir, address, _stop) = engine().await;
-        let mut data = super::proto::services::data_client::DataClient::connect(address).await.expect("connects");
+        let address2 = address.clone();
+        let mut data = super::proto::services::market_client::MarketClient::connect(address).await.expect("connects");
 
         // ADR-0016: fetching changes the library and stales findings, so it is
         // a person's decision. An agent holds engine.json and nothing else.
@@ -1121,15 +1187,17 @@ mod tests {
         assert!(decoded.iter().any(|source| source.venue == "YF"), "{decoded:?}");
 
         // A credential is the engine's alone (ADR-0028), so it sits behind the
-        // control token with the rest of the data tier.
-        let refused = data.list_accounts(with_token(Empty {}, TOKEN)).await.unwrap_err();
+        // control token like every other service a person drives.
+        let mut accounts =
+            super::proto::services::accounts_client::AccountsClient::connect(address2).await.expect("connects");
+        let refused = accounts.list_accounts(with_token(Empty {}, TOKEN)).await.unwrap_err();
         assert_eq!(refused.code(), tonic::Code::Unauthenticated);
-        let accounts = data.list_accounts(with_token(Empty {}, CONTROL)).await.expect("ok").into_inner();
-        let decoded: Vec<arvo_views::AccountView> = wire::decode(accounts).expect("decodes");
+        let listed = accounts.list_accounts(with_token(Empty {}, CONTROL)).await.expect("ok").into_inner();
+        let decoded: Vec<arvo_views::AccountView> = wire::decode(listed).expect("decodes");
         assert!(decoded.iter().any(|account| account.id == "alpaca"), "{decoded:?}");
 
         // Refused before any browser could open, so this stays offline.
-        let refused = data
+        let refused = accounts
             .begin_sign_in(with_token(VendorId { vendor: "yahoo".to_owned() }, CONTROL))
             .await
             .unwrap_err();
@@ -1323,26 +1391,24 @@ mod tests {
         // Each service is its own file in the contract now, which is the
         // boundary this asserts made visible.
         let proto = include_str!("../../../contract/protos/arvo/services/v1/research.proto");
-        let control = include_str!("../../../contract/protos/arvo/services/v1/data.proto");
-        // The research service's block alone: the control tier is a second
-        // service behind a second token, and its calls are the point of it.
-        let data = control
-            .split("service Data {")
-            .nth(1)
-            .and_then(|rest| rest.split('}').next())
-            .expect("the data service is declared");
-        assert!(data.contains("rpc FetchBars"), "fetching lives on the control tier, not the research one");
-        // Import is on the forbidden list below: an agent may run what this
-        // build implements, not a file someone sent it.
+        let market = include_str!("../../../contract/protos/arvo/services/v1/market.proto");
+        // Each service is its own file, so where a call lives is where it is
+        // written down. Fetching changes the library and stales findings; a
+        // shared experiment is a file somebody sent. Both are a person's
+        // decision, and both are declared away from `Research`.
+        let block = |text: &'static str, name: &str| -> &'static str {
+            text.split(&format!("service {name} {{"))
+                .nth(1)
+                .and_then(|rest| rest.split("
+}").next())
+                .unwrap_or_else(|| panic!("{name} is declared"))
+        };
+        assert!(block(market, "Market").contains("rpc FetchBars"), "fetching is not the research tier's");
         assert!(
-            data.contains("rpc RunSharedExperiment"),
-            "importing lives on the control tier, not the research one"
+            block(proto, "ResearchFiles").contains("rpc RunSharedExperiment"),
+            "importing is not the research tier's"
         );
-        let research = proto
-            .split("service Research {")
-            .nth(1)
-            .and_then(|rest| rest.split('}').next())
-            .expect("the research service is declared");
+        let research = block(proto, "Research");
         let calls: Vec<&str> = research
             .lines()
             .filter_map(|line| line.trim().strip_prefix("rpc "))
