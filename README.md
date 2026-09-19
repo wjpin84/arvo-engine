@@ -56,7 +56,7 @@ cargo run -p arvo-runtime --example recheck -- <data-dir> <evidence-dir>   # re-
 
 An agent can read research memory and run studies — never fetch or trade —
 through a stdio MCP server over the window's own folders
-([ADR-0016](docs/adr/0016-an-agent-reaches-arvo-through-a-tool-list-that-cannot-trade.md)):
+([ADR-0016](https://github.com/wjpin84/arvo-adrs/blob/main/0016-an-agent-reaches-arvo-through-a-tool-list-that-cannot-trade.md)):
 
 ```
 cargo build --release -p arvo-mcp-server
@@ -71,4 +71,4 @@ that agent has run, and every call is appended to `agent-audit.jsonl`.
 
 Apache-2.0. NautilusTrader is LGPL-3.0-only and is linked into the shipped
 binary — see [`NOTICE`](NOTICE) and
-[ADR-0002](docs/adr/0002-apache-2-with-lgpl-dependency.md).
+[ADR-0002](https://github.com/wjpin84/arvo-adrs/blob/main/0002-apache-2-with-lgpl-dependency.md).

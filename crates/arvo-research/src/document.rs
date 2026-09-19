@@ -5,7 +5,7 @@
 //! us. The outside user's catalog is 272 execution copies a matrix builder
 //! generated from rule registries; Arvo's own families with their parameter
 //! grids are the same thing already — a search over data — and are the
-//! second implementation ([ADR-0005](../../../docs/adr/0005-providers-are-earned.md)).
+//! second implementation ([ADR-0005](../../../https://github.com/wjpin84/arvo-adrs/blob/main/0005-providers-are-earned.md)).
 //!
 //! # What a document says, and what it does not
 //!

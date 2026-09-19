@@ -22,7 +22,7 @@
 //! indistinguishable from an honest one. This is a format for people who want
 //! the answer to be right, not a proof system.
 //!
-//! [ADR-0014]: https://github.com/wjpin84/arvo-desktop/blob/master/docs/adr/0014-a-shared-experiment-carries-its-search.md
+//! [ADR-0014]: https://github.com/wjpin84/arvo-desktop/blob/master/https://github.com/wjpin84/arvo-adrs/blob/main/0014-a-shared-experiment-carries-its-search.md
 
 use std::collections::{BTreeMap, BTreeSet};
 

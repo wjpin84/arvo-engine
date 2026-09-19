@@ -27,7 +27,7 @@
 //! [`DividendGap::corrected_excess`] refuses on the one where subtracting is
 //! wrong. See [ADR-0013].
 //!
-//! [ADR-0013]: https://github.com/wjpin84/arvo-desktop/blob/master/docs/adr/0013-dividends-arrive-as-reinvestment.md
+//! [ADR-0013]: https://github.com/wjpin84/arvo-desktop/blob/master/https://github.com/wjpin84/arvo-adrs/blob/main/0013-dividends-arrive-as-reinvestment.md
 //!
 //! # Why this is measured rather than estimated
 //!
@@ -142,7 +142,7 @@ impl DividendGap {
     /// A figure that is silently wrong under a basis nobody checked is exactly
     /// what [ADR-0011] exists to refuse.
     ///
-    /// [ADR-0011]: https://github.com/wjpin84/arvo-desktop/blob/master/docs/adr/0011-dividend-gap-beside-not-folded-in.md
+    /// [ADR-0011]: https://github.com/wjpin84/arvo-desktop/blob/master/https://github.com/wjpin84/arvo-adrs/blob/main/0011-dividend-gap-beside-not-folded-in.md
     #[must_use]
     pub fn corrected_excess(&self, excess_return: f64) -> Option<f64> {
         match self.adjustment {

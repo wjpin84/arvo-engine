@@ -76,7 +76,7 @@ pub struct DatasetRef {
     /// is the only basis any source has ever asked for: every record written
     /// before this field existed genuinely ran on it.
     ///
-    /// [ADR-0013]: https://github.com/wjpin84/arvo-desktop/blob/master/docs/adr/0013-dividends-arrive-as-reinvestment.md
+    /// [ADR-0013]: https://github.com/wjpin84/arvo-desktop/blob/master/https://github.com/wjpin84/arvo-adrs/blob/main/0013-dividends-arrive-as-reinvestment.md
     #[serde(default)]
     pub adjustment: arvo_data::source::Adjustment,
 }

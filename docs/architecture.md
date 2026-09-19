@@ -18,7 +18,7 @@ crates. Arvo does not reimplement what Nautilus already solves — orders,
 positions, accounts, portfolio, execution, backtesting, message bus, cache.
 
 > **Arvo owns concepts unique to Arvo. Nautilus owns trading-engine concepts
-> Nautilus already solves well.** — [ADR-0003](adr/0003-nautilus-containment.md)
+> Nautilus already solves well.** — [ADR-0003](https://github.com/wjpin84/arvo-adrs/blob/main/0003-nautilus-containment.md)
 
 ## The differentiator is evaluation, not execution
 
@@ -39,6 +39,11 @@ Hence the sequencing rule that orders the roadmap:
 
 ## Standing rules
 
+Decisions are recorded in [arvo-adrs](https://github.com/wjpin84/arvo-adrs),
+one numbered file each, across every Arvo repository. This document links to
+them by number.
+
+
 - **The UI must not know Nautilus exists.** Leptos works in Arvo concepts —
   experiments, hypotheses, evidence, datasets — never engine internals.
 - **The AI never receives broker credentials.** It acts through declared
@@ -46,7 +51,7 @@ Hence the sequencing rule that orders the roadmap:
   system: it proposes hypotheses, and *evidence* updates them.
 - **A provider trait is earned by removing a dependency or a panic**, never by
   anticipating an implementation nobody has asked for —
-  [ADR-0005](adr/0005-providers-are-earned.md).
+  [ADR-0005](https://github.com/wjpin84/arvo-adrs/blob/main/0005-providers-are-earned.md).
 - **Systematic, not discretionary.** Nautilus is an algorithmic execution
   framework, and systematic is the only form the benchmark discipline can
   evaluate.
@@ -66,14 +71,14 @@ contracts:
 - **Arvo calls a provider.** A provider serves `arvo.source.v1.Source` or
   `arvo.signal.v1.Signals`; Arvo spawns it, hands it a token per spawn and a
   `Grant` per call, and asks nothing of a service it did not claim
-  ([ADR-0022](adr/0022-a-plugin-serves-an-earned-trait-and-the-sources-go-first.md),
-  [ADR-0023](adr/0023-arvo-owns-the-lifecycle-of-what-it-spawns.md)). The
+  ([ADR-0022](https://github.com/wjpin84/arvo-adrs/blob/main/0022-a-plugin-serves-an-earned-trait-and-the-sources-go-first.md),
+  [ADR-0023](https://github.com/wjpin84/arvo-adrs/blob/main/0023-arvo-owns-the-lifecycle-of-what-it-spawns.md)). The
   provider authenticates with its vendor; that is what the grant is for.
 - **Something calls Arvo.** An agent over MCP, a script or the window over
   the engine's gRPC. Arvo is the authenticated service, behind the research
   token and the control token, and the tool list is the boundary
-  ([ADR-0016](adr/0016-an-agent-reaches-arvo-through-a-tool-list-that-cannot-trade.md),
-  [ADR-0018](adr/0018-arvo-keeps-running-when-the-window-closes.md)).
+  ([ADR-0016](https://github.com/wjpin84/arvo-adrs/blob/main/0016-an-agent-reaches-arvo-through-a-tool-list-that-cannot-trade.md),
+  [ADR-0018](https://github.com/wjpin84/arvo-adrs/blob/main/0018-arvo-keeps-running-when-the-window-closes.md)).
 
 Neither direction gets a generic identity, credential-reference or capability
 protocol until a second-party caller needs one. What an outside developer
@@ -108,7 +113,7 @@ app/           the desktop application
 | `app/arvo-views` | The shapes crossing to the UI, defined once |
 | `app/arvo-editor` | The Leptos workbench |
 | `app/arvo-mcp-server` | Arvo as a stdio MCP server: an agent reads and runs research, never trades |
-| `app/arvo-engine` | The engine's local gRPC API and the research tier every non-window front end shares ([ADR-0018](adr/0018-arvo-keeps-running-when-the-window-closes.md)) |
+| `app/arvo-engine` | The engine's local gRPC API and the research tier every non-window front end shares ([ADR-0018](https://github.com/wjpin84/arvo-adrs/blob/main/0018-arvo-keeps-running-when-the-window-closes.md)) |
 
 Crates provide *architecture* (compile-time boundaries). Extensions provide
 *replaceable runtime capabilities*. Not every crate is an extension, and not
@@ -117,7 +122,7 @@ every extension needs a crate.
 ### Where the traits live
 
 Beside their implementer or their primary consumer, never in a shared types
-crate — see [ADR-0005](adr/0005-providers-are-earned.md), and note that
+crate — see [ADR-0005](https://github.com/wjpin84/arvo-adrs/blob/main/0005-providers-are-earned.md), and note that
 `SimulationProvider` sits in `arvo-research` *specifically* so that
 `arvo-nautilus` depends on it and not the reverse.
 
@@ -136,18 +141,18 @@ thing that must, and it lives in the composition root.
 ## Data, and what it assumes
 
 Bars are fetched to files and pinned by content hash, never read live during a
-run — [ADR-0008](adr/0008-fetch-writes-files.md). Everything downstream reads
+run — [ADR-0008](https://github.com/wjpin84/arvo-adrs/blob/main/0008-fetch-writes-files.md). Everything downstream reads
 `arvo_data::CsvBars`.
 
 Sources are asked for **split-adjusted** prices: raw prices make a split look
 like a crash, which a breakout rule would trade. Split-adjusted is not
 total-return adjusted, so dividends are absent from the series and nothing
 credits them — a bias that always favours the strategy, now measured rather than
-estimated ([ADR-0011](adr/0011-dividend-gap-beside-not-folded-in.md)).
+estimated ([ADR-0011](https://github.com/wjpin84/arvo-adrs/blob/main/0011-dividend-gap-beside-not-folded-in.md)).
 
 Total-return prices are served too, by separate sources under separate venues
 (`YFTR`, `AIEXTR`, `ASIPTR`): distributions reinvested at the ex-date, which is
-what an account with DRIP does ([ADR-0013](adr/0013-dividends-arrive-as-reinvestment.md)).
+what an account with DRIP does ([ADR-0013](https://github.com/wjpin84/arvo-adrs/blob/main/0013-dividends-arrive-as-reinvestment.md)).
 The basis is read from the venue, so a study on one records it and the dividend
 gap describes the margin rather than correcting it.
 
@@ -159,11 +164,11 @@ today's names is a panel over survivors.
 
 Research and paper first. Live execution with real capital was always a separate
 and explicit decision rather than a configuration flag
-([ADR-0006](adr/0006-live-execution-is-a-separate-decision.md)); that decision
+([ADR-0006](https://github.com/wjpin84/arvo-adrs/blob/main/0006-live-execution-is-a-separate-decision.md)); that decision
 has since been taken, and the work is tracked in milestones M3–M5.
 
 The load-bearing constraint is that **one risk policy runs in both the backtest
-and a live session** ([ADR-0009](adr/0009-one-risk-policy.md)). A second risk
+and a live session** ([ADR-0009](https://github.com/wjpin84/arvo-adrs/blob/main/0009-one-risk-policy.md)). A second risk
 engine on the live side would not be a refinement — it would make every stored
 verdict a statement about a system that does not exist.
 

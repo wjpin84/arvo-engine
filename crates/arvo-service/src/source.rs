@@ -127,7 +127,7 @@ pub fn by_id(id: &str) -> Result<Box<dyn Source>, SourceError> {
 ///   split-adjusted ones. An understated edge is the safe error for a figure
 ///   whose purpose is to stop a result being believed too readily.
 ///
-/// [ADR-0013]: https://github.com/wjpin84/arvo-desktop/blob/master/docs/adr/0013-dividends-arrive-as-reinvestment.md
+/// [ADR-0013]: https://github.com/wjpin84/arvo-desktop/blob/master/https://github.com/wjpin84/arvo-adrs/blob/main/0013-dividends-arrive-as-reinvestment.md
 #[must_use]
 pub fn adjustment_across<'a>(instruments: impl IntoIterator<Item = &'a str>) -> Adjustment {
     let sources = all();
