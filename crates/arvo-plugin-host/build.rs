@@ -14,15 +14,18 @@ fn main() {
         std::env::set_var("PROTOC", protoc);
     }
 
+    // A proto edit must recompile; without this, a field added to engine.proto
+    // was invisible to every dependent until a clean build.
+    println!("cargo:rerun-if-changed=../../protos");
+
     tonic_prost_build::compile_protos("../../protos/arvo/plugin/v1/plugin.proto")
         .expect("failed to compile plugin.proto");
     tonic_prost_build::compile_protos("../../protos/arvo/source/v1/source.proto")
         .expect("failed to compile source.proto");
     tonic_prost_build::compile_protos("../../protos/arvo/signal/v1/signal.proto")
         .expect("failed to compile signal.proto");
-    // The engine's own API (ADR-0018): compiled here, where both the engine
-    // and the window can reach it, since the engine depends on the window's
-    // crate and not the reverse.
+    // The engine's own API (ADR-0018): compiled here, where the engine, the
+    // service tier and the window can all reach it.
     tonic_prost_build::compile_protos("../../protos/arvo/engine/v1/engine.proto")
         .expect("failed to compile engine.proto");
 }

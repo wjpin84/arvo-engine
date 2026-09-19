@@ -255,6 +255,7 @@ impl research_server::Research for Service {
                 .map(|plan| Strategy {
                     ranks_a_set: arvo_service::research::StrategyPlan::find(&plan.name)
                         .is_some_and(|found| found.ranks_a_set()),
+                    backtests: u32::try_from(plan.backtests).unwrap_or(u32::MAX),
                     name: plan.name,
                     label: plan.label,
                     interval: plan.interval,
