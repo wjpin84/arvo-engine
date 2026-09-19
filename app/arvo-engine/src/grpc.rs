@@ -15,9 +15,10 @@ use proto::research_server::{self, ResearchServer};
 use proto::sessions_server::{self, SessionsServer};
 use proto::{
     Advice, AttachRequest, Attachment, Attachments, Empty, Finding, FindingId, FindingSummary, Findings,
-    Instrument, Instruments, Point, ReportRequest, RunRequest, SessionId, SessionList, SessionStatus,
-    StartRequest, Strategies, Strategy,
+    Instrument, Instruments, Point, ReportRequest, RiskModel, Rules, RulesetForm, RulesetPath, Rulesets,
+    Ruleset, RunRequest, SessionId, SessionList, SessionStatus, StartRequest, Strategies,
 };
+use arvo_service::wire;
 
 /// The keys of a summary that have their own fields; everything else is
 /// `detail_json`.
@@ -247,22 +248,44 @@ impl Service {
 #[tonic::async_trait]
 impl research_server::Research for Service {
     async fn list_strategies(&self, _: Request<Empty>) -> Result<Response<Strategies>, Status> {
-        let plans = arvo_service::research::list_strategies()
-            .map_err(|err| Status::internal(err.to_string()))?;
+        let plans = arvo_service::research::list_strategies().map_err(|err| Status::internal(err.to_string()))?;
         Ok(Response::new(Strategies {
             strategies: plans
                 .into_iter()
-                .map(|plan| Strategy {
-                    ranks_a_set: arvo_service::research::StrategyPlan::find(&plan.name)
-                        .is_some_and(|found| found.ranks_a_set()),
-                    backtests: u32::try_from(plan.backtests).unwrap_or(u32::MAX),
-                    name: plan.name,
-                    label: plan.label,
-                    interval: plan.interval,
-                    premise: plan.premise,
+                .map(|plan| {
+                    let ranks_a_set = arvo_service::research::StrategyPlan::find(&plan.name)
+                        .is_some_and(|found| found.ranks_a_set());
+                    wire::strategy(plan, ranks_a_set)
                 })
                 .collect(),
         }))
+    }
+
+    async fn list_rulesets(&self, _: Request<Empty>) -> Result<Response<Rulesets>, Status> {
+        let rulesets = arvo_service::rulesets::list(self.research.root()).into_iter().map(wire::ruleset).collect();
+        Ok(Response::new(Rulesets { rulesets }))
+    }
+
+    async fn read_ruleset(&self, request: Request<RulesetPath>) -> Result<Response<RulesetForm>, Status> {
+        let path = required(&request.get_ref().path, "path")?;
+        arvo_service::rulesets::read_form(self.research.root(), path)
+            .map(|form| Response::new(wire::ruleset_form(form)))
+            .map_err(Status::invalid_argument)
+    }
+
+    async fn write_ruleset(&self, request: Request<RulesetForm>) -> Result<Response<Ruleset>, Status> {
+        let form = wire::ruleset_form_view(request.into_inner());
+        arvo_service::rulesets::write_form(self.research.root(), form)
+            .map(|written| Response::new(wire::ruleset(written)))
+            .map_err(Status::invalid_argument)
+    }
+
+    async fn list_rules(&self, _: Request<Empty>) -> Result<Response<Rules>, Status> {
+        Ok(Response::new(Rules { rules: arvo_service::rulesets::list_rules().into_iter().map(wire::rule).collect() }))
+    }
+
+    async fn get_risk_model(&self, _: Request<Empty>) -> Result<Response<RiskModel>, Status> {
+        Ok(Response::new(wire::risk_model(arvo_service::risk::view(self.research.root()))))
     }
 
     async fn list_instruments(&self, _: Request<Empty>) -> Result<Response<Instruments>, Status> {
@@ -561,6 +584,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_ruleset_written_over_the_wire_is_listed_read_back_and_runs_under_the_shipped_risk() {
+        let (_dir, address, _stop) = engine().await;
+        let mut client = ResearchClient::connect(address).await.expect("connects");
+
+        let rules = client.list_rules(with_token(Empty {}, TOKEN)).await.expect("ok").into_inner().rules;
+        let cross = rules.iter().find(|rule| rule.name == "sma_cross").expect("shipped");
+        let form = RulesetForm {
+            name: "my_cross".to_owned(),
+            rule: cross.name.clone(),
+            label: "Mine".to_owned(),
+            premise: String::new(),
+            params: cross
+                .fixed
+                .iter()
+                .map(|fixed| proto::Param { name: fixed.name.clone(), values: vec![fixed.value] })
+                .chain(cross.axes.iter().cloned())
+                .collect(),
+        };
+        let written = client.write_ruleset(with_token(form, TOKEN)).await.expect("written").into_inner();
+        assert_eq!(written.problem, None, "{written:?}");
+
+        let listed = client.list_rulesets(with_token(Empty {}, TOKEN)).await.expect("ok").into_inner().rulesets;
+        assert_eq!(listed.iter().map(|ruleset| ruleset.name.as_str()).collect::<Vec<_>>(), ["my_cross"]);
+
+        let read = client
+            .read_ruleset(with_token(RulesetPath { path: written.path.clone() }, TOKEN))
+            .await
+            .expect("read")
+            .into_inner();
+        assert_eq!(read.rule, "sma_cross");
+        let outside = client.read_ruleset(with_token(RulesetPath { path: "../x.json".to_owned() }, TOKEN)).await;
+        assert_eq!(outside.unwrap_err().code(), tonic::Code::InvalidArgument);
+
+        let risk = client.get_risk_model(with_token(Empty {}, TOKEN)).await.expect("ok").into_inner();
+        assert!(!risk.exists && risk.error.is_none(), "{risk:?}");
+        assert!(risk.model_json.starts_with('{'), "{}", risk.model_json);
+    }
+
+    #[tokio::test]
     async fn an_empty_memory_lists_nothing_and_a_missing_finding_is_not_found() {
         let (_dir, address, _stop) = engine().await;
         let mut client = ResearchClient::connect(address).await.expect("connects");
@@ -721,9 +783,16 @@ mod tests {
         // RecordFinding takes evidence in; it fetches nothing, shares nothing
         // and trades nothing, and the type has no field for a verdict.
         // AttachFile keeps bytes with a finding the caller already owns.
+        // The ruleset calls read and write files under the project's own
+        // rulesets folder, validated by `offerable` before they are written,
+        // and GetRiskModel reads the risk file: what a study will run under,
+        // never a way to change it.
         assert_eq!(
             calls,
-            ["ListStrategies", "ListInstruments", "ListFindings", "OpenFinding", "RunStudy", "RunWalkForward", "RecordFinding", "AttachFile"]
+            [
+                "ListStrategies", "ListInstruments", "ListFindings", "OpenFinding", "RunStudy", "RunWalkForward",
+                "RecordFinding", "AttachFile", "ListRulesets", "ReadRuleset", "WriteRuleset", "ListRules", "GetRiskModel",
+            ]
         );
         for forbidden in ["Fetch", "Order", "Trade", "Share", "Import", "Key", "Sign", "Session", "Halt"] {
             assert!(!calls.iter().any(|call| call.contains(forbidden)), "{forbidden}");

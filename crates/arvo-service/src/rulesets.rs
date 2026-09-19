@@ -191,6 +191,52 @@ pub fn template(plan: &StrategyPlan, name: &str) -> StrategyDocument {
 }
 
 /// Arvo's own rules, with the numbers each takes: what a ruleset starts from.
+/// A ruleset's parts, for the form. A `rules` document (#160) has no grid
+/// to show and is left to the editor.
+///
+/// # Errors
+///
+/// A path outside the rulesets folder, or a file that cannot be read as a
+/// grid ruleset.
+pub fn read_form(root: &Path, relative: &str) -> Result<RulesetFormView, String> {
+    let file = root.join(relative);
+    if !file.starts_with(root.join(SUBDIR)) {
+        return Err(format!("{relative} is not a ruleset file"));
+    }
+    let document = read_one(&file)?;
+    let StrategyKind::Grid(grid) = document.kind else {
+        return Err("a rules document has no grid to edit here; open the file".to_owned());
+    };
+    let mut params: Vec<(String, Vec<f64>)> = grid.fixed.into_iter().map(|(key, value)| (key, vec![value])).collect();
+    params.extend(grid.axes);
+    params.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(RulesetFormView { name: document.name, rule: grid.rule, label: document.label, premise: document.premise, params })
+}
+
+/// Writes a ruleset from the form's parts and answers with what the picker
+/// makes of it. A parameter with one value is fixed; with several, searched.
+///
+/// # Errors
+///
+/// A parameter with no value, or as [`write`].
+pub fn write_form(root: &Path, form: RulesetFormView) -> Result<RulesetView, String> {
+    let mut fixed = std::collections::BTreeMap::new();
+    let mut axes = std::collections::BTreeMap::new();
+    for (key, values) in form.params {
+        match values.as_slice() {
+            [] => return Err(format!("{key} has no value; give it one to fix it or several to search")),
+            [one] => {
+                fixed.insert(key, *one);
+            }
+            _ => {
+                axes.insert(key, values);
+            }
+        }
+    }
+    let optional = |text: String| if text.trim().is_empty() { None } else { Some(text) };
+    write(root, &form.name, &form.rule, fixed, axes, optional(form.label), optional(form.premise))
+}
+
 pub fn list_rules() -> Vec<RuleView> {
     StrategyPlan::shipped()
         .iter()

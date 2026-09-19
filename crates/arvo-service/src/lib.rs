@@ -16,6 +16,7 @@ pub mod research;
 pub mod risk;
 pub mod rulesets;
 pub mod source;
+pub mod wire;
 
 mod error;
 pub use error::CommandError;
