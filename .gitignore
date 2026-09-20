@@ -1,6 +1,5 @@
 /dist/
 /target/
-/Cargo.lock
 /build/
 # The engine, staged by arvo-runtime's build script for the bundler (#32).
 /app/arvo-runtime/binaries/
