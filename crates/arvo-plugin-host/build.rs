@@ -14,14 +14,18 @@ fn main() {
         std::env::set_var("PROTOC", protoc);
     }
 
-    // A proto edit must recompile; without this, a field added to engine.proto
-    // was invisible to every dependent until a clean build.
-    println!("cargo:rerun-if-changed=../../protos");
-
-    tonic_prost_build::compile_protos("../../protos/arvo/plugin/v1/plugin.proto")
-        .expect("failed to compile plugin.proto");
-    tonic_prost_build::compile_protos("../../protos/arvo/source/v1/source.proto")
-        .expect("failed to compile source.proto");
-    tonic_prost_build::compile_protos("../../protos/arvo/signal/v1/signal.proto")
-        .expect("failed to compile signal.proto");
+    // The provider contract is its own repository, checked out as the
+    // `extension` submodule: this side implements what a provider calls and
+    // must not carry a copy that can drift from it.
+    println!("cargo:rerun-if-changed=../../extension/proto");
+    let root = "../../extension/proto";
+    assert!(
+        std::path::Path::new(root).is_dir(),
+        "no provider protos under {root}; run `git submodule update --init`"
+    );
+    for file in ["arvo/plugin/v1/plugin.proto", "arvo/source/v1/source.proto", "arvo/signal/v1/signal.proto"] {
+        tonic_prost_build::configure()
+            .compile_protos(&[format!("{root}/{file}")], &[root.to_owned()])
+            .unwrap_or_else(|err| panic!("failed to compile {file}: {err}"));
+    }
 }

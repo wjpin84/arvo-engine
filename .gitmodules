@@ -1,3 +1,6 @@
 [submodule "contract"]
 	path = contract
 	url = https://github.com/wjpin84/arvo-engine-api.git
+[submodule "extension"]
+	path = extension
+	url = https://github.com/wjpin84/arvo-extension-api.git
