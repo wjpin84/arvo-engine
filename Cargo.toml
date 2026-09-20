@@ -7,8 +7,6 @@ members = [
     "crates/arvo-risk",
     "crates/arvo-plugin-host",
     "crates/arvo-service",
-    "crates/arvo-api",
-    "crates/arvo-client",
     "crates/arvo-schedule",
     "crates/arvo-mcp",
     "crates/arvo-oauth",
@@ -24,6 +22,9 @@ members = [
     "app/arvo-mcp-server",
     "app/arvo-engine",
 ]
+# The contract's own workspace, checked out as a submodule; its crates are
+# path dependencies below and members of nothing here.
+exclude = ["contract"]
 
 # Single source of truth for versions shared across crates, so a bump happens
 # once rather than per-manifest.
@@ -41,7 +42,7 @@ arvo-yfinance = { path = "integrations/arvo-yfinance" }
 arvo-data = { path = "crates/arvo-data" }
 arvo-mcp = { path = "crates/arvo-mcp" }
 arvo-oauth = { path = "crates/arvo-oauth" }
-arvo-api = { path = "crates/arvo-api" }
+arvo-api = { path = "contract/rust/arvo-api" }
 arvo-window = { path = "app/arvo-window" }
 arvo-nautilus = { path = "engines/arvo-nautilus" }
 arvo-portfolio = { path = "crates/arvo-portfolio" }
@@ -49,7 +50,7 @@ arvo-research = { path = "crates/arvo-research" }
 arvo-risk = { path = "crates/arvo-risk" }
 arvo-plugin-host = { path = "crates/arvo-plugin-host" }
 arvo-service = { path = "crates/arvo-service" }
-arvo-client = { path = "crates/arvo-client" }
+arvo-client = { path = "contract/rust/arvo-client" }
 arvo-schedule = { path = "crates/arvo-schedule" }
 
 anyhow = "1.0.104"

@@ -110,8 +110,9 @@ app/           the desktop application
 | `integrations/arvo-yfinance` | A second opinion, and dividends |
 | `integrations/arvo-alpaca` | Bars and corporate actions, on two feeds |
 | `app/arvo-runtime` | The Tauri host, the source registry, commands |
-| `crates/arvo-api` | The contract's types, generated from `contract/protos`. Messages only, no tonic, so the WebAssembly editor can link it |
-| `crates/arvo-client` | The contract's service stubs, and where to find the engine. Adds the gRPC transport to `arvo-api` |
+| `contract/rust/arvo-api` | The contract's types, from the contract repository (a submodule). Messages only, no tonic, so the WebAssembly editor can link it |
+| `contract/rust/arvo-client` | The contract's service stubs and discovery, from the same place. Adds the gRPC transport to `arvo-api` |
+| `app/arvo-window` | The shapes the window and its editor agree on and the engine never sees |
 | `app/arvo-editor` | The Leptos workbench |
 | `app/arvo-mcp-server` | Arvo as a stdio MCP server: an agent reads and runs research, never trades |
 | `app/arvo-engine` | The engine's local gRPC API and the research tier every non-window front end shares ([ADR-0018](https://github.com/wjpin84/arvo-adrs/blob/main/0018-arvo-keeps-running-when-the-window-closes.md)) |
