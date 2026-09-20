@@ -1,16 +1,25 @@
 [package]
 name = "arvo-mcp-server"
-description = "Arvo as an MCP server over stdio: an agent can read research memory and run studies, never trade."
+description = "Arvo as an MCP server over stdio: an agent can read research memory and run studies, never trade. A client of the engine's API."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-# The research tier itself: the same code a script reaches over the engine's
-# gRPC API, so an agent's run and a script's run are one run (ADR-0018).
-arvo-engine = { path = "../arvo-engine" }
-arvo-service.workspace = true
+# A front end of the engine, like the window and the Python client (#151):
+# it holds the research token and reaches nothing the `Research` service
+# does not offer. It links no engine crate, and that is the boundary.
+arvo-api.workspace = true
+arvo-client.workspace = true
+serde.workspace = true
 serde_json = "1"
+tokio.workspace = true
+tonic.workspace = true
 
 [dev-dependencies]
+# An engine in process, for the tests that need one to talk to. A test
+# dependency only: the server itself does not link the engine.
+arvo-engine = { path = "../arvo-engine" }
+arvo-schedule.workspace = true
+arvo-service.workspace = true
 tempfile = "3"

@@ -116,7 +116,7 @@ fn every_shipped_rule_trades_under_the_shipped_risk_model() {
     )
     .expect("ordered");
 
-    for offered in list_strategies().expect("listing the menu never fails") {
+    for offered in list_strategies(std::path::Path::new("")).expect("listing the menu never fails") {
         let plan = StrategyPlan::find(&offered.name).expect("the menu names real plans");
         // An option plan trades a chain this stock fixture does not have, and
         // ships no stop by design: the engine refuses one for a chain rule.

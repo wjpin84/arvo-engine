@@ -166,7 +166,7 @@ fn same_day_chain() -> (InMemoryBars, DateRange) {
 
 #[test]
 fn every_shipped_option_rule_runs_reconciles_and_trades_on_a_chain() {
-    let options: Vec<(String, &StrategyPlan)> = list_strategies()
+    let options: Vec<(String, &StrategyPlan)> = list_strategies(std::path::Path::new(""))
         .expect("listing the menu never fails")
         .into_iter()
         .map(|offered| {

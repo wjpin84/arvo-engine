@@ -2,12 +2,19 @@
 //!
 //!     arvo-mcp-server [<app-data-dir>] [--agent NAME]
 //!
-//! An agent can read research memory and run studies against the same data
-//! and evidence folders the window uses. It cannot fetch, share, or reach a
-//! broker: no tool here names a credential, a source or an order. See
-//! [`server`] for what is offered and why.
+//! An agent can read research memory and run studies against the same engine
+//! the window uses. It cannot fetch, share, or reach a broker: no tool here
+//! names a credential, a source or an order, and the token it holds reaches
+//! only the engine's research service. See [`server`] for what is offered
+//! and why.
 //!
-//! `<data-dir>` defaults to the open project folder, else `%APPDATA%/com.arvo.desktop`.
+//! This is a client of the engine (#151, ADR-0018). It finds the engine
+//! through `engine.json` in `<app-data-dir>`, which defaults to
+//! `%APPDATA%/com.arvo.desktop`; when none is running it starts one, from
+//! `ARVO_ENGINE` or from `arvo-engine` beside this executable, and that
+//! engine keeps running after this server exits, as one engine per user
+//! means.
+//!
 //! `--agent` names who is running, for attribution and deflation; without it
 //! the client's own name from `initialize` is used.
 //!
@@ -36,21 +43,19 @@ fn run() -> Result<(), String> {
         }
         None => None,
     };
-    let root = match args.first() {
-        Some(dir) => PathBuf::from(dir),
-        None => arvo_engine::research::default_root()?,
+    let (root, explicit) = match args.first() {
+        Some(dir) => (PathBuf::from(dir), true),
+        None => (arvo_client::discovery::default_root()?, false),
     };
 
-    let mut server = server::Server::new(&root, agent);
+    let mut server = server::Server::connect(&root, explicit, agent)?;
     for line in std::io::stdin().lines() {
         let line = line.map_err(|err| format!("reading stdin: {err}"))?;
         if line.trim().is_empty() {
             continue;
         }
         if let Some(reply) = server.handle_line(&line) {
-            // Locked per reply, never across a call. Holding stdout for the
-            // session deadlocked the first study: the engine's logger thread
-            // blocked on the lock while this thread waited for the engine.
+            // Locked per reply, never across a call.
             let mut stdout = std::io::stdout().lock();
             writeln!(stdout, "{reply}").map_err(|err| format!("writing stdout: {err}"))?;
             stdout.flush().map_err(|err| format!("flushing stdout: {err}"))?;

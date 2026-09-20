@@ -714,7 +714,8 @@ impl research_server::Research for Service {
     }
 
     async fn list_strategies(&self, _: Request<Empty>) -> Result<Response<Strategies>, Status> {
-        let strategies = arvo_service::research::list_strategies().map_err(|err| Status::internal(err.to_string()))?;
+        let strategies = arvo_service::research::list_strategies(self.research.root())
+            .map_err(|err| Status::internal(err.to_string()))?;
         Ok(Response::new(Strategies { strategies }))
     }
 

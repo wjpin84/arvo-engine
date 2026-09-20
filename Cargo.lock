@@ -199,10 +199,16 @@ dependencies = [
 name = "arvo-mcp-server"
 version = "0.1.0"
 dependencies = [
+ "arvo-api",
+ "arvo-client",
  "arvo-engine",
+ "arvo-schedule",
  "arvo-service",
+ "serde",
  "serde_json",
  "tempfile",
+ "tokio",
+ "tonic",
 ]
 
 [[package]]

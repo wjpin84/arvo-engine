@@ -85,18 +85,10 @@ pub fn read_one(path: &Path) -> Result<StrategyDocument, String> {
     Ok(document)
 }
 
-/// Puts what the project and the extensions contribute in front of the
-/// picker, together. Either alone would replace the other. Handle-free, so
-/// the engine's `list_strategies` sees the project's rulesets as well.
-pub fn refresh() {
-    match crate::project::remembered() {
-        Some(root) => refresh_at(&root),
-        None => crate::research::set_contributed(&crate::extensions::contributed()),
-    }
-}
-
-/// As [`refresh`], for a root the caller names: the engine and the MCP
-/// server run over whichever folder they were given.
+/// Puts what the project under `root` and the extensions contribute in
+/// front of the picker, together. Either alone would replace the other.
+/// Always for a root the caller names: an engine runs over the folder it
+/// was given, never over whichever one the app data happens to remember.
 pub fn refresh_at(root: &Path) {
     let mut documents = crate::extensions::contributed();
     documents.extend(

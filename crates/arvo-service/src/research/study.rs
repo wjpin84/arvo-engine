@@ -224,11 +224,14 @@ pub fn panel_dataset_version(
 ///
 /// Never. Fallible only to match the shape every other command has.
 #[allow(clippy::unnecessary_wraps, reason = "uniform command signature")]
-pub fn list_strategies() -> Result<Vec<Strategy>, CommandError> {
+pub fn list_strategies(root: &std::path::Path) -> Result<Vec<Strategy>, CommandError> {
     // Arvo's own, the extensions' (#162) and the project's rulesets, from
     // one place, so the picker cannot drift from what can be run. Re-read
     // on every ask: a ruleset edited a moment ago is what the person means.
-    crate::rulesets::refresh();
+    // From `root`, the engine's own project: an engine started over another
+    // directory must not offer the rulesets of whichever folder the app
+    // data remembers, which it did.
+    crate::rulesets::refresh_at(root);
     Ok(super::offered()
         .into_iter()
         .map(|plan| Strategy {

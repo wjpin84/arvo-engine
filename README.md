@@ -73,10 +73,15 @@ cargo build --release -p arvo-mcp-server
 claude mcp add arvo -- <path-to>/target/release/arvo-mcp-server
 ```
 
-With no argument it uses the open project folder (`%APPDATA%/com.arvo.desktop`
-until one is chosen); pass a directory to use another. Runs are saved as the
-agent's findings, deflated against everything that agent has run, and every
-call is appended to `agent-audit.jsonl`.
+It is a client of the engine, like the window and the Python package
+(#151): it finds the engine through `engine.json` in the app data directory
+(`%APPDATA%/com.arvo.desktop`, or the directory given as its argument) and
+holds only the research token, so it cannot reach any service that fetches,
+holds a credential or trades. When no engine is running it starts one, from
+`ARVO_ENGINE` or from `arvo-engine` beside its own executable, and that
+engine keeps running after the agent's session ends. Runs are saved as the
+agent's findings, deflated against everything that agent has run, and the
+engine appends every run to `agent-audit.jsonl`, whichever front end asked.
 
 ## The workspace
 
