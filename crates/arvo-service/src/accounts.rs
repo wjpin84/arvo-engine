@@ -15,7 +15,7 @@
 //! The flows themselves stay vendor code. Robinhood signs in through a browser
 //! and OAuth; Alpaca is a key pair typed once.
 
-use arvo_views::{AccountView, SubAccountView};
+use arvo_api::{AccountView, SubAccountView};
 
 use crate::source::{self, Credential};
 use crate::CommandError;

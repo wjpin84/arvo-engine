@@ -24,7 +24,7 @@ use std::path::Path;
 use arvo_research::{StrategyDocument, StrategyKind};
 
 use crate::research::StrategyPlan;
-pub use arvo_views::{RuleView, RulesetFormView, RulesetView};
+pub use arvo_api::{RuleView, RulesetFormView, RulesetView};
 
 /// Where the files live, relative to the project folder.
 pub const SUBDIR: &str = "rulesets";

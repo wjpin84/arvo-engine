@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-pub use arvo_views::{FileContentView, FileEntryView, GitStatusView, ProjectFolderView, SearchHitView};
+pub use arvo_api::{FileContentView, FileEntryView, GitStatusView, ProjectFolderView, SearchHitView};
 
 /// When `path` last changed, in milliseconds since the epoch, or 0 when the
 /// file system cannot say. What a save compares against.

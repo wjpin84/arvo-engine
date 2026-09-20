@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use arvo_plugin_host::registry::{PluginRegistry, PluginStatus};
 use arvo_plugin_host::supervisor::{Launch, Restart, Supervisor};
-use arvo_views::EventView;
+use arvo_api::EventView;
 
 use arvo_schedule::Jobs;
 
@@ -117,13 +117,13 @@ impl Plugins {
     }
 
     /// Every plugin, as a front end shows it.
-    pub async fn snapshot(&self) -> Vec<arvo_views::PluginView> {
+    pub async fn snapshot(&self) -> Vec<arvo_api::PluginView> {
         self.registry.snapshot().await.iter().map(view_of).collect()
     }
 
     /// Probes every plugin now, re-plugs what they serve, and answers with the
     /// new list.
-    pub async fn refresh(&self) -> Vec<arvo_views::PluginView> {
+    pub async fn refresh(&self) -> Vec<arvo_api::PluginView> {
         self.registry.refresh().await;
         crate::source::plug(self.registry.served_sources().await);
         self.snapshot().await
@@ -146,17 +146,17 @@ impl Plugins {
     ///
     /// A name published without being declared is shown rather than dropped: a
     /// rule could read it, so a person should be able to see it.
-    pub async fn signals(&self) -> Vec<arvo_views::SignalView> {
+    pub async fn signals(&self) -> Vec<arvo_api::SignalView> {
         use arvo_plugin_host::signal;
 
         let providers = self.registry.served_signals().await;
         let declared = signal::declared(&providers);
         let published = signal::publish_into(&providers).await;
-        let mut views: Vec<arvo_views::SignalView> = declared
+        let mut views: Vec<arvo_api::SignalView> = declared
             .values()
             .map(|declaration| {
                 let held = published.get(declaration.name.as_str());
-                arvo_views::SignalView {
+                arvo_api::SignalView {
                     name: declaration.name.to_string(),
                     description: declaration.description.clone(),
                     causal: declaration.causal,
@@ -170,7 +170,7 @@ impl Plugins {
         for name in published.names() {
             if !declared.contains_key(name) {
                 let held = published.get(name.as_str());
-                views.push(arvo_views::SignalView {
+                views.push(arvo_api::SignalView {
                     name: name.to_string(),
                     description: "published without being declared".to_owned(),
                     causal: false,
@@ -188,13 +188,13 @@ impl Plugins {
 
 /// One plugin, as a front end sees it.
 ///
-/// A free function rather than a `From` impl: [`arvo_views::PluginView`] and
+/// A free function rather than a `From` impl: [`arvo_api::PluginView`] and
 /// [`arvo_plugin_host::registry::PluginEntry`] are both foreign here, so the
 /// orphan rule forbids the impl. That is the rule doing its job.
-fn view_of(entry: &arvo_plugin_host::registry::PluginEntry) -> arvo_views::PluginView {
+fn view_of(entry: &arvo_plugin_host::registry::PluginEntry) -> arvo_api::PluginView {
     let status = match &entry.status {
-        PluginStatus::Reachable(manifest) => arvo_views::PluginStatusView::reachable(manifest.name.clone(), manifest.version.clone(), manifest.capabilities.iter().map(|capability| capability.name.clone()).collect()),
-        PluginStatus::Unreachable(reason) => arvo_views::PluginStatusView::unreachable(reason.clone()),
+        PluginStatus::Reachable(manifest) => arvo_api::PluginStatusView::reachable(manifest.name.clone(), manifest.version.clone(), manifest.capabilities.iter().map(|capability| capability.name.clone()).collect()),
+        PluginStatus::Unreachable(reason) => arvo_api::PluginStatusView::unreachable(reason.clone()),
     };
-    arvo_views::PluginView { id: entry.id.clone(), address: entry.address.clone(), status: Some(status) }
+    arvo_api::PluginView { id: entry.id.clone(), address: entry.address.clone(), status: Some(status) }
 }

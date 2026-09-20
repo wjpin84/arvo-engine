@@ -43,7 +43,7 @@ use arvo_execution::{Executor, Session};
 use arvo_nautilus::{NautilusSimulation, Shadow, Side, Signal};
 use arvo_research::{DateRange, EvidenceStore, Experiment, Record, RiskGate};
 use arvo_risk::Proposal;
-use arvo_views::EventView;
+use arvo_api::EventView;
 use serde::Serialize;
 use tokio::sync::broadcast;
 

@@ -32,7 +32,7 @@ pub fn resolve(id: Option<&str>) -> Result<Box<dyn Source>, CommandError> {
 
 /// Reports an event to whoever is listening: the engine broadcasts it, the
 /// window emits it. A source failure is the only thing these commands raise.
-pub type Report<'a> = &'a (dyn Fn(arvo_views::EventView) + Send + Sync);
+pub type Report<'a> = &'a (dyn Fn(arvo_api::EventView) + Send + Sync);
 
 /// Turns a source failure into a command error, announcing a dead session on
 /// the way past.
@@ -69,7 +69,7 @@ pub fn library(service: &ResearchService) -> Result<DataLibraryView, CommandErro
                 id,
                 from: coverage.map(|(from, _)| from.to_string()),
                 to: coverage.map(|(_, to)| to.to_string()),
-                bars: arvo_views::count(bars),
+                bars: arvo_api::count(bars),
                 fingerprint,
             }
         })

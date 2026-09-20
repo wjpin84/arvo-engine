@@ -14,7 +14,7 @@
 
 use std::fmt::Write as _;
 
-use arvo_views::{
+use arvo_api::{
     MetricsView, PanelView, RecommendationView, RecordView, ReportedView, StudyView, TradeRowView,
     TradesView, WalkForwardView,
 };
@@ -45,10 +45,10 @@ pub struct ReportMeta {
 pub fn compose(view: &RecordView, meta: &ReportMeta) -> String {
     let mut out = String::new();
     match view.of.as_ref() {
-        Some(arvo_views::record_view::Of::Study(study)) => study_report(&mut out, study, meta),
-        Some(arvo_views::record_view::Of::Walkforward(walk)) => walk_report(&mut out, walk, meta),
-        Some(arvo_views::record_view::Of::Panel(panel)) => panel_report(&mut out, panel, meta),
-        Some(arvo_views::record_view::Of::Reported(reported)) => reported_report(&mut out, reported, meta),
+        Some(arvo_api::record_view::Of::Study(study)) => study_report(&mut out, study, meta),
+        Some(arvo_api::record_view::Of::Walkforward(walk)) => walk_report(&mut out, walk, meta),
+        Some(arvo_api::record_view::Of::Panel(panel)) => panel_report(&mut out, panel, meta),
+        Some(arvo_api::record_view::Of::Reported(reported)) => reported_report(&mut out, reported, meta),
         // A kind this build does not know: say so rather than render nothing.
         None => out.push_str("This finding is of a kind this build cannot read.
 "),
@@ -320,7 +320,7 @@ fn figure(out: &mut String, meta: &ReportMeta) {
     }
 }
 
-fn params(out: &mut String, chosen: &[arvo_views::NamedNumber]) {
+fn params(out: &mut String, chosen: &[arvo_api::NamedNumber]) {
     if chosen.is_empty() {
         return;
     }
@@ -510,8 +510,8 @@ mod tests {
             in_sample: "2020-01-01 to 2022-12-31".to_owned(),
             out_of_sample: "2023-01-01 to 2023-12-31".to_owned(),
             selected_params: vec![
-                arvo_views::NamedNumber { name: "fast".to_owned(), value: 20.0 },
-                arvo_views::NamedNumber { name: "slow".to_owned(), value: 50.5 },
+                arvo_api::NamedNumber { name: "fast".to_owned(), value: 20.0 },
+                arvo_api::NamedNumber { name: "slow".to_owned(), value: 50.5 },
             ],
             strategy: Some(metrics_view(0.12)),
             benchmark: Some(metrics_view(0.20)),

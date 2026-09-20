@@ -2,25 +2,25 @@
 //! The window's views on the wire.
 //!
 //! The engine answers in `engine.proto` messages and the window renders
-//! `arvo_views` types. Both crates are foreign here, so the orphan rule
+//! `arvo_api` types. Both crates are foreign here, so the orphan rule
 //! forbids `From` impls; these free functions are the one place the two
 //! shapes meet, and the engine and the window both call them, so neither can
 //! drift from the other.
 
 use crate::proto;
-use arvo_views::{AttachmentView, QuoteTick, RiskModelView, RuleView, RulesetFormView, RulesetView, StrategyView};
+use arvo_api::{AttachmentView, QuoteTick, RiskModelView, RuleView, RulesetFormView, RulesetView, StrategyView};
 
 /// The most a message may carry, both ways. A study view holds curves,
 /// ledgers and a search surface; tonic's default of four megabytes is not a
 /// fit for a finding.
 pub const MAX_MESSAGE_BYTES: usize = 64 << 20;
 
-/// A workbench view on the wire: `kind` names the `arvo_views` type, `json`
+/// A workbench view on the wire: `kind` names the `arvo_api` type, `json`
 /// is how that type serialises. The window decodes it with [`decode`].
 ///
 /// # Errors
 ///
-/// The view does not serialise, which no `arvo_views` type fails to do.
+/// The view does not serialise, which no `arvo_api` type fails to do.
 pub fn view<T: serde::Serialize>(kind: &str, value: &T) -> Result<proto::common::View, String> {
     Ok(proto::common::View { kind: kind.to_owned(), json: serde_json::to_string(value).map_err(|err| err.to_string())? })
 }

@@ -55,7 +55,7 @@ pub fn record_view(service: &ResearchService, stored: arvo_research::StoredRecor
         stored.recorded_at.to_rfc3339(),
         stored.author.agent().unwrap_or_default().to_owned(),
     );
-    let attachments: Vec<arvo_views::AttachmentView> = stored.attachments.iter().map(attachment_view).collect();
+    let attachments: Vec<arvo_api::AttachmentView> = stored.attachments.iter().map(attachment_view).collect();
     match stored.record {
         // The view carries the id it was read from, so a tab opened out of
         // History can ask for a report of the record it is showing (#159).
@@ -81,7 +81,7 @@ pub fn record_view(service: &ResearchService, stored: arvo_research::StoredRecor
                 Judgement::Evaluated(evaluation) => Some(evaluation.as_ref()),
                 Judgement::Inconclusive { .. } => None,
             };
-            RecordView::reported(arvo_views::ReportedView {
+            RecordView::reported(arvo_api::ReportedView {
                 id,
                 hypothesis: evidence.reported.hypothesis.to_string(),
                 claim: evidence.claim.clone(),
@@ -95,7 +95,7 @@ pub fn record_view(service: &ResearchService, stored: arvo_research::StoredRecor
                 verdict: format!("{:?}", evidence.verdict),
                 reasons: evidence.reasons.clone(),
                 trades: arvo_research::TradeStats::from_ledger(&evidence.reported.strategy_ledger).closed,
-                trials: evidence.reported.trials.map(arvo_views::count),
+                trials: evidence.reported.trials.map(arvo_api::count),
                 total_return: evaluated.map(|e| e.strategy.total_return),
                 excess_return: evaluated.map(|e| e.excess_return),
                 sharpe: evaluated.and_then(|e| e.strategy.sharpe),
@@ -108,8 +108,8 @@ pub fn record_view(service: &ResearchService, stored: arvo_research::StoredRecor
     }
 }
 
-pub fn attachment_view(kept: &arvo_research::memory::Attachment) -> arvo_views::AttachmentView {
-    arvo_views::AttachmentView {
+pub fn attachment_view(kept: &arvo_research::memory::Attachment) -> arvo_api::AttachmentView {
+    arvo_api::AttachmentView {
         name: kept.name.clone(),
         media_type: kept.media_type.clone(),
         hash: kept.hash.clone(),
@@ -143,7 +143,7 @@ pub fn origin_in(origin: &str, root: &std::path::Path) -> Option<(String, u32)> 
 /// the verdict, then every warning and recommendation, each with the
 /// severity the Problems panel understands.
 pub fn caveats(view: &RecordView) -> Vec<(String, String)> {
-    use arvo_views::record_view::Of;
+    use arvo_api::record_view::Of;
 
     let (verdict, reasons, recommendations): (&str, &[String], &[RecommendationView]) = match view.of.as_ref() {
         Some(Of::Study(study)) => (&study.verdict, &study.reasons, &study.recommendations),
@@ -779,8 +779,8 @@ pub fn list_history(service: &ResearchService) -> Result<HistoryView, CommandErr
                     stale: live.map(|live| live != summary.dataset_version),
                     agent: summary.agent.clone(),
                     origin: summary.origin.clone(),
-                    trials: summary.trials.map(arvo_views::count),
-                    attachments: arvo_views::count(summary.attachments),
+                    trials: summary.trials.map(arvo_api::count),
+                    attachments: arvo_api::count(summary.attachments),
                 }
             })
             .collect(),
@@ -793,7 +793,7 @@ pub fn list_history(service: &ResearchService) -> Result<HistoryView, CommandErr
 /// # Errors
 ///
 /// No such finding.
-pub fn list_attachments(service: &ResearchService, id: &str) -> Result<Vec<arvo_views::AttachmentView>, CommandError> {
+pub fn list_attachments(service: &ResearchService, id: &str) -> Result<Vec<arvo_api::AttachmentView>, CommandError> {
     let stored = service.memory.open(id).map_err(|err| CommandError::Failed(err.to_string()))?;
     Ok(stored.attachments.iter().map(attachment_view).collect())
 }
@@ -808,7 +808,7 @@ pub fn list_attachments(service: &ResearchService, id: &str) -> Result<Vec<arvo_
 pub fn list_research_problems(
     service: &ResearchService,
     root: &std::path::Path,
-) -> Result<Vec<arvo_views::ResearchProblemView>, CommandError> {
+) -> Result<Vec<arvo_api::ResearchProblemView>, CommandError> {
     let (summaries, _) = service.memory.summaries().map_err(|err| CommandError::Failed(err.to_string()))?;
     // The latest finding per call site: a line re-run replaces what it said.
     let mut latest: std::collections::HashMap<(String, u32), &arvo_research::Summary> = std::collections::HashMap::new();
@@ -827,7 +827,7 @@ pub fn list_research_problems(
     for ((path, line), summary) in latest {
         let Some(stored) = loaded.records.iter().find(|stored| stored.id == summary.id) else { continue };
         let view = record_view(service, stored.clone());
-        out.extend(caveats(&view).into_iter().map(|(severity, message)| arvo_views::ResearchProblemView {
+        out.extend(caveats(&view).into_iter().map(|(severity, message)| arvo_api::ResearchProblemView {
             path: path.clone(),
             line,
             severity,

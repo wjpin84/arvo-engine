@@ -7,11 +7,11 @@ members = [
     "crates/arvo-risk",
     "crates/arvo-plugin-host",
     "crates/arvo-service",
+    "crates/arvo-api",
     "crates/arvo-client",
     "crates/arvo-schedule",
     "crates/arvo-mcp",
     "crates/arvo-oauth",
-    "app/arvo-views",
     "engines/arvo-nautilus",
     "crates/arvo-portfolio",
     "app/arvo-editor",
@@ -40,7 +40,7 @@ arvo-yfinance = { path = "integrations/arvo-yfinance" }
 arvo-data = { path = "crates/arvo-data" }
 arvo-mcp = { path = "crates/arvo-mcp" }
 arvo-oauth = { path = "crates/arvo-oauth" }
-arvo-views = { path = "app/arvo-views" }
+arvo-api = { path = "crates/arvo-api" }
 arvo-nautilus = { path = "engines/arvo-nautilus" }
 arvo-portfolio = { path = "crates/arvo-portfolio" }
 arvo-research = { path = "crates/arvo-research" }

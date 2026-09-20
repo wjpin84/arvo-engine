@@ -52,12 +52,12 @@ use arvo_research::{
     Metrics, ParameterGrid, SimulationProvider, StrategyDocument, StrategySpec, Verdict,
 };
 
-// The view shapes live in `arvo-views` so the window cannot drift from
+// The view shapes live in `arvo-api` so the window cannot drift from
 // them. See that crate for what two hand-mirrored copies cost.
 //
 // `pub use`, not `use`: these are re-exported as this module's own surface
 // and `tests/chart_alignment.rs` reaches them through it.
-pub use arvo_views::{
+pub use arvo_api::{
     AttachmentView, EventKindView, EventView, ResearchProblemView, SeverityView, TradeRowExport,
     BookView, BreadthView, CandlePoint, ComparisonRowView, ComparisonView, CurvePoint,
     AfterTaxView, DataFindingView, DataLibraryView, DivergenceView, DividendGapView, FetchView, FoldView,

@@ -25,7 +25,7 @@ use proto::portfolio::{PortfolioName};
 use proto::research::{Advice, AttachRequest, Attachment, AttachmentRef, Attachments, BookRequest, Finding, FindingId, FindingIds, FindingSummary, Findings, Point, ReportFigure, ReportRequest, RiskModel, Rules, Ruleset, RulesetForm, RulesetPath, Rulesets, RunRequest, SharedExperiment, Strategies, StudyRequest, TradeExport};
 use proto::session::{SessionId, SessionList, SessionStatus, StartRequest};
 use arvo_client::wire;
-use arvo_views::EventView;
+use arvo_api::EventView;
 
 /// The keys of a summary that have their own fields; everything else is
 /// `detail_json`.
@@ -64,7 +64,7 @@ pub struct Engine {
     pub jobs: arvo_schedule::Jobs,
     pub plugins: arvo_service::plugins::Plugins,
     pub stream: arvo_service::stream::Stream,
-    pub ticks: tokio::sync::broadcast::Sender<arvo_views::QuoteTick>,
+    pub ticks: tokio::sync::broadcast::Sender<arvo_api::QuoteTick>,
     /// Sent when a front end asks this engine to stop. `serve` waits on the
     /// other half alongside whatever `shutdown` it was given.
     pub stop: tokio::sync::oneshot::Sender<()>,
@@ -189,7 +189,7 @@ struct Market {
     portfolios: std::sync::Arc<arvo_service::portfolio::PortfolioService>,
     events: tokio::sync::broadcast::Sender<EventView>,
     stream: std::sync::Arc<arvo_service::stream::Stream>,
-    ticks: tokio::sync::broadcast::Sender<arvo_views::QuoteTick>,
+    ticks: tokio::sync::broadcast::Sender<arvo_api::QuoteTick>,
 }
 
 impl Market {
@@ -413,7 +413,7 @@ impl research_files_server::ResearchFiles for ResearchFiles {
 
     async fn export_trades(&self, request: Request<TradeExport>) -> Result<Response<ExportedPath>, Status> {
         let TradeExport { name, rows_json } = request.into_inner();
-        let rows: Vec<arvo_views::TradeRowExport> =
+        let rows: Vec<arvo_api::TradeRowExport> =
             serde_json::from_str(&rows_json).map_err(|err| Status::invalid_argument(format!("rows_json: {err}")))?;
         let path = arvo_service::research::history::export_trades(&self.workbench, &name, &rows).map_err(refused)?;
         Ok(Response::new(ExportedPath { path }))
@@ -1193,7 +1193,7 @@ mod tests {
         let refused = accounts.list_accounts(with_token(Empty {}, TOKEN)).await.unwrap_err();
         assert_eq!(refused.code(), tonic::Code::Unauthenticated);
         let listed = accounts.list_accounts(with_token(Empty {}, CONTROL)).await.expect("ok").into_inner();
-        let decoded: Vec<arvo_views::AccountView> = wire::decode(listed).expect("decodes");
+        let decoded: Vec<arvo_api::AccountView> = wire::decode(listed).expect("decodes");
         assert!(decoded.iter().any(|account| account.id == "alpaca"), "{decoded:?}");
 
         // Refused before any browser could open, so this stays offline.

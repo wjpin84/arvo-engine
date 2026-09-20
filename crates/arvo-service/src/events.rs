@@ -19,7 +19,7 @@
 //! duplicating it was the alternative.
 
 use arvo_core::events::{Event, StatusKind};
-use arvo_views::{EventKindView, EventView, SeverityView};
+use arvo_api::{EventKindView, EventView, SeverityView};
 
 /// The registry's own event, in the shape the window reads.
 pub fn plugin(event: &Event) -> EventView {

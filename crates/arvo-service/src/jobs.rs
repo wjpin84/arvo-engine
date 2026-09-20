@@ -13,7 +13,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use arvo_views::EventView;
+use arvo_api::EventView;
 
 use crate::research::ResearchService;
 use arvo_schedule::Jobs;

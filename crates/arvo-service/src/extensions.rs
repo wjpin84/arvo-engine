@@ -115,8 +115,8 @@ fn contributed_in(dir: &Path, disabled: &BTreeSet<String>) -> Vec<(String, arvo_
 /// Here rather than in the window because the answer is `offerable`'s: what
 /// the picker can run is this side's question.
 #[must_use]
-pub fn strategy_view(extension: &str, value: &serde_json::Value) -> arvo_views::StrategyContributionView {
-    let unreadable = |reason: String| arvo_views::StrategyContributionView {
+pub fn strategy_view(extension: &str, value: &serde_json::Value) -> arvo_api::StrategyContributionView {
+    let unreadable = |reason: String| arvo_api::StrategyContributionView {
         id: format!("{extension}.?"),
         label: String::new(),
         premise: String::new(),
@@ -133,7 +133,7 @@ pub fn strategy_view(extension: &str, value: &serde_json::Value) -> arvo_views::
         arvo_research::StrategyKind::Grid(grid) => ("grid", grid.configurations()),
         arvo_research::StrategyKind::Rules(_) => ("rules", 0),
     };
-    arvo_views::StrategyContributionView {
+    arvo_api::StrategyContributionView {
         // Namespaced by its extension, as a theme is: two catalogs may both
         // ship a `fast-cross`.
         id: namespaced(extension, &document.name),
@@ -141,7 +141,7 @@ pub fn strategy_view(extension: &str, value: &serde_json::Value) -> arvo_views::
         premise: document.premise.clone(),
         kind: kind.to_owned(),
         interval: document.interval.to_string(),
-        configurations: arvo_views::count(configurations),
+        configurations: arvo_api::count(configurations),
         problem: crate::research::offerable(&document).err(),
     }
 }
@@ -207,7 +207,7 @@ pub fn launches() -> Vec<(String, arvo_plugin_host::supervisor::Launch)> {
 /// this side of the wire. A front end renders the rows; it does not decide
 /// which of them work.
 #[must_use]
-pub fn contributed_views() -> std::collections::BTreeMap<String, Vec<arvo_views::StrategyContributionView>> {
+pub fn contributed_views() -> std::collections::BTreeMap<String, Vec<arvo_api::StrategyContributionView>> {
     let mut out = std::collections::BTreeMap::new();
     let Ok(dir) = root() else { return out };
     let Ok(entries) = std::fs::read_dir(&dir) else { return out };

@@ -26,7 +26,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use arvo_views::JobView;
+use arvo_api::JobView;
 use chrono::{DateTime, Local, Utc};
 
 /// When a job runs.

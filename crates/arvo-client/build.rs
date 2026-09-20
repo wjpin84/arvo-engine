@@ -1,3 +1,15 @@
+//! The contract's services, generated here.
+//!
+//! Only the services. Their request and response types are generated once, by
+//! `arvo-api`, and `extern_path` points the stubs at that crate rather than
+//! emitting a second copy of every message: prost generates one Rust module
+//! per proto package, so two crates compiling `arvo.research.v1` would define
+//! `RunRequest` twice and the window would spend its life converting one into
+//! the other.
+//!
+//! The division is what lets the editor link `arvo-api` alone. It compiles to
+//! WebAssembly, where the gRPC transport this crate brings does not build.
+
 fn main() {
     // protoc is vendored rather than required on the machine, as in
     // arvo-plugin-host.
@@ -13,25 +25,21 @@ fn main() {
     // each generate from rather than sharing a crate.
     println!("cargo:rerun-if-changed=../../contract/protos");
     let root = std::path::Path::new("../../contract/protos");
-    let files: Vec<std::path::PathBuf> = walk(root).filter(|p| p.extension().is_some_and(|e| e == "proto")).collect();
-    assert!(!files.is_empty(), "no protos under {}; run `git submodule update --init`", root.display());
-    tonic_prost_build::configure()
-        // One file with the whole module tree: a package that names a type in
-        // another is generated as a path through it, so the modules have to
-        // mirror the package names rather than be flattened by hand.
-        .include_file("arvo.rs")
-        // The views reach the editor over Tauri's bridge, which is JSON, so the
-        // generated types carry serde as well as prost.
-        .type_attribute(".arvo.views.v1", "#[derive(serde::Serialize, serde::Deserialize)]")
+    let services = root.join("arvo/services/v1");
+    let files: Vec<std::path::PathBuf> = std::fs::read_dir(&services)
+        .expect("the contract is checked out; run `git submodule update --init`")
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|e| e == "proto"))
+        .collect();
+    assert!(!files.is_empty(), "no service protos under {}", services.display());
+    let mut config = tonic_prost_build::configure();
+    for domain in ["common", "market", "platform", "portfolio", "research", "session"] {
+        config = config.extern_path(format!(".arvo.{domain}.v1"), format!("::arvo_api::{domain}"));
+    }
+    config
+        .build_client(true)
+        .build_server(true)
         .compile_protos(&files, &[root.to_path_buf()])
         .expect("failed to compile the engine API");
-}
-
-/// Every file under `dir`, depth first.
-fn walk(dir: &std::path::Path) -> Box<dyn Iterator<Item = std::path::PathBuf>> {
-    let Ok(entries) = std::fs::read_dir(dir) else { return Box::new(std::iter::empty()) };
-    Box::new(entries.flatten().flat_map(|entry| {
-        let path = entry.path();
-        if path.is_dir() { walk(&path) } else { Box::new(std::iter::once(path)) }
-    }))
 }

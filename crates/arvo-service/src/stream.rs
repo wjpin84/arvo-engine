@@ -35,7 +35,7 @@
 
 use std::time::Duration;
 
-use arvo_views::{EventView, QuoteTick};
+use arvo_api::{EventView, QuoteTick};
 use futures_util::{SinkExt, StreamExt};
 use prost::Message as _;
 use tokio::sync::{broadcast, watch};

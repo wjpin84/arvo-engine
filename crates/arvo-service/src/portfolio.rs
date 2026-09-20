@@ -15,9 +15,9 @@ use arvo_portfolio::{
     history::{latest_change, SnapshotStore},
     PriceSource, ValuedPortfolio,
 };
-// The view shapes live in `arvo-views` so the window cannot drift from
+// The view shapes live in `arvo-api` so the window cannot drift from
 // them. See that crate for what two hand-mirrored copies cost.
-pub use arvo_views::{ChangeView, HoldingView, ImportView, PortfolioLibraryView, PortfolioView, ValuePoint};
+pub use arvo_api::{ChangeView, HoldingView, ImportView, PortfolioLibraryView, PortfolioView, ValuePoint};
 
 use crate::source;
 use crate::CommandError;
@@ -413,7 +413,7 @@ fn view_of(
         total_cost: valued.total_cost,
         unrealized: valued.unrealized,
         unrealized_pct: valued.unrealized_pct,
-        without_cost_basis: arvo_views::count(valued.without_cost_basis),
+        without_cost_basis: arvo_api::count(valued.without_cost_basis),
         cash: valued.cash,
         holdings: valued
             .holdings
@@ -457,10 +457,10 @@ fn view_of(
             columns: report
                 .columns
                 .iter()
-                .map(|(name, value)| arvo_views::NamedText { name: name.clone(), value: value.clone() })
+                .map(|(name, value)| arvo_api::NamedText { name: name.clone(), value: value.clone() })
                 .collect(),
             ignored: report.ignored.clone(),
-            rows_imported: arvo_views::count(report.rows_imported),
+            rows_imported: arvo_api::count(report.rows_imported),
             rows_skipped: report.rows_skipped.clone(),
             cost_basis_derived: report.cost_basis_derived,
         }),

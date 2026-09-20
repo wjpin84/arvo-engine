@@ -1,7 +1,7 @@
 //! Engine types as the window sees them.
 //!
 //! Free functions rather than `From` impls throughout: the view shapes live in
-//! `arvo-views` and the engine types in `arvo-research`, so neither is local
+//! `arvo-api` and the engine types in `arvo-research`, so neither is local
 //! here and the orphan rule forbids the impl. That is the rule doing its job —
 //! the conversion is this crate's business and belongs in this crate.
 
@@ -10,7 +10,7 @@ use super::*;
 /// A metrics summary, as the window sees it.
 ///
 /// A free function rather than a `From` impl: [`MetricsView`] lives in
-/// `arvo-views` and `Metrics` in `arvo-research`, so neither is local here and
+/// `arvo-api` and `Metrics` in `arvo-research`, so neither is local here and
 /// the orphan rule forbids the impl.
 pub fn metrics_view(metrics: &Metrics) -> MetricsView {
 
@@ -436,8 +436,8 @@ pub fn study_view(
         members: members(&found.selected, &evaluation.strategy_ledger),
         verdict: verdict_label(found.verdict).to_owned(),
         reasons: found.reasons.clone(),
-        trials: arvo_views::count(found.selection.trials),
-        prior_trials: arvo_views::count(found.selection.prior_trials),
+        trials: arvo_api::count(found.selection.trials),
+        prior_trials: arvo_api::count(found.selection.prior_trials),
         best_sharpe: found.selection.best_sharpe,
         expected_best_under_null: found.selection.expected_best_under_null,
         survived_deflation: found.selection.survived_deflation,
@@ -449,7 +449,7 @@ pub fn study_view(
             .strategy
             .params
             .iter()
-            .map(|(name, value)| arvo_views::NamedNumber { name: name.clone(), value: *value })
+            .map(|(name, value)| arvo_api::NamedNumber { name: name.clone(), value: *value })
             .collect(),
         strategy: Some(metrics_view(&evaluation.strategy)),
         benchmark: Some(metrics_view(&evaluation.benchmark)),
@@ -563,7 +563,7 @@ pub fn walk_forward_view(
                         .filter(|(name, _)| {
                             found.stability.iter().any(|axis| &axis.axis == *name)
                         })
-                        .map(|(name, value)| arvo_views::NamedNumber { name: name.clone(), value: *value })
+                        .map(|(name, value)| arvo_api::NamedNumber { name: name.clone(), value: *value })
                         .collect(),
                     strategy_return: evaluation.strategy.total_return,
                     benchmark_return: evaluation.benchmark.total_return,
@@ -572,14 +572,14 @@ pub fn walk_forward_view(
                 }
             })
             .collect(),
-        folds_surviving_deflation: arvo_views::count(found.folds_surviving_deflation),
-        folds_without_trades: arvo_views::count(found.folds_without_trades),
+        folds_surviving_deflation: arvo_api::count(found.folds_surviving_deflation),
+        folds_without_trades: arvo_api::count(found.folds_without_trades),
         stability: found
             .stability
             .iter()
             .map(|axis| StabilityView {
                 axis: axis.axis.clone(),
-                distinct: arvo_views::count(axis.distinct),
+                distinct: arvo_api::count(axis.distinct),
                 modal: axis.modal,
                 modal_share: axis.modal_share,
             })
@@ -691,14 +691,14 @@ pub fn dividend_gap_view(
     excess_return: f64,
 ) -> Option<DividendGapView> {
     gap.map(|gap| DividendGapView {
-        events: arvo_views::count(gap.events),
+        events: arvo_api::count(gap.events),
         strategy_income: gap.strategy_income,
         benchmark_income: gap.benchmark_income,
         overstatement: gap.overstatement,
         corrected_excess: gap.corrected_excess(excess_return),
         complete: gap.complete(),
-        covered: arvo_views::count(gap.covered),
-        instruments: arvo_views::count(gap.instruments),
+        covered: arvo_api::count(gap.covered),
+        instruments: arvo_api::count(gap.instruments),
     })
 }
 
@@ -726,10 +726,10 @@ pub fn panel_view(found: &arvo_research::PanelEvidence, engine: &str) -> PanelVi
             found,
             &arvo_research::EvaluationCriteria::default(),
         )),
-        instruments: arvo_views::count(found.pooled.instruments),
+        instruments: arvo_api::count(found.pooled.instruments),
         total_trades: found.pooled.total_trades,
         mean_excess_return: found.pooled.mean_excess_return,
-        beat_benchmark: arvo_views::count(found.pooled.beat_benchmark),
+        beat_benchmark: arvo_api::count(found.pooled.beat_benchmark),
         mean_max_drawdown: found.pooled.mean_max_drawdown,
         book: found.book.as_ref().map(|metrics| BookView {
             metrics: Some(metrics_view(metrics)),
@@ -743,8 +743,8 @@ pub fn panel_view(found: &arvo_research::PanelEvidence, engine: &str) -> PanelVi
             correlations: breadth
                 .correlations
                 .iter()
-                .map(|row| arvo_views::CorrelationRow {
-                    cells: row.iter().map(|cell| arvo_views::OptionalDouble { value: *cell }).collect(),
+                .map(|row| arvo_api::CorrelationRow {
+                    cells: row.iter().map(|cell| arvo_api::OptionalDouble { value: *cell }).collect(),
                 })
                 .collect(),
             mean_correlation: breadth.mean_correlation,
@@ -752,7 +752,7 @@ pub fn panel_view(found: &arvo_research::PanelEvidence, engine: &str) -> PanelVi
             overstatement: breadth.overstatement(),
         }),
         worst_max_drawdown: found.pooled.worst_max_drawdown,
-        trials: arvo_views::count(found.selection.trials),
+        trials: arvo_api::count(found.selection.trials),
         best_sharpe: found.selection.best_sharpe,
         expected_best_under_null: found.selection.expected_best_under_null,
         survived_deflation: found.selection.survived_deflation,
@@ -761,7 +761,7 @@ pub fn panel_view(found: &arvo_research::PanelEvidence, engine: &str) -> PanelVi
         selected_params: found
             .selected_params
             .iter()
-            .map(|(name, value)| arvo_views::NamedNumber { name: name.clone(), value: *value })
+            .map(|(name, value)| arvo_api::NamedNumber { name: name.clone(), value: *value })
             .collect(),
         per_instrument: found
             .per_instrument

@@ -24,7 +24,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use arvo_research::Summary;
-use arvo_views::EventView;
+use arvo_api::EventView;
 
 use super::ResearchService;
 
