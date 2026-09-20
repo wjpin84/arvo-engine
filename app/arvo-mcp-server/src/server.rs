@@ -151,9 +151,11 @@ impl Server {
                 result(
                     id,
                     match self.call(name, &arguments) {
+                        // `structuredContent` must be an object (MCP schema);
+                        // a list goes under `items`, the text keeps the list.
                         Ok(value) => json!({
                             "content": [{ "type": "text", "text": pretty(&value) }],
-                            "structuredContent": value,
+                            "structuredContent": if value.is_array() { json!({ "items": value }) } else { value },
                             "isError": false,
                         }),
                         Err(reason) => json!({
@@ -602,11 +604,11 @@ mod tests {
 
         let listed = call(&mut server, json!({ "jsonrpc": "2.0", "id": 6, "method": "tools/call",
                                                "params": { "name": "list_rulesets", "arguments": {} } }));
-        assert_eq!(listed["result"]["structuredContent"][0]["name"], json!("agent_cross"));
+        assert_eq!(listed["result"]["structuredContent"]["items"][0]["name"], json!("agent_cross"));
 
         let strategies = call(&mut server, json!({ "jsonrpc": "2.0", "id": 8, "method": "tools/call",
                                                    "params": { "name": "list_strategies", "arguments": {} } }));
-        let names: Vec<&str> = strategies["result"]["structuredContent"]
+        let names: Vec<&str> = strategies["result"]["structuredContent"]["items"]
             .as_array()
             .expect("a list")
             .iter()
