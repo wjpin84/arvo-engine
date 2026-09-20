@@ -68,7 +68,10 @@ pub use generated::arvo::{
 /// always fills this", in one place, instead of at every reader.
 mod ergonomics {
     use super::{
-        platform::plugin_status_view, research::record_view,
+        platform::{event_kind_view, plugin_status_view},
+        research::record_view,
+        EventKindView, EventView, FeedEvent, FindingsEvent, PluginEvent, SessionEvent, SeverityView,
+        StreamEvent,
         BookView, ImportView, MetricsView, PanelView, PluginStatusView, PluginStatusViewReachable,
         PluginStatusViewUnreachable, PluginView, PortfolioView, RecordView, ReportedView, StudyView,
         TradesView, WalkForwardView,
@@ -155,6 +158,52 @@ mod ergonomics {
         #[must_use]
         pub fn unreachable(reason: String) -> Self {
             Self { of: Some(plugin_status_view::Of::Unreachable(PluginStatusViewUnreachable { reason })) }
+        }
+    }
+
+    impl EventKindView {
+        /// A plugin became reachable, or stopped being.
+        #[must_use]
+        pub fn plugin(id: String, reachable: bool) -> Self {
+            Self { of: Some(event_kind_view::Of::Plugin(PluginEvent { id, reachable })) }
+        }
+
+        /// A broker connection came up or went away.
+        #[must_use]
+        pub fn feed(id: String, connected: bool) -> Self {
+            Self { of: Some(event_kind_view::Of::Feed(FeedEvent { id, connected })) }
+        }
+
+        /// The live price stream stopped or came back.
+        #[must_use]
+        pub fn stream(live: bool) -> Self {
+            Self { of: Some(event_kind_view::Of::Stream(StreamEvent { live })) }
+        }
+
+        /// Stored findings went stale.
+        #[must_use]
+        pub fn findings(count: u32) -> Self {
+            Self { of: Some(event_kind_view::Of::Findings(FindingsEvent { count })) }
+        }
+
+        /// A trading session changed state.
+        #[must_use]
+        pub fn session(id: String, state: String) -> Self {
+            Self { of: Some(event_kind_view::Of::Session(SessionEvent { id, state })) }
+        }
+    }
+
+    impl EventView {
+        /// An event, with the kind and the text a renderer shows.
+        #[must_use]
+        pub fn new(kind: EventKindView, title: String, detail: String, severity: SeverityView) -> Self {
+            Self { kind: Some(kind), title, detail, severity: severity as i32 }
+        }
+
+        /// What happened, structurally, if the sender said.
+        #[must_use]
+        pub fn of(&self) -> Option<&event_kind_view::Of> {
+            self.kind.as_ref()?.of.as_ref()
         }
     }
 
@@ -394,28 +443,6 @@ pub struct WorkspaceView {
     /// the session: treating it as data is what stops a dockview upgrade from
     /// becoming a Rust change.
     pub layout: String,
-}
-
-/// One price, as it arrived.
-///
-/// Separate from [`QuoteView`] and deliberately thinner: a tick carries only
-/// what moved. Which rows exist, and which of them you hold, is settled once
-/// by the `watchlist` command — a stream that also decided the row set would
-/// make a socket blip look like a portfolio change.
-///
-/// `regular` is not decoration. Outside 09:30–16:00 the stream keeps sending,
-/// on thin volume and wide spreads, and a pre-market print rendered
-/// identically to a regular-session one is a worse answer than no price at
-/// all. The panel marks it; it does not hide it.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct QuoteTick {
-    /// The bare ticker, matching [`QuoteView::symbol`].
-    pub symbol: String,
-    pub price: f64,
-    /// Move since the previous close, as a fraction.
-    pub change: Option<f64>,
-    /// Whether this print happened in the regular session.
-    pub regular: bool,
 }
 
 /// The channel name the live prices arrive on.
@@ -690,65 +717,6 @@ pub struct ScriptOutputView {
 /// shape above is: a name only one side changes is a channel that goes quiet
 /// with nothing failing to compile.
 pub const EVENT_CHANNEL: &str = "arvo://event";
-
-/// Something the backend reports without being asked.
-///
-/// Everything else in this file answers a question the window put to a
-/// command. This is the other direction — what happened while nobody was
-/// looking: a plugin dropped, a broker session ended.
-///
-/// # Why the text is in the payload
-///
-/// `title` and `detail` are filled in by the backend rather than derived from
-/// `kind` by whoever renders it. There are two renderers — the OS
-/// notification and the in-app alerts list — and text derived twice is text
-/// that drifts. `kind` is left for what a renderer needs *structurally*: the
-/// status bar needs to know a feed is down, not how to phrase it.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct EventView {
-    pub kind: EventKindView,
-    pub title: String,
-    pub detail: String,
-    pub severity: SeverityView,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "of")]
-pub enum EventKindView {
-    Plugin { id: String, reachable: bool },
-    /// A broker connection came up or went away. `connected: false` covers
-    /// both signing out and a session that expired underneath you — which of
-    /// the two it was is in `detail`, because the difference matters to a
-    /// person reading it and not at all to the status bar.
-    Feed { id: String, connected: bool },
-    /// The live price stream stopped or came back.
-    ///
-    /// Its own variant rather than another `Feed`: the status bar reads
-    /// `Feed` to decide whether a broker session is held, and a price socket
-    /// dropping says nothing about that. Folding the two together would have
-    /// a Yahoo reconnect claim you had been signed out of your broker.
-    ///
-    /// Worth an event at all because the failure is otherwise invisible: a
-    /// dead socket looks exactly like a market where nothing is trading.
-    Stream { live: bool },
-    /// Stored findings went stale since they were last checked — their data
-    /// changed or disappeared. `count` is how many were newly so.
-    Findings { count: usize },
-    /// A trading session changed state: starting, running, stopped, halted
-    /// or failed.
-    Session { id: String, state: String },
-}
-
-/// Whether this is worth interrupting someone for.
-///
-/// The one thing that decides it: `Warning` raises an OS notification,
-/// `Info` only lands in the alerts list. Both are always recorded, so the
-/// distinction costs nothing but noise.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub enum SeverityView {
-    Info,
-    Warning,
-}
 
 #[cfg(test)]
 mod tests {

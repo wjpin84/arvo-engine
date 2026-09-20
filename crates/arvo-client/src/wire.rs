@@ -1,51 +1,21 @@
 
-//! The window's views on the wire.
+//! Where a contract message and a hand-written `arvo_api` type meet.
 //!
-//! The engine answers in `engine.proto` messages and the window renders
-//! `arvo_api` types. Both crates are foreign here, so the orphan rule
-//! forbids `From` impls; these free functions are the one place the two
-//! shapes meet, and the engine and the window both call them, so neither can
-//! drift from the other.
+//! Both crates are foreign here, so the orphan rule forbids `From` impls;
+//! these free functions are the one place the two shapes meet, and the engine
+//! and the window both call them, so neither can drift from the other.
+//!
+//! Every shape still listed here is one the contract does not define yet.
+//! When it does, the pair for it goes away — as the `View { kind, json }`
+//! envelope did once every call named the message it answers with.
 
 use crate::proto;
-use arvo_api::{AttachmentView, QuoteTick, RiskModelView, RuleView, RulesetFormView, RulesetView, StrategyView};
+use arvo_api::{AttachmentView, RiskModelView, RuleView, RulesetFormView, RulesetView, StrategyView};
 
 /// The most a message may carry, both ways. A study view holds curves,
 /// ledgers and a search surface; tonic's default of four megabytes is not a
 /// fit for a finding.
 pub const MAX_MESSAGE_BYTES: usize = 64 << 20;
-
-/// A workbench view on the wire: `kind` names the `arvo_api` type, `json`
-/// is how that type serialises. The window decodes it with [`decode`].
-///
-/// # Errors
-///
-/// The view does not serialise, which no `arvo_api` type fails to do.
-pub fn view<T: serde::Serialize>(kind: &str, value: &T) -> Result<proto::common::View, String> {
-    Ok(proto::common::View { kind: kind.to_owned(), json: serde_json::to_string(value).map_err(|err| err.to_string())? })
-}
-
-/// A view back from the wire, as the type the caller expects.
-///
-/// # Errors
-///
-/// The engine answered with another type or another version of this one;
-/// the message names both kinds.
-pub fn decode<T: serde::de::DeserializeOwned>(wire: proto::common::View) -> Result<T, String> {
-    serde_json::from_str(&wire.json).map_err(|err| {
-        format!("the engine answered with a {} this build cannot read ({err}); are the two the same version?", wire.kind)
-    })
-}
-
-#[must_use]
-pub fn quote_tick(view: QuoteTick) -> proto::market::QuoteTick {
-    proto::market::QuoteTick { symbol: view.symbol, price: view.price, change: view.change, regular: view.regular }
-}
-
-#[must_use]
-pub fn quote_tick_view(wire: proto::market::QuoteTick) -> QuoteTick {
-    QuoteTick { symbol: wire.symbol, price: wire.price, change: wire.change, regular: wire.regular }
-}
 
 #[must_use]
 pub fn attachment(view: AttachmentView) -> proto::research::Attachment {
@@ -209,14 +179,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_view_round_trips_and_a_foreign_kind_is_named_in_the_refusal() {
+    fn a_risk_model_survives_the_round_trip() {
+        // The model itself is still JSON inside the message: it is a
+        // person's file, whose shape this build does not get to decide.
         let sent = RiskModelView { path: "p".into(), exists: false, model: serde_json::json!({"a": 1}), error: None };
-        let wire = view("RiskModelView", &sent).expect("serialises");
-        assert_eq!(wire.kind, "RiskModelView");
-        assert_eq!(decode::<RiskModelView>(wire).expect("decodes"), sent);
-        let wrong = proto::common::View { kind: "SomethingElse".into(), json: "[]".into() };
-        let refused = decode::<RiskModelView>(wrong).unwrap_err();
-        assert!(refused.contains("SomethingElse"), "{refused}");
+        assert_eq!(risk_model_view(risk_model(sent.clone())), sent);
     }
 
     #[test]

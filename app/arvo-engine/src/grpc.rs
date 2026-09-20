@@ -18,11 +18,22 @@ use proto::services::platform_server::{self, PlatformServer};
 use proto::services::portfolio_server::{self, PortfolioServer};
 use proto::services::research_files_server::{self, ResearchFilesServer};
 use proto::services::sessions_server::{self, SessionsServer};
-use proto::common::{Empty, ExportedPath, View};
-use proto::market::{CompareRequest, FetchRequest, Instrument, InstrumentSearch, Instruments, QuoteTick};
-use proto::platform::{AccountKeys, JobId, SignIn, VendorId, VendorProfile};
-use proto::portfolio::{PortfolioName};
-use proto::research::{Advice, AttachRequest, Attachment, AttachmentRef, Attachments, BookRequest, Finding, FindingId, FindingIds, FindingSummary, Findings, Point, ReportFigure, ReportRequest, RiskModel, Rules, Ruleset, RulesetForm, RulesetPath, Rulesets, RunRequest, SharedExperiment, Strategies, StudyRequest, TradeExport};
+use proto::common::{Empty, ExportedPath};
+use proto::market::{
+    CompareRequest, DataLibraryView, FetchRequest, FetchView, Instrument, InstrumentSearch, Instruments,
+    MatchesView, QuoteTick, SourceComparisonView, SourcesView, WatchlistView,
+};
+use proto::platform::{
+    AccountKeys, AccountsView, ExtensionStrategiesView, JobId, JobsView, PluginsView, SignIn, SignalsView,
+    StrategyContributionsView, VendorId, VendorProfile,
+};
+use proto::portfolio::{PortfolioLibraryView, PortfolioName};
+use proto::research::{
+    Advice, AttachRequest, Attachment, AttachmentRef, Attachments, BookRequest, ComparisonView, Finding,
+    FindingId, FindingIds, FindingSummary, Findings, HistoryView, PanelView, Point, ProblemsView, RecordView,
+    ReplayView, ReportFigure, ReportRequest, RiskModel, Rules, Ruleset, RulesetForm, RulesetPath, Rulesets,
+    RunRequest, SharedExperiment, Strategies, StudyRequest, StudyView, TradeExport, WalkForwardView,
+};
 use proto::session::{SessionId, SessionList, SessionStatus, StartRequest};
 use arvo_client::wire;
 use arvo_api::EventView;
@@ -205,24 +216,25 @@ impl Market {
 impl market_server::Market for Market {
     type StreamQuotesStream = std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<QuoteTick, Status>> + Send>>;
 
-    async fn view_library(&self, _: Request<Empty>) -> Result<Response<View>, Status> {
+    async fn view_library(&self, _: Request<Empty>) -> Result<Response<DataLibraryView>, Status> {
         let view = arvo_service::research::data::library(&self.workbench).map_err(refused)?;
-        viewed("DataLibraryView", &view)
+        Ok(Response::new(view))
     }
 
-    async fn list_sources(&self, _: Request<Empty>) -> Result<Response<View>, Status> {
-        viewed("Vec<SourceView>", &arvo_service::research::data::list_sources().await)
+    async fn list_sources(&self, _: Request<Empty>) -> Result<Response<SourcesView>, Status> {
+        let sources = arvo_service::research::data::list_sources().await;
+        Ok(Response::new(SourcesView { sources }))
     }
 
-    async fn search_instruments(&self, request: Request<InstrumentSearch>) -> Result<Response<View>, Status> {
+    async fn search_instruments(&self, request: Request<InstrumentSearch>) -> Result<Response<MatchesView>, Status> {
         let InstrumentSearch { query, source } = request.into_inner();
         let view = arvo_service::research::data::fetch::search(&self.workbench, &query, source.as_deref(), &self.report())
             .await
             .map_err(refused)?;
-        viewed("Vec<MatchView>", &view)
+        Ok(Response::new(MatchesView { matches: view }))
     }
 
-    async fn fetch_bars(&self, request: Request<FetchRequest>) -> Result<Response<View>, Status> {
+    async fn fetch_bars(&self, request: Request<FetchRequest>) -> Result<Response<FetchView>, Status> {
         let FetchRequest { instrument, interval, days, source } = request.into_inner();
         let view = arvo_service::research::data::fetch::bars(
             &self.workbench,
@@ -234,10 +246,10 @@ impl market_server::Market for Market {
         )
         .await
         .map_err(refused)?;
-        viewed("FetchView", &view)
+        Ok(Response::new(view))
     }
 
-    async fn compare_sources(&self, request: Request<CompareRequest>) -> Result<Response<View>, Status> {
+    async fn compare_sources(&self, request: Request<CompareRequest>) -> Result<Response<SourceComparisonView>, Status> {
         let CompareRequest { instrument, interval, first, second, days } = request.into_inner();
         let view = arvo_service::research::data::fetch::compare_two(
             &instrument,
@@ -249,10 +261,10 @@ impl market_server::Market for Market {
         )
         .await
         .map_err(refused)?;
-        viewed("SourceComparisonView", &view)
+        Ok(Response::new(view))
     }
 
-    async fn watchlist(&self, _: Request<Empty>) -> Result<Response<View>, Status> {
+    async fn watchlist(&self, _: Request<Empty>) -> Result<Response<WatchlistView>, Status> {
         use arvo_service::research::data::watchlist;
 
         let held = self.portfolios.held();
@@ -263,7 +275,7 @@ impl market_server::Market for Market {
         // can still price these rows.
         self.stream.watch(priceable.iter().map(|id| watchlist::symbol_only(id)).collect());
         let rows = watchlist::priced(&held, chosen, &priceable, &self.report()).await;
-        viewed("Vec<QuoteView>", &rows)
+        Ok(Response::new(WatchlistView { rows }))
     }
 
     async fn stream_quotes(&self, _: Request<Empty>) -> Result<Response<Self::StreamQuotesStream>, Status> {
@@ -273,7 +285,7 @@ impl market_server::Market for Market {
         // socket: the next print is worth more than the one it missed.
         let stream = tokio_stream::wrappers::BroadcastStream::new(self.ticks.subscribe())
             .filter_map(|tick| tick.ok())
-            .map(|tick| Ok(arvo_client::wire::quote_tick(tick)));
+            .map(Ok);
         Ok(Response::new(Box::pin(stream)))
     }
 }
@@ -286,8 +298,8 @@ struct Accounts {
 
 #[tonic::async_trait]
 impl accounts_server::Accounts for Accounts {
-    async fn list_accounts(&self, _: Request<Empty>) -> Result<Response<View>, Status> {
-        viewed("Vec<AccountView>", &arvo_service::accounts::list().await)
+    async fn list_accounts(&self, _: Request<Empty>) -> Result<Response<AccountsView>, Status> {
+        Ok(Response::new(AccountsView { accounts: arvo_service::accounts::list().await }))
     }
 
     async fn begin_sign_in(&self, request: Request<VendorId>) -> Result<Response<SignIn>, Status> {
@@ -334,20 +346,20 @@ struct Portfolio {
 
 #[tonic::async_trait]
 impl portfolio_server::Portfolio for Portfolio {
-    async fn list_portfolios(&self, _: Request<Empty>) -> Result<Response<View>, Status> {
+    async fn list_portfolios(&self, _: Request<Empty>) -> Result<Response<PortfolioLibraryView>, Status> {
         let view = arvo_service::portfolio::list(&self.portfolios).map_err(refused)?;
-        viewed("PortfolioLibraryView", &view)
+        Ok(Response::new(view))
     }
 
-    async fn sync_accounts(&self, _: Request<Empty>) -> Result<Response<View>, Status> {
+    async fn sync_accounts(&self, _: Request<Empty>) -> Result<Response<PortfolioLibraryView>, Status> {
         let view = arvo_service::portfolio::sync_accounts(&self.portfolios).await.map_err(refused)?;
-        viewed("PortfolioLibraryView", &view)
+        Ok(Response::new(view))
     }
 
-    async fn sync_portfolio(&self, request: Request<PortfolioName>) -> Result<Response<View>, Status> {
+    async fn sync_portfolio(&self, request: Request<PortfolioName>) -> Result<Response<PortfolioLibraryView>, Status> {
         let name = required(&request.get_ref().name, "name")?;
         let view = arvo_service::portfolio::sync_one(&self.portfolios, name).await.map_err(refused)?;
-        viewed("PortfolioLibraryView", &view)
+        Ok(Response::new(view))
     }
 }
 
@@ -359,8 +371,8 @@ struct Platform {
 
 #[tonic::async_trait]
 impl platform_server::Platform for Platform {
-    async fn list_jobs(&self, _: Request<Empty>) -> Result<Response<View>, Status> {
-        viewed("Vec<JobView>", &self.jobs.snapshot())
+    async fn list_jobs(&self, _: Request<Empty>) -> Result<Response<JobsView>, Status> {
+        Ok(Response::new(JobsView { jobs: self.jobs.snapshot() }))
     }
 
     async fn run_job(&self, request: Request<JobId>) -> Result<Response<Empty>, Status> {
@@ -372,16 +384,16 @@ impl platform_server::Platform for Platform {
         Ok(Response::new(Empty {}))
     }
 
-    async fn list_plugins(&self, _: Request<Empty>) -> Result<Response<View>, Status> {
-        viewed("Vec<PluginView>", &self.plugins.snapshot().await)
+    async fn list_plugins(&self, _: Request<Empty>) -> Result<Response<PluginsView>, Status> {
+        Ok(Response::new(PluginsView { plugins: self.plugins.snapshot().await }))
     }
 
-    async fn refresh_plugins(&self, _: Request<Empty>) -> Result<Response<View>, Status> {
-        viewed("Vec<PluginView>", &self.plugins.refresh().await)
+    async fn refresh_plugins(&self, _: Request<Empty>) -> Result<Response<PluginsView>, Status> {
+        Ok(Response::new(PluginsView { plugins: self.plugins.refresh().await }))
     }
 
-    async fn list_signals(&self, _: Request<Empty>) -> Result<Response<View>, Status> {
-        viewed("Vec<SignalView>", &self.plugins.signals().await)
+    async fn list_signals(&self, _: Request<Empty>) -> Result<Response<SignalsView>, Status> {
+        Ok(Response::new(SignalsView { signals: self.plugins.signals().await }))
     }
 
     async fn reconcile_providers(&self, _: Request<Empty>) -> Result<Response<Empty>, Status> {
@@ -389,8 +401,12 @@ impl platform_server::Platform for Platform {
         Ok(Response::new(Empty {}))
     }
 
-    async fn extension_strategies(&self, _: Request<Empty>) -> Result<Response<View>, Status> {
-        viewed("BTreeMap<String, Vec<StrategyContributionView>>", &arvo_service::extensions::contributed_views())
+    async fn extension_strategies(&self, _: Request<Empty>) -> Result<Response<ExtensionStrategiesView>, Status> {
+        let by_extension = arvo_service::extensions::contributed_views()
+            .into_iter()
+            .map(|(extension, contributions)| (extension, StrategyContributionsView { contributions }))
+            .collect();
+        Ok(Response::new(ExtensionStrategiesView { by_extension }))
     }
 }
 
@@ -402,13 +418,13 @@ struct ResearchFiles {
 
 #[tonic::async_trait]
 impl research_files_server::ResearchFiles for ResearchFiles {
-    async fn run_shared_experiment(&self, request: Request<SharedExperiment>) -> Result<Response<View>, Status> {
+    async fn run_shared_experiment(&self, request: Request<SharedExperiment>) -> Result<Response<StudyView>, Status> {
         let SharedExperiment { text, instrument } = request.into_inner();
         let view = blocking(&self.workbench, move |workbench| {
             arvo_service::research::study::run_shared(workbench, &text, &instrument)
         })
         .await?;
-        viewed("StudyView", &view)
+        Ok(Response::new(view))
     }
 
     async fn export_trades(&self, request: Request<TradeExport>) -> Result<Response<ExportedPath>, Status> {
@@ -493,11 +509,6 @@ impl sessions_server::Sessions for Control {
 /// exist, an instrument without bars, a finding that is not there.
 fn refused(err: arvo_service::CommandError) -> Status {
     Status::invalid_argument(err.to_string())
-}
-
-/// A view, serialised for the wire.
-fn viewed<T: serde::Serialize>(kind: &str, value: &T) -> Result<Response<View>, Status> {
-    wire::view(kind, value).map(Response::new).map_err(Status::internal)
 }
 
 /// Runs `work` on a blocking thread with the workbench: studies are backtests,
@@ -624,7 +635,7 @@ impl Service {
 
 #[tonic::async_trait]
 impl research_server::Research for Service {
-    type SubscribeStream = std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<View, Status>> + Send>>;
+    type SubscribeStream = std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<EventView, Status>> + Send>>;
 
     async fn subscribe(&self, _: Request<Empty>) -> Result<Response<Self::SubscribeStream>, Status> {
         use tokio_stream::StreamExt as _;
@@ -632,7 +643,7 @@ impl research_server::Research for Service {
         // what it missed is in the session record.
         let stream = tokio_stream::wrappers::BroadcastStream::new(self.events.subscribe())
             .filter_map(|item| item.ok())
-            .map(|event| wire::view("EventView", &event).map_err(Status::internal));
+            .map(Ok);
         Ok(Response::new(Box::pin(stream)))
     }
 
@@ -677,30 +688,30 @@ impl research_server::Research for Service {
         Ok(Response::new(wire::risk_model(arvo_service::risk::view(self.research.root()))))
     }
 
-    async fn view_study(&self, request: Request<StudyRequest>) -> Result<Response<View>, Status> {
+    async fn view_study(&self, request: Request<StudyRequest>) -> Result<Response<StudyView>, Status> {
         let StudyRequest { instrument, strategy } = request.into_inner();
         let view = blocking(&self.workbench, move |workbench| {
             arvo_service::research::study::run_study(workbench, &instrument, strategy.as_deref())
         })
         .await?;
-        viewed("StudyView", &view)
+        Ok(Response::new(view))
     }
 
-    async fn view_walk_forward(&self, request: Request<StudyRequest>) -> Result<Response<View>, Status> {
+    async fn view_walk_forward(&self, request: Request<StudyRequest>) -> Result<Response<WalkForwardView>, Status> {
         let StudyRequest { instrument, strategy } = request.into_inner();
         let view = blocking(&self.workbench, move |workbench| {
             arvo_service::research::study::run_walk_forward(workbench, &instrument, strategy.as_deref())
         })
         .await?;
-        viewed("WalkForwardView", &view)
+        Ok(Response::new(view))
     }
 
-    async fn view_panel(&self, _: Request<Empty>) -> Result<Response<View>, Status> {
+    async fn view_panel(&self, _: Request<Empty>) -> Result<Response<PanelView>, Status> {
         let view = blocking(&self.workbench, arvo_service::research::study::run_panel).await?;
-        viewed("PanelView", &view)
+        Ok(Response::new(view))
     }
 
-    async fn view_book(&self, request: Request<BookRequest>) -> Result<Response<View>, Status> {
+    async fn view_book(&self, request: Request<BookRequest>) -> Result<Response<StudyView>, Status> {
         let BookRequest { instruments, strategy, max_concurrent_positions, max_per_sector } = request.into_inner();
         let sector_cap = arvo_service::research::study::book_sector_cap(max_per_sector.map(size), &instruments)
             .await
@@ -715,39 +726,39 @@ impl research_server::Research for Service {
             )
         })
         .await?;
-        viewed("StudyView", &view)
+        Ok(Response::new(view))
     }
 
-    async fn view_history(&self, _: Request<Empty>) -> Result<Response<View>, Status> {
+    async fn view_history(&self, _: Request<Empty>) -> Result<Response<HistoryView>, Status> {
         let view = arvo_service::research::history::list_history(&self.workbench).map_err(refused)?;
-        viewed("HistoryView", &view)
+        Ok(Response::new(view))
     }
 
-    async fn view_record(&self, request: Request<FindingId>) -> Result<Response<View>, Status> {
+    async fn view_record(&self, request: Request<FindingId>) -> Result<Response<RecordView>, Status> {
         let id = required(&request.get_ref().id, "id")?;
         let view = arvo_service::research::history::open_record(&self.workbench, id).map_err(refused)?;
-        viewed("RecordView", &view)
+        Ok(Response::new(view))
     }
 
-    async fn view_replay(&self, request: Request<FindingId>) -> Result<Response<View>, Status> {
+    async fn view_replay(&self, request: Request<FindingId>) -> Result<Response<ReplayView>, Status> {
         let id = required(&request.get_ref().id, "id")?.to_owned();
         let view = blocking(&self.workbench, move |workbench| {
             arvo_service::research::history::replay_record(workbench, &id)
         })
         .await?;
-        viewed("ReplayView", &view)
+        Ok(Response::new(view))
     }
 
-    async fn view_comparison(&self, request: Request<FindingIds>) -> Result<Response<View>, Status> {
+    async fn view_comparison(&self, request: Request<FindingIds>) -> Result<Response<ComparisonView>, Status> {
         let view = arvo_service::research::history::compare_records(&self.workbench, &request.get_ref().ids)
             .map_err(refused)?;
-        viewed("ComparisonView", &view)
+        Ok(Response::new(view))
     }
 
-    async fn view_problems(&self, _: Request<Empty>) -> Result<Response<View>, Status> {
+    async fn view_problems(&self, _: Request<Empty>) -> Result<Response<ProblemsView>, Status> {
         let view = arvo_service::research::history::list_research_problems(&self.workbench, self.research.root())
             .map_err(refused)?;
-        viewed("Vec<ResearchProblemView>", &view)
+        Ok(Response::new(ProblemsView { problems: view }))
     }
 
     async fn list_attachments(&self, request: Request<FindingId>) -> Result<Response<Attachments>, Status> {
@@ -982,6 +993,7 @@ fn reported_from(request: &ReportRequest) -> Result<(arvo_research::Reported, St
 mod tests {
     use super::proto::services::research_client::ResearchClient;
     use super::*;
+    use arvo_api::{EventKindView, SeverityView};
 
     const TOKEN: &str = "test-token";
     const CONTROL: &str = "control-token";
@@ -1126,13 +1138,10 @@ mod tests {
         let mut client = ResearchClient::connect(address).await.expect("connects");
 
         let history = client.view_history(with_token(Empty {}, TOKEN)).await.expect("ok").into_inner();
-        assert_eq!(history.kind, "HistoryView");
-        let decoded: arvo_service::research::HistoryView = wire::decode(history).expect("decodes");
-        assert!(decoded.entries.is_empty() && decoded.unreadable.is_empty());
+        assert!(history.entries.is_empty() && history.unreadable.is_empty(), "{history:?}");
 
         let problems = client.view_problems(with_token(Empty {}, TOKEN)).await.expect("ok").into_inner();
-        let decoded: Vec<arvo_service::research::ResearchProblemView> = wire::decode(problems).expect("decodes");
-        assert!(decoded.is_empty());
+        assert!(problems.problems.is_empty(), "{problems:?}");
 
         let no_bars = client
             .view_study(with_token(StudyRequest { instrument: "NOPE.YF".to_owned(), strategy: None }, TOKEN))
@@ -1179,12 +1188,10 @@ mod tests {
         assert_eq!(refused.code(), tonic::Code::Unauthenticated);
 
         let library = data.view_library(with_token(Empty {}, CONTROL)).await.expect("ok").into_inner();
-        let decoded: arvo_service::research::DataLibraryView = wire::decode(library).expect("decodes");
-        assert!(decoded.instruments.is_empty(), "{decoded:?}");
+        assert!(library.instruments.is_empty(), "{library:?}");
 
         let sources = data.list_sources(with_token(Empty {}, CONTROL)).await.expect("ok").into_inner();
-        let decoded: Vec<arvo_service::research::SourceView> = wire::decode(sources).expect("decodes");
-        assert!(decoded.iter().any(|source| source.venue == "YF"), "{decoded:?}");
+        assert!(sources.sources.iter().any(|source| source.venue == "YF"), "{sources:?}");
 
         // A credential is the engine's alone (ADR-0028), so it sits behind the
         // control token like every other service a person drives.
@@ -1193,8 +1200,7 @@ mod tests {
         let refused = accounts.list_accounts(with_token(Empty {}, TOKEN)).await.unwrap_err();
         assert_eq!(refused.code(), tonic::Code::Unauthenticated);
         let listed = accounts.list_accounts(with_token(Empty {}, CONTROL)).await.expect("ok").into_inner();
-        let decoded: Vec<arvo_api::AccountView> = wire::decode(listed).expect("decodes");
-        assert!(decoded.iter().any(|account| account.id == "alpaca"), "{decoded:?}");
+        assert!(listed.accounts.iter().any(|account| account.id == "alpaca"), "{listed:?}");
 
         // Refused before any browser could open, so this stays offline.
         let refused = accounts
@@ -1209,8 +1215,7 @@ mod tests {
             .await
             .expect("ok")
             .into_inner();
-        let decoded: Vec<arvo_service::research::MatchView> = wire::decode(found).expect("decodes");
-        assert!(decoded.is_empty());
+        assert!(found.matches.is_empty(), "{found:?}");
     }
 
     #[tokio::test]
@@ -1233,14 +1238,12 @@ mod tests {
             .expect("an event within ten seconds")
             .expect("the stream is open")
             .expect("ok");
-        assert_eq!(first.kind, "EventView");
-        let event: arvo_service::research::EventView = wire::decode(first).expect("decodes");
         assert_eq!(
-            event.kind,
-            arvo_service::research::EventKindView::Session { id: "nope@alpaca-paper".to_owned(), state: "failed".to_owned() },
-            "{event:?}"
+            first.kind,
+            Some(EventKindView::session("nope@alpaca-paper".to_owned(), "failed".to_owned())),
+            "{first:?}"
         );
-        assert_eq!(event.severity, arvo_service::research::SeverityView::Warning);
+        assert_eq!(first.severity(), SeverityView::Warning);
     }
 
     #[tokio::test]

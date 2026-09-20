@@ -25,37 +25,28 @@ use arvo_api::{EventKindView, EventView, SeverityView};
 pub fn plugin(event: &Event) -> EventView {
     let Event::PluginStatusChanged { id, status } = event;
     match status {
-        StatusKind::Reachable => EventView {
-            kind: EventKindView::Plugin {
-                id: id.clone(),
-                reachable: true,
-            },
-            title: "Plugin reachable".to_owned(),
-            detail: format!("{id} is now reachable"),
-            severity: SeverityView::Info,
-        },
-        StatusKind::Unreachable => EventView {
-            kind: EventKindView::Plugin {
-                id: id.clone(),
-                reachable: false,
-            },
-            title: "Plugin unreachable".to_owned(),
-            detail: format!("{id} went unreachable"),
-            severity: SeverityView::Warning,
-        },
+        StatusKind::Reachable => EventView::new(
+            EventKindView::plugin(id.clone(), true),
+            "Plugin reachable".to_owned(),
+            format!("{id} is now reachable"),
+            SeverityView::Info,
+        ),
+        StatusKind::Unreachable => EventView::new(
+            EventKindView::plugin(id.clone(), false),
+            "Plugin unreachable".to_owned(),
+            format!("{id} went unreachable"),
+            SeverityView::Warning,
+        ),
     }
 }
 
 pub fn feed_connected(id: &str) -> EventView {
-    EventView {
-        kind: EventKindView::Feed {
-            id: id.to_owned(),
-            connected: true,
-        },
-        title: format!("Signed in to {id}"),
-        detail: format!("{id} market data is available"),
-        severity: SeverityView::Info,
-    }
+    EventView::new(
+        EventKindView::feed(id.to_owned(), true),
+        format!("Signed in to {id}"),
+        format!("{id} market data is available"),
+        SeverityView::Info,
+    )
 }
 
 /// A connection that went away.
@@ -64,23 +55,12 @@ pub fn feed_connected(id: &str) -> EventView {
 /// expired while you were reading a chart". Only the second is worth an OS
 /// notification — the first is something the person is already looking at.
 pub fn feed_disconnected(id: &str, reason: &str, deliberate: bool) -> EventView {
-    EventView {
-        kind: EventKindView::Feed {
-            id: id.to_owned(),
-            connected: false,
-        },
-        title: if deliberate {
-            format!("Signed out of {id}")
-        } else {
-            format!("{id} session ended")
-        },
-        detail: reason.to_owned(),
-        severity: if deliberate {
-            SeverityView::Info
-        } else {
-            SeverityView::Warning
-        },
-    }
+    EventView::new(
+        EventKindView::feed(id.to_owned(), false),
+        if deliberate { format!("Signed out of {id}") } else { format!("{id} session ended") },
+        reason.to_owned(),
+        if deliberate { SeverityView::Info } else { SeverityView::Warning },
+    )
 }
 
 /// Live prices stopped arriving.
@@ -90,12 +70,12 @@ pub fn feed_disconnected(id: &str, reason: &str, deliberate: bool) -> EventView 
 /// identical on screen. Only raised once per outage, and only after the
 /// socket had been working — see `stream`.
 pub fn stream_stalled(reason: &str) -> EventView {
-    EventView {
-        kind: EventKindView::Stream { live: false },
-        title: "Live prices interrupted".to_owned(),
-        detail: reason.to_owned(),
-        severity: SeverityView::Warning,
-    }
+    EventView::new(
+        EventKindView::stream(false),
+        "Live prices interrupted".to_owned(),
+        reason.to_owned(),
+        SeverityView::Warning,
+    )
 }
 
 /// Stored findings went stale while nobody was looking.
@@ -136,15 +116,15 @@ pub fn findings_stale(changed: &[String], gone: &[String]) -> EventView {
             named(gone),
         ));
     }
-    EventView {
-        kind: EventKindView::Findings { count },
-        title: format!("{} went stale", plural(count, "finding", "findings")),
-        detail: format!(
+    EventView::new(
+        EventKindView::findings(arvo_api::count(count)),
+        format!("{} went stale", plural(count, "finding", "findings")),
+        format!(
             "{}. Their verdicts describe data you no longer have; re-run from History to see whether they still hold.",
             detail.join("; ")
         ),
-        severity: SeverityView::Warning,
-    }
+        SeverityView::Warning,
+    )
 }
 
 fn plural(count: usize, one: &str, many: &str) -> String {
@@ -159,15 +139,15 @@ fn plural(count: usize, one: &str, many: &str) -> String {
 #[must_use]
 pub fn session(id: &str, state: &str, detail: Option<&str>) -> EventView {
     let alarming = matches!(state, "halted" | "failed");
-    EventView {
-        kind: EventKindView::Session { id: id.to_owned(), state: state.to_owned() },
-        title: format!("Session {state}"),
-        detail: match detail {
+    EventView::new(
+        EventKindView::session(id.to_owned(), state.to_owned()),
+        format!("Session {state}"),
+        match detail {
             Some(why) => format!("{id}: {why}"),
             None => id.to_owned(),
         },
-        severity: if alarming { SeverityView::Warning } else { SeverityView::Info },
-    }
+        if alarming { SeverityView::Warning } else { SeverityView::Info },
+    )
 }
 
 /// A source failure worth announcing, if it is one.
@@ -188,12 +168,12 @@ pub fn disconnected(err: &crate::source::SourceError) -> Option<EventView> {
 
 /// Live prices came back.
 pub fn stream_live() -> EventView {
-    EventView {
-        kind: EventKindView::Stream { live: true },
-        title: "Live prices resumed".to_owned(),
-        detail: "the price stream reconnected".to_owned(),
-        severity: SeverityView::Info,
-    }
+    EventView::new(
+        EventKindView::stream(true),
+        "Live prices resumed".to_owned(),
+        "the price stream reconnected".to_owned(),
+        SeverityView::Info,
+    )
 }
 
 #[cfg(test)]
@@ -211,16 +191,10 @@ mod tests {
             status: StatusKind::Unreachable,
         });
 
-        assert_eq!(up.severity, SeverityView::Info);
-        assert_eq!(down.severity, SeverityView::Warning);
+        assert_eq!(up.severity(), SeverityView::Info);
+        assert_eq!(down.severity(), SeverityView::Warning);
         assert!(down.detail.contains("stub"));
-        assert_eq!(
-            up.kind,
-            EventKindView::Plugin {
-                id: "stub".into(),
-                reachable: true
-            }
-        );
+        assert_eq!(up.kind, Some(EventKindView::plugin("stub".into(), true)));
     }
 
     #[test]
@@ -229,8 +203,8 @@ mod tests {
             &["AAPL.YF".to_owned(), "MSFT.YF".to_owned()],
             &["OLD.SIM".to_owned()],
         );
-        assert_eq!(event.severity, SeverityView::Warning);
-        assert_eq!(event.kind, EventKindView::Findings { count: 3 });
+        assert_eq!(event.severity(), SeverityView::Warning);
+        assert_eq!(event.kind, Some(EventKindView::findings(3)));
         assert_eq!(event.title, "3 findings went stale");
         assert!(event.detail.contains("2 findings were produced"), "{}", event.detail);
         assert!(event.detail.contains("MSFT.YF"), "{}", event.detail);
@@ -252,17 +226,11 @@ mod tests {
         let expired = feed_disconnected("robinhood", "the token was rejected", false);
         let signed_out = feed_disconnected("robinhood", "you signed out", true);
 
-        assert_eq!(expired.severity, SeverityView::Warning);
-        assert_eq!(signed_out.severity, SeverityView::Info);
+        assert_eq!(expired.severity(), SeverityView::Warning);
+        assert_eq!(signed_out.severity(), SeverityView::Info);
         // Both still say the feed is down — the status bar reads one field.
         for event in [&expired, &signed_out] {
-            assert_eq!(
-                event.kind,
-                EventKindView::Feed {
-                    id: "robinhood".into(),
-                    connected: false
-                }
-            );
+            assert_eq!(event.kind, Some(EventKindView::feed("robinhood".into(), false)));
         }
     }
 }
