@@ -567,8 +567,7 @@ async fn drive<E: Executor>(
                         status.lock().unwrap_or_else(std::sync::PoisonError::into_inner).reconciled = true;
                     }
                     Err(err) => {
-                        status.lock().unwrap_or_else(std::sync::PoisonError::into_inner).last_error = Some(err.to_string());
-                        record.write("reconcile_failed", Some(serde_json::json!(err.to_string())));
+                        trouble(status, record, events, "reconcile_failed", &err);
                     }
                 },
                 Command::Resume => match frozen {
@@ -655,8 +654,7 @@ async fn drive<E: Executor>(
             match source.bars(symbol, experiment.interval, from, today).await {
                 Ok(fetched) => fresh.extend(fetched.bars),
                 Err(err) => {
-                    status.lock().unwrap_or_else(std::sync::PoisonError::into_inner).last_error = Some(err.to_string());
-                    record.write("fetch_failed", Some(serde_json::json!(err.to_string())));
+                    trouble(status, record, events, "fetch_failed", &err);
                 }
             }
         }
@@ -708,8 +706,7 @@ async fn drive<E: Executor>(
                 }
                 Ok(_) => {}
                 Err(err) => {
-                    status.lock().unwrap_or_else(std::sync::PoisonError::into_inner).last_error = Some(err.to_string());
-                    record.write("settle_failed", Some(serde_json::json!(err.to_string())));
+                    trouble(status, record, events, "settle_failed", &err);
                 }
             }
             if frozen.is_none() {
@@ -725,8 +722,7 @@ async fn drive<E: Executor>(
                     }
                     Ok(_) => {}
                     Err(err) => {
-                        status.lock().unwrap_or_else(std::sync::PoisonError::into_inner).last_error = Some(err.to_string());
-                        record.write("audit_failed", Some(serde_json::json!(err.to_string())));
+                        trouble(status, record, events, "audit_failed", &err);
                     }
                 }
             }
@@ -847,6 +843,17 @@ fn thaw(status: &Mutex<Status>, record: &Recorder, events: &broadcast::Sender<Ev
     status.state = "running".to_owned();
     status.frozen = None;
     status.reconciled = false;
+    announce(events, &status);
+}
+
+/// A poll, a settle, an audit or a reconcile that failed: kept on the status,
+/// written to the record, and raised as an alert (#196) — the session is
+/// still running, but on stale ground, and nobody watching the window
+/// would otherwise know until the next thing broke.
+fn trouble(status: &Mutex<Status>, record: &Recorder, events: &broadcast::Sender<EventView>, event: &str, err: &impl std::fmt::Display) {
+    record.write(event, Some(serde_json::json!(err.to_string())));
+    let mut status = status.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    status.last_error = Some(err.to_string());
     announce(events, &status);
 }
 
