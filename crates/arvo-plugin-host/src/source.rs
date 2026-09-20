@@ -59,7 +59,7 @@ use crate::plugin::plugin_server::{Plugin, PluginServer};
 use crate::plugin::{Capability, GetManifestRequest, Manifest};
 use crate::supervisor::HANDSHAKE;
 
-/// Generated from `protos/arvo/source/v1/source.proto`.
+/// Generated from `extension/proto/arvo/source/v1/source.proto`.
 pub mod v1 {
     tonic::include_proto!("arvo.source.v1");
 }
@@ -856,17 +856,17 @@ mod tests {
         let published = [
             (
                 "plugin/v1/plugin.proto",
-                include_str!("../../../protos/arvo/plugin/v1/plugin.proto"),
+                include_str!("../../../extension/proto/arvo/plugin/v1/plugin.proto"),
                 "4b5092432ec8080f0fcedc8d74f5bfa1ce8c402a0c253e2af2bb2161814a6c86",
             ),
             (
                 "source/v1/source.proto",
-                include_str!("../../../protos/arvo/source/v1/source.proto"),
+                include_str!("../../../extension/proto/arvo/source/v1/source.proto"),
                 "7640bb5886708ec5902ae0c67928e4513575663d8309a5eb21aca77f0430f06e",
             ),
             (
                 "signal/v1/signal.proto",
-                include_str!("../../../protos/arvo/signal/v1/signal.proto"),
+                include_str!("../../../extension/proto/arvo/signal/v1/signal.proto"),
                 "6e793cc2cdfc57e9718eacc6a9438f13646e38c3345d9e3752839fe0ab032d20",
             ),
         ];

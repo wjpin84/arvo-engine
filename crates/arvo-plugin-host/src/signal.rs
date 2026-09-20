@@ -30,7 +30,7 @@ use arvo_data::{Signal, SignalName, Signals};
 
 use crate::source::{with_token, Token};
 
-/// Generated from `protos/arvo/signal/v1/signal.proto`.
+/// Generated from `extension/proto/arvo/signal/v1/signal.proto`.
 pub mod v1 {
     tonic::include_proto!("arvo.signal.v1");
 }

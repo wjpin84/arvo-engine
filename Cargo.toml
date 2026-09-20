@@ -12,13 +12,10 @@ members = [
     "crates/arvo-oauth",
     "engines/arvo-nautilus",
     "crates/arvo-portfolio",
-    "app/arvo-editor",
-    "app/arvo-window",
     "crates/arvo-execution",
     "integrations/arvo-alpaca",
     "integrations/arvo-robinhood",
     "integrations/arvo-yfinance",
-    "app/arvo-runtime",
     "app/arvo-mcp-server",
     "app/arvo-engine",
 ]
@@ -43,7 +40,6 @@ arvo-data = { path = "crates/arvo-data" }
 arvo-mcp = { path = "crates/arvo-mcp" }
 arvo-oauth = { path = "crates/arvo-oauth" }
 arvo-api = { path = "contract/rust/arvo-api" }
-arvo-window = { path = "app/arvo-window" }
 arvo-nautilus = { path = "engines/arvo-nautilus" }
 arvo-portfolio = { path = "crates/arvo-portfolio" }
 arvo-research = { path = "crates/arvo-research" }
@@ -66,9 +62,7 @@ tonic-prost-build = "0.14.6"
 protoc-bin-vendored = "3.2.0"
 
 # Must live in the *workspace root* manifest. Cargo ignores `[profile.*]` in
-# member crates and warns about it — these settings sat in the app crate's own
-# manifest and were silently doing nothing, so every release build ran at
-# defaults. See tauri.app/concept/size/#cargo-configuration.
+# member crates and warns about it.
 [profile.release]
 codegen-units = 1
 lto = true

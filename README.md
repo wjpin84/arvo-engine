@@ -1,16 +1,27 @@
-# Arvo Desktop
+# Arvo Engine
 
-The window on Arvo: an editor, a research workbench and the panels that show
-what the engine found, in one place. The engine itself, the process that
-runs studies, keeps the data library, holds credentials and keeps running
-when this window closes, lives in
-[arvo-engine](https://github.com/wjpin84/arvo-engine). This repository
-talks to it over its gRPC API and knows nothing about how a study is run.
+The process behind Arvo: it runs studies, keeps the data library, holds
+credentials, hosts plugins, schedules a person's scripts, and keeps doing all
+of it when the window closes. Everything that decides anything is here.
+What a person sees is [arvo-desktop](https://github.com/wjpin84/arvo-desktop),
+which talks to this over the gRPC API in
+[arvo-engine-api](https://github.com/wjpin84/arvo-engine-api) and knows
+nothing about how a study is run.
 
 Arvo is an AI-native financial research platform, closer to "VS Code for
-quantitative finance" than to another backtesting engine. The premise is
-that most backtest results are noise and the job is to avoid believing them.
-Hence the rule that orders everything else:
+quantitative finance" than to another backtesting engine. NautilusTrader is
+the execution engine underneath; Arvo owns the research loop above it.
+
+```
+Hypothesis → Experiment → Simulation → Evaluation → Evidence → Research Memory
+```
+
+The differentiator is **evaluation, not execution**: out-of-sample selection,
+deflation against multiple testing, `Inconclusive` as a first-class verdict,
+reconciliation invariants that refuse to let a self-contradicting result be
+read, and replayable findings. The premise is that most backtest results are
+noise and the job is to avoid believing them. Hence the rule that orders
+everything else:
 
 > Anything that makes a wrong answer look right outranks anything that adds
 > capability.
@@ -20,56 +31,70 @@ Hence the rule that orders everything else:
 | | |
 |---|---|
 | Architecture | [docs/architecture.md](docs/architecture.md) |
-| The engine | [arvo-engine](https://github.com/wjpin84/arvo-engine) — the daemon, the MCP server, and every crate that decides anything |
-| The engine's API | [arvo-engine-api](https://github.com/wjpin84/arvo-engine-api), checked out at `contract/` — the protos and the Rust and Python bindings this window builds against |
+| The API | [arvo-engine-api](https://github.com/wjpin84/arvo-engine-api), checked out at `contract/` — the protos this serves, and the Rust and Python bindings generated from them |
+| The provider contract | [arvo-extension-api](https://github.com/wjpin84/arvo-extension-api), checked out at `extension/` — what a data source or signal plugin implements and this calls |
+| The window | [arvo-desktop](https://github.com/wjpin84/arvo-desktop) |
 | Decisions | [arvo-adrs](https://github.com/wjpin84/arvo-adrs) — one per file, superseded rather than edited, across every Arvo repository |
-| Roadmap | [GitHub Project](https://github.com/users/wjpin84/projects/5) — the UI board; the engine has its own |
+| Roadmap | [GitHub Project](https://github.com/users/wjpin84/projects/4) |
 
 Clone with `--recurse-submodules`, or run `git submodule update --init`
-afterwards: the contract crates are path dependencies into `contract/`.
+afterwards: both contracts are submodules and the build reads them.
 
-## What is in the workspace
+## What ships
+
+Three binaries, released together as one archive per platform:
+
+| Binary | What it is |
+|---|---|
+| `arvo-engine` | The daemon. Serves the API on loopback, writes `engine.json` and `control.json` to the app data directory, and is what the window starts and what a script reaches |
+| `arvo-mcp-server` | Arvo as a stdio MCP server: an agent reads research memory and runs studies, and cannot fetch or trade ([ADR-0016](https://github.com/wjpin84/arvo-adrs/blob/main/0016-an-agent-reaches-arvo-through-a-tool-list-that-cannot-trade.md)) |
+| `arvo` | The command line. Not written yet; it is a thin client over `arvo-client` and belongs here |
+
+## Building
+
+```
+cargo test --workspace                 # the suite
+cargo build -p arvo-engine             # the daemon, in target/debug
+target/debug/arvo-engine               # leave running; the window and a script find it through engine.json
+```
+
+The Python client's tests live with the contract and run against a built
+engine:
+
+```
+cd contract/python
+ARVO_ENGINE=../../target/debug/arvo-engine uv run pytest
+```
+
+### As an MCP server
+
+```
+cargo build --release -p arvo-mcp-server
+claude mcp add arvo -- <path-to>/target/release/arvo-mcp-server
+```
+
+With no argument it uses the open project folder (`%APPDATA%/com.arvo.desktop`
+until one is chosen); pass a directory to use another. Runs are saved as the
+agent's findings, deflated against everything that agent has run, and every
+call is appended to `agent-audit.jsonl`.
+
+## The workspace
 
 | Crate | What it is |
 |---|---|
-| `app/arvo-runtime` | The Tauri host: the window, the tray, the commands the editor calls, and the client of the engine |
-| `app/arvo-editor` | The Leptos workbench, compiled to WebAssembly |
-| `app/arvo-window` | The shapes the host and the editor agree on and the engine never sees |
-| `contract/rust/arvo-api`, `contract/rust/arvo-client` | The engine's API, from the contract repository |
-
-Nothing here depends on an engine crate. That is the point of the split:
-the window renders what the engine says, and the engine does not know the
-window exists.
-
-## Building and running
-
-The window needs a built engine to start. Point it at one:
-
-```
-cargo test --workspace                                # the suite
-$env:ARVO_ENGINE = "..\arvo-engine\target\debug\arvo-engine.exe"   # a local build
-cargo tauri dev                                       # the app
-```
-
-Without `ARVO_ENGINE`, the window looks for `arvo-engine` beside its own
-executable, which is where a bundle installs it and where a combined cargo
-tree used to put it.
-
-For an installer, ship a released engine rather than a local build:
-
-```
-python tools/fetch_engine.py          # downloads the version in app/arvo-runtime/engine-version
-$env:ARVO_ENGINE = "<the path it prints>"
-cargo tauri build
-```
-
-The build stages the engine as a sidecar beside the window (#32), so an
-installed Arvo starts its own engine and a script run from the editor works
-without a terminal. `engine-version` pins which engine release this window
-was built against; bump it when the contract moves.
+| `app/arvo-engine` | The daemon: the gRPC surface and its two token tiers, sessions, the composition root |
+| `app/arvo-mcp-server` | The MCP server over the research tier |
+| `crates/arvo-service` | The service tier every front end shares: research, data, portfolios, accounts, plugins, scripts, jobs |
+| `crates/arvo-core`, `arvo-data`, `arvo-research`, `arvo-risk`, `arvo-portfolio`, `arvo-execution` | The domain |
+| `crates/arvo-plugin-host` | Out-of-process plugins over gRPC, against `extension/` |
+| `crates/arvo-schedule` | The scheduler: intervals and cron, with the Unix weekday dialect translated |
+| `crates/arvo-mcp`, `crates/arvo-oauth` | Protocol and authorization, vendor-agnostic |
+| `engines/arvo-nautilus` | The only crate permitted to name a Nautilus type |
+| `integrations/arvo-robinhood`, `arvo-yfinance`, `arvo-alpaca` | Vendors |
+| `contract/rust/arvo-api`, `contract/rust/arvo-client` | The API, from the contract repository: this implements its server traits |
 
 ## Licence
 
 Apache-2.0. NautilusTrader is LGPL-3.0-only and is linked into the shipped
-engine — see [`NOTICE`](NOTICE) and
+binary — see [`NOTICE`](NOTICE) and
 [ADR-0002](https://github.com/wjpin84/arvo-adrs/blob/main/0002-apache-2-with-lgpl-dependency.md).

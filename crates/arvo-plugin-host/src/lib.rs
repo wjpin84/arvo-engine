@@ -10,7 +10,7 @@ pub mod signal;
 pub mod source;
 pub mod supervisor;
 
-/// Generated from `protos/arvo/plugin/v1/plugin.proto`.
+/// Generated from `extension/proto/arvo/plugin/v1/plugin.proto`.
 pub mod plugin {
     tonic::include_proto!("arvo.plugin.v1");
 }
