@@ -55,7 +55,7 @@ pub fn record_view(service: &ResearchService, stored: arvo_research::StoredRecor
         stored.recorded_at.to_rfc3339(),
         stored.author.agent().unwrap_or_default().to_owned(),
     );
-    let attachments: Vec<arvo_api::AttachmentView> = stored.attachments.iter().map(attachment_view).collect();
+    let attachments: Vec<arvo_api::Attachment> = stored.attachments.iter().map(attachment_view).collect();
     match stored.record {
         // The view carries the id it was read from, so a tab opened out of
         // History can ask for a report of the record it is showing (#159).
@@ -108,8 +108,8 @@ pub fn record_view(service: &ResearchService, stored: arvo_research::StoredRecor
     }
 }
 
-pub fn attachment_view(kept: &arvo_research::memory::Attachment) -> arvo_api::AttachmentView {
-    arvo_api::AttachmentView {
+pub fn attachment_view(kept: &arvo_research::memory::Attachment) -> arvo_api::Attachment {
+    arvo_api::Attachment {
         name: kept.name.clone(),
         media_type: kept.media_type.clone(),
         hash: kept.hash.clone(),
@@ -373,7 +373,7 @@ pub fn export_name(name: &str) -> Result<String, CommandError> {
 /// writer silently shifts every column after it — the same failure that ate a
 /// fund name in the portfolio importer, found only because a file that should
 /// have held forty holdings held none.
-pub fn trades_csv(rows: &[TradeRowExport]) -> String {
+pub fn trades_csv(rows: &[TradeRow]) -> String {
     let cell = |text: &str| {
         if text.contains([',', '"', '\n', '\r']) {
             format!("\"{}\"", text.replace('"', "\"\""))
@@ -564,8 +564,8 @@ mod comparison_tests {
 mod csv_tests {
     use super::*;
 
-    fn row(reason: &str) -> TradeRowExport {
-        TradeRowExport {
+    fn row(reason: &str) -> TradeRow {
+        TradeRow {
             instrument: "AAPL.NASDAQ".to_owned(),
             opened: "2024-01-02 00:00".to_owned(),
             closed: "2024-01-05 00:00".to_owned(),
@@ -793,7 +793,7 @@ pub fn list_history(service: &ResearchService) -> Result<HistoryView, CommandErr
 /// # Errors
 ///
 /// No such finding.
-pub fn list_attachments(service: &ResearchService, id: &str) -> Result<Vec<arvo_api::AttachmentView>, CommandError> {
+pub fn list_attachments(service: &ResearchService, id: &str) -> Result<Vec<arvo_api::Attachment>, CommandError> {
     let stored = service.memory.open(id).map_err(|err| CommandError::Failed(err.to_string()))?;
     Ok(stored.attachments.iter().map(attachment_view).collect())
 }
@@ -951,7 +951,7 @@ pub fn write_export(service: &ResearchService, name: &str, contents: &str) -> Re
 /// # Errors
 ///
 /// As [`write_export`].
-pub fn export_trades(service: &ResearchService, name: &str, rows: &[TradeRowExport]) -> Result<String, CommandError> {
+pub fn export_trades(service: &ResearchService, name: &str, rows: &[TradeRow]) -> Result<String, CommandError> {
     write_export(service, &format!("{name}-trades.csv"), &trades_csv(rows))
 }
 

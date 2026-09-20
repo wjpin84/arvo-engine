@@ -58,13 +58,13 @@ use arvo_research::{
 // `pub use`, not `use`: these are re-exported as this module's own surface
 // and `tests/chart_alignment.rs` reaches them through it.
 pub use arvo_api::{
-    AttachmentView, EventKindView, EventView, ResearchProblemView, SeverityView, TradeRowExport,
+    Attachment, EventKindView, EventView, ResearchProblemView, SeverityView, TradeRow,
     BookView, BreadthView, CandlePoint, ComparisonRowView, ComparisonView, CurvePoint,
     AfterTaxView, DataFindingView, DataLibraryView, DivergenceView, DividendGapView, FetchView, FoldView,
     HistoryEntryView,
     HistoryView, InstrumentView, MatchView, MemberView, MetricsView, MonthlyReturnView, NamedCurveView,
     InstrumentChartView, OutcomeView, PanelView, QuoteView, RecommendationView, RecordView, ReplayView, StabilityView,
-    SourceComparisonView, SourceView, StrategyView, StudyView, SurfaceCell, SurfaceView,
+    SourceComparisonView, SourceView, Strategy, StudyView, SurfaceCell, SurfaceView,
     TradeMarkerView, TradeRowView,
     TradesView, UnreadableView, WalkForwardView,
 };

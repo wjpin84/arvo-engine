@@ -223,19 +223,23 @@ pub fn panel_dataset_version(
 ///
 /// Never. Fallible only to match the shape every other command has.
 #[allow(clippy::unnecessary_wraps, reason = "uniform command signature")]
-pub fn list_strategies() -> Result<Vec<StrategyView>, CommandError> {
+pub fn list_strategies() -> Result<Vec<Strategy>, CommandError> {
     // Arvo's own, the extensions' (#162) and the project's rulesets, from
     // one place, so the picker cannot drift from what can be run. Re-read
     // on every ask: a ruleset edited a moment ago is what the person means.
     crate::rulesets::refresh();
     Ok(super::offered()
         .into_iter()
-        .map(|plan| StrategyView {
+        .map(|plan| Strategy {
             name: plan.name().to_owned(),
             label: plan.label.to_owned(),
             premise: plan.premise.to_owned(),
             interval: plan.interval().to_string(),
-            backtests: plan.backtests(),
+            backtests: arvo_api::count(plan.backtests()),
+            // The shipped rule behind this plan, when there is one. A ruleset
+            // is a grid over a shipped rule and inherits the answer; a plan
+            // this build does not know ranks nothing.
+            ranks_a_set: super::StrategyPlan::find(plan.name()).is_some_and(|found| found.ranks_a_set()),
         })
         .collect())
 }

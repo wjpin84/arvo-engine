@@ -24,13 +24,13 @@ use std::path::Path;
 use arvo_research::{StrategyDocument, StrategyKind};
 
 use crate::research::StrategyPlan;
-pub use arvo_api::{RuleView, RulesetFormView, RulesetView};
+pub use arvo_api::{Rule, RulesetForm, Ruleset};
 
 /// Where the files live, relative to the project folder.
 pub const SUBDIR: &str = "rulesets";
 
 /// Every ruleset file, readable or not, with what the picker makes of it.
-fn read_all(root: &Path) -> Vec<(RulesetView, Option<StrategyDocument>)> {
+fn read_all(root: &Path) -> Vec<(Ruleset, Option<StrategyDocument>)> {
     let dir = root.join(SUBDIR);
     let Ok(entries) = std::fs::read_dir(&dir) else { return Vec::new() };
     let mut found: Vec<_> = entries
@@ -46,19 +46,19 @@ fn read_all(root: &Path) -> Vec<(RulesetView, Option<StrategyDocument>)> {
                         StrategyKind::Rules(_) => ("rules".to_owned(), 0),
                     };
                     let problem = crate::research::offerable(&document).err();
-                    let view = RulesetView {
+                    let view = Ruleset {
                         path: relative,
                         name: document.name.clone(),
                         label: document.label.clone(),
                         rule,
                         interval: document.interval.to_string(),
-                        searches,
+                        searches: arvo_api::count(searches),
                         problem,
                     };
                     (view, Some(document))
                 }
                 Err(problem) => (
-                    RulesetView {
+                    Ruleset {
                         path: relative,
                         name: String::new(),
                         label: String::new(),
@@ -109,7 +109,7 @@ pub fn refresh_at(root: &Path) {
 
 /// Every ruleset under `root`, with any reason it cannot be run.
 #[must_use]
-pub fn list(root: &Path) -> Vec<RulesetView> {
+pub fn list(root: &Path) -> Vec<Ruleset> {
     read_all(root).into_iter().map(|(view, _)| view).collect()
 }
 
@@ -133,7 +133,7 @@ pub fn write(
     axes: std::collections::BTreeMap<String, Vec<f64>>,
     label: Option<String>,
     premise: Option<String>,
-) -> Result<RulesetView, String> {
+) -> Result<Ruleset, String> {
     let name = name.trim();
     if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
         return Err("a ruleset name is letters, digits, _ and -".to_owned());
@@ -163,13 +163,13 @@ pub fn write(
     let text = serde_json::to_string_pretty(&document).map_err(|err| err.to_string())?;
     std::fs::write(&path, text + "\n").map_err(|err| format!("{}: {err}", path.display()))?;
     refresh_at(root);
-    Ok(RulesetView {
+    Ok(Ruleset {
         path: format!("{SUBDIR}/{name}.json"),
         name: name.to_owned(),
         label: document.label,
         rule: rule.to_owned(),
         interval: document.interval.to_string(),
-        searches,
+        searches: arvo_api::count(searches),
         problem: None,
     })
 }
@@ -198,7 +198,7 @@ pub fn template(plan: &StrategyPlan, name: &str) -> StrategyDocument {
 ///
 /// A path outside the rulesets folder, or a file that cannot be read as a
 /// grid ruleset.
-pub fn read_form(root: &Path, relative: &str) -> Result<RulesetFormView, String> {
+pub fn read_form(root: &Path, relative: &str) -> Result<RulesetForm, String> {
     let file = root.join(relative);
     if !file.starts_with(root.join(SUBDIR)) {
         return Err(format!("{relative} is not a ruleset file"));
@@ -207,10 +207,11 @@ pub fn read_form(root: &Path, relative: &str) -> Result<RulesetFormView, String>
     let StrategyKind::Grid(grid) = document.kind else {
         return Err("a rules document has no grid to edit here; open the file".to_owned());
     };
-    let mut params: Vec<(String, Vec<f64>)> = grid.fixed.into_iter().map(|(key, value)| (key, vec![value])).collect();
-    params.extend(grid.axes);
-    params.sort_by(|a, b| a.0.cmp(&b.0));
-    Ok(RulesetFormView { name: document.name, rule: grid.rule, label: document.label, premise: document.premise, params })
+    let mut params: Vec<arvo_api::Param> =
+        grid.fixed.into_iter().map(|(name, value)| arvo_api::Param { name, values: vec![value] }).collect();
+    params.extend(grid.axes.into_iter().map(|(name, values)| arvo_api::Param { name, values }));
+    params.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(RulesetForm { name: document.name, rule: grid.rule, label: document.label, premise: document.premise, params })
 }
 
 /// Writes a ruleset from the form's parts and answers with what the picker
@@ -219,10 +220,10 @@ pub fn read_form(root: &Path, relative: &str) -> Result<RulesetFormView, String>
 /// # Errors
 ///
 /// A parameter with no value, or as [`write`].
-pub fn write_form(root: &Path, form: RulesetFormView) -> Result<RulesetView, String> {
+pub fn write_form(root: &Path, form: RulesetForm) -> Result<Ruleset, String> {
     let mut fixed = std::collections::BTreeMap::new();
     let mut axes = std::collections::BTreeMap::new();
-    for (key, values) in form.params {
+    for arvo_api::Param { name: key, values } in form.params {
         match values.as_slice() {
             [] => return Err(format!("{key} has no value; give it one to fix it or several to search")),
             [one] => {
@@ -237,16 +238,20 @@ pub fn write_form(root: &Path, form: RulesetFormView) -> Result<RulesetView, Str
     write(root, &form.name, &form.rule, fixed, axes, optional(form.label), optional(form.premise))
 }
 
-pub fn list_rules() -> Vec<RuleView> {
+pub fn list_rules() -> Vec<Rule> {
     StrategyPlan::shipped()
         .iter()
-        .map(|plan| RuleView {
+        .map(|plan| Rule {
             name: plan.name().to_owned(),
             label: plan.label.to_owned(),
             premise: plan.premise.to_owned(),
             interval: plan.interval().to_string(),
-            fixed: plan.fixed.iter().map(|(key, value)| ((*key).to_owned(), *value)).collect(),
-            axes: plan.axes.iter().map(|(key, values)| ((*key).to_owned(), values.to_vec())).collect(),
+            fixed: plan.fixed.iter().map(|(name, value)| arvo_api::Fixed { name: (*name).to_owned(), value: *value }).collect(),
+            axes: plan
+                .axes
+                .iter()
+                .map(|(name, values)| arvo_api::Param { name: (*name).to_owned(), values: values.to_vec() })
+                .collect(),
             ranks_a_set: plan.ranks_a_set(),
             trades_options: plan.trades_options(),
         })

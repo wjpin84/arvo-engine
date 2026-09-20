@@ -117,17 +117,17 @@ pub fn parse(text: &str) -> Result<RiskModel, String> {
 /// The project's risk file as the window and the engine report it: what is
 /// in force for the next study, and why the file was refused if it was.
 #[must_use]
-pub fn view(root: &Path) -> arvo_api::RiskModelView {
+pub fn view(root: &Path) -> arvo_api::RiskModel {
     let path = root.join(PROJECT_FILE);
     let exists = path.exists();
     let (model, error) = match read(&path) {
         Ok(model) => (model, None),
         Err(reason) => (current(), Some(reason)),
     };
-    arvo_api::RiskModelView {
+    arvo_api::RiskModel {
         path: PROJECT_FILE.to_owned(),
         exists,
-        model: serde_json::to_value(model).unwrap_or_default(),
+        model_json: serde_json::to_string(&model).unwrap_or_default(),
         error,
     }
 }

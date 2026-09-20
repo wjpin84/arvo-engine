@@ -15,6 +15,7 @@ members = [
     "engines/arvo-nautilus",
     "crates/arvo-portfolio",
     "app/arvo-editor",
+    "app/arvo-window",
     "crates/arvo-execution",
     "integrations/arvo-alpaca",
     "integrations/arvo-robinhood",
@@ -41,6 +42,7 @@ arvo-data = { path = "crates/arvo-data" }
 arvo-mcp = { path = "crates/arvo-mcp" }
 arvo-oauth = { path = "crates/arvo-oauth" }
 arvo-api = { path = "crates/arvo-api" }
+arvo-window = { path = "app/arvo-window" }
 arvo-nautilus = { path = "engines/arvo-nautilus" }
 arvo-portfolio = { path = "crates/arvo-portfolio" }
 arvo-research = { path = "crates/arvo-research" }

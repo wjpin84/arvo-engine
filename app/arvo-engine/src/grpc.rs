@@ -37,7 +37,6 @@ use proto::research::{
     RunRequest, SharedExperiment, Strategies, StudyRequest, StudyView, TradeExport, WalkForwardView,
 };
 use proto::session::{SessionId, SessionList, SessionStatus, StartRequest};
-use arvo_client::wire;
 use arvo_api::EventView;
 
 /// The keys of a summary that have their own fields; everything else is
@@ -493,9 +492,7 @@ impl research_files_server::ResearchFiles for ResearchFiles {
     }
 
     async fn export_trades(&self, request: Request<TradeExport>) -> Result<Response<ExportedPath>, Status> {
-        let TradeExport { name, rows_json } = request.into_inner();
-        let rows: Vec<arvo_api::TradeRowExport> =
-            serde_json::from_str(&rows_json).map_err(|err| Status::invalid_argument(format!("rows_json: {err}")))?;
+        let TradeExport { name, rows } = request.into_inner();
         let path = arvo_service::research::history::export_trades(&self.workbench, &name, &rows).map_err(refused)?;
         Ok(Response::new(ExportedPath { path }))
     }
@@ -713,44 +710,34 @@ impl research_server::Research for Service {
     }
 
     async fn list_strategies(&self, _: Request<Empty>) -> Result<Response<Strategies>, Status> {
-        let plans = arvo_service::research::list_strategies().map_err(|err| Status::internal(err.to_string()))?;
-        Ok(Response::new(Strategies {
-            strategies: plans
-                .into_iter()
-                .map(|plan| {
-                    let ranks_a_set = arvo_service::research::StrategyPlan::find(&plan.name)
-                        .is_some_and(|found| found.ranks_a_set());
-                    wire::strategy(plan, ranks_a_set)
-                })
-                .collect(),
-        }))
+        let strategies = arvo_service::research::list_strategies().map_err(|err| Status::internal(err.to_string()))?;
+        Ok(Response::new(Strategies { strategies }))
     }
 
     async fn list_rulesets(&self, _: Request<Empty>) -> Result<Response<Rulesets>, Status> {
-        let rulesets = arvo_service::rulesets::list(self.research.root()).into_iter().map(wire::ruleset).collect();
+        let rulesets = arvo_service::rulesets::list(self.research.root());
         Ok(Response::new(Rulesets { rulesets }))
     }
 
     async fn read_ruleset(&self, request: Request<RulesetPath>) -> Result<Response<RulesetForm>, Status> {
         let path = required(&request.get_ref().path, "path")?;
         arvo_service::rulesets::read_form(self.research.root(), path)
-            .map(|form| Response::new(wire::ruleset_form(form)))
+            .map(Response::new)
             .map_err(Status::invalid_argument)
     }
 
     async fn write_ruleset(&self, request: Request<RulesetForm>) -> Result<Response<Ruleset>, Status> {
-        let form = wire::ruleset_form_view(request.into_inner());
-        arvo_service::rulesets::write_form(self.research.root(), form)
-            .map(|written| Response::new(wire::ruleset(written)))
+        arvo_service::rulesets::write_form(self.research.root(), request.into_inner())
+            .map(Response::new)
             .map_err(Status::invalid_argument)
     }
 
     async fn list_rules(&self, _: Request<Empty>) -> Result<Response<Rules>, Status> {
-        Ok(Response::new(Rules { rules: arvo_service::rulesets::list_rules().into_iter().map(wire::rule).collect() }))
+        Ok(Response::new(Rules { rules: arvo_service::rulesets::list_rules() }))
     }
 
     async fn get_risk_model(&self, _: Request<Empty>) -> Result<Response<RiskModel>, Status> {
-        Ok(Response::new(wire::risk_model(arvo_service::risk::view(self.research.root()))))
+        Ok(Response::new(arvo_service::risk::view(self.research.root())))
     }
 
     async fn view_study(&self, request: Request<StudyRequest>) -> Result<Response<StudyView>, Status> {
@@ -829,7 +816,7 @@ impl research_server::Research for Service {
     async fn list_attachments(&self, request: Request<FindingId>) -> Result<Response<Attachments>, Status> {
         let id = required(&request.get_ref().id, "id")?;
         let kept = arvo_service::research::history::list_attachments(&self.workbench, id).map_err(refused)?;
-        Ok(Response::new(Attachments { attachments: kept.into_iter().map(wire::attachment).collect() }))
+        Ok(Response::new(Attachments { attachments: kept }))
     }
 
     async fn list_instruments(&self, _: Request<Empty>) -> Result<Response<Instruments>, Status> {
