@@ -127,12 +127,23 @@ async fn run() -> Result<(), String> {
     served.map_err(|err| format!("serving: {err}"))
 }
 
-/// `session list|start|stop`, against the engine `engine.json` names.
+/// `session list|start|stop|reconcile|resume`, against the engine
+/// `engine.json` names; `session explain <id> <time>` reads the record on
+/// disk and needs no engine.
 async fn session_command(args: &[String]) -> Result<(), String> {
     use arvo_engine::grpc::proto::common::Empty;
     use arvo_engine::grpc::proto::services::sessions_client::SessionsClient;
     use arvo_engine::grpc::proto::session::{SessionId, SessionStatus, StartRequest};
 
+    if let [verb, id, when] = args {
+        if verb == "explain" {
+            let when = arvo_engine::explain::parse_when(when)?;
+            let path = session::record_path(&research::default_root()?, id);
+            let record = std::fs::read_to_string(&path).map_err(|err| format!("{}: {err}", path.display()))?;
+            print!("{}", arvo_engine::explain::explain(&record, when));
+            return Ok(());
+        }
+    }
     let root = arvo_service::project::app_data_root().map_err(|err| format!("no app data directory: {err}"))?;
     let found = discovery::running(&root).ok_or("no engine is running; open Arvo or start arvo-engine")?;
     let token = discovery::read_control(&root).ok_or("no control.json beside engine.json")?;
@@ -204,7 +215,7 @@ async fn session_command(args: &[String]) -> Result<(), String> {
         }
         _ => {
             return Err(
-                "usage: arvo-engine session list | start <finding> <executor> | stop <id> | reconcile <id> | resume <id>".to_owned(),
+                "usage: arvo-engine session list | start <finding> <executor> | stop <id> | reconcile <id> | resume <id> | explain <id> <time>".to_owned(),
             )
         }
     }

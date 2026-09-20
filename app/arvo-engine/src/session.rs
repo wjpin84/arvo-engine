@@ -38,6 +38,12 @@
 //! money — and then resumes, and both are events in the record. Nothing
 //! resumes on its own: a freeze that lifted itself would be a warning.
 //!
+//! # The record is a chain
+//!
+//! Each event names what caused it (#188): a signal its bar, an order its
+//! signal, a fill its order and the position it left. `explain` walks it
+//! backwards from a position to the bar it was decided on.
+//!
 //! # Nothing here writes the library
 //!
 //! Bars fetched for a session are pushed and forgotten. The library is fetched
@@ -367,7 +373,7 @@ fn run(
         .build()
         .map_err(|err| err.to_string())?;
 
-    let record = Recorder::open(&data.join(SUBDIR), &format!("{finding}@{executor}"))?;
+    let record = Recorder::open(data, &format!("{finding}@{executor}"))?;
     let library = CsvBars::new(&data.join("data"));
     let last_in_library = library
         .bars(&instrument, experiment.interval, experiment.window.from, today)
@@ -493,7 +499,9 @@ async fn drive<E: Executor>(
             match command {
                 Command::Reconcile => match session.adopt(now(), venue).await {
                     Ok(corrected) => {
-                        record.write("reconciled", Some(serde_json::json!({ "corrected": corrected })));
+                        let positions: BTreeMap<&String, f64> =
+                            session.gate().positions().iter().map(|(instrument, held)| (instrument, held.quantity)).collect();
+                        record.write("reconciled", Some(serde_json::json!({ "corrected": corrected, "positions": positions })));
                         frozen = Some(true);
                         status.lock().unwrap_or_else(std::sync::PoisonError::into_inner).reconciled = true;
                     }
@@ -546,8 +554,11 @@ async fn drive<E: Executor>(
                 status.last_bar = Some(bar.at.to_string());
                 status.signals += u32::try_from(signals.len()).unwrap_or(u32::MAX);
             }
-            for signal in signals {
-                act(&mut session, &signal, &proposer, now(), frozen.is_some(), record, status).await?;
+            for (n, signal) in signals.iter().enumerate() {
+                // The bar's instant and the signal's place in it: unique in
+                // the record, and readable back to the bar without a lookup.
+                let id = format!("{}#{n}", bar.at);
+                act(&mut session, &id, signal, &proposer, now(), frozen.is_some(), record, status).await?;
             }
             if let Some(why) = session.gate().halted() {
                 halt(status, record, events, why);
@@ -559,7 +570,10 @@ async fn drive<E: Executor>(
             Ok(filled) if filled > 0 => {
                 let executions = session.executions();
                 for execution in &executions[executions.len() - filled..] {
-                    record.write("filled", Some(serde_json::to_value(execution).unwrap_or_default()));
+                    let mut detail = serde_json::to_value(execution).unwrap_or_default();
+                    let position = session.gate().positions().get(&execution.instrument).map_or(0.0, |held| held.quantity);
+                    detail["position"] = serde_json::json!(position);
+                    record.write("filled", Some(detail));
                 }
                 status.lock().unwrap_or_else(std::sync::PoisonError::into_inner).fills +=
                     u32::try_from(filled).unwrap_or(u32::MAX);
@@ -615,8 +629,10 @@ async fn pause(stop: &AtomicBool, mailbox: &Mailbox) {
 
 /// One signal, to the gate or to the venue. While `frozen`, an entry is
 /// refused before it reaches the gate; an exit is never refused.
+#[expect(clippy::too_many_arguments, reason = "one call site; a struct would only rename the arguments")]
 async fn act<E: Executor>(
     session: &mut Session<E>,
+    id: &str,
     signal: &Signal,
     proposer: &str,
     now: chrono::NaiveDateTime,
@@ -625,6 +641,8 @@ async fn act<E: Executor>(
     status: &Mutex<Status>,
 ) -> Result<(), String> {
     record.write("signal", Some(serde_json::json!({
+        "id": id,
+        "bar": signal.signalled_at,
         "side": format!("{:?}", signal.side),
         "quantity": signal.quantity,
         "price": signal.reference_price,
@@ -637,7 +655,7 @@ async fn act<E: Executor>(
             .close(&signal.instrument, signal.reference_price, signal.signalled_at)
             .await
             .map_err(|err| err.to_string())?;
-        record.write("exit", Some(serde_json::json!({ "why": why, "order": sent.as_ref().map(ToString::to_string) })));
+        record.write("exit", Some(serde_json::json!({ "signal": id, "why": why, "order": sent.as_ref().map(ToString::to_string) })));
         if sent.is_some() {
             status.lock().unwrap_or_else(std::sync::PoisonError::into_inner).submitted += 1;
         }
@@ -646,11 +664,11 @@ async fn act<E: Executor>(
     if signal.side == Side::Sell {
         // ponytail: every hosted rule is long-only; a sell that is not an exit
         // is a short, and the gate's short path is for options.
-        record.write("ignored", Some(serde_json::json!("a sell to open is not hosted")));
+        record.write("ignored", Some(serde_json::json!({ "signal": id, "why": "a sell to open is not hosted" })));
         return Ok(());
     }
     if frozen {
-        record.write("refused", Some(serde_json::json!("frozen: the book disagrees with the venue; reconcile and resume")));
+        record.write("refused", Some(serde_json::json!({ "signal": id, "why": "frozen: the book disagrees with the venue; reconcile and resume" })));
         status.lock().unwrap_or_else(std::sync::PoisonError::into_inner).refused += 1;
         return Ok(());
     }
@@ -665,12 +683,12 @@ async fn act<E: Executor>(
     };
     match session.propose(&proposal, now, None).await.map_err(|err| err.to_string())? {
         Some(order) => {
-            record.write("submitted", Some(serde_json::json!(order.to_string())));
+            record.write("submitted", Some(serde_json::json!({ "signal": id, "order": order.to_string() })));
             status.lock().unwrap_or_else(std::sync::PoisonError::into_inner).submitted += 1;
         }
         None => {
             let why = session.refusals().last().map(|(_, rejection)| format!("{rejection:?}"));
-            record.write("refused", Some(serde_json::json!(why)));
+            record.write("refused", Some(serde_json::json!({ "signal": id, "why": why })));
             status.lock().unwrap_or_else(std::sync::PoisonError::into_inner).refused += 1;
         }
     }
@@ -697,11 +715,21 @@ struct Recorder {
     path: PathBuf,
 }
 
+/// `<data>/sessions/<id>.jsonl`, with anything but a letter, digit, `-` or
+/// `_` in the id made `_`.
+#[must_use]
+pub fn record_path(data: &Path, id: &str) -> PathBuf {
+    let safe: String = id.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect();
+    data.join(SUBDIR).join(format!("{safe}.jsonl"))
+}
+
 impl Recorder {
-    fn open(dir: &Path, id: &str) -> Result<Self, String> {
-        std::fs::create_dir_all(dir).map_err(|err| format!("{}: {err}", dir.display()))?;
-        let safe: String = id.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect();
-        Ok(Self { path: dir.join(format!("{safe}.jsonl")) })
+    fn open(data: &Path, id: &str) -> Result<Self, String> {
+        let path = record_path(data, id);
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(|err| format!("{}: {err}", dir.display()))?;
+        }
+        Ok(Self { path })
     }
 
     fn write(&self, event: &str, detail: Option<serde_json::Value>) {
