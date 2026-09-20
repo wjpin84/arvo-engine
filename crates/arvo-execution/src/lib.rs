@@ -268,6 +268,22 @@ impl Reconciliation {
     }
 }
 
+/// One instrument the gate and the venue disagree about.
+///
+/// Found by [`Session::audit`], while a session is running rather than as it
+/// starts. A fill the venue reported and this process never heard, a position
+/// closed by hand, a broker-side liquidation: each leaves the gate sizing
+/// against a book that is not the account's.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Discrepancy {
+    /// Arvo instrument id, as the gate keys it.
+    pub instrument: String,
+    /// What the gate believes is held. Zero when it believes nothing is.
+    pub expected: f64,
+    /// What the venue reports. Zero when it reports nothing.
+    pub at_venue: f64,
+}
+
 /// What a kill switch managed to do.
 ///
 /// Not a `Result`: the halt is armed either way, and some exits succeeding
@@ -665,6 +681,73 @@ impl<E: Executor> Session<E> {
                     )
                 },
             ));
+        }
+        Ok(found)
+    }
+
+    /// Compares the gate's book with the venue's, without touching either.
+    ///
+    /// Run every poll. An order still working is not a discrepancy — the venue
+    /// is ahead of the gate by exactly that order until [`Self::settle`] hears
+    /// the fill — so the audit says nothing at all while anything is
+    /// outstanding, rather than raising an incident over its own order.
+    /// Quantity is what is compared; the venue's average entry is its own
+    /// accounting and drifts from a fill price for reasons that are not an
+    /// incident.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecutionError`] if the venue cannot be asked.
+    pub async fn audit(&self, venue: &str) -> Result<Vec<Discrepancy>, ExecutionError> {
+        if self.unfilled > 0 {
+            return Ok(Vec::new());
+        }
+        let state = self.executor.at_venue().await?;
+        let held: std::collections::BTreeMap<String, f64> = state
+            .positions
+            .iter()
+            .map(|holding| (format!("{}.{venue}", holding.symbol), holding.quantity))
+            .collect();
+        let mut found: Vec<Discrepancy> = self
+            .gate
+            .positions()
+            .iter()
+            .map(|(instrument, position)| Discrepancy {
+                instrument: instrument.clone(),
+                expected: position.quantity,
+                at_venue: held.get(instrument).copied().unwrap_or_default(),
+            })
+            .collect();
+        found.extend(held.iter().filter(|(instrument, _)| !self.gate.positions().contains_key(*instrument)).map(
+            |(instrument, quantity)| Discrepancy { instrument: instrument.clone(), expected: 0.0, at_venue: *quantity },
+        ));
+        found.retain(|each| (each.expected - each.at_venue).abs() > 1e-9);
+        Ok(found)
+    }
+
+    /// Makes the gate's book the venue's, one position at a time.
+    ///
+    /// The venue is the truth: it holds the money. Each disagreement is
+    /// closed on the gate and reopened at the venue's quantity and entry, so
+    /// whatever the gate knows around a position — opened when, for the
+    /// day-trade count — is reset to today for the ones that changed and left
+    /// alone for the ones that did not. Realised P&L on a position that
+    /// vanished is booked as zero: nobody here saw the exit price.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecutionError`] if the venue cannot be asked.
+    pub async fn adopt(&mut self, now: NaiveDateTime, venue: &str) -> Result<Vec<Discrepancy>, ExecutionError> {
+        let state = self.executor.at_venue().await?;
+        let found = self.audit(venue).await?;
+        for each in &found {
+            // ponytail: zero P&L on a position the venue no longer holds; the
+            // fill price was never seen, and the trade journal (#190) is where
+            // the venue's own figure would come from.
+            self.gate.closed(&each.instrument, 0.0, now.date());
+            if let Some(holding) = state.positions.iter().find(|h| format!("{}.{venue}", h.symbol) == each.instrument) {
+                self.gate.opened(&each.instrument, holding.quantity, holding.entry, now.date());
+            }
         }
         Ok(found)
     }

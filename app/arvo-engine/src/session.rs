@@ -26,6 +26,18 @@
 //! fires overnight and fills at the open — the fill the backtest assumed
 //! (ADR-0010).
 //!
+//! # A disagreement with the venue is an incident, not a warning
+//!
+//! Every poll the gate's book is audited against the venue's (#187). A
+//! position the venue reports and the gate does not, or the other way round,
+//! means something traded that this rule did not decide, and the rule can no
+//! longer size against a book it trusts. The session *freezes*: entries are
+//! refused, exits still go out (ADR-0009), bars keep flowing so the rule
+//! stays current, and the record names the disagreement. A person reconciles
+//! — the gate is made to agree with the venue, since the venue holds the
+//! money — and then resumes, and both are events in the record. Nothing
+//! resumes on its own: a freeze that lifted itself would be a warning.
+//!
 //! # Nothing here writes the library
 //!
 //! Bars fetched for a session are pushed and forgotten. The library is fetched
@@ -76,7 +88,7 @@ pub struct Status {
     pub instrument: String,
     pub strategy: String,
     pub started_at: String,
-    /// `starting`, `running`, `halted`, `stopped` or `failed`.
+    /// `starting`, `running`, `frozen`, `halted`, `stopped` or `failed`.
     pub state: String,
     pub signals: u32,
     pub submitted: u32,
@@ -87,7 +99,24 @@ pub struct Status {
     pub last_error: Option<String>,
     /// When the last bar was pushed, if any.
     pub last_bar: Option<String>,
+    /// What the gate and the venue disagreed about, while frozen.
+    pub frozen: Option<String>,
+    /// Whether the disagreement has been reconciled, so a resume is allowed.
+    pub reconciled: bool,
 }
+
+/// What a person can ask of a frozen session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Command {
+    /// Make the gate's book the venue's.
+    Reconcile,
+    /// Take entries again. Only after a reconcile.
+    Resume,
+}
+
+/// One slot: the session loop takes what is there at the top of each turn,
+/// and the caller waits for the slot to empty.
+type Mailbox = Arc<Mutex<Option<Command>>>;
 
 /// One line of a session's record.
 #[derive(Debug, Serialize)]
@@ -101,6 +130,7 @@ struct Event<'a> {
 struct Running {
     status: Arc<Mutex<Status>>,
     stop: Arc<AtomicBool>,
+    mailbox: Mailbox,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -162,8 +192,11 @@ impl Sessions {
             halted: None,
             last_error: None,
             last_bar: None,
+            frozen: None,
+            reconciled: false,
         }));
         let stop = Arc::new(AtomicBool::new(false));
+        let mailbox: Mailbox = Arc::default();
         let snapshot = status.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
         let thread = {
             let data = self.data.clone();
@@ -171,6 +204,7 @@ impl Sessions {
             let executor = executor.to_owned();
             let status = status.clone();
             let stop = stop.clone();
+            let mailbox = mailbox.clone();
             let events = self.events.clone();
             // Its own thread: the shadow's message bus is thread-local
             // (ADR-0001), and a session is a loop that sleeps.
@@ -178,7 +212,7 @@ impl Sessions {
                 .name(id.clone())
                 .spawn(move || {
                     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        run(&data, &finding, &executor, &status, &stop, &events)
+                        run(&data, &finding, &executor, &status, &stop, &mailbox, &events)
                     }));
                     let mut status = status.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                     match outcome {
@@ -200,7 +234,7 @@ impl Sessions {
                 })
                 .map_err(|err| format!("starting the session thread: {err}"))?
         };
-        running.insert(id, Running { status, stop, thread: Some(thread) });
+        running.insert(id, Running { status, stop, mailbox, thread: Some(thread) });
         Ok(snapshot)
     }
 
@@ -220,6 +254,55 @@ impl Sessions {
         }
         let status = found.status.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
         Ok(status)
+    }
+
+    /// Makes a frozen session's gate agree with the venue. The session stays
+    /// frozen: reconciling is looking, resuming is deciding.
+    ///
+    /// # Errors
+    ///
+    /// No session by that id, or one that is not frozen.
+    pub fn reconcile(&self, id: &str) -> Result<Status, String> {
+        self.command(id, Command::Reconcile)
+    }
+
+    /// Lets a frozen session take entries again.
+    ///
+    /// # Errors
+    ///
+    /// No session by that id, one that is not frozen, or one not yet
+    /// reconciled: resuming against a book the venue disagrees with is the
+    /// state the freeze exists to prevent.
+    pub fn resume(&self, id: &str) -> Result<Status, String> {
+        self.command(id, Command::Resume)
+    }
+
+    fn command(&self, id: &str, command: Command) -> Result<Status, String> {
+        let (status, mailbox) = {
+            let running = self.running.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let found = running.get(id).ok_or_else(|| format!("no session {id}"))?;
+            (found.status.clone(), found.mailbox.clone())
+        };
+        {
+            let status = status.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if status.state != "frozen" {
+                return Err(format!("{id} is {}, not frozen", status.state));
+            }
+            if command == Command::Resume && !status.reconciled {
+                return Err(format!("{id} has not been reconciled; reconcile first"));
+            }
+        }
+        *mailbox.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(command);
+        // The loop takes the command within a pause step. Waiting for that
+        // means the status handed back already shows what the command did.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while mailbox.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_some()
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let now = status.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+        Ok(now)
     }
 
     #[must_use]
@@ -252,6 +335,7 @@ fn run(
     executor: &str,
     status: &Mutex<Status>,
     stop: &AtomicBool,
+    mailbox: &Mailbox,
     events: &broadcast::Sender<EventView>,
 ) -> Result<(), String> {
     let store = EvidenceStore::new(&data.join("evidence"));
@@ -305,6 +389,7 @@ fn run(
             &record,
             status,
             stop,
+            mailbox,
             events,
         )),
         "alpaca-live" => runtime.block_on(drive(
@@ -318,6 +403,7 @@ fn run(
             &record,
             status,
             stop,
+            mailbox,
             events,
         )),
         robinhood if robinhood.starts_with("robinhood-") => {
@@ -340,6 +426,7 @@ fn run(
                 &record,
                 status,
                 stop,
+                mailbox,
                 events,
             ))
         }
@@ -347,7 +434,8 @@ fn run(
     }
 }
 
-/// The loop: reconcile, then poll for bars until asked to stop or halted.
+/// The loop: reconcile, then poll for bars until asked to stop or halted,
+/// auditing the book against the venue each time round.
 #[expect(clippy::too_many_arguments, reason = "one call site; a struct would only rename the arguments")]
 async fn drive<E: Executor>(
     executor: E,
@@ -360,6 +448,7 @@ async fn drive<E: Executor>(
     record: &Recorder,
     status: &Mutex<Status>,
     stop: &AtomicBool,
+    mailbox: &Mailbox,
     events: &broadcast::Sender<EventView>,
 ) -> Result<(), String> {
     let now = || chrono::Utc::now().naive_utc();
@@ -394,7 +483,40 @@ async fn drive<E: Executor>(
         announce(events, &status);
     }
 
+    // `Some` while frozen; the flag says whether a reconcile has happened.
+    let mut frozen: Option<bool> = None;
     while !stop.load(Ordering::SeqCst) {
+        // Taken, then the lock is dropped: the caller polls that lock while
+        // the command runs, and a reconcile waits on the venue.
+        let command = mailbox.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+        if let Some(command) = command {
+            match command {
+                Command::Reconcile => match session.adopt(now(), venue).await {
+                    Ok(corrected) => {
+                        record.write("reconciled", Some(serde_json::json!({ "corrected": corrected })));
+                        frozen = Some(true);
+                        status.lock().unwrap_or_else(std::sync::PoisonError::into_inner).reconciled = true;
+                    }
+                    Err(err) => {
+                        status.lock().unwrap_or_else(std::sync::PoisonError::into_inner).last_error = Some(err.to_string());
+                        record.write("reconcile_failed", Some(serde_json::json!(err.to_string())));
+                    }
+                },
+                Command::Resume => {
+                    if frozen == Some(true) {
+                        frozen = None;
+                        record.write("resumed", None);
+                        let mut status = status.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                        status.state = "running".to_owned();
+                        status.frozen = None;
+                        status.reconciled = false;
+                        announce(events, &status);
+                    } else {
+                        record.write("resume_refused", Some(serde_json::json!("not reconciled")));
+                    }
+                }
+            }
+        }
         let today = now().date();
         // From the last bar the rule saw, so a library that stopped a fortnight
         // ago is caught up bar by bar rather than skipped to today; three days
@@ -405,7 +527,7 @@ async fn drive<E: Executor>(
             Err(err) => {
                 status.lock().unwrap_or_else(std::sync::PoisonError::into_inner).last_error = Some(err.to_string());
                 record.write("fetch_failed", Some(serde_json::json!(err.to_string())));
-                pause(stop).await;
+                pause(stop, mailbox).await;
                 continue;
             }
         };
@@ -425,7 +547,7 @@ async fn drive<E: Executor>(
                 status.signals += u32::try_from(signals.len()).unwrap_or(u32::MAX);
             }
             for signal in signals {
-                act(&mut session, &signal, &proposer, now(), record, status).await?;
+                act(&mut session, &signal, &proposer, now(), frozen.is_some(), record, status).await?;
             }
             if let Some(why) = session.gate().halted() {
                 halt(status, record, events, why);
@@ -448,29 +570,57 @@ async fn drive<E: Executor>(
                 record.write("settle_failed", Some(serde_json::json!(err.to_string())));
             }
         }
-        pause(stop).await;
+        if frozen.is_none() {
+            match session.audit(venue).await {
+                Ok(found) if !found.is_empty() => {
+                    frozen = Some(false);
+                    let why = found
+                        .iter()
+                        .map(|d| format!("{}: gate {} venue {}", d.instrument, d.expected, d.at_venue))
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    record.write("frozen", Some(serde_json::json!({ "discrepancies": found })));
+                    let mut status = status.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    status.state = "frozen".to_owned();
+                    status.frozen = Some(why);
+                    status.reconciled = false;
+                    announce(events, &status);
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    status.lock().unwrap_or_else(std::sync::PoisonError::into_inner).last_error = Some(err.to_string());
+                    record.write("audit_failed", Some(serde_json::json!(err.to_string())));
+                }
+            }
+        }
+        pause(stop, mailbox).await;
     }
     record.write("stopped", None);
     Ok(())
 }
 
-/// Sleeps one poll, waking early when asked to stop so a stop is prompt
-/// rather than a minute away.
-async fn pause(stop: &AtomicBool) {
+/// Sleeps one poll, waking early when asked to stop or handed a command, so
+/// neither is a minute away.
+async fn pause(stop: &AtomicBool, mailbox: &Mailbox) {
     let step = Duration::from_secs(1);
     let mut slept = Duration::ZERO;
-    while slept < POLL && !stop.load(Ordering::SeqCst) {
+    while slept < POLL
+        && !stop.load(Ordering::SeqCst)
+        && mailbox.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_none()
+    {
         tokio::time::sleep(step).await;
         slept += step;
     }
 }
 
-/// One signal, to the gate or to the venue.
+/// One signal, to the gate or to the venue. While `frozen`, an entry is
+/// refused before it reaches the gate; an exit is never refused.
 async fn act<E: Executor>(
     session: &mut Session<E>,
     signal: &Signal,
     proposer: &str,
     now: chrono::NaiveDateTime,
+    frozen: bool,
     record: &Recorder,
     status: &Mutex<Status>,
 ) -> Result<(), String> {
@@ -497,6 +647,11 @@ async fn act<E: Executor>(
         // ponytail: every hosted rule is long-only; a sell that is not an exit
         // is a short, and the gate's short path is for options.
         record.write("ignored", Some(serde_json::json!("a sell to open is not hosted")));
+        return Ok(());
+    }
+    if frozen {
+        record.write("refused", Some(serde_json::json!("frozen: the book disagrees with the venue; reconcile and resume")));
+        status.lock().unwrap_or_else(std::sync::PoisonError::into_inner).refused += 1;
         return Ok(());
     }
     let proposal = Proposal {
@@ -533,7 +688,7 @@ fn halt(status: &Mutex<Status>, record: &Recorder, events: &broadcast::Sender<Ev
 /// Tells whoever is listening what state a session is in now. A send with
 /// no receiver is fine: the engine runs with the window closed.
 fn announce(events: &broadcast::Sender<EventView>, status: &Status) {
-    let why = status.last_error.as_deref().or(status.halted.as_deref());
+    let why = status.last_error.as_deref().or(status.halted.as_deref()).or(status.frozen.as_deref());
     let _ = events.send(arvo_service::events::session(&status.id, &status.state, why));
 }
 
@@ -586,5 +741,17 @@ mod tests {
         assert_eq!(stopped.state, "failed");
         assert!(stopped.last_error.is_some());
         assert_eq!(sessions.list().len(), 1);
+    }
+
+    #[test]
+    fn only_a_frozen_session_takes_a_reconcile_or_a_resume() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sessions = Sessions::new(dir.path(), broadcast::channel(16).0);
+        let started = sessions.start("nope", "alpaca-paper").expect("starts");
+        sessions.stop(&started.id).expect("joins");
+        let refused = sessions.reconcile(&started.id).expect_err("not frozen");
+        assert!(refused.contains("failed, not frozen"), "{refused}");
+        assert!(sessions.resume(&started.id).is_err());
+        assert!(sessions.resume("nobody").expect_err("unknown").contains("no session"));
     }
 }

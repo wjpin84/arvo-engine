@@ -169,6 +169,8 @@ struct Stocked {
     state: VenueState,
     /// Orders it will refuse to take back.
     immovable: Vec<&'static str>,
+    /// Orders it reports as still working.
+    outstanding: usize,
 }
 
 #[async_trait::async_trait]
@@ -182,7 +184,7 @@ impl Executor for Stocked {
     }
 
     async fn drain(&self) -> Result<(Vec<Execution>, usize), ExecutionError> {
-        Ok((Vec::new(), 0))
+        Ok((Vec::new(), self.outstanding))
     }
 
     async fn at_venue(&self) -> Result<VenueState, ExecutionError> {
@@ -208,7 +210,7 @@ fn stocked(state: VenueState, immovable: Vec<&'static str>) -> Session<Stocked> 
     use arvo_risk::{RiskGate, RiskModel};
     Session::new(
         RiskGate::new(RiskModel::default(), 10_000.0, day()),
-        Stocked { state, immovable },
+        Stocked { state, immovable, outstanding: 0 },
     )
 }
 
@@ -408,4 +410,66 @@ fn a_session_with_no_fills_reports_nothing_rather_than_dividing_by_zero() {
     let divergence = Divergence::of(&[], 0, None);
     assert_eq!(divergence.fills, 0);
     assert!(divergence.optimism_bps().is_none());
+}
+
+#[tokio::test]
+async fn an_audit_names_what_the_gate_and_the_venue_disagree_about() {
+    // The gate holds MSFT 20 and AAPL 5; the venue holds MSFT 10 and TSLA 3.
+    // Every kind of disagreement at once: shrunk, gone, and never heard of.
+    let state = VenueState {
+        positions: vec![holding("MSFT", 10.0), holding("TSLA", 3.0)],
+        resting: Vec::new(),
+    };
+    let mut session = stocked(state, Vec::new());
+    session.gate.opened("MSFT.RH", 20.0, 100.0, day());
+    session.gate.opened("AAPL.RH", 5.0, 100.0, day());
+
+    let found = session.audit("RH").await.expect("readable");
+    let mut named: Vec<(&str, f64, f64)> = found.iter().map(|d| (d.instrument.as_str(), d.expected, d.at_venue)).collect();
+    named.sort_by(|a, b| a.0.cmp(b.0));
+    assert_eq!(named, vec![("AAPL.RH", 5.0, 0.0), ("MSFT.RH", 20.0, 10.0), ("TSLA.RH", 0.0, 3.0)]);
+    assert!(session.gate().halted().is_none(), "an audit reports; it does not decide");
+}
+
+#[tokio::test]
+async fn an_audit_agreeing_with_the_venue_says_nothing() {
+    let state = VenueState { positions: vec![holding("MSFT", 20.0)], resting: Vec::new() };
+    let mut session = stocked(state, Vec::new());
+    session.gate.opened("MSFT.RH", 20.0, 100.0, day());
+    assert!(session.audit("RH").await.expect("readable").is_empty());
+}
+
+#[tokio::test]
+async fn an_audit_stays_quiet_while_its_own_order_is_still_working() {
+    // The venue is ahead of the gate by exactly the order in flight. Raising
+    // an incident over that would freeze every session on every entry.
+    let state = VenueState { positions: vec![holding("MSFT", 20.0)], resting: Vec::new() };
+    let mut session = stocked(state, Vec::new());
+    session.executor.outstanding = 1;
+    session.settle().await.expect("drains");
+    assert!(session.audit("RH").await.expect("readable").is_empty());
+
+    session.executor.outstanding = 0;
+    session.settle().await.expect("drains");
+    assert_eq!(session.audit("RH").await.expect("readable").len(), 1, "and speaks once the order has settled");
+}
+
+#[tokio::test]
+async fn adopting_makes_the_gate_agree_with_the_venue_and_the_audit_go_quiet() {
+    let state = VenueState {
+        positions: vec![holding("MSFT", 10.0), holding("TSLA", 3.0)],
+        resting: Vec::new(),
+    };
+    let mut session = stocked(state, Vec::new());
+    session.gate.opened("MSFT.RH", 20.0, 90.0, day());
+    session.gate.opened("AAPL.RH", 5.0, 100.0, day());
+
+    let corrected = session.adopt(at(0, 0, 0), "RH").await.expect("readable");
+    assert_eq!(corrected.len(), 3);
+    let book = session.gate().positions();
+    assert!((book["MSFT.RH"].quantity - 10.0).abs() < 1e-9);
+    assert!((book["MSFT.RH"].entry - 100.0).abs() < 1e-9, "the venue's entry, not the gate's");
+    assert!((book["TSLA.RH"].quantity - 3.0).abs() < 1e-9);
+    assert!(!book.contains_key("AAPL.RH"));
+    assert!(session.audit("RH").await.expect("readable").is_empty());
 }

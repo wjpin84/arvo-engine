@@ -148,7 +148,7 @@ async fn session_command(args: &[String]) -> Result<(), String> {
     }
     let show = |status: &SessionStatus| {
         println!(
-            "{}  {}  {} {}  signals {}  submitted {}  refused {}  fills {}{}{}{}",
+            "{}  {}  {} {}  signals {}  submitted {}  refused {}  fills {}{}{}{}{}",
             status.id,
             status.state,
             status.instrument,
@@ -159,6 +159,9 @@ async fn session_command(args: &[String]) -> Result<(), String> {
             status.fills,
             status.last_bar.as_ref().map_or(String::new(), |at| format!("  last bar {at}")),
             status.halted.as_ref().map_or(String::new(), |why| format!("  HALTED: {why}")),
+            status.frozen.as_ref().map_or(String::new(), |why| {
+                format!("  FROZEN: {why}{}", if status.reconciled { " (reconciled; resume when ready)" } else { " (reconcile first)" })
+            }),
             status.last_error.as_ref().map_or(String::new(), |err| format!("  error: {err}")),
         );
     };
@@ -185,7 +188,25 @@ async fn session_command(args: &[String]) -> Result<(), String> {
                 .map_err(|err| err.message().to_owned())?;
             show(&stopped.into_inner());
         }
-        _ => return Err("usage: arvo-engine session list | start <finding> <executor> | stop <id>".to_owned()),
+        [verb, id] if verb == "reconcile" => {
+            let reconciled = client
+                .reconcile_session(bearer(SessionId { id: id.clone() }, &token))
+                .await
+                .map_err(|err| err.message().to_owned())?;
+            show(&reconciled.into_inner());
+        }
+        [verb, id] if verb == "resume" => {
+            let resumed = client
+                .resume_session(bearer(SessionId { id: id.clone() }, &token))
+                .await
+                .map_err(|err| err.message().to_owned())?;
+            show(&resumed.into_inner());
+        }
+        _ => {
+            return Err(
+                "usage: arvo-engine session list | start <finding> <executor> | stop <id> | reconcile <id> | resume <id>".to_owned(),
+            )
+        }
     }
     Ok(())
 }

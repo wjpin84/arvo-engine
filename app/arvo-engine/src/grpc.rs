@@ -205,6 +205,8 @@ fn session_status(status: crate::session::Status) -> SessionStatus {
         halted: status.halted,
         last_error: status.last_error,
         last_bar: status.last_bar,
+        frozen: status.frozen,
+        reconciled: status.reconciled,
     }
 }
 
@@ -557,6 +559,27 @@ impl sessions_server::Sessions for Control {
             .map_err(|err| Status::internal(err.to_string()))?
             .map(|status| Response::new(session_status(status)))
             .map_err(Status::not_found)
+    }
+
+    async fn reconcile_session(&self, request: Request<SessionId>) -> Result<Response<SessionStatus>, Status> {
+        let id = request.into_inner().id;
+        let sessions = self.sessions.clone();
+        // Waits for the session loop to take the command, up to a pause step.
+        tokio::task::spawn_blocking(move || sessions.reconcile(&id))
+            .await
+            .map_err(|err| Status::internal(err.to_string()))?
+            .map(|status| Response::new(session_status(status)))
+            .map_err(Status::failed_precondition)
+    }
+
+    async fn resume_session(&self, request: Request<SessionId>) -> Result<Response<SessionStatus>, Status> {
+        let id = request.into_inner().id;
+        let sessions = self.sessions.clone();
+        tokio::task::spawn_blocking(move || sessions.resume(&id))
+            .await
+            .map_err(|err| Status::internal(err.to_string()))?
+            .map(|status| Response::new(session_status(status)))
+            .map_err(Status::failed_precondition)
     }
 
     async fn list_sessions(&self, _: Request<Empty>) -> Result<Response<SessionList>, Status> {
