@@ -17,6 +17,7 @@ use proto::services::market_server::{self, MarketServer};
 use proto::services::platform_server::{self, PlatformServer};
 use proto::services::portfolio_server::{self, PortfolioServer};
 use proto::services::research_files_server::{self, ResearchFilesServer};
+use proto::services::scripts_server::{self, ScriptsServer};
 use proto::services::sessions_server::{self, SessionsServer};
 use proto::common::{Empty, ExportedPath};
 use proto::market::{
@@ -24,7 +25,8 @@ use proto::market::{
     MatchesView, QuoteTick, SourceComparisonView, SourcesView, WatchlistView,
 };
 use proto::platform::{
-    AccountKeys, AccountsView, ExtensionStrategiesView, JobId, JobsView, PluginsView, SignIn, SignalsView,
+    AccountKeys, AccountsView, ExtensionStrategiesView, JobId, JobsView, PluginsView, RunId, ScriptJobsView,
+    ScriptOutputView, ScriptPath, ScriptSchedule, SignIn, SignalsView,
     StrategyContributionsView, VendorId, VendorProfile,
 };
 use proto::portfolio::{PortfolioLibraryView, PortfolioName};
@@ -105,6 +107,14 @@ pub async fn serve(
 ) -> Result<(), tonic::transport::Error> {
     let Engine { research, sessions, events, jobs, plugins, stream, ticks, stop } = engine;
     let stop = std::sync::Arc::new(std::sync::Mutex::new(Some(stop)));
+    // A person's scripts run here rather than in a window, so a cadence they
+    // set is honoured after they close it (ADR-0018). Built before the
+    // services because constructing it registers every saved schedule.
+    let scripts = arvo_service::scripts::Scripts::new(
+        research.root().to_path_buf(),
+        arvo_service::project::app_data_root().map_or_else(|_| research.root().to_path_buf(), std::convert::Into::into),
+        jobs.clone(),
+    );
     let workbench = std::sync::Arc::new(arvo_service::research::ResearchService::new(
         research.root().join(arvo_service::research::DATA_SUBDIR),
         research.root().join(arvo_service::research::EVIDENCE_SUBDIR),
@@ -151,6 +161,10 @@ pub async fn serve(
         ResearchFilesServer::new(ResearchFiles { workbench }).max_decoding_message_size(MAX_MESSAGE_BYTES),
         control(),
     );
+    let scripts_tier = tonic::service::interceptor::InterceptedService::new(
+        ScriptsServer::new(Scripts { scripts }).max_decoding_message_size(MAX_MESSAGE_BYTES),
+        control(),
+    );
     tonic::transport::Server::builder()
         .add_service(research_tier)
         .add_service(sessions_tier)
@@ -159,6 +173,7 @@ pub async fn serve(
         .add_service(portfolio_tier)
         .add_service(platform_tier)
         .add_service(files_tier)
+        .add_service(scripts_tier)
         .serve_with_incoming_shutdown(tokio_stream::wrappers::TcpListenerStream::new(listener), shutdown)
         .await
 }
@@ -407,6 +422,56 @@ impl platform_server::Platform for Platform {
             .map(|(extension, contributions)| (extension, StrategyContributionsView { contributions }))
             .collect();
         Ok(Response::new(ExtensionStrategiesView { by_extension }))
+    }
+}
+
+/// A person's own scripts: running one, and the cadences they set.
+///
+/// Here rather than in a window because a schedule that only fires while
+/// someone is watching is not a schedule (ADR-0018).
+struct Scripts {
+    scripts: std::sync::Arc<arvo_service::scripts::Scripts>,
+}
+
+#[tonic::async_trait]
+impl scripts_server::Scripts for Scripts {
+    type WatchOutputStream = std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<ScriptOutputView, Status>> + Send>>;
+
+    async fn run_script(&self, request: Request<ScriptPath>) -> Result<Response<RunId>, Status> {
+        let path = required(&request.get_ref().path, "path")?.to_owned();
+        let run = self.scripts.start(&path).map_err(refused)?;
+        Ok(Response::new(RunId { run }))
+    }
+
+    async fn stop_script(&self, request: Request<RunId>) -> Result<Response<Empty>, Status> {
+        self.scripts.stop(request.get_ref().run);
+        Ok(Response::new(Empty {}))
+    }
+
+    async fn watch_output(&self, _: Request<Empty>) -> Result<Response<Self::WatchOutputStream>, Status> {
+        use tokio_stream::StreamExt as _;
+
+        // A reader that falls behind drops lines rather than stalling the
+        // script: a run is not for the watchers' benefit.
+        let stream = tokio_stream::wrappers::BroadcastStream::new(self.scripts.watch())
+            .filter_map(|line| line.ok())
+            .map(Ok::<_, Status>);
+        Ok(Response::new(Box::pin(stream)))
+    }
+
+    async fn list_script_jobs(&self, _: Request<Empty>) -> Result<Response<ScriptJobsView>, Status> {
+        Ok(Response::new(ScriptJobsView { jobs: self.scripts.saved() }))
+    }
+
+    async fn save_script_job(&self, request: Request<ScriptSchedule>) -> Result<Response<ScriptJobsView>, Status> {
+        let ScriptSchedule { script, every_secs, cron, enabled } = request.into_inner();
+        let jobs = self.scripts.save(script, every_secs, cron, enabled).map_err(refused)?;
+        Ok(Response::new(ScriptJobsView { jobs }))
+    }
+
+    async fn remove_script_job(&self, request: Request<ScriptPath>) -> Result<Response<ScriptJobsView>, Status> {
+        let jobs = self.scripts.remove(&request.get_ref().path).map_err(refused)?;
+        Ok(Response::new(ScriptJobsView { jobs }))
     }
 }
 

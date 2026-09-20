@@ -539,22 +539,6 @@ pub struct ThemeView {
     pub colors: std::collections::BTreeMap<String, String>,
 }
 
-/// One scheduled script: a project file the runtime runs on a timer.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ScriptJobView {
-    /// Relative to the project folder, and what identifies the schedule:
-    /// one schedule per script.
-    pub script: String,
-    /// The cadence when `cron` is `None`. Kept either way, so switching to a
-    /// cron expression and back does not lose what the interval was.
-    pub every_secs: u64,
-    /// A cron expression, as the person wrote it. When this is set it decides
-    /// when the script runs and `every_secs` is not consulted.
-    #[serde(default)]
-    pub cron: Option<String>,
-    pub enabled: bool,
-}
-
 /// One of Arvo's rules, as the Rulesets view describes it: what a ruleset
 /// can be made from, with the numbers it takes.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -699,17 +683,6 @@ pub struct TerminalOutputView {
 /// Where the language server's stderr lines arrive in the window, one text
 /// per event, for the Output panel's Language Server channel (ADR-0021).
 pub const LSP_LOG_CHANNEL: &str = "arvo://lsp-log";
-
-/// One line from a running script, or the fact that it ended.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ScriptOutputView {
-    /// Which run, as `run_project_script` returned it.
-    pub run: u32,
-    /// `"out"`, `"err"`, `"info"` (what Arvo started) or `"exit"`.
-    pub stream: String,
-    /// The line without its newline; for `"exit"`, how it ended.
-    pub text: String,
-}
 
 /// The channel name the push events arrive on.
 ///
