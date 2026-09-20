@@ -131,6 +131,9 @@ impl Research {
                 "verdict": s.verdict,
                 "recorded_at": s.recorded_at.to_rfc3339(),
                 "agent": s.agent,
+                "strategy": s.strategy,
+                "code_commit": s.code_commit,
+                "ruleset_hash": s.ruleset_hash,
             })).collect::<Vec<_>>(),
             "unreadable": unreadable.len(),
         }))
@@ -194,8 +197,10 @@ impl Research {
 
         let store = self.store();
         let history = store.load().map_err(|err| err.to_string())?.records;
+        let provenance = arvo_service::research::provenance_for(Some(plan.name()));
         let stored = StoredRecord::by_agent(record, author, &history, chrono::Utc::now())
-            .with_origin(origin.map(ToOwned::to_owned));
+            .with_origin(origin.map(ToOwned::to_owned))
+            .with_provenance(provenance);
         store.save(&stored).map_err(|err| err.to_string())?;
         Ok(summarize(&stored))
     }
@@ -218,8 +223,11 @@ impl Research {
         let record = Record::Reported(Box::new(evidence));
         let store = self.store();
         let history = store.load().map_err(|err| err.to_string())?.records;
+        // No ruleset: the evidence came from an engine that is not this one.
+        let provenance = arvo_service::research::provenance_for(None);
         let stored = StoredRecord::by_agent(record, author, &history, chrono::Utc::now())
-            .with_origin(origin.map(ToOwned::to_owned));
+            .with_origin(origin.map(ToOwned::to_owned))
+            .with_provenance(provenance);
         store.save(&stored).map_err(|err| err.to_string())?;
         Ok(summarize(&stored))
     }
@@ -282,6 +290,9 @@ pub fn summarize(stored: &StoredRecord) -> Value {
         "author": stored.author,
         "attachments": stored.attachments,
         "read_this_first": record.verdict().read_this_first(),
+        "strategy": stored.provenance.ruleset.as_ref().map_or(record.strategy(), |ruleset| ruleset.name.as_str()),
+        "code_commit": stored.provenance.code_commit,
+        "ruleset_hash": stored.provenance.ruleset.as_ref().map(|ruleset| ruleset.hash.as_str()),
     });
     match record {
         Record::Study(found) => {

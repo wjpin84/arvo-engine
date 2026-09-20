@@ -95,6 +95,22 @@ impl Record {
         }
     }
 
+    /// Which rule or ruleset ran, by the name the picker shows.
+    #[must_use]
+    pub fn strategy(&self) -> &str {
+        match self {
+            Self::Study(evidence) => &evidence.selected.strategy.name,
+            // A panel's record does not carry the rule's name: the workbench
+            // runs its default rule across every instrument that has data,
+            // and the evidence keeps the chosen parameters and the outcomes.
+            // Naming it here would be a persisted-format change for a value
+            // that is the same on every panel; empty says "not recorded".
+            Self::Panel(_) => "",
+            Self::WalkForward(evidence) => &evidence.template.strategy.name,
+            Self::Reported(evidence) => &evidence.reported.experiment.strategy.name,
+        }
+    }
+
     #[must_use]
     pub fn verdict(&self) -> Verdict {
         match self {
@@ -229,6 +245,37 @@ impl Author {
 /// happened.
 pub const SCHEMA: u32 = 1;
 
+/// What produced a finding, beyond the experiment it describes (#189).
+///
+/// An experiment says what was asked; this says what answered. Evidence
+/// records its dataset version but, before this, not which code or which
+/// ruleset produced it, so two findings from different versions of one
+/// ruleset were indistinguishable in a list and a ruleset edited after a
+/// run left its finding looking current.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Provenance {
+    /// The engine build: the git commit, `-dirty` when the tree had
+    /// uncommitted changes, `unknown` for a build made outside a checkout,
+    /// and empty for a finding recorded before builds were stamped.
+    #[serde(default)]
+    pub code_commit: String,
+    /// The ruleset that ran, when the strategy was a ruleset rather than a
+    /// shipped rule. `None` for a shipped rule, whose definition the commit
+    /// already pins.
+    #[serde(default)]
+    pub ruleset: Option<RulesetRef>,
+}
+
+/// A ruleset as it was when a finding ran: the name the picker shows, and
+/// the document's content hash. The experiment records the engine rule
+/// underneath (`sma_cross`), which is what ran; this records what the person
+/// chose (`my_cross`), which is what they will edit.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RulesetRef {
+    pub name: String,
+    pub hash: String,
+}
+
 /// A record plus when it was taken.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StoredRecord {
@@ -249,6 +296,11 @@ pub struct StoredRecord {
     /// person's — which they all were.
     #[serde(default)]
     pub author: Author,
+    /// What produced it (#189). `default` because this is a persisted
+    /// format: a finding recorded before it was stamped reads as unknown,
+    /// which is the truth.
+    #[serde(default)]
+    pub provenance: Provenance,
     pub record: Record,
 }
 
@@ -305,6 +357,13 @@ pub struct Summary {
     /// The size of the search this finding was held to, for an agent's.
     #[serde(default)]
     pub trials: Option<usize>,
+    /// Which rule or ruleset ran, and what produced the finding (#189).
+    /// Required rather than `default`, like `alongside`: an index written
+    /// before these is rebuilt from the findings rather than read as
+    /// "nothing stamped".
+    pub strategy: String,
+    pub code_commit: String,
+    pub ruleset_hash: Option<String>,
 }
 
 /// A finding that could not be read, and why.
@@ -341,6 +400,7 @@ impl StoredRecord {
             schema: SCHEMA,
             attachments: Vec::new(),
             author: Author::Person,
+            provenance: Provenance::default(),
             record,
         }
     }
@@ -370,6 +430,13 @@ impl StoredRecord {
             },
             ..Self::new(record, recorded_at)
         }
+    }
+
+    /// The same record, stamped with what produced it.
+    #[must_use]
+    pub fn with_provenance(mut self, provenance: Provenance) -> Self {
+        self.provenance = provenance;
+        self
     }
 
     /// Records where the agent's code asked for this. Nothing for a person.
@@ -417,6 +484,14 @@ impl StoredRecord {
             agent: self.author.agent().map(ToOwned::to_owned),
             origin: self.author.origin().map(ToOwned::to_owned),
             trials: self.author.trials(),
+            // The picker's name when a ruleset ran, else the rule's.
+            strategy: self
+                .provenance
+                .ruleset
+                .as_ref()
+                .map_or_else(|| self.record.strategy().to_owned(), |ruleset| ruleset.name.clone()),
+            code_commit: self.provenance.code_commit.clone(),
+            ruleset_hash: self.provenance.ruleset.as_ref().map(|ruleset| ruleset.hash.clone()),
         }
     }
 }
@@ -762,6 +837,34 @@ pub(crate) mod tests {
             );
             stored.id = format!("{at}-{subject}");
             stored
+        }
+
+        /// A finding recorded before builds were stamped reads as unknown,
+        /// and a stamped one reads back what stamped it, on the summary too.
+        #[test]
+        fn provenance_survives_the_store_and_an_unstamped_finding_reads_as_unknown() {
+            let (_dir, store) = store();
+            let stamped = record("AAPL.NASDAQ", 1_700_000_000).with_provenance(Provenance {
+                code_commit: "abc123def456".to_owned(),
+                ruleset: Some(RulesetRef { name: "my_cross".to_owned(), hash: "h1".to_owned() }),
+            });
+            store.save(&stamped).expect("saves");
+            let opened = store.open(&stamped.id).expect("opens");
+            assert_eq!(opened.provenance, stamped.provenance);
+            let (summaries, _) = store.summaries().expect("lists");
+            assert_eq!(summaries[0].code_commit, "abc123def456");
+            assert_eq!(summaries[0].ruleset_hash.as_deref(), Some("h1"));
+            assert_eq!(summaries[0].strategy, "my_cross", "the name the person chose, not the rule under it");
+
+            let mut old: serde_json::Value =
+                serde_json::to_value(record("MSFT.NASDAQ", 1_700_000_001)).expect("encodes");
+            old.as_object_mut().expect("object").remove("provenance");
+            let path = store.root.join("1700000001-MSFT.NASDAQ.json");
+            std::fs::write(&path, serde_json::to_vec(&old).expect("json")).expect("writes");
+            let loaded = read_record(&path).expect("reads without the field");
+            assert_eq!(loaded.provenance, Provenance::default());
+            assert_eq!(loaded.summary().code_commit, "");
+            assert_eq!(loaded.summary().strategy, "sma_cross", "unstamped: the rule is all that is known");
         }
 
         #[test]

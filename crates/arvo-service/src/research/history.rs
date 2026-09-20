@@ -13,6 +13,16 @@ use super::*;
 /// is every member's hash combined and is recomputed the same way it was
 /// produced — over the instruments present today, so one added or removed also
 /// reads as stale, which is correct: the panel would not run the same twice.
+/// Whether the ruleset a finding ran is no longer the ruleset in the file:
+/// edited, or gone. A shipped rule cannot change underfoot, so it never is.
+#[must_use]
+pub fn ruleset_changed(summary: &arvo_research::Summary) -> bool {
+    summary
+        .ruleset_hash
+        .as_ref()
+        .is_some_and(|ran| super::StrategyPlan::ruleset_version(&summary.strategy).as_ref() != Some(ran))
+}
+
 pub fn live_version(service: &ResearchService, summary: &arvo_research::Summary) -> Option<String> {
     match (&summary.instrument, summary.interval) {
         // A study of an option rule: the bars and the chain, as it was made.
@@ -693,6 +703,9 @@ mod staleness_tests {
             agent: None,
             origin: None,
             trials: None,
+            strategy: "sma_cross".to_owned(),
+            code_commit: String::new(),
+            ruleset_hash: None,
         }
     }
 
@@ -765,22 +778,37 @@ mod staleness_tests {
 /// The directory cannot be listed.
 pub fn list_history(service: &ResearchService) -> Result<HistoryView, CommandError> {
     let (summaries, unreadable) = service.memory.summaries().map_err(|err| CommandError::Failed(err.to_string()))?;
+    // The rulesets as they are now, from this engine's own project rather
+    // than whichever folder the app data remembers, so a finding whose
+    // ruleset was edited since is marked, not just one whose data was.
+    crate::rulesets::refresh_at(service.data_dir.parent().unwrap_or(&service.data_dir));
     Ok(HistoryView {
         entries: summaries
             .iter()
             .map(|summary| {
                 let live = live_version(service, summary);
+                let data_changed = live.map(|live| live != summary.dataset_version);
+                let ruleset_changed = ruleset_changed(summary);
                 HistoryEntryView {
                     id: summary.id.clone(),
                     kind: summary.kind.clone(),
                     subject: summary.subject.clone(),
                     verdict: verdict_label(summary.verdict).to_owned(),
                     recorded_at: summary.recorded_at.format("%Y-%m-%d %H:%M").to_string(),
-                    stale: live.map(|live| live != summary.dataset_version),
+                    stale: data_changed.map(|data| data || ruleset_changed),
+                    stale_reason: match (data_changed, ruleset_changed) {
+                        (Some(true), true) => "data and ruleset",
+                        (Some(true), false) => "data",
+                        (Some(false), true) => "ruleset",
+                        _ => "",
+                    }
+                    .to_owned(),
                     agent: summary.agent.clone(),
                     origin: summary.origin.clone(),
                     trials: summary.trials.map(arvo_api::count),
                     attachments: arvo_api::count(summary.attachments),
+                    code_commit: summary.code_commit.clone(),
+                    ruleset_hash: summary.ruleset_hash.clone().unwrap_or_default(),
                 }
             })
             .collect(),

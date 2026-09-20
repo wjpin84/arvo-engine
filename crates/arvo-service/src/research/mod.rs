@@ -339,6 +339,15 @@ impl StrategyPlan {
         PLANS.iter().find(|plan| plan.name == name)
     }
 
+    /// The content hash of the ruleset document behind `name`, as the
+    /// catalog last read it; `None` for a shipped rule or a name it does not
+    /// hold. What a finding is stamped with, and what it is checked against.
+    #[must_use]
+    pub fn ruleset_version(name: &str) -> Option<String> {
+        let table = CONTRIBUTED.lock().ok()?;
+        table.get(name).map(|(version, _)| version.clone())
+    }
+
     /// Every rule Arvo implements, in menu order.
     #[must_use]
     pub fn shipped() -> &'static [Self] {
@@ -517,6 +526,28 @@ pub fn set_contributed(documents: &[(String, StrategyDocument)]) {
         next.insert(id.clone(), (version, plan));
     }
     *table = next;
+}
+
+/// The engine build that is running: the git commit it was built from,
+/// `-dirty` when the tree had uncommitted changes, `unknown` outside a
+/// checkout. Stamped on every finding (#189).
+#[must_use]
+pub const fn code_commit() -> &'static str {
+    env!("ARVO_COMMIT")
+}
+
+/// What to stamp a finding with: this build, and the ruleset when `plan` is
+/// one. The plan's name is the picker's name, which is the ruleset file's;
+/// the experiment underneath records the engine rule, which is not.
+#[must_use]
+pub fn provenance_for(plan: Option<&str>) -> arvo_research::memory::Provenance {
+    arvo_research::memory::Provenance {
+        code_commit: code_commit().to_owned(),
+        ruleset: plan.and_then(|name| {
+            StrategyPlan::ruleset_version(name)
+                .map(|hash| arvo_research::memory::RulesetRef { name: name.to_owned(), hash })
+        }),
+    }
 }
 
 /// Leaks one contributed document as a plan the run path can hold.

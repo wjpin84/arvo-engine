@@ -15,9 +15,10 @@ use super::*;
 /// never started.
 pub fn remember<V: Recorded>(
     service: &ResearchService,
+    plan: Option<&str>,
     (mut view, record): (V, Record),
 ) -> Result<V, CommandError> {
-    let stored = StoredRecord::new(record, chrono::Utc::now());
+    let stored = StoredRecord::new(record, chrono::Utc::now()).with_provenance(super::provenance_for(plan));
     match service.memory.save(&stored) {
         Ok(path) => tracing::info!(id = %stored.id, path = %path.display(), "recorded a finding"),
         Err(err) => tracing::error!(error = %err, id = %stored.id, "could not record a finding"),
@@ -448,7 +449,7 @@ pub fn run_study(service: &ResearchService, instrument: &str, strategy: Option<&
     )
     .map_err(|err| CommandError::Failed(err.to_string()))?;
     let view = study_view(&found, &service.bars, service.simulation.engine());
-    remember(service, (view, Record::Study(Box::new(found))))
+    remember(service, Some(plan.name()), (view, Record::Study(Box::new(found))))
 }
 
 /// Runs a rolling re-selection over an instrument's whole history and records
@@ -475,7 +476,7 @@ pub fn run_walk_forward(
     )
     .map_err(|err| CommandError::Failed(err.to_string()))?;
     let view = walk_forward_view(&found, &service.bars, service.simulation.engine());
-    remember(service, (view, Record::WalkForward(Box::new(found))))
+    remember(service, Some(plan.name()), (view, Record::WalkForward(Box::new(found))))
 }
 
 /// Runs one configuration across every instrument that has data and records
@@ -497,7 +498,7 @@ pub fn run_panel(service: &ResearchService) -> Result<PanelView, CommandError> {
     )
     .map_err(|err| CommandError::Failed(err.to_string()))?;
     let view = panel_view(&found, service.simulation.engine());
-    remember(service, (view, Record::Panel(Box::new(found))))
+    remember(service, Some(STRATEGY), (view, Record::Panel(Box::new(found))))
 }
 
 /// The sector cap a book asked for, labelled from Robinhood before the run:
@@ -612,7 +613,7 @@ pub fn run_book(
     )
     .map_err(|err| CommandError::Failed(err.to_string()))?;
     let view = study_view(&found, &service.bars, service.simulation.engine());
-    remember(service, (view, Record::Study(Box::new(found))))
+    remember(service, Some(plan.name()), (view, Record::Study(Box::new(found))))
 }
 
 /// Runs a shared experiment file against this machine's data for
@@ -678,7 +679,7 @@ pub fn run_shared(service: &ResearchService, text: &str, instrument: &str) -> Re
     let found = arvo_research::run_family(service.simulation.as_ref(), &family, &shared.criteria)
         .map_err(|err| CommandError::Failed(err.to_string()))?;
     let view = study_view(&found, &service.bars, service.simulation.engine());
-    remember(service, (view, Record::Study(Box::new(found))))
+    remember(service, None, (view, Record::Study(Box::new(found))))
 }
 
 #[cfg(test)]

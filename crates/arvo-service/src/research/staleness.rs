@@ -54,6 +54,7 @@ pub struct Newly {
 pub fn compare(
     summaries: &[Summary],
     live: impl Fn(&Summary) -> Option<String>,
+    ruleset: impl Fn(&Summary) -> Option<String>,
     reported: &BTreeSet<String>,
 ) -> (BTreeSet<String>, Newly) {
     let mut stale = BTreeSet::new();
@@ -64,8 +65,13 @@ pub fn compare(
         if summary.kind == "reported" {
             continue;
         }
+        // A ruleset edited since the run makes the finding stale the same
+        // way changed data does: the rule it measured is not the rule in
+        // the file (#189). A shipped rule has no hash and never changes.
+        let ruleset_changed =
+            summary.ruleset_hash.as_ref().is_some_and(|ran| ruleset(summary).as_ref() != Some(ran));
         let gone = match live(summary) {
-            Some(current) if current == summary.dataset_version => continue,
+            Some(current) if current == summary.dataset_version && !ruleset_changed => continue,
             Some(_) => false,
             None => true,
         };
@@ -103,9 +109,11 @@ pub fn check(service: &ResearchService, record: &Path) -> Option<EventView> {
         .and_then(|text| serde_json::from_str(&text).ok())
         .unwrap_or_default();
 
+    crate::rulesets::refresh_at(service.data_dir.parent().unwrap_or(&service.data_dir));
     let (stale, newly) = compare(
         &summaries,
         |summary| super::history::live_version(service, summary),
+        |summary| super::StrategyPlan::ruleset_version(&summary.strategy),
         &reported,
     );
 
@@ -142,7 +150,34 @@ mod tests {
             agent: None,
             origin: None,
             trials: None,
+            strategy: "sma_cross".to_owned(),
+            code_commit: String::new(),
+            ruleset_hash: None,
         }
+    }
+
+    /// The reason this issue exists: a ruleset edited after a run leaves the
+    /// finding measuring a rule the file no longer holds.
+    #[test]
+    fn an_edited_ruleset_makes_its_finding_stale_and_a_shipped_rule_never_is() {
+        let mut ran = summary("a", "v1");
+        ran.strategy = "my_cross".to_owned();
+        ran.ruleset_hash = Some("h1".to_owned());
+        let shipped = summary("b", "v1");
+        let store = [ran, shipped];
+        let same = |s: &Summary| Some(s.dataset_version.clone());
+
+        let (stale, _) = compare(&store, same, |_| Some("h1".to_owned()), &BTreeSet::new());
+        assert!(stale.is_empty(), "the file still holds what ran");
+
+        let (stale, newly) = compare(&store, same, |_| Some("h2".to_owned()), &BTreeSet::new());
+        assert_eq!(stale.len(), 1, "only the ruleset's finding: {stale:?}");
+        assert!(stale.contains("a"));
+        assert_eq!(newly.changed, vec!["a.SIM".to_owned()], "reported as changed, not gone");
+
+        let (stale, _) = compare(&store, same, |_| None, &BTreeSet::new());
+        assert!(stale.contains("a"), "a ruleset that is gone is a changed rule too");
+        assert!(!stale.contains("b"), "a shipped rule has no file to change");
     }
 
     #[test]
@@ -150,11 +185,11 @@ mod tests {
         let store = [summary("a", "v1"), summary("b", "v1")];
         let live = |s: &Summary| Some(if s.id == "a" { "v2" } else { "v1" }.to_owned());
 
-        let (stale, newly) = compare(&store, live, &BTreeSet::new());
+        let (stale, newly) = compare(&store, live, |_| None, &BTreeSet::new());
         assert_eq!(newly.changed, vec!["a.SIM"]);
         assert!(newly.gone.is_empty());
 
-        let (_, again) = compare(&store, live, &stale);
+        let (_, again) = compare(&store, live, |_| None, &stale);
         assert_eq!(
             again,
             Newly::default(),
@@ -166,7 +201,7 @@ mod tests {
     fn data_that_is_gone_is_told_apart_from_data_that_changed() {
         let store = [summary("a", "v1"), summary("b", "v1")];
         let live = |s: &Summary| (s.id == "a").then(|| "v2".to_owned());
-        let (stale, newly) = compare(&store, live, &BTreeSet::new());
+        let (stale, newly) = compare(&store, live, |_| None, &BTreeSet::new());
         assert_eq!(newly.changed, vec!["a.SIM"]);
         assert_eq!(newly.gone, vec!["b.SIM"]);
         assert_eq!(stale.len(), 2);
@@ -175,17 +210,17 @@ mod tests {
     #[test]
     fn a_finding_that_was_fresh_again_can_be_reported_again() {
         let store = [summary("a", "v1")];
-        let (stale, _) = compare(&store, |_| Some("v2".to_owned()), &BTreeSet::new());
-        let (fresh, _) = compare(&store, |_| Some("v1".to_owned()), &stale);
+        let (stale, _) = compare(&store, |_| Some("v2".to_owned()), |_| None, &BTreeSet::new());
+        let (fresh, _) = compare(&store, |_| Some("v1".to_owned()), |_| None, &stale);
         assert!(fresh.is_empty(), "it is fresh, so it leaves the record");
-        let (_, newly) = compare(&store, |_| Some("v3".to_owned()), &fresh);
+        let (_, newly) = compare(&store, |_| Some("v3".to_owned()), |_| None, &fresh);
         assert_eq!(newly.changed, vec!["a.SIM"]);
     }
 
     #[test]
     fn a_fresh_store_raises_nothing() {
         let store = [summary("a", "v1")];
-        let (stale, newly) = compare(&store, |_| Some("v1".to_owned()), &BTreeSet::new());
+        let (stale, newly) = compare(&store, |_| Some("v1".to_owned()), |_| None, &BTreeSet::new());
         assert!(stale.is_empty());
         assert_eq!(newly, Newly::default());
     }

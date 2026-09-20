@@ -43,6 +43,7 @@ use arvo_api::EventView;
 /// `detail_json`.
 const TYPED: &[&str] = &[
     "id", "kind", "subject", "verdict", "recorded_at", "read_this_first", "reasons", "advice", "attachments",
+    "strategy", "code_commit", "ruleset_hash",
 ];
 
 /// The largest message either side accepts: a figure or a trades table
@@ -627,6 +628,9 @@ fn finding(summary: &Value) -> Finding {
             verdict: text(summary.get("verdict")),
             recorded_at: text(summary.get("recorded_at")),
             author: author.to_owned(),
+            strategy: text(summary.get("strategy")),
+            code_commit: text(summary.get("code_commit")),
+            ruleset_hash: text(summary.get("ruleset_hash")),
         }),
         read_this_first: text(summary.get("read_this_first")),
         reasons: summary
@@ -854,6 +858,9 @@ impl research_server::Research for Service {
                             verdict: text(row.get("verdict")),
                             recorded_at: text(row.get("recorded_at")),
                             author: text(row.get("agent")),
+                            strategy: text(row.get("strategy")),
+                            code_commit: text(row.get("code_commit")),
+                            ruleset_hash: text(row.get("ruleset_hash")),
                         })
                         .collect()
                 })
