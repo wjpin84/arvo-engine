@@ -18,6 +18,17 @@
 //! rather than an assumption. `alpaca-live` and `robinhood` are real money and
 //! say so by name.
 //!
+//! # Streamed when the source can, polled when it cannot
+//!
+//! An intraday rule asks the source for a live feed (`Source::stream`, #185)
+//! and takes each bar as it closes; the poll still runs once a minute
+//! underneath, catching up what the library lacked at start and anything a
+//! feed dropped. A feed that goes dark freezes the session the way a book
+//! disagreement does — entries wait, exits go — and the freeze lifts on its
+//! own when the feed is back, because nothing about the book is in doubt.
+//! A daily rule polls, as it always did; a minute either way is nothing to
+//! a bar that closes overnight.
+//!
 //! # A bar is accepted only once it is over
 //!
 //! A vendor serves today's daily bar while today is still trading. Pushing it
@@ -56,6 +67,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use arvo_data::source::FeedEvent;
 use arvo_data::{BarProvider as _, CsvBars};
 use arvo_execution::{Executor, Session};
 use arvo_nautilus::{NautilusSimulation, Shadow, Side, Signal};
@@ -95,6 +107,8 @@ pub struct Status {
     pub strategy: String,
     pub started_at: String,
     /// `starting`, `running`, `frozen`, `halted`, `stopped` or `failed`.
+    /// Frozen is a book the venue disagrees with (#187) or a feed that has
+    /// gone dark (#185); `frozen` says which.
     pub state: String,
     pub signals: u32,
     pub submitted: u32,
@@ -118,6 +132,17 @@ enum Command {
     Reconcile,
     /// Take entries again. Only after a reconcile.
     Resume,
+}
+
+/// Why a session is not taking entries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Freeze {
+    /// The book disagrees with the venue (#187). Lifts on a resume, after a
+    /// reconcile.
+    Discrepancy { reconciled: bool },
+    /// The feed has gone dark (#185). Lifts on its own when it is back, or
+    /// on a resume.
+    Stale,
 }
 
 /// One slot: the session loop takes what is there at the top of each turn,
@@ -489,8 +514,12 @@ async fn drive<E: Executor>(
         announce(events, &status);
     }
 
-    // `Some` while frozen; the flag says whether a reconcile has happened.
-    let mut frozen: Option<bool> = None;
+    // The feed, when the source has one for this interval; the poll runs
+    // underneath either way.
+    let mut feed = source.stream(symbol, experiment.interval);
+    record.write("feed", Some(serde_json::json!({ "streaming": feed.is_some(), "source": source.id() })));
+    let mut frozen: Option<Freeze> = None;
+    let mut last_poll: Option<std::time::Instant> = None;
     while !stop.load(Ordering::SeqCst) {
         // Taken, then the lock is dropped: the caller polls that lock while
         // the command runs, and a reconcile waits on the venue.
@@ -502,7 +531,9 @@ async fn drive<E: Executor>(
                         let positions: BTreeMap<&String, f64> =
                             session.gate().positions().iter().map(|(instrument, held)| (instrument, held.quantity)).collect();
                         record.write("reconciled", Some(serde_json::json!({ "corrected": corrected, "positions": positions })));
-                        frozen = Some(true);
+                        if let Some(Freeze::Discrepancy { reconciled }) = &mut frozen {
+                            *reconciled = true;
+                        }
                         status.lock().unwrap_or_else(std::sync::PoisonError::into_inner).reconciled = true;
                     }
                     Err(err) => {
@@ -510,43 +541,70 @@ async fn drive<E: Executor>(
                         record.write("reconcile_failed", Some(serde_json::json!(err.to_string())));
                     }
                 },
-                Command::Resume => {
-                    if frozen == Some(true) {
+                Command::Resume => match frozen {
+                    Some(Freeze::Discrepancy { reconciled: true } | Freeze::Stale) => {
                         frozen = None;
-                        record.write("resumed", None);
-                        let mut status = status.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                        status.state = "running".to_owned();
-                        status.frozen = None;
-                        status.reconciled = false;
-                        announce(events, &status);
-                    } else {
-                        record.write("resume_refused", Some(serde_json::json!("not reconciled")));
+                        thaw(status, record, events, None);
                     }
+                    _ => record.write("resume_refused", Some(serde_json::json!("not reconciled"))),
+                },
+            }
+        }
+
+        let mut fresh: Vec<arvo_data::Bar> = Vec::new();
+        // One event from the feed, or a second of nothing. The wait is what
+        // paces a streaming session; a polling one sleeps in `pause` below.
+        if let Some(live) = &mut feed {
+            match tokio::time::timeout(Duration::from_secs(1), live.next()).await {
+                Ok(Some(FeedEvent::Bar(bar))) => fresh.push(bar),
+                Ok(Some(FeedEvent::Up)) => {
+                    record.write("feed_up", None);
+                    if matches!(frozen, Some(Freeze::Stale)) {
+                        frozen = None;
+                        thaw(status, record, events, Some("the feed is back"));
+                    }
+                }
+                Ok(Some(FeedEvent::Down(why))) => {
+                    record.write("feed_down", Some(serde_json::json!(why)));
+                    if frozen.is_none() {
+                        frozen = Some(Freeze::Stale);
+                        // Nothing to reconcile: the book is not in doubt, so a
+                        // person may resume at once rather than wait for the feed.
+                        freeze(status, record, events, "frozen", serde_json::json!({ "stale": why }), format!("stale feed: {why}"), true);
+                    }
+                }
+                Ok(None) => {
+                    record.write("feed_ended", None);
+                    feed = None;
+                }
+                Err(_) => {}
+            }
+        }
+
+        let due = last_poll.is_none_or(|last| last.elapsed() >= POLL);
+        if due {
+            last_poll = Some(std::time::Instant::now());
+            let today = now().date();
+            // From the last bar the rule saw, so a library that stopped a fortnight
+            // ago is caught up bar by bar rather than skipped to today; three days
+            // back otherwise, so a Monday still sees Friday's bar.
+            let from = last_pushed.map_or(today - chrono::Duration::days(3), |last| last.date());
+            match source.bars(symbol, experiment.interval, from, today).await {
+                Ok(fetched) => fresh.extend(fetched.bars),
+                Err(err) => {
+                    status.lock().unwrap_or_else(std::sync::PoisonError::into_inner).last_error = Some(err.to_string());
+                    record.write("fetch_failed", Some(serde_json::json!(err.to_string())));
                 }
             }
         }
-        let today = now().date();
-        // From the last bar the rule saw, so a library that stopped a fortnight
-        // ago is caught up bar by bar rather than skipped to today; three days
-        // back otherwise, so a Monday still sees Friday's bar.
-        let from = last_pushed.map_or(today - chrono::Duration::days(3), |last| last.date());
-        let fetched = match source.bars(symbol, experiment.interval, from, today).await {
-            Ok(fetched) => fetched.bars,
-            Err(err) => {
-                status.lock().unwrap_or_else(std::sync::PoisonError::into_inner).last_error = Some(err.to_string());
-                record.write("fetch_failed", Some(serde_json::json!(err.to_string())));
-                pause(stop, mailbox).await;
-                continue;
-            }
-        };
-        let fresh: Vec<_> = fetched
-            .into_iter()
-            .filter(|bar| last_pushed.map_or(true, |last| bar.at > last))
-            .filter(|bar| bar.at + experiment.interval.duration() <= now())
-            .collect();
+        fresh.sort_by_key(|bar| bar.at);
+        fresh.dedup_by_key(|bar| bar.at);
+        fresh.retain(|bar| last_pushed.is_none_or(|last| bar.at > last));
+        fresh.retain(|bar| bar.at + experiment.interval.duration() <= now());
+        let pushed = !fresh.is_empty();
 
         for bar in fresh {
-            let signals = shadow.push(&[(instrument.clone(), bar.clone())]).map_err(|err| err.to_string())?;
+            let signals = shadow.push(&[(instrument.clone(), bar)]).map_err(|err| err.to_string())?;
             last_pushed = Some(bar.at);
             record.write("bar", Some(serde_json::json!({ "at": bar.at, "close": bar.close, "signals": signals.len() })));
             {
@@ -566,48 +624,50 @@ async fn drive<E: Executor>(
             }
         }
 
-        match session.settle().await {
-            Ok(filled) if filled > 0 => {
-                let executions = session.executions();
-                for execution in &executions[executions.len() - filled..] {
-                    let mut detail = serde_json::to_value(execution).unwrap_or_default();
-                    let position = session.gate().positions().get(&execution.instrument).map_or(0.0, |held| held.quantity);
-                    detail["position"] = serde_json::json!(position);
-                    record.write("filled", Some(detail));
-                }
-                status.lock().unwrap_or_else(std::sync::PoisonError::into_inner).fills +=
-                    u32::try_from(filled).unwrap_or(u32::MAX);
-            }
-            Ok(_) => {}
-            Err(err) => {
-                status.lock().unwrap_or_else(std::sync::PoisonError::into_inner).last_error = Some(err.to_string());
-                record.write("settle_failed", Some(serde_json::json!(err.to_string())));
-            }
-        }
-        if frozen.is_none() {
-            match session.audit(venue).await {
-                Ok(found) if !found.is_empty() => {
-                    frozen = Some(false);
-                    let why = found
-                        .iter()
-                        .map(|d| format!("{}: gate {} venue {}", d.instrument, d.expected, d.at_venue))
-                        .collect::<Vec<_>>()
-                        .join("; ");
-                    record.write("frozen", Some(serde_json::json!({ "discrepancies": found })));
-                    let mut status = status.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                    status.state = "frozen".to_owned();
-                    status.frozen = Some(why);
-                    status.reconciled = false;
-                    announce(events, &status);
+        // The venue is asked on the poll's cadence, or right after a bar that
+        // may have sent something; a streaming session's one-second turns do
+        // not each cost two broker calls.
+        if due || pushed {
+            match session.settle().await {
+                Ok(filled) if filled > 0 => {
+                    let executions = session.executions();
+                    for execution in &executions[executions.len() - filled..] {
+                        let mut detail = serde_json::to_value(execution).unwrap_or_default();
+                        let position = session.gate().positions().get(&execution.instrument).map_or(0.0, |held| held.quantity);
+                        detail["position"] = serde_json::json!(position);
+                        record.write("filled", Some(detail));
+                    }
+                    status.lock().unwrap_or_else(std::sync::PoisonError::into_inner).fills +=
+                        u32::try_from(filled).unwrap_or(u32::MAX);
                 }
                 Ok(_) => {}
                 Err(err) => {
                     status.lock().unwrap_or_else(std::sync::PoisonError::into_inner).last_error = Some(err.to_string());
-                    record.write("audit_failed", Some(serde_json::json!(err.to_string())));
+                    record.write("settle_failed", Some(serde_json::json!(err.to_string())));
+                }
+            }
+            if frozen.is_none() {
+                match session.audit(venue).await {
+                    Ok(found) if !found.is_empty() => {
+                        frozen = Some(Freeze::Discrepancy { reconciled: false });
+                        let why = found
+                            .iter()
+                            .map(|d| format!("{}: gate {} venue {}", d.instrument, d.expected, d.at_venue))
+                            .collect::<Vec<_>>()
+                            .join("; ");
+                        freeze(status, record, events, "frozen", serde_json::json!({ "discrepancies": found }), why, false);
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        status.lock().unwrap_or_else(std::sync::PoisonError::into_inner).last_error = Some(err.to_string());
+                        record.write("audit_failed", Some(serde_json::json!(err.to_string())));
+                    }
                 }
             }
         }
-        pause(stop, mailbox).await;
+        if feed.is_none() {
+            pause(stop, mailbox).await;
+        }
     }
     record.write("stopped", None);
     Ok(())
@@ -693,6 +753,32 @@ async fn act<E: Executor>(
         }
     }
     Ok(())
+}
+
+fn freeze(
+    status: &Mutex<Status>,
+    record: &Recorder,
+    events: &broadcast::Sender<EventView>,
+    event: &str,
+    detail: serde_json::Value,
+    why: String,
+    reconciled: bool,
+) {
+    record.write(event, Some(detail));
+    let mut status = status.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    status.state = "frozen".to_owned();
+    status.frozen = Some(why);
+    status.reconciled = reconciled;
+    announce(events, &status);
+}
+
+fn thaw(status: &Mutex<Status>, record: &Recorder, events: &broadcast::Sender<EventView>, why: Option<&str>) {
+    record.write("resumed", why.map(|why| serde_json::json!(why)));
+    let mut status = status.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    status.state = "running".to_owned();
+    status.frozen = None;
+    status.reconciled = false;
+    announce(events, &status);
 }
 
 fn halt(status: &Mutex<Status>, record: &Recorder, events: &broadcast::Sender<EventView>, why: &str) {

@@ -56,6 +56,7 @@ pub mod options;
 pub mod holdings;
 mod parse;
 mod source;
+mod stream;
 
 pub use auth::{forget, has, store, stored_keys, Env, Keys, LEGACY_CREDENTIAL_ID};
 pub use holdings::{holdings, AccountHoldings, Position};

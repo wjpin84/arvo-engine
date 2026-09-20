@@ -1,0 +1,320 @@
+//! Alpaca's bar stream, behind `Source::stream` (#185).
+//!
+//! One socket per session, on the feed the source fetches from, subscribed
+//! to one symbol's one-minute bars. Alpaca sends a bar a moment after the
+//! minute closes, which is what a 1-minute rule needs and what polling every
+//! sixty seconds cannot give it.
+//!
+//! # What "stale" means here
+//!
+//! A dead socket, not a quiet one. Alpaca sends nothing between bars and
+//! nothing at all while the market is closed, so silence is not evidence.
+//! What is evidence is a ping that gets no pong: the socket is pinged every
+//! [`PING`], and one that has said nothing back for [`QUIET`] is dropped,
+//! reported as `Down`, and reconnected. A session sees `Down` and decides
+//! what a dark feed means for it; it sees `Up` when the outage is over.
+//!
+//! ponytail: a live socket that stops delivering bars during market hours
+//! is not caught here; add the venue clock (`/v2/clock`) to the check when
+//! one has been seen.
+
+use std::time::{Duration, Instant};
+
+use arvo_data::source::{BarFeed, FeedEvent};
+use arvo_data::Bar;
+use futures_util::{SinkExt, StreamExt};
+use serde_json::{json, Value};
+use tokio::sync::mpsc;
+use tokio_tungstenite::tungstenite::Message;
+
+use crate::auth::Keys;
+
+const ENDPOINT: &str = "wss://stream.data.alpaca.markets/v2";
+/// How often the socket is pinged.
+const PING: Duration = Duration::from_secs(15);
+/// How long a socket may say nothing — no bar, no pong — before it is
+/// declared dead. Two pings' worth and change.
+const QUIET: Duration = Duration::from_secs(40);
+/// How long each step of the handshake may take.
+const HANDSHAKE: Duration = Duration::from_secs(10);
+/// How long to wait before reconnecting.
+const BACKOFF: Duration = Duration::from_secs(3);
+
+type Socket = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// The receiving end of one subscription.
+pub struct AlpacaFeed {
+    events: mpsc::Receiver<FeedEvent>,
+}
+
+#[async_trait::async_trait]
+impl BarFeed for AlpacaFeed {
+    async fn next(&mut self) -> Option<FeedEvent> {
+        self.events.recv().await
+    }
+}
+
+/// Opens the stream for `symbol` on `feed` (`iex` or `sip`). The socket
+/// lives on a task of the current runtime and dies with the receiver.
+pub(crate) fn open(feed: &'static str, symbol: String, keys: Keys) -> AlpacaFeed {
+    let (events, receiver) = mpsc::channel(64);
+    tokio::spawn(run(feed, symbol, keys, events));
+    AlpacaFeed { events: receiver }
+}
+
+async fn run(feed: &'static str, symbol: String, keys: Keys, events: mpsc::Sender<FeedEvent>) {
+    let url = format!("{ENDPOINT}/{feed}");
+    loop {
+        match serve(&url, &symbol, &keys, &events, PING, QUIET).await {
+            // The receiver is gone: the session ended.
+            Ok(()) => return,
+            Err(reason) => {
+                if events.send(FeedEvent::Down(reason)).await.is_err() {
+                    return;
+                }
+                tokio::time::sleep(BACKOFF).await;
+            }
+        }
+    }
+}
+
+/// One connection, from handshake to the frame that kills it. `ping` and
+/// `quiet` are [`PING`] and [`QUIET`] outside the tests.
+async fn serve(
+    url: &str,
+    symbol: &str,
+    keys: &Keys,
+    events: &mpsc::Sender<FeedEvent>,
+    ping: Duration,
+    quiet: Duration,
+) -> Result<(), String> {
+    let (mut socket, _) = tokio_tungstenite::connect_async(url)
+        .await
+        .map_err(|err| format!("connecting: {err}"))?;
+    expect(&mut socket, "connected").await?;
+    send(&mut socket, json!({ "action": "auth", "key": keys.key_id, "secret": keys.secret })).await?;
+    expect(&mut socket, "authenticated").await?;
+    send(&mut socket, json!({ "action": "subscribe", "bars": [symbol] })).await?;
+    if events.send(FeedEvent::Up).await.is_err() {
+        return Ok(());
+    }
+
+    let mut heard = Instant::now();
+    let mut ping = tokio::time::interval(ping);
+    ping.tick().await;
+    loop {
+        tokio::select! {
+            frame = socket.next() => {
+                let message = match frame {
+                    None => return Err("the socket closed".to_owned()),
+                    Some(Err(err)) => return Err(format!("the socket failed: {err}")),
+                    Some(Ok(message)) => message,
+                };
+                heard = Instant::now();
+                for event in decode(&message)? {
+                    if events.send(event).await.is_err() {
+                        return Ok(());
+                    }
+                }
+            }
+            _ = ping.tick() => {
+                if heard.elapsed() > quiet {
+                    return Err(format!("nothing heard for {}s", heard.elapsed().as_secs()));
+                }
+                socket.send(Message::Ping(Default::default())).await.map_err(|err| format!("pinging: {err}"))?;
+            }
+        }
+    }
+}
+
+async fn send(socket: &mut Socket, body: Value) -> Result<(), String> {
+    socket.send(Message::text(body.to_string())).await.map_err(|err| format!("sending: {err}"))
+}
+
+/// Reads until Alpaca says `{"T":"success","msg":<msg>}`, failing on an
+/// error message or on silence.
+async fn expect(socket: &mut Socket, msg: &str) -> Result<(), String> {
+    let deadline = tokio::time::sleep(HANDSHAKE);
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            frame = socket.next() => {
+                let message = match frame {
+                    None => return Err(format!("the socket closed before {msg:?}")),
+                    Some(Err(err)) => return Err(format!("the socket failed before {msg:?}: {err}")),
+                    Some(Ok(message)) => message,
+                };
+                if items(&message)?.iter().any(|item| item.get("T").and_then(Value::as_str) == Some("success") && item.get("msg").and_then(Value::as_str) == Some(msg)) {
+                    return Ok(());
+                }
+            }
+            () = &mut deadline => return Err(format!("no {msg:?} within {}s", HANDSHAKE.as_secs())),
+        }
+    }
+}
+
+/// The JSON items in one frame: Alpaca sends arrays, one message each.
+/// Control frames carry none. An `error` item is the whole frame's failure.
+fn items(message: &Message) -> Result<Vec<Value>, String> {
+    let text = match message {
+        Message::Text(text) => text.as_str().to_owned(),
+        Message::Binary(bytes) => String::from_utf8_lossy(bytes).into_owned(),
+        _ => return Ok(Vec::new()),
+    };
+    let value: Value = serde_json::from_str(&text).map_err(|err| format!("not JSON: {err}"))?;
+    let items = match value {
+        Value::Array(items) => items,
+        other => vec![other],
+    };
+    if let Some(error) = items.iter().find(|item| item.get("T").and_then(Value::as_str) == Some("error")) {
+        return Err(format!(
+            "alpaca refused: {} (code {})",
+            error.get("msg").and_then(Value::as_str).unwrap_or("no reason"),
+            error.get("code").and_then(Value::as_i64).unwrap_or_default()
+        ));
+    }
+    Ok(items)
+}
+
+/// The bars in one frame, regular session only, like the fetched ones.
+/// Everything else Alpaca sends — subscription confirmations, trade
+/// updates nobody asked for — is not an event.
+fn decode(message: &Message) -> Result<Vec<FeedEvent>, String> {
+    Ok(items(message)?
+        .iter()
+        .filter(|item| item.get("T").and_then(Value::as_str) == Some("b"))
+        .map(bar_of)
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|bar| arvo_data::session::in_regular_session(bar.at))
+        .map(FeedEvent::Bar)
+        .collect())
+}
+
+fn bar_of(item: &Value) -> Result<Bar, String> {
+    let field = |name: &str| item.get(name).and_then(Value::as_f64);
+    let (Some(open), Some(high), Some(low), Some(close)) = (field("o"), field("h"), field("l"), field("c")) else {
+        return Err("a streamed bar is missing one of o/h/l/c".to_owned());
+    };
+    let at = item.get("t").and_then(Value::as_str).ok_or("a streamed bar has no timestamp")?;
+    let at = chrono::DateTime::parse_from_rfc3339(at)
+        .map_err(|err| format!("timestamp {at:?}: {err}"))?
+        .naive_utc();
+    Ok(Bar { at, open, high, low, close, volume: field("v").unwrap_or_default() })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame(text: &str) -> Message {
+        Message::text(text.to_owned())
+    }
+
+    #[test]
+    fn a_bar_frame_becomes_a_bar_at_its_open_and_a_confirmation_becomes_nothing() {
+        // 14:30 UTC is 10:30 New York on a Tuesday: inside the regular session.
+        let decoded = decode(&frame(
+            r#"[{"T":"subscription","bars":["AAPL"]},{"T":"b","S":"AAPL","o":100.0,"h":101.0,"l":99.5,"c":100.5,"v":1200,"t":"2026-09-15T14:30:00Z","n":40,"vw":100.2}]"#,
+        ))
+        .expect("decodes");
+        let [FeedEvent::Bar(bar)] = decoded.as_slice() else {
+            panic!("one bar, no event for the confirmation: {decoded:?}");
+        };
+        assert_eq!(bar.at, chrono::NaiveDate::from_ymd_opt(2026, 9, 15).unwrap().and_hms_opt(14, 30, 0).unwrap());
+        assert!((bar.close - 100.5).abs() < 1e-9);
+        assert!((bar.volume - 1200.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_bar_outside_the_regular_session_is_dropped_like_a_fetched_one() {
+        // 08:00 New York: pre-market. The REST path drops these; so does this.
+        let decoded = decode(&frame(r#"[{"T":"b","S":"AAPL","o":1,"h":1,"l":1,"c":1,"v":1,"t":"2026-09-15T12:00:00Z"}]"#)).expect("decodes");
+        assert!(decoded.is_empty(), "{decoded:?}");
+    }
+
+    #[test]
+    fn an_error_from_alpaca_fails_the_frame_with_its_reason() {
+        let refused = decode(&frame(r#"[{"T":"error","code":402,"msg":"auth failed"}]"#)).expect_err("refused");
+        assert!(refused.contains("auth failed") && refused.contains("402"), "{refused}");
+    }
+
+    #[test]
+    fn half_a_bar_is_refused_rather_than_filled_in() {
+        let refused = decode(&frame(r#"[{"T":"b","S":"AAPL","o":1,"h":1,"t":"2026-09-15T14:30:00Z"}]"#)).expect_err("refused");
+        assert!(refused.contains("o/h/l/c"), "{refused}");
+    }
+
+    #[test]
+    fn control_frames_carry_no_events() {
+        assert!(decode(&Message::Pong(Default::default())).expect("fine").is_empty());
+    }
+
+    /// A stand-in for Alpaca on a loopback port: answers the handshake, then
+    /// does what `then` says with the socket.
+    async fn fake_alpaca<F>(then: F) -> String
+    where
+        F: FnOnce(Socket) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + 'static,
+    {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("a port");
+        let url = format!("ws://{}", listener.local_addr().expect("bound"));
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.expect("a client");
+            let mut socket: Socket = tokio_tungstenite::accept_async(tokio_tungstenite::MaybeTlsStream::Plain(tcp)).await.expect("a websocket");
+            socket.send(Message::text(r#"[{"T":"success","msg":"connected"}]"#)).await.expect("sent");
+            let auth = socket.next().await.expect("auth").expect("a frame");
+            assert!(auth.to_text().expect("text").contains(r#""action":"auth""#), "{auth:?}");
+            socket.send(Message::text(r#"[{"T":"success","msg":"authenticated"}]"#)).await.expect("sent");
+            let subscribe = socket.next().await.expect("subscribe").expect("a frame");
+            assert!(subscribe.to_text().expect("text").contains(r#""bars":["AAPL"]"#), "{subscribe:?}");
+            then(socket).await;
+        });
+        url
+    }
+
+    fn keys() -> Keys {
+        Keys { key_id: "k".to_owned(), secret: "s".to_owned() }
+    }
+
+    #[tokio::test]
+    async fn a_socket_that_stops_answering_pings_is_declared_dead() {
+        // Never reads, so never pongs: what a half-open connection looks like.
+        let url = fake_alpaca(|socket| {
+            Box::pin(async move {
+                let _held_open = socket;
+                std::future::pending::<()>().await;
+            })
+        })
+        .await;
+        let (events, mut receiver) = mpsc::channel(8);
+        let started = Instant::now();
+        let ended = serve(&url, "AAPL", &keys(), &events, Duration::from_millis(50), Duration::from_millis(200)).await;
+
+        assert_eq!(receiver.recv().await, Some(FeedEvent::Up));
+        let reason = ended.expect_err("declared dead");
+        assert!(reason.starts_with("nothing heard"), "{reason}");
+        assert!(started.elapsed() < Duration::from_secs(3), "and promptly: {:?}", started.elapsed());
+    }
+
+    #[tokio::test]
+    async fn a_bar_arrives_as_an_event_and_a_close_is_reported_with_its_reason() {
+        let url = fake_alpaca(|mut socket| {
+            Box::pin(async move {
+                socket
+                    .send(Message::text(r#"[{"T":"b","S":"AAPL","o":1,"h":2,"l":0.5,"c":1.5,"v":10,"t":"2026-09-15T14:30:00Z"}]"#))
+                    .await
+                    .expect("sent");
+                socket.close(None).await.expect("closed");
+            })
+        })
+        .await;
+        let (events, mut receiver) = mpsc::channel(8);
+        let ended = serve(&url, "AAPL", &keys(), &events, Duration::from_secs(1), Duration::from_secs(5)).await;
+
+        assert_eq!(receiver.recv().await, Some(FeedEvent::Up));
+        let Some(FeedEvent::Bar(bar)) = receiver.recv().await else { panic!("a bar") };
+        assert!((bar.close - 1.5).abs() < 1e-9);
+        // Closed, or reset once the fake is gone: either way the socket, named.
+        assert!(ended.expect_err("ended").contains("the socket"));
+    }
+}

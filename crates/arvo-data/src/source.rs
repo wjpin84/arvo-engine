@@ -215,6 +215,28 @@ pub struct Fetched {
     pub interpolated: usize,
 }
 
+/// What a live feed delivers, in order.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FeedEvent {
+    /// A completed bar, timestamped at its open like every other bar here.
+    Bar(Bar),
+    /// The feed is connected and subscribed. Sent once per connection, so
+    /// after a `Down` it means the outage is over.
+    Up,
+    /// The feed is not delivering and says why. It reconnects on its own;
+    /// the caller decides what a dark feed means for it.
+    Down(String),
+}
+
+/// A live feed, as [`Source::stream`] hands one out.
+///
+/// `None` from [`Self::next`] means the feed has ended for good, and the
+/// caller should fall back to polling.
+#[async_trait::async_trait]
+pub trait BarFeed: Send {
+    async fn next(&mut self) -> Option<FeedEvent>;
+}
+
 /// One instrument a source knows about.
 #[derive(Debug, Clone)]
 pub struct Match {
@@ -437,6 +459,17 @@ pub trait Source: Send + Sync {
         from: chrono::NaiveDate,
         to: chrono::NaiveDate,
     ) -> Result<Fetched, SourceError>;
+
+    /// A live feed of completed bars, when this source has one at this
+    /// interval (#185). `None` means poll [`Self::bars`], which every source
+    /// supports and which is right for a daily rule anyway.
+    ///
+    /// Defaulted, unlike [`Self::basis`]: not streaming degrades to the poll
+    /// that was always there, never to a wrong answer. Must be called from
+    /// inside an async runtime; the feed runs on it.
+    fn stream(&self, _symbol: &str, _interval: BarInterval) -> Option<Box<dyn BarFeed>> {
+        None
+    }
 
     /// Cash distributions over the same window, oldest first.
     ///

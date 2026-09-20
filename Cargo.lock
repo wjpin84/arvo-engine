@@ -88,10 +88,12 @@ dependencies = [
  "arvo-risk",
  "async-trait",
  "chrono",
+ "futures-util",
  "reqwest",
  "serde",
  "serde_json",
  "tokio",
+ "tokio-tungstenite",
  "uuid",
 ]
 
