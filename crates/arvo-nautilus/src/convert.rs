@@ -29,7 +29,8 @@ pub(crate) fn equity(
     commission_bps: f64,
 ) -> anyhow::Result<InstrumentAny> {
     let fee = Decimal::try_from(commission_bps / 10_000.0)?;
-    let tick = Price::new_checked(0.01, PRICE_PRECISION)?;
+    let described = arvo_data::Instrument::of(&instrument_id.to_string());
+    let tick = Price::new_checked(described.tick, PRICE_PRECISION)?;
 
     // Optional fields are left unset rather than passed as `None`: the builder
     // applies the same defaults checked construction would.
@@ -72,7 +73,8 @@ pub(crate) fn option(
     commission_bps: f64,
 ) -> anyhow::Result<InstrumentAny> {
     let fee = Decimal::try_from(commission_bps / 10_000.0)?;
-    let tick = Price::new_checked(0.01, PRICE_PRECISION)?;
+    let described = arvo_data::Instrument::of(&instrument_id.to_string());
+    let tick = Price::new_checked(described.tick, PRICE_PRECISION)?;
     let expires = contract
         .expires_at()
         .and_utc()
@@ -100,7 +102,7 @@ pub(crate) fn option(
         .price_precision(PRICE_PRECISION)
         .price_increment(tick)
         .multiplier(Quantity::from(1))
-        .lot_size(Quantity::from(arvo_data::option::MULTIPLIER as u64))
+        .lot_size(Quantity::from(described.lot as u64))
         .maker_fee(fee)
         .taker_fee(fee)
         .ts_event(UnixNanos::default())

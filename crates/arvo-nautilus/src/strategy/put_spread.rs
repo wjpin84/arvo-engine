@@ -40,7 +40,12 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use arvo_data::option::{OptionContract, Right, MULTIPLIER};
+use arvo_data::option::{OptionContract, Right};
+
+/// Units in one contract of `id`, as the instrument says (#186).
+fn lot(id: &InstrumentId) -> f64 {
+    arvo_data::Instrument::of(&id.to_string()).lot
+}
 use arvo_research::greeks::{greeks, implied_volatility, years_to_expiry, Market};
 use chrono::{NaiveDate, NaiveDateTime};
 use nautilus_common::actor::data_actor::DataActor;
@@ -405,7 +410,7 @@ impl PutSpread {
             &long_id,
             long_price,
             false,
-            f64::from(spreads) * MULTIPLIER,
+            f64::from(spreads) * lot(&long_id),
             now,
         )
         else {
@@ -467,7 +472,7 @@ impl PutSpread {
         long_price: f64,
         today: NaiveDate,
     ) -> u32 {
-        let wanted = (self.trade_size.as_f64() / MULTIPLIER).floor();
+        let wanted = (self.trade_size.as_f64() / lot(long)).floor();
         if wanted < 1.0 {
             return 0;
         }
@@ -491,7 +496,7 @@ impl PutSpread {
         (1..=wanted as u32)
             .rev()
             .find(|&spreads| {
-                let units = f64::from(spreads) * MULTIPLIER;
+                let units = f64::from(spreads) * lot(long);
                 let long_cost = units * per_share + 2.0 * costs.per_fill;
                 let mut with_long = held.clone();
                 with_long.push((long_name.as_str(), units));

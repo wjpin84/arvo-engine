@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 
+use arvo_data::Instrument;
 use chrono::{NaiveDate, NaiveDateTime};
 use serde::{Deserialize, Serialize};
 
@@ -65,6 +66,11 @@ pub struct Position {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Rejection {
+    /// The proposer asked for a quantity that is not a whole number of the
+    /// instrument's lots — two and a half contracts. Refused rather than
+    /// rounded: a rule that asks for half a contract has a bug, and sizing
+    /// it down would hide it (#186).
+    NotWholeLot { asked: f64, lot: f64 },
     /// The account stopped trading: either it breached
     /// [`RiskModel::max_drawdown`], or someone pulled the kill switch. Which
     /// one decides whether it can resume — see [`Halt::manual`].
@@ -229,10 +235,12 @@ pub struct AccountState<'a> {
 /// reported reason is the most fundamental one rather than whichever check
 /// happened to be written last.
 #[must_use]
+#[expect(clippy::too_many_arguments, reason = "the policy takes the account, the ask and the instrument apart on purpose")]
 pub fn decide(
     model: &RiskModel,
     account: &AccountState<'_>,
     proposal: &Proposal,
+    instrument: &Instrument,
     now: NaiveDateTime,
     max_signal_age_ms: i64,
     correlations: Option<&dyn Correlations>,
@@ -315,7 +323,7 @@ pub fn decide(
         }
     }
 
-    size(model, account, proposal, costs)
+    size(model, account, proposal, instrument, costs)
 }
 
 /// Whether this instrument would over-fill its sector.

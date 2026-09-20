@@ -20,16 +20,14 @@
 //! in shares, which is why expiry and assignment are a model of their own (#84)
 //! rather than a price going to zero.
 //!
-//! The multiplier is 100 for every contract read here. An adjusted contract
+//! A standard contract is a lot of 100 units of the deliverable — that fact
+//! lives on [`crate::Instrument`], not here (#186). An adjusted contract
 //! after a split or special dividend delivers something else, and OCC gives it
 //! a root with a digit (`SPY1`) — which [`OptionContract::parse`] refuses, so
 //! such a contract cannot be read as a standard one.
 
 use chrono::{NaiveDate, NaiveDateTime};
 use serde::{Deserialize, Serialize};
-
-/// Shares of the underlying one standard contract delivers.
-pub const MULTIPLIER: f64 = 100.0;
 
 /// The right a contract grants its holder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

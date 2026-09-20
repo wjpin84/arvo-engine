@@ -460,6 +460,14 @@ pub trait Source: Send + Sync {
         to: chrono::NaiveDate,
     ) -> Result<Fetched, SourceError>;
 
+    /// What this source knows about an instrument it serves: its lot, tick,
+    /// hours and margin (#186). What the name alone says, until a source
+    /// knows better — a venue that lists fractional shares or trades round
+    /// the clock overrides this. The id carries this source's venue.
+    fn instrument(&self, symbol: &str) -> crate::Instrument {
+        crate::Instrument::of(&format!("{symbol}.{}", self.venue()))
+    }
+
     /// A live feed of completed bars, when this source has one at this
     /// interval (#185). `None` means poll [`Self::bars`], which every source
     /// supports and which is right for a daily rule anyway.

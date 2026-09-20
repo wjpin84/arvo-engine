@@ -492,6 +492,7 @@ fn sized(spendable: Option<f64>, costs: Option<&CostModel>) -> f64 {
             spendable,
         },
         &greedy,
+        &arvo_data::Instrument::of(&greedy.instrument),
         greedy.signalled_at,
         i64::MAX,
         None,
@@ -535,6 +536,7 @@ fn sized_option(premium: f64, wanted: f64, costs: Option<&CostModel>) -> Decisio
             spendable: None,
         },
         &proposal,
+        &arvo_data::Instrument::of(&proposal.instrument),
         proposal.signalled_at,
         i64::MAX,
         None,
@@ -557,6 +559,7 @@ fn decided(positions: BTreeMap<String, Position>, proposal: &Proposal) -> Decisi
             spendable: Some(100_000.0),
         },
         proposal,
+        &arvo_data::Instrument::of(&proposal.instrument),
         proposal.signalled_at,
         i64::MAX,
         None,
@@ -622,14 +625,21 @@ fn an_option_is_sized_in_whole_contracts_and_pays_its_spread() {
         sized_option(2.0, 1e9, Some(&costs)),
         Decision::Accept { quantity: 4_900.0 }
     );
-    // Asking for 250 shares is asking for two and a half contracts.
+    // Asking for 250 shares is asking for two and a half contracts: a rule
+    // with a bug, refused rather than quietly rounded to two (#186).
     assert_eq!(
         sized_option(2.0, 250.0, Some(&costs)),
+        Decision::Reject(Rejection::NotWholeLot { asked: 250.0, lot: 100.0 })
+    );
+    // Whole contracts are taken as asked.
+    assert_eq!(
+        sized_option(2.0, 200.0, Some(&costs)),
         Decision::Accept { quantity: 200.0 }
     );
-    // Less than one contract is nothing, not a fraction of one.
+    // One contract the account cannot pay for is nothing, not a fraction
+    // of one: $150 a share is $15,000 a contract against $10,000.
     assert!(matches!(
-        sized_option(2.0, 99.0, Some(&costs)),
+        sized_option(150.0, 100.0, Some(&costs)),
         Decision::Reject(Rejection::TooSmall { .. })
     ));
 }

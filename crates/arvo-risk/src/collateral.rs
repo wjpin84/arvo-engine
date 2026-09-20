@@ -24,7 +24,7 @@
 
 use std::collections::BTreeMap;
 
-use arvo_data::option::{OptionContract, Right, MULTIPLIER};
+use arvo_data::option::{OptionContract, Right};
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 
@@ -101,9 +101,10 @@ pub fn sellable<'a>(
     wanted: u32,
 ) -> Result<u32, Uncovered> {
     let before = reserved(held.iter().copied())?;
+    let lot = arvo_data::Instrument::of(proposed).lot;
     let mut contracts = 0;
     while contracts < wanted {
-        let next = f64::from(contracts + 1) * MULTIPLIER;
+        let next = f64::from(contracts + 1) * lot;
         let mut after: Vec<(&str, f64)> = held.to_vec();
         after.push((proposed, -next));
         if reserved(after)? - before > available + 1e-9 {

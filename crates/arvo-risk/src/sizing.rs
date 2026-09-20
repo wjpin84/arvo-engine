@@ -1,5 +1,8 @@
 //! How much of an accepted proposal to send.
 
+use arvo_data::instrument::Kind;
+use arvo_data::Instrument;
+
 use super::decide::{AccountState, Decision, Proposal, Rejection};
 use crate::{CostModel, RiskModel};
 
@@ -46,6 +49,7 @@ pub(super) fn size(
     model: &RiskModel,
     account: &AccountState<'_>,
     proposal: &Proposal,
+    instrument: &Instrument,
     costs: Option<&CostModel>,
 ) -> Decision {
     let starting_cash = account.starting_cash;
@@ -63,17 +67,21 @@ pub(super) fn size(
     // units of 100, each priced per share as quoted. Holding the unit at one
     // share keeps every dollar figure downstream — curve, stops, P&L — the
     // product of a price and a quantity, with no multiplier to forget.
-    let lot = if arvo_data::option::OptionContract::parse(&proposal.instrument).is_some() {
-        arvo_data::option::MULTIPLIER
-    } else {
-        1.0
-    };
+    // What the instrument's source said, or what its name says (#186). An
+    // asked-for quantity that is not whole lots is the proposer's mistake.
+    let lot = instrument.lot;
+    let option = matches!(instrument.kind, Kind::Option(_));
+    if let Some(asked) = proposal.desired_quantity {
+        if !instrument.is_whole_lots(asked) {
+            return Decision::Reject(Rejection::NotWholeLot { asked, lot });
+        }
+    }
 
     // What one unit costs to buy, all in. An option pays half its spread
     // rather than equity basis points.
     let (per_unit, per_fill) = costs.map_or((proposal.reference_price, 0.0), |costs| {
         let crossed = match costs.option_spread {
-            Some(spread) if lot > 1.0 => {
+            Some(spread) if option => {
                 proposal.reference_price + spread.half_spread(proposal.reference_price)
             }
             _ => proposal.reference_price * (1.0 + costs.slippage_bps / 10_000.0),
@@ -105,7 +113,7 @@ pub(super) fn size(
     let spendable = account.spendable.map(|cash| cash - reserve);
 
     if proposal.opens_short {
-        if lot <= 1.0 {
+        if !option {
             return Decision::Reject(Rejection::CannotShort {
                 instrument: proposal.instrument.clone(),
             });

@@ -185,11 +185,7 @@ impl DataActor for BuyAndHold {
         // to its benchmark that asked for 100 SPY shares in a $25,000 account,
         // the venue refused, and the rule's -1.7% was judged against a flat
         // line that held no SPY at all. Whole contracts for an option.
-        let lot = if arvo_data::option::OptionContract::parse(&self.instrument_id.to_string()).is_some() {
-            arvo_data::option::MULTIPLIER
-        } else {
-            1.0
-        };
+        let lot = arvo_data::Instrument::of(&self.instrument_id.to_string()).lot;
         let costs = self.position.risk().costs;
         let price = bar.close.as_f64();
         let per_unit = costs

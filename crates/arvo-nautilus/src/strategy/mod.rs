@@ -431,6 +431,8 @@ pub(crate) fn decide_entry(
             spendable,
         },
         &proposal,
+        // The library has no source at hand to ask, so the name says (#186).
+        &arvo_data::Instrument::of(instrument),
         now,
         // Never stale. See `signalled_at` above.
         i64::MAX,

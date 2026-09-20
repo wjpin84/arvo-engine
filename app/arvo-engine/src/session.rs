@@ -485,11 +485,13 @@ async fn drive<E: Executor>(
     let now = || chrono::Utc::now().naive_utc();
     let instrument = experiment.instrument.clone();
     let proposer = format!("shadow:{}", experiment.strategy.name);
-    let mut session = Session::new(
-        RiskGate::new(experiment.risk.clone(), experiment.starting_cash, now().date()),
-        executor,
-    )
-    .against_assumed_slippage_bps(experiment.costs.slippage_bps);
+    // The source that serves the bars says what the instrument is — its
+    // lot, tick, hours — and the gate sizes against that (#186).
+    let described = source.instrument(symbol);
+    record.write("instrument", Some(serde_json::to_value(&described).unwrap_or_default()));
+    let mut gate = RiskGate::new(experiment.risk.clone(), experiment.starting_cash, now().date());
+    gate.learn(described);
+    let mut session = Session::new(gate, executor).against_assumed_slippage_bps(experiment.costs.slippage_bps);
 
     // What the venue already holds is adopted and halts the session: a
     // position this rule did not open is one it cannot reason about.

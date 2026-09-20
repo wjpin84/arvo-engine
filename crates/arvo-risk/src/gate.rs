@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 
+use arvo_data::Instrument;
 use chrono::{NaiveDate, NaiveDateTime};
 use serde::{Deserialize, Serialize};
 
@@ -21,6 +22,9 @@ pub struct RiskGate {
     equity: f64,
     peak_equity: f64,
     positions: BTreeMap<String, Position>,
+    /// What the sources said about the instruments this account trades
+    /// (#186). Anything not here is sized on what its name says.
+    instruments: BTreeMap<String, Instrument>,
     /// When each held position was opened, so a close on the same day can be
     /// recognised as a day trade. Kept beside the book rather than on
     /// `Position`, which is also what the engine hands in and has no opening
@@ -68,6 +72,7 @@ impl RiskGate {
             equity: starting_cash,
             peak_equity: starting_cash,
             positions: BTreeMap::new(),
+            instruments: BTreeMap::new(),
             opened_on: BTreeMap::new(),
             day_trades: Vec::new(),
             realised_today: 0.0,
@@ -165,6 +170,13 @@ impl RiskGate {
         self.propose_within(proposal, now, correlations, None)
     }
 
+    /// Tells the gate what an instrument's source says it is — its lot,
+    /// tick, hours — so proposals on it are sized against that rather than
+    /// against its name.
+    pub fn learn(&mut self, instrument: Instrument) {
+        self.instruments.insert(instrument.id.clone(), instrument);
+    }
+
     /// As [`Self::propose`], with the cash the account can spend right now.
     ///
     /// The book is the gate's; the cash is the venue's. A gate that tracked
@@ -179,6 +191,11 @@ impl RiskGate {
         correlations: Option<&dyn Correlations>,
         spendable: Option<f64>,
     ) -> Decision {
+        let instrument = self
+            .instruments
+            .get(&proposal.instrument)
+            .cloned()
+            .unwrap_or_else(|| Instrument::of(&proposal.instrument));
         decide(
             &self.model,
             &AccountState {
@@ -191,6 +208,7 @@ impl RiskGate {
                 spendable,
             },
             proposal,
+            &instrument,
             now,
             self.max_signal_age_ms,
             correlations,
