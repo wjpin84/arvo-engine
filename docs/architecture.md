@@ -1,7 +1,8 @@
 # Architecture
 
-Where Arvo is going and what shape it takes to get there. Decisions with
-consequences live in [arvo-adrs](https://github.com/wjpin84/arvo-adrs); this is the standing picture they add up to.
+The shape of the platform and the rules that keep it. Decisions with
+consequences live in [arvo-adrs](https://github.com/wjpin84/arvo-adrs), as do
+the research notes and plans; this is the standing picture they add up to.
 
 ## Destination
 
@@ -108,11 +109,8 @@ app/           the daemon and the MCP server
 | `integrations/arvo-robinhood` | Bars, search and quotes over MCP, with OAuth |
 | `integrations/arvo-yfinance` | A second opinion, and dividends |
 | `integrations/arvo-alpaca` | Bars and corporate actions, on two feeds |
-| `app/arvo-runtime` | The Tauri host, the source registry, commands |
-| `contract/rust/arvo-api` | The contract's types, from the contract repository (a submodule). Messages only, no tonic, so the WebAssembly editor can link it |
-| `contract/rust/arvo-client` | The contract's service stubs and discovery, from the same place. Adds the gRPC transport to `arvo-api` |
-| `app/arvo-window` | The shapes the window and its editor agree on and the engine never sees |
-| `app/arvo-editor` | The Leptos workbench |
+| `contract/rust/arvo-api` | The contract's types, from the contract repository (a submodule). Messages only, no tonic |
+| `contract/rust/arvo-client` | The contract's service stubs and discovery, from the same place. This repository implements the server traits |
 | `app/arvo-mcp-server` | Arvo as a stdio MCP server: an agent reads and runs research, never trades |
 | `app/arvo-engine` | The engine's local gRPC API and the research tier every non-window front end shares ([ADR-0018](https://github.com/wjpin84/arvo-adrs/blob/main/0018-arvo-keeps-running-when-the-window-closes.md)) |
 
@@ -136,8 +134,8 @@ crate — see [ADR-0005](https://github.com/wjpin84/arvo-adrs/blob/main/0005-pro
 | `Correlations` | `arvo-risk`, next to the gate that consumes it |
 
 An integration depends only on `arvo-data` and its own protocol crates —
-never on `app/arvo-runtime`. The registry that knows every vendor is the one
-thing that must, and it lives in the composition root.
+never on the daemon. The registry that knows every vendor is the one thing
+that must, and it lives in the composition root.
 
 ## Data, and what it assumes
 
@@ -173,9 +171,17 @@ and a live session** ([ADR-0009](https://github.com/wjpin84/arvo-adrs/blob/main/
 engine on the live side would not be a refinement — it would make every stored
 verdict a statement about a system that does not exist.
 
-## Repo layout
+## The repositories
 
-`arvo-platform/` is **not** a git repo; `arvo-desktop/` is.
-`arvo-retirement-service/` is a sibling Python repo, parked — leftover reference
-material to migrate into a platform extension later, not a component of this
-architecture.
+Four, since 2026-09-20, and one for decisions.
+
+| | |
+|---|---|
+| [arvo-engine](https://github.com/wjpin84/arvo-engine) | this: the daemon, the MCP server and every crate that decides anything |
+| [arvo-desktop](https://github.com/wjpin84/arvo-desktop) | the window and its editor; links no engine crate, talks to this over the API |
+| [arvo-engine-api](https://github.com/wjpin84/arvo-engine-api) | the API: protos, and the Rust and Python bindings generated from them; the `contract/` submodule here and in the desktop |
+| [arvo-extension-api](https://github.com/wjpin84/arvo-extension-api) | the provider contract a plugin implements; the `extension/` submodule here |
+| [arvo-adrs](https://github.com/wjpin84/arvo-adrs) | decisions, research notes and plans, across all of them |
+
+`arvo-platform/` on a developer's machine is a folder holding checkouts of
+these, not a repository.
