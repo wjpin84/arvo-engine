@@ -414,31 +414,40 @@ fn search(
         prior_trials,
     };
 
-    let mut scored: Vec<(f64, BTreeMap<String, f64>)> = Vec::with_capacity(combinations.len());
-    let mut failures = Vec::new();
-
-    for combination in combinations {
-        let trial = variant(&family.template, &combination, in_sample, "is");
-        match provider.run(&trial) {
-            Ok(result) => {
+    // Every configuration's backtest is independent of every other, so they
+    // run across the cores (#212). The outcomes come back in grid order —
+    // rayon's collect keeps an indexed iterator's order — and are scored in
+    // that order below, so a re-run produces the same trials in the same
+    // order and a tie between two configurations is broken exactly as the
+    // sequential loop broke it. Only how fast the trials run changes; never
+    // which trial wins.
+    use rayon::prelude::*;
+    let outcomes: Vec<Result<Option<f64>, String>> = combinations
+        .par_iter()
+        .map(|combination| {
+            let trial = variant(&family.template, combination, in_sample, "is");
+            provider.run(&trial).map_err(|err| err.to_string()).map(|result| {
                 // Annualised at the experiment's own resolution, not a
                 // constant: a five-minute Sharpe scaled by 252 is understated
                 // by about nine times, and nothing in the output would show it.
-                let sharpe = Metrics::from_curve(
+                Metrics::from_curve(
                     &result.equity_curve,
                     result.trades,
                     family.template.interval.periods_per_year(),
                 )
-                .and_then(|metrics| metrics.sharpe);
-                match sharpe {
-                    Some(sharpe) => scored.push((sharpe, combination)),
-                    // A flat curve is a configuration that never traded. It
-                    // did not lose the search, it did not enter it.
-                    None => {
-                        failures.push(format!("{combination:?}: produced no measurable return"))
-                    }
-                }
-            }
+                .and_then(|metrics| metrics.sharpe)
+            })
+        })
+        .collect();
+
+    let mut scored: Vec<(f64, BTreeMap<String, f64>)> = Vec::with_capacity(combinations.len());
+    let mut failures = Vec::new();
+    for (combination, outcome) in combinations.into_iter().zip(outcomes) {
+        match outcome {
+            Ok(Some(sharpe)) => scored.push((sharpe, combination)),
+            // A flat curve is a configuration that never traded. It did not
+            // lose the search, it did not enter it.
+            Ok(None) => failures.push(format!("{combination:?}: produced no measurable return")),
             Err(err) => failures.push(format!("{combination:?}: {err}")),
         }
     }
@@ -728,5 +737,69 @@ mod tests {
             "one trial is no search"
         );
         assert_eq!(expected_best_under_null(&[]), None);
+    }
+
+    /// A provider whose result depends only on `fast`, so two configurations
+    /// that share it tie exactly. The sequential loop broke a tie by taking
+    /// the later configuration in grid order; the parallel one must too.
+    struct Scripted;
+
+    impl crate::SimulationProvider for Scripted {
+        fn engine(&self) -> &str {
+            "scripted 0"
+        }
+
+        fn run(&self, experiment: &Experiment) -> Result<crate::SimulationResult, crate::SimulationError> {
+            let fast = experiment.strategy.params.get("fast").copied().unwrap_or(1.0);
+            let step = 0.0005 * fast;
+            let start = date(2023, 1, 2).and_time(chrono::NaiveTime::MIN);
+            let equity_curve = (0..300)
+                .map(|i| crate::EquityPoint {
+                    at: start + chrono::Duration::days(i),
+                    // A steady drift with a deterministic wobble, so the
+                    // Sharpe is finite and differs by `fast` alone.
+                    equity: 100_000.0 * (1.0 + step).powi(i as i32) * (1.0 + 0.002 * ((i as f64) * 0.7).sin()),
+                })
+                .collect();
+            Ok(crate::SimulationResult {
+                experiment: experiment.id.clone(),
+                engine: "scripted 0".to_owned(),
+                trades: 4,
+                equity_curve,
+                ledger: Vec::new(),
+                refused: Default::default(),
+            })
+        }
+    }
+
+    /// The sweep runs across the cores (#212); nothing about which trial wins
+    /// may depend on which finished first.
+    #[test]
+    fn a_parallel_sweep_scores_trials_in_grid_order_and_breaks_a_tie_as_the_loop_did() {
+        let crate::memory::Record::Study(seed) = crate::memory::tests::study("AAPL.NASDAQ", "hash-a") else { unreachable!() };
+        let template = seed.selected.clone();
+        let grid = ParameterGrid::new().axis("fast", vec![5.0, 10.0]).axis("slow", vec![20.0, 30.0]);
+        let family = ExperimentFamily {
+            hypothesis: template.hypothesis.clone(),
+            template,
+            grid: grid.clone(),
+            in_sample_fraction: 0.7,
+            prior_trials: 0,
+        };
+        let criteria = EvaluationCriteria::default();
+
+        let first = run_family(&Scripted, &family, &criteria).expect("runs");
+        let second = run_family(&Scripted, &family, &criteria).expect("runs again");
+
+        let order: Vec<_> = first.selection.scored.iter().map(|trial| trial.params.clone()).collect();
+        assert_eq!(order, grid.combinations(), "trials are scored in grid order, whatever finished first");
+        assert_eq!(first.selection.scored, second.selection.scored, "a re-run is the same search");
+
+        // fast=10 beats fast=5; between (10, 20) and (10, 30) the Sharpe is
+        // identical, and the later in grid order is the one that won before.
+        let winner = &first.selected.strategy.params;
+        assert_eq!(winner.get("fast"), Some(&10.0));
+        assert_eq!(winner.get("slow"), Some(&30.0), "the tie breaks as the sequential loop broke it");
+        assert_eq!(second.selected.strategy.params, *winner);
     }
 }

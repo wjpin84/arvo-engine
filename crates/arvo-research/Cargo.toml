@@ -20,6 +20,8 @@ chrono.workspace = true
 serde.workspace = true
 serde_json = "1"
 thiserror.workspace = true
+# The family sweep runs its configurations across the cores (#212).
+rayon = "1.12.0"
 
 [dev-dependencies]
 tempfile = "3.27.0"
