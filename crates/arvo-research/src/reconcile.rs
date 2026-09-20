@@ -427,6 +427,7 @@ mod tests {
             pnl: (exit - entry) * quantity - commission,
             commission,
             exit_reason: ExitReason::Signal,
+            journal: None,
         }
     }
 

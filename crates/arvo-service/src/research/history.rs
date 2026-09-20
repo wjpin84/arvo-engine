@@ -403,11 +403,11 @@ pub fn trades_csv(rows: &[TradeRow]) -> String {
     // quoting above exists to prevent.
     out.push_str(
         "instrument,opened,closed,direction,quantity,entry,exit,pnl,commission,held_days,\
-         exit_reason\n",
+         exit_reason,rule,signal,regime,asked\n",
     );
     for row in rows {
         out.push_str(&format!(
-            "{},{},{},{},{},{},{},{},{},{},{}\n",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
             cell(&row.instrument),
             cell(&row.opened),
             cell(&row.closed),
@@ -419,6 +419,10 @@ pub fn trades_csv(rows: &[TradeRow]) -> String {
             row.commission,
             number(row.held_days),
             cell(&row.exit_reason),
+            cell(row.rule.as_deref().unwrap_or_default()),
+            number(row.signal),
+            cell(row.regime.as_deref().unwrap_or_default()),
+            number(row.asked),
         ));
     }
     out
@@ -587,6 +591,10 @@ mod csv_tests {
             commission: 1.0,
             held_days: Some(3.0),
             exit_reason: reason.to_owned(),
+            rule: None,
+            signal: None,
+            regime: None,
+            asked: None,
         }
     }
 
@@ -596,8 +604,8 @@ mod csv_tests {
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 3);
         assert!(lines[0].starts_with("instrument,opened,closed,direction"));
-        assert_eq!(lines[0].split(',').count(), 11);
-        assert_eq!(lines[1].split(',').count(), 11);
+        assert_eq!(lines[0].split(',').count(), 15);
+        assert_eq!(lines[1].split(',').count(), 15);
     }
 
     #[test]

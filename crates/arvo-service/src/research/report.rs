@@ -537,6 +537,10 @@ mod tests {
                 commission: 1.0,
                 held_days: Some(7.0),
                 exit_reason: "signal".to_owned(),
+                rule: None,
+                signal: None,
+                regime: None,
+                asked: None,
             }],
             monthly: vec![],
             trades_detail: Some(TradesView {

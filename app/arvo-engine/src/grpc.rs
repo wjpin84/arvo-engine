@@ -1031,6 +1031,17 @@ fn reported_from(request: &ReportRequest) -> Result<(arvo_research::Reported, St
                     "still_open" | "open" => ExitReason::StillOpen,
                     other => return Err(format!("exit_reason {other:?} is not one this knows (signal, stop, halted, expired, still_open)")),
                 },
+                // A reported run may say what its rule saw (#190); the rule
+                // and the value together, or nothing.
+                journal: match (&trade.rule, trade.signal) {
+                    (Some(rule), Some(signal)) => Some(arvo_research::Journal {
+                        rule: rule.clone(),
+                        signal,
+                        regime: trade.regime.clone(),
+                        asked: trade.asked.unwrap_or(trade.quantity),
+                    }),
+                    _ => None,
+                },
             })
         })
         .collect::<Result<Vec<_>, String>>()?;

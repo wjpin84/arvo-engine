@@ -301,6 +301,7 @@ mod tests {
             pnl: 0.0,
             commission: 0.0,
             exit_reason: ExitReason::Signal,
+            journal: None,
         }
     }
 

@@ -354,6 +354,19 @@ fn an_experiment_runs_end_to_end_through_nautilus() {
         "the curve opens at the starting balance"
     );
     assert!(result.trades > 0, "a crossing path should trade");
+
+    // Every trade says what the rule saw (#190): the crossing, its spread,
+    // the regime once enough bars had been seen, and the size asked for.
+    for trade in &result.ledger {
+        let journal = trade.journal.as_ref().expect("a rule's trade carries its journal");
+        assert_eq!(journal.rule, "fast crossed above slow");
+        assert!(journal.signal > 0.0, "the fast average was above the slow one: {}", journal.signal);
+        assert!(journal.asked >= trade.quantity - 1e-9, "the gate never gives more than was asked: {} vs {}", journal.asked, trade.quantity);
+    }
+    assert!(
+        result.ledger.iter().any(|trade| trade.journal.as_ref().is_some_and(|journal| journal.regime.is_some())),
+        "after twenty bars the regime is known"
+    );
 }
 
 #[test]

@@ -1009,6 +1009,7 @@ mod tests {
             pnl,
             commission: 1.0,
             exit_reason: ExitReason::Signal,
+            journal: None,
         }
     }
 

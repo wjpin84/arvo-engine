@@ -267,6 +267,7 @@ mod tests {
             pnl: 0.0,
             commission: 0.0,
             exit_reason: crate::ExitReason::StillOpen,
+            journal: None,
         }
     }
 

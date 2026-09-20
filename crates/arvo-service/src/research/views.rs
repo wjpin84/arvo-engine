@@ -317,6 +317,10 @@ pub fn trade_rows(ledger: &[arvo_research::Trade]) -> Vec<TradeRowView> {
                 arvo_research::ExitReason::StillOpen => "open",
             }
             .to_owned(),
+            rule: trade.journal.as_ref().map(|journal| journal.rule.clone()),
+            signal: trade.journal.as_ref().map(|journal| journal.signal),
+            regime: trade.journal.as_ref().and_then(|journal| journal.regime.clone()),
+            asked: trade.journal.as_ref().map(|journal| journal.asked),
         })
         .collect()
 }
@@ -980,6 +984,7 @@ mod chart_tests {
             pnl: 100.0,
             commission: 1.0,
             exit_reason: closed.map_or(ExitReason::StillOpen, |_| ExitReason::Stop),
+            journal: None,
         }
     }
 
@@ -1166,6 +1171,7 @@ mod member_tests {
             pnl,
             commission: 1.0,
             exit_reason: arvo_research::ExitReason::Signal,
+            journal: None,
         }
     }
 

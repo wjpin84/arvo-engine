@@ -39,7 +39,7 @@ use crate::backtest;
 use crate::chain::Settlement;
 use crate::convert::to_nautilus_bar;
 use crate::plan::Plan;
-use crate::strategy::ENTRY_STOP;
+use crate::strategy::{ENTRY_REGIME, ENTRY_RULE, ENTRY_SIGNAL, ENTRY_STOP};
 
 /// Which way a signal goes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,6 +66,12 @@ pub struct Signal {
     /// `Some(why)` when this closes a position — `stop`, `signal`, `halt` —
     /// which a session sends without asking the gate (ADR-0009).
     pub exit: Option<String>,
+    /// The condition that fired, in the rule's words, on an entry (#190).
+    pub rule: Option<String>,
+    /// The value it was judged on.
+    pub signal: Option<f64>,
+    /// The regime the rule saw the instrument in, when it had seen enough.
+    pub regime: Option<String>,
 }
 
 /// A backtest engine kept alive and fed one bar at a time.
@@ -165,10 +171,11 @@ impl Shadow {
                 .iter()
                 .find_map(|tag| tag.as_str().strip_prefix("arvo:exit="))
                 .map(str::to_owned);
-            let stop_distance = tags
-                .iter()
-                .find_map(|tag| tag.as_str().strip_prefix(ENTRY_STOP))
-                .and_then(|distance| distance.parse().ok());
+            let tagged = |prefix: &str| tags.iter().find_map(|tag| tag.as_str().strip_prefix(prefix).map(str::to_owned));
+            let stop_distance = tagged(ENTRY_STOP).and_then(|distance| distance.parse().ok());
+            let rule = tagged(ENTRY_RULE);
+            let value = tagged(ENTRY_SIGNAL).and_then(|value| value.parse().ok());
+            let regime = tagged(ENTRY_REGIME);
             signals.push(Signal {
                 instrument,
                 side: match order.order_side() {
@@ -180,6 +187,9 @@ impl Shadow {
                 stop_distance,
                 signalled_at,
                 exit,
+                rule,
+                signal: value,
+                regime,
             });
         }
         Ok(signals)

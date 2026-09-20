@@ -68,7 +68,7 @@ pub use pdt::{
     business_days_before, day_trades_in_window, DayTradingRule, PDT_DAY_TRADES, PDT_EQUITY_FLOOR,
     PDT_WINDOW_DAYS,
 };
-pub use trade::{Direction, ExitReason, Trade, TradeStats};
+pub use trade::{Direction, ExitReason, Journal, Trade, TradeStats};
 
 use serde::{Deserialize, Serialize};
 

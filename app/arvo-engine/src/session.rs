@@ -710,6 +710,9 @@ async fn act<E: Executor>(
         "price": signal.reference_price,
         "at": signal.signalled_at,
         "exit": signal.exit,
+        "rule": signal.rule,
+        "signal": signal.signal,
+        "regime": signal.regime,
     })));
     if let Some(why) = &signal.exit {
         // Exits do not ask the gate (ADR-0009).

@@ -78,7 +78,7 @@ pub use risk::{
 };
 pub use panel::{run_panel, InstrumentOutcome, KeptEvidence, PanelEvidence, PanelStudy, PooledOutcome};
 pub use reported::{judge, Judgement, Reported, ReportedEvidence};
-pub use trade::{Direction, ExitReason, Trade, TradeStats};
+pub use trade::{Direction, ExitReason, Journal, Trade, TradeStats};
 pub use walk_forward::{run_walk_forward, AxisStability, WalkForward, WalkForwardEvidence};
 
 // The risk crate, where it has always been reached from: `arvo_research::risk`,

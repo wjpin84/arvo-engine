@@ -906,6 +906,7 @@ fn day_trades_are_counted_the_same_way_from_a_ledger() {
         pnl: 1.0,
         commission: 0.0,
         exit_reason: crate::ExitReason::Signal,
+        journal: None,
     };
     let overnight = Trade {
         closed: Some(day(10).and_time(chrono::NaiveTime::MIN)),

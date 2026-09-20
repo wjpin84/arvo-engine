@@ -10,7 +10,7 @@
 //! calculation of the same quantity is a second thing that can be wrong, and
 //! the one that disagrees with the equity curve would be this one.
 
-use arvo_research::{Direction, ExitReason, Trade};
+use arvo_research::{Direction, ExitReason, Journal, Trade};
 use nautilus_common::cache::Cache;
 use nautilus_core::UnixNanos;
 use nautilus_model::{
@@ -109,7 +109,23 @@ fn to_trade(cache: &Cache, position: &Position) -> Trade {
             .get(&position.settlement_currency)
             .map_or(0.0, nautilus_model::types::Money::as_f64),
         exit_reason: exit_reason(cache, position),
+        journal: journal(cache, position),
     }
+}
+
+/// What the rule saw when it opened the position, from the tags on its
+/// opening order (#190). `None` when the order is gone from the cache or
+/// carried no rule tag — an adoption, a settlement.
+fn journal(cache: &Cache, position: &Position) -> Option<Journal> {
+    let order = cache.order(&position.opening_order_id)?;
+    let tags = order.tags()?;
+    let tagged = |prefix: &str| tags.iter().find_map(|tag| tag.as_str().strip_prefix(prefix).map(str::to_owned));
+    Some(Journal {
+        rule: tagged(crate::strategy::ENTRY_RULE)?,
+        signal: tagged(crate::strategy::ENTRY_SIGNAL)?.parse().ok()?,
+        regime: tagged(crate::strategy::ENTRY_REGIME),
+        asked: tagged(crate::strategy::ENTRY_ASKED).and_then(|asked| asked.parse().ok()).unwrap_or(position.peak_qty.as_f64()),
+    })
 }
 
 /// How the position ended, read from the tag the strategy stamped on the

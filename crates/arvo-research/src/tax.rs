@@ -191,6 +191,7 @@ mod tests {
             pnl,
             commission: 0.0,
             exit_reason: crate::ExitReason::Signal,
+            journal: None,
         }
     }
 

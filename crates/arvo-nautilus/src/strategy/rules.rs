@@ -16,7 +16,7 @@ use nautilus_trading::strategy::StrategyCore;
 
 use super::{
     indicator::{Atr, Donchian, Session, SessionVwap, Sma},
-    managed_strategy, Managed, Position, Risk, EXIT_SIGNAL,
+    managed_strategy, Managed, Position, Risk, Trigger, EXIT_SIGNAL,
 };
 
 /// Bars of a session that must pass before a VWAP deviation means anything.
@@ -105,7 +105,9 @@ impl DataActor for SmaCross {
 
         let fast_above = fast > slow;
         match self.previous_fast_above.replace(fast_above) {
-            Some(false) if fast_above => self.enter_long(close, atr, None).map(|_| ()),
+            Some(false) if fast_above => self
+                .enter_long(close, atr, None, Trigger::new("fast crossed above slow", fast - slow))
+                .map(|_| ()),
             Some(true) if !fast_above => self.close(EXIT_SIGNAL),
             _ => Ok(()),
         }
@@ -207,7 +209,8 @@ impl DataActor for BuyAndHold {
             }
             _ => size,
         };
-        self.send(OrderSide::Buy, size, None)
+        let asked = self.position.default_size().as_f64();
+        self.send(OrderSide::Buy, size, Trigger::new("first bar", price).tags(self.position.regime(), asked))
     }
 }
 
@@ -264,7 +267,7 @@ impl DataActor for SellAndHold {
     fn on_bar(&mut self, bar: &Bar) -> anyhow::Result<()> {
         self.observe_bar(bar);
         if !self.entered {
-            self.entered = self.enter_short(bar.close.as_f64())?;
+            self.entered = self.enter_short(bar.close.as_f64(), Trigger::new("first bar", bar.close.as_f64()))?;
         }
         Ok(())
     }
@@ -400,7 +403,7 @@ impl DataActor for OpeningRange {
             return Ok(());
         }
         let target = close + width * self.target_range_multiple;
-        if self.enter_long(close, atr, Some(target))? {
+        if self.enter_long(close, atr, Some(target), Trigger::new("close above the opening range", (close - range_high) / width))? {
             self.traded_today = true;
         }
         Ok(())
@@ -496,7 +499,7 @@ impl DataActor for VolatilityBreakout {
             // The ATR used for the stop is this crate's `Position` reading the
             // same indicator, so the entry threshold and the stop distance
             // move together by construction.
-            self.enter_long(close, Some(atr), None)?;
+            self.enter_long(close, Some(atr), None, Trigger::new("close above the reference by more than the ATR multiple", (close - reference) / atr))?;
         }
         Ok(())
     }
@@ -608,7 +611,7 @@ impl DataActor for VwapReversion {
             return Ok(());
         };
         if close < vwap - deviation * self.entry_deviations {
-            self.enter_long(close, atr, Some(vwap))?;
+            self.enter_long(close, atr, Some(vwap), Trigger::new("close below VWAP by more than the deviation multiple", (vwap - close) / deviation))?;
         }
         Ok(())
     }
@@ -703,7 +706,7 @@ impl DataActor for MomentumBreakout {
 
         if let Some((breakout_high, _)) = entry_channel {
             if close > breakout_high {
-                self.enter_long(close, atr, None)?;
+                self.enter_long(close, atr, None, Trigger::new("close above the entry channel high", close - breakout_high))?;
             }
         }
         Ok(())

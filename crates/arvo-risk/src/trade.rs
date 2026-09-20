@@ -58,6 +58,32 @@ pub enum ExitReason {
     StillOpen,
 }
 
+/// What the rule saw when it opened a trade (#190).
+///
+/// An agent asked "why did this trade fail" has nothing to reason from in a
+/// ledger of prices and quantities. This is the missing half: the condition
+/// that fired and its value, the market's regime at the time, and what the
+/// rule asked the gate for before the gate sized it. Written by the rule as
+/// tags on its entry order and read back off the fill, so the backtest
+/// ledger and a live session's record say the same things.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Journal {
+    /// The condition that fired, in the rule's words: `fast crossed above
+    /// slow`, `close above the entry channel high`.
+    pub rule: String,
+    /// The value the condition was judged on — a spread, a distance in ATRs,
+    /// a deviation. Its meaning is the rule's; the number is what an agent
+    /// compares across trades.
+    pub signal: f64,
+    /// The instrument's regime when the trade opened, as
+    /// `arvo_research::regime` labels it. `None` when the rule had not seen
+    /// enough bars to say.
+    pub regime: Option<String>,
+    /// The quantity the rule asked for. The trade's `quantity` is what the
+    /// gate allowed; the difference is the gate's decision.
+    pub asked: f64,
+}
+
 /// One position, from opening fill to closing fill.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Trade {
@@ -91,6 +117,11 @@ pub struct Trade {
     /// commission, flat per-order fees and per-share or sell-side charges.
     pub commission: f64,
     pub exit_reason: ExitReason,
+    /// What the rule saw at entry. `None` for a trade recorded before the
+    /// journal existed, or opened by something that is not a rule — an
+    /// adoption, a hand-placed order.
+    #[serde(default)]
+    pub journal: Option<Journal>,
 }
 
 impl Trade {
@@ -544,6 +575,7 @@ mod tests {
             pnl: sign * (exit - entry) * 100.0 - 1.0,
             commission: 1.0,
             exit_reason: ExitReason::Signal,
+            journal: None,
         }
     }
 
@@ -597,6 +629,7 @@ mod tests {
             pnl,
             commission: 1.0,
             exit_reason: reason,
+            journal: None,
         }
     }
 
@@ -632,6 +665,7 @@ mod tests {
             pnl: 95.0,
             commission: 5.0,
             exit_reason: ExitReason::Signal,
+            journal: None,
         }];
 
         let curve = equity_curve(1_000.0, &one("X.SIM", bars.clone()), arvo_data::BarInterval::DAILY, &ledger);
@@ -656,6 +690,7 @@ mod tests {
             pnl: 0.0,
             commission: 0.0,
             exit_reason: ExitReason::StillOpen,
+            journal: None,
         }];
 
         let curve = equity_curve(1_000.0, &one("X.SIM", bars.clone()), arvo_data::BarInterval::DAILY, &ledger);
@@ -781,6 +816,7 @@ mod tests {
             pnl: 0.0,
             commission: 0.0,
             exit_reason: ExitReason::StillOpen,
+            journal: None,
         }];
 
         let curve = equity_curve(1_000.0, &bars, arvo_data::BarInterval::DAILY, &ledger);
@@ -813,6 +849,7 @@ mod tests {
             pnl: 0.0,
             commission: 0.0,
             exit_reason: ExitReason::StillOpen,
+            journal: None,
         }];
 
         let curve = equity_curve(1_000.0, &bars, arvo_data::BarInterval::DAILY, &ledger);
@@ -854,6 +891,7 @@ mod tests {
             pnl: 0.0,
             commission: 0.0,
             exit_reason: ExitReason::StillOpen,
+            journal: None,
         }];
 
         let curve = equity_curve(

@@ -420,7 +420,12 @@ impl PutSpread {
         let Ok(size) = Quantity::new_checked(long_units, 0) else {
             return Ok(());
         };
-        self.send(long_id, OrderSide::Buy, size, None)?;
+        self.send(
+            long_id,
+            OrderSide::Buy,
+            size,
+            super::Trigger::new("put spread opened", long_price).tags(None, f64::from(spreads) * lot(&long_id)),
+        )?;
         self.entered_on = Some(now.date());
         self.pending = Some(Pending {
             open: Open {
@@ -451,13 +456,13 @@ impl PutSpread {
             pending.now,
         ) {
             arvo_research::Decision::Accept { quantity: accepted } if accepted >= quantity => {
-                self.send(pending.open.short, OrderSide::Sell, size, None)?;
+                self.send(pending.open.short, OrderSide::Sell, size, Vec::new())?;
                 self.open = Some(pending.open);
             }
             _ => {
                 // No half spreads: the long leg alone is a different position.
                 *self.skipped.entry("refused").or_default() += 1;
-                self.send(pending.open.long, OrderSide::Sell, size, Some(EXIT_SIGNAL))?;
+                self.send(pending.open.long, OrderSide::Sell, size, vec![EXIT_SIGNAL.to_owned()])?;
             }
         }
         Ok(())
@@ -546,7 +551,7 @@ impl PutSpread {
             OrderSide::Sell
         };
         match Quantity::new_checked(held.abs(), 0) {
-            Ok(size) if held != 0.0 => self.send(id, side, size, Some(EXIT_SIGNAL)),
+            Ok(size) if held != 0.0 => self.send(id, side, size, vec![EXIT_SIGNAL.to_owned()]),
             _ => Ok(()),
         }
     }
@@ -556,7 +561,7 @@ impl PutSpread {
         instrument: InstrumentId,
         side: OrderSide,
         size: Quantity,
-        reason: Option<&'static str>,
+        tags: Vec<String>,
     ) -> anyhow::Result<()> {
         let order = self.order().market(
             instrument,
@@ -567,7 +572,7 @@ impl PutSpread {
             None,
             None,
             None,
-            reason.map(|reason| vec![ustr::Ustr::from(reason)]),
+            (!tags.is_empty()).then(|| tags.iter().map(|tag| ustr::Ustr::from(tag)).collect()),
             None,
         );
         self.submit_order(order, None, None, None)

@@ -20,6 +20,7 @@ fn trade(day: u32, held: i64, pnl: f64, reason: ExitReason) -> Trade {
         pnl,
         commission: 1.0,
         exit_reason: reason,
+        journal: None,
     }
 }
 

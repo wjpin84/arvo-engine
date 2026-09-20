@@ -200,7 +200,7 @@ impl ZeroDteBreakout {
                     None
                 };
                 if let (Some(reason), Ok(size)) = (reason, Quantity::new_checked(position, 0)) {
-                    self.send(held.id, OrderSide::Sell, size, Some(reason))?;
+                    self.send(held.id, OrderSide::Sell, size, vec![reason.to_owned()])?;
                 }
             }
             return Ok(());
@@ -272,7 +272,12 @@ impl ZeroDteBreakout {
         let Ok(size) = Quantity::new_checked(quantity, 0) else {
             return Ok(());
         };
-        self.send(id, OrderSide::Buy, size, None)?;
+        self.send(
+            id,
+            OrderSide::Buy,
+            size,
+            super::Trigger::new("strongest breakout in the chain", price).tags(None, self.trade_size.as_f64()),
+        )?;
         self.held = Some(Held {
             id,
             chosen_at: price,
@@ -312,7 +317,7 @@ impl ZeroDteBreakout {
         instrument: InstrumentId,
         side: OrderSide,
         size: Quantity,
-        reason: Option<&'static str>,
+        tags: Vec<String>,
     ) -> anyhow::Result<()> {
         let order = self.order().market(
             instrument,
@@ -323,7 +328,7 @@ impl ZeroDteBreakout {
             None,
             None,
             None,
-            reason.map(|reason| vec![ustr::Ustr::from(reason)]),
+            (!tags.is_empty()).then(|| tags.iter().map(|tag| ustr::Ustr::from(tag)).collect()),
             None,
         );
         self.submit_order(order, None, None, None)

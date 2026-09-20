@@ -139,9 +139,20 @@ fn chain(lines: &[Line], fill: &Line, out: &mut String) {
                 Some(Value::String(why)) => format!("  exit: {why}"),
                 _ => String::new(),
             };
+            // What the rule saw (#190): the condition, its value, the regime.
+            let mut saw = String::new();
+            if let Some(Value::String(rule)) = signal.detail.get("rule") {
+                saw.push_str(&format!("  rule: {rule}"));
+            }
+            if let Some(value) = signal.detail.get("signal").and_then(Value::as_f64) {
+                saw.push_str(&format!(" = {value}"));
+            }
+            if let Some(Value::String(regime)) = signal.detail.get("regime") {
+                saw.push_str(&format!("  regime: {regime}"));
+            }
             let _ = writeln!(
                 out,
-                "    signal    {}  {} {} @ {}{exit}",
+                "    signal    {}  {} {} @ {}{exit}{saw}",
                 signal_id,
                 text(&signal.detail, "side").to_lowercase(),
                 number(&signal.detail, "quantity"),
@@ -243,7 +254,7 @@ mod tests {
         [
             r#"{"at":"2026-09-18T14:36:00+00:00","event":"started","detail":{"experiment":"x"}}"#,
             r#"{"at":"2026-09-18T14:36:01+00:00","event":"bar","detail":{"at":"2026-09-17T00:00:00","close":497.75,"signals":1}}"#,
-            r#"{"at":"2026-09-18T14:36:01+00:00","event":"signal","detail":{"id":"2026-09-17T00:00:00#0","bar":"2026-09-17T00:00:00","side":"Buy","quantity":137.0,"price":497.75,"at":"2026-09-17T00:00:00","exit":null}}"#,
+            r#"{"at":"2026-09-18T14:36:01+00:00","event":"signal","detail":{"id":"2026-09-17T00:00:00#0","bar":"2026-09-17T00:00:00","side":"Buy","quantity":137.0,"price":497.75,"at":"2026-09-17T00:00:00","exit":null,"rule":"fast crossed above slow","signal":1.25,"regime":"trending up"}}"#,
             r#"{"at":"2026-09-18T14:36:02+00:00","event":"submitted","detail":{"signal":"2026-09-17T00:00:00#0","order":"ord-1"}}"#,
             r#"{"at":"2026-09-18T14:37:22+00:00","event":"filled","detail":{"order":"ord-1","instrument":"MSFT.RH","side":"buy","proposer":"shadow:sma_cross","quantity":137.0,"decision_price":497.75,"fill_price":497.9,"decision_at":"2026-09-17T00:00:00","filled_at":"2026-09-18T14:37:22","position":137.0}}"#,
             r#"{"at":"2026-09-18T15:00:00+00:00","event":"frozen","detail":{"discrepancies":[{"instrument":"BTCUSD.RH","expected":0.0,"at_venue":0.001}]}}"#,
@@ -257,7 +268,7 @@ mod tests {
         let out = explain(&record(), parse_when("2026-09-18T14:37:22Z").unwrap());
         assert!(out.starts_with("MSFT.RH: 137 at "), "{out}");
         assert!(out.contains("bar       2026-09-17T00:00:00 close 497.75"), "{out}");
-        assert!(out.contains("signal    2026-09-17T00:00:00#0  buy 137 @ 497.75"), "{out}");
+        assert!(out.contains("signal    2026-09-17T00:00:00#0  buy 137 @ 497.75  rule: fast crossed above slow = 1.25  regime: trending up"), "{out}");
         assert!(out.contains("gate      accepted; order ord-1 acknowledged 2026-09-18T14:36:02+00:00"), "{out}");
         assert!(out.contains("fill      buy 137 @ 497.9 at 2026-09-18T14:37:22") && out.contains("→ position 137"), "{out}");
         assert!(!out.contains("BTCUSD"), "adopted later, not held yet");

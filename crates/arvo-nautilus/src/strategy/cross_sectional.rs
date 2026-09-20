@@ -292,7 +292,13 @@ impl CrossSectionalMomentum {
             }
             position.stop = stop_distance.map(|distance| reading.close - distance);
             position.hold(size);
-            self.send(id, OrderSide::Buy, size, None)?;
+            let asked = position.default_size().as_f64();
+            self.send(
+                id,
+                OrderSide::Buy,
+                size,
+                super::Trigger::new("ranked among the top risers", reading.close).tags(None, asked),
+            )?;
         }
         Ok(())
     }
@@ -329,7 +335,7 @@ impl CrossSectionalMomentum {
         let Some(size) = size else {
             return Ok(());
         };
-        self.send(id, OrderSide::Sell, size, Some(reason))
+        self.send(id, OrderSide::Sell, size, vec![reason.to_owned()])
     }
 
     /// ponytail: the order mechanics `super::Managed` already has, taking an
@@ -342,7 +348,7 @@ impl CrossSectionalMomentum {
         instrument: InstrumentId,
         side: OrderSide,
         size: Quantity,
-        reason: Option<&'static str>,
+        tags: Vec<String>,
     ) -> anyhow::Result<()> {
         let order = self.order().market(
             instrument,
@@ -353,7 +359,7 @@ impl CrossSectionalMomentum {
             None,
             None,
             None,
-            reason.map(|reason| vec![ustr::Ustr::from(reason)]),
+            (!tags.is_empty()).then(|| tags.iter().map(|tag| ustr::Ustr::from(tag)).collect()),
             None,
         );
         self.submit_order(order, None, None, None)

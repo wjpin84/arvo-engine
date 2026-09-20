@@ -70,6 +70,35 @@ pub(crate) const EXIT_HALT: &str = "arvo:exit=halt";
 /// live gate re-deciding the same entry has the number it needs
 /// (`shadow`). `arvo:stop=<price distance>`.
 pub(crate) const ENTRY_STOP: &str = "arvo:stop=";
+/// What the rule saw when it entered (#190), on the entry order for the
+/// ledger and the shadow to read back: the condition, its value, the regime
+/// and the quantity asked for before the gate sized it.
+pub(crate) const ENTRY_RULE: &str = "arvo:rule=";
+pub(crate) const ENTRY_SIGNAL: &str = "arvo:signal=";
+pub(crate) const ENTRY_REGIME: &str = "arvo:regime=";
+pub(crate) const ENTRY_ASKED: &str = "arvo:asked=";
+
+/// The condition that fired and the value it was judged on.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Trigger {
+    pub rule: &'static str,
+    pub signal: f64,
+}
+
+impl Trigger {
+    pub(crate) const fn new(rule: &'static str, signal: f64) -> Self {
+        Self { rule, signal }
+    }
+
+    /// The tags an entry order carries for it, plus the regime and the ask.
+    pub(crate) fn tags(self, regime: Option<arvo_research::regime::Regime>, asked: f64) -> Vec<String> {
+        let mut tags = vec![format!("{ENTRY_RULE}{}", self.rule), format!("{ENTRY_SIGNAL}{}", self.signal), format!("{ENTRY_ASKED}{asked}")];
+        if let Some(regime) = regime {
+            tags.push(format!("{ENTRY_REGIME}{}", regime.label()));
+        }
+        tags
+    }
+}
 
 /// What the engine's own rules call themselves when they propose a trade.
 ///
@@ -139,6 +168,9 @@ pub(crate) struct Position {
     /// reading one — that is what lets the same function run identically here,
     /// where time is a bar timestamp, and in a live session where it is not.
     last_bar_at: Option<chrono::NaiveDateTime>,
+    /// The last few closes, for the regime at entry (#190). One more than
+    /// the lookback, which is what one label needs.
+    closes: Vec<arvo_research::EquityPoint>,
     /// The highest account equity seen so far, and whether the drawdown limit
     /// has since been reached.
     ///
@@ -163,9 +195,19 @@ impl Position {
             target: None,
             held: None,
             last_bar_at: None,
+            closes: Vec::new(),
             peak_equity: None,
             halted: false,
         }
+    }
+
+    /// The regime the closes seen so far put the instrument in, or `None`
+    /// before enough of them.
+    pub(crate) fn regime(&self) -> Option<arvo_research::regime::Regime> {
+        arvo_research::regime::label(&self.closes, arvo_research::regime::LOOKBACK)
+            .last()
+            .copied()
+            .flatten()
     }
 
     /// Records what was just bought.
@@ -461,6 +503,7 @@ pub(crate) trait Managed: Strategy + StrategyNative + DataActorNative {
         price: f64,
         atr: Option<f64>,
         target: Option<f64>,
+        trigger: Trigger,
     ) -> anyhow::Result<bool> {
         let Ok(stop_distance) = self.position().stop_distance(atr) else {
             // A stop was asked for and the ATR has not warmed up.
@@ -480,17 +523,16 @@ pub(crate) trait Managed: Strategy + StrategyNative + DataActorNative {
             return Ok(false);
         };
 
+        let asked = self.position().default_size().as_f64();
+        let mut tags = trigger.tags(self.position().regime(), asked);
+        tags.extend(stop_distance.map(|distance| format!("{ENTRY_STOP}{distance}")));
         {
             let position = self.position_mut();
             position.stop = stop_distance.map(|distance| price - distance);
             position.target = target;
             position.hold(size);
         }
-        self.send(
-            OrderSide::Buy,
-            size,
-            stop_distance.map(|distance| format!("{ENTRY_STOP}{distance}")),
-        )?;
+        self.send(OrderSide::Buy, size, tags)?;
         Ok(true)
     }
 
@@ -500,7 +542,7 @@ pub(crate) trait Managed: Strategy + StrategyNative + DataActorNative {
     /// Unstopped and untargeted: [`Self::exit_on_levels`] reads a long's levels,
     /// and a rule that sells manages its own exit. The gate refuses anything
     /// that is not an option, and any call it could not cover.
-    fn enter_short(&mut self, price: f64) -> anyhow::Result<bool> {
+    fn enter_short(&mut self, price: f64, trigger: Trigger) -> anyhow::Result<bool> {
         let Some(arvo_research::Decision::Accept { quantity }) = self.ask_risk(price, None, true)
         else {
             return Ok(false);
@@ -509,7 +551,8 @@ pub(crate) trait Managed: Strategy + StrategyNative + DataActorNative {
             return Ok(false);
         };
         self.position_mut().hold(size);
-        self.send(OrderSide::Sell, size, None)?;
+        let asked = self.position().default_size().as_f64();
+        self.send(OrderSide::Sell, size, trigger.tags(self.position().regime(), asked))?;
         Ok(true)
     }
 
@@ -571,6 +614,13 @@ pub(crate) trait Managed: Strategy + StrategyNative + DataActorNative {
         self.position_mut().last_bar_at = at;
 
         if let Some(at) = at {
+            {
+                let closes = &mut self.position_mut().closes;
+                closes.push(arvo_research::EquityPoint { at, equity: bar.close.as_f64() });
+                if closes.len() > arvo_research::regime::LOOKBACK + 1 {
+                    closes.remove(0);
+                }
+            }
             let instrument = self.instrument().to_string();
             self.position()
                 .correlations
@@ -611,7 +661,7 @@ pub(crate) trait Managed: Strategy + StrategyNative + DataActorNative {
         let Some(size) = size else {
             return Ok(());
         };
-        self.send(side, size, Some(reason.to_owned()))
+        self.send(side, size, vec![reason.to_owned()])
     }
 
     /// Squares what this strategy believes it holds with the venue, after the
@@ -695,7 +745,7 @@ pub(crate) trait Managed: Strategy + StrategyNative + DataActorNative {
         Ok(true)
     }
 
-    fn send(&mut self, side: OrderSide, size: Quantity, tag: Option<String>) -> anyhow::Result<()> {
+    fn send(&mut self, side: OrderSide, size: Quantity, tags: Vec<String>) -> anyhow::Result<()> {
         let instrument = self.instrument();
         let order = self.order().market(
             instrument,
@@ -706,7 +756,7 @@ pub(crate) trait Managed: Strategy + StrategyNative + DataActorNative {
             None, // quote_quantity
             None, // exec_algorithm_id
             None, // exec_algorithm_params
-            tag.map(|tag| vec![ustr::Ustr::from(&tag)]),
+            (!tags.is_empty()).then(|| tags.iter().map(|tag| ustr::Ustr::from(tag)).collect()),
             None, // client_order_id
         );
         self.submit_order(order, None, None, None)
