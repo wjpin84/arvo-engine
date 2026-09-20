@@ -86,13 +86,12 @@ needs today is to build a provider without this repository, which is #181.
 
 ## Layout
 
-Four groups, one rule each.
+Three groups, one rule each.
 
 ```
-crates/        the platform
-engines/       runs a backtest
+crates/        the platform, including the one crate that runs a backtest
 integrations/  talks to a vendor
-app/           the desktop application
+app/           the daemon and the MCP server
 ```
 
 | | Owns |
@@ -105,7 +104,7 @@ app/           the desktop application
 | `crates/arvo-execution` | The `Executor` trait, the paper executor, divergence |
 | `crates/arvo-mcp`, `crates/arvo-oauth` | Protocol and authorization, both vendor-agnostic |
 | `crates/arvo-plugin-host` | Out-of-process plugins over gRPC |
-| `engines/arvo-nautilus` | The only crate permitted to name a Nautilus type |
+| `crates/arvo-nautilus` | The only crate permitted to name a Nautilus type |
 | `integrations/arvo-robinhood` | Bars, search and quotes over MCP, with OAuth |
 | `integrations/arvo-yfinance` | A second opinion, and dividends |
 | `integrations/arvo-alpaca` | Bars and corporate actions, on two feeds |

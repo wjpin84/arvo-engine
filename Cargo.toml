@@ -10,7 +10,7 @@ members = [
     "crates/arvo-schedule",
     "crates/arvo-mcp",
     "crates/arvo-oauth",
-    "engines/arvo-nautilus",
+    "crates/arvo-nautilus",
     "crates/arvo-portfolio",
     "crates/arvo-execution",
     "integrations/arvo-alpaca",
@@ -40,7 +40,7 @@ arvo-data = { path = "crates/arvo-data" }
 arvo-mcp = { path = "crates/arvo-mcp" }
 arvo-oauth = { path = "crates/arvo-oauth" }
 arvo-api = { path = "contract/rust/arvo-api" }
-arvo-nautilus = { path = "engines/arvo-nautilus" }
+arvo-nautilus = { path = "crates/arvo-nautilus" }
 arvo-portfolio = { path = "crates/arvo-portfolio" }
 arvo-research = { path = "crates/arvo-research" }
 arvo-risk = { path = "crates/arvo-risk" }

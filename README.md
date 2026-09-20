@@ -89,7 +89,7 @@ call is appended to `agent-audit.jsonl`.
 | `crates/arvo-plugin-host` | Out-of-process plugins over gRPC, against `extension/` |
 | `crates/arvo-schedule` | The scheduler: intervals and cron, with the Unix weekday dialect translated |
 | `crates/arvo-mcp`, `crates/arvo-oauth` | Protocol and authorization, vendor-agnostic |
-| `engines/arvo-nautilus` | The only crate permitted to name a Nautilus type |
+| `crates/arvo-nautilus` | The only crate permitted to name a Nautilus type |
 | `integrations/arvo-robinhood`, `arvo-yfinance`, `arvo-alpaca` | Vendors |
 | `contract/rust/arvo-api`, `contract/rust/arvo-client` | The API, from the contract repository: this implements its server traits |
 
