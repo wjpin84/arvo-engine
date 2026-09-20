@@ -28,13 +28,29 @@ async fn main() {
     }
 }
 
+const USAGE: &str = "usage:
+  arvo-engine [<data-dir>]                       serve; the app data directory when none is given
+  arvo-engine session list
+  arvo-engine session start <finding> <executor>
+  arvo-engine session stop|reconcile|resume <id>
+  arvo-engine session halt <id>|--all [reason...] the kill switch: arm the gate, flatten, stay halted
+  arvo-engine session explain <id> <time>        the chain behind every position held then";
+
 async fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(String::as_str) == Some("session") {
         return session_command(&args[1..]).await;
     }
-    let (root, data) = match args.first() {
-        Some(dir) => (PathBuf::from(&dir), PathBuf::from(dir)),
+    // A positional argument is a data directory that exists. Anything else
+    // is a mistake to say so about, not a directory to create and serve: an
+    // `arvo-engine help` once started a second engine under `./help`.
+    let (root, data) = match args.first().map(String::as_str) {
+        Some("help" | "--help" | "-h") => {
+            println!("{USAGE}");
+            return Ok(());
+        }
+        Some(dir) if std::path::Path::new(dir).is_dir() => (PathBuf::from(dir), PathBuf::from(dir)),
+        Some(other) => return Err(format!("{other:?} is not a directory or a verb\n{USAGE}")),
         None => (
             arvo_service::project::app_data_root().map_err(|err| format!("no app data directory: {err}"))?,
             research::default_root()?,
@@ -133,7 +149,7 @@ async fn run() -> Result<(), String> {
 async fn session_command(args: &[String]) -> Result<(), String> {
     use arvo_engine::grpc::proto::common::Empty;
     use arvo_engine::grpc::proto::services::sessions_client::SessionsClient;
-    use arvo_engine::grpc::proto::session::{SessionId, SessionStatus, StartRequest};
+    use arvo_engine::grpc::proto::session::{HaltRequest, SessionId, SessionStatus, StartRequest};
 
     if let [verb, id, when] = args {
         if verb == "explain" {
@@ -206,6 +222,31 @@ async fn session_command(args: &[String]) -> Result<(), String> {
                 .map_err(|err| err.message().to_owned())?;
             show(&reconciled.into_inner());
         }
+        [verb, target, reason @ ..] if verb == "halt" => {
+            let reason = reason.join(" ");
+            let ids: Vec<String> = if target == "--all" {
+                let listed = client.list_sessions(bearer(Empty {}, &token)).await.map_err(|err| err.message().to_owned())?;
+                listed
+                    .into_inner()
+                    .sessions
+                    .into_iter()
+                    .filter(|status| matches!(status.state.as_str(), "starting" | "running" | "frozen"))
+                    .map(|status| status.id)
+                    .collect()
+            } else {
+                vec![target.clone()]
+            };
+            if ids.is_empty() {
+                println!("nothing to halt");
+            }
+            for id in ids {
+                let halted = client
+                    .halt_session(bearer(HaltRequest { id, reason: reason.clone() }, &token))
+                    .await
+                    .map_err(|err| err.message().to_owned())?;
+                show(&halted.into_inner());
+            }
+        }
         [verb, id] if verb == "resume" => {
             let resumed = client
                 .resume_session(bearer(SessionId { id: id.clone() }, &token))
@@ -213,11 +254,7 @@ async fn session_command(args: &[String]) -> Result<(), String> {
                 .map_err(|err| err.message().to_owned())?;
             show(&resumed.into_inner());
         }
-        _ => {
-            return Err(
-                "usage: arvo-engine session list | start <finding> <executor> | stop <id> | reconcile <id> | resume <id> | explain <id> <time>".to_owned(),
-            )
-        }
+        _ => return Err(USAGE.to_owned()),
     }
     Ok(())
 }

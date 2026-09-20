@@ -125,13 +125,15 @@ pub struct Status {
     pub reconciled: bool,
 }
 
-/// What a person can ask of a frozen session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// What a person can ask of a running session.
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Command {
     /// Make the gate's book the venue's.
     Reconcile,
     /// Take entries again. Only after a reconcile.
     Resume,
+    /// The kill switch (#127): arm the gate, then flatten. Carries the reason.
+    Halt(String),
 }
 
 /// Why a session is not taking entries.
@@ -308,6 +310,18 @@ impl Sessions {
         self.command(id, Command::Resume)
     }
 
+    /// The kill switch: arms the gate and flattens what the session holds.
+    /// The session stays up, halted, so the exits' fills are still booked
+    /// and the record says what the venue would not exit.
+    ///
+    /// # Errors
+    ///
+    /// No session by that id, or one that is not running or frozen.
+    pub fn halt(&self, id: &str, reason: &str) -> Result<Status, String> {
+        let reason = if reason.trim().is_empty() { "a person pressed the kill switch".to_owned() } else { reason.to_owned() };
+        self.command(id, Command::Halt(reason))
+    }
+
     fn command(&self, id: &str, command: Command) -> Result<Status, String> {
         let (status, mailbox) = {
             let running = self.running.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -316,11 +330,20 @@ impl Sessions {
         };
         {
             let status = status.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            if status.state != "frozen" {
-                return Err(format!("{id} is {}, not frozen", status.state));
-            }
-            if command == Command::Resume && !status.reconciled {
-                return Err(format!("{id} has not been reconciled; reconcile first"));
+            match command {
+                Command::Halt(_) => {
+                    if !matches!(status.state.as_str(), "starting" | "running" | "frozen") {
+                        return Err(format!("{id} is {}; nothing to halt", status.state));
+                    }
+                }
+                Command::Reconcile | Command::Resume => {
+                    if status.state != "frozen" {
+                        return Err(format!("{id} is {}, not frozen", status.state));
+                    }
+                    if command == Command::Resume && !status.reconciled {
+                        return Err(format!("{id} has not been reconciled; reconcile first"));
+                    }
+                }
             }
         }
         *mailbox.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(command);
@@ -522,10 +545,15 @@ async fn drive<E: Executor>(
     record.write("feed", Some(serde_json::json!({ "streaming": feed.is_some(), "source": source.id() })));
     let mut frozen: Option<Freeze> = None;
     let mut last_poll: Option<std::time::Instant> = None;
+    // The last close seen, as the reference price for a kill switch's exits.
+    let mut last_close: Option<f64> = None;
+    // Whether the kill switch fired: the loop then keeps settling the exits
+    // rather than ending on the gate's halt like a drawdown does.
+    let mut killed = false;
     while !stop.load(Ordering::SeqCst) {
-        // Taken, then the lock is dropped: the caller polls that lock while
+        // Read, then the lock is dropped: the caller polls that lock while
         // the command runs, and a reconcile waits on the venue.
-        let command = mailbox.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+        let command = mailbox.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
         if let Some(command) = command {
             match command {
                 Command::Reconcile => match session.adopt(now(), venue).await {
@@ -550,7 +578,40 @@ async fn drive<E: Executor>(
                     }
                     _ => record.write("resume_refused", Some(serde_json::json!("not reconciled"))),
                 },
+                Command::Halt(reason) => {
+                    // Armed first, then flattened; see `Session::kill`. The
+                    // reference prices are the last closes, so the exits'
+                    // slippage is measured against something.
+                    let prices: BTreeMap<String, f64> =
+                        session.gate().positions().keys().filter_map(|held| last_close.map(|close| (held.clone(), close))).collect();
+                    let flatten = session.kill(&reason, &prices, now()).await;
+                    killed = true;
+                    frozen = None;
+                    record.write(
+                        "halted",
+                        Some(serde_json::json!({
+                            "reason": reason,
+                            "flattened": flatten.submitted.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                            "failed": flatten.failed.iter().map(|(instrument, err)| format!("{instrument}: {err}")).collect::<Vec<_>>(),
+                        })),
+                    );
+                    let mut status = status.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    status.state = "halted".to_owned();
+                    status.halted = Some(if flatten.complete() {
+                        reason
+                    } else {
+                        format!("{reason}; {} position(s) the venue would not exit are still held", flatten.failed.len())
+                    });
+                    status.frozen = None;
+                    status.reconciled = false;
+                    announce(events, &status);
+                }
             }
+            // Cleared only now: the caller waits on this slot, and the status
+            // it reads back must already show what the command did. Taking it
+            // first let a resume sent straight after a reconcile find the
+            // reconcile not yet done.
+            *mailbox.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         }
 
         let mut fresh: Vec<arvo_data::Bar> = Vec::new();
@@ -608,6 +669,7 @@ async fn drive<E: Executor>(
         for bar in fresh {
             let signals = shadow.push(&[(instrument.clone(), bar)]).map_err(|err| err.to_string())?;
             last_pushed = Some(bar.at);
+            last_close = Some(bar.close);
             record.write("bar", Some(serde_json::json!({ "at": bar.at, "close": bar.close, "signals": signals.len() })));
             {
                 let mut status = status.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -620,7 +682,9 @@ async fn drive<E: Executor>(
                 let id = format!("{}#{n}", bar.at);
                 act(&mut session, &id, signal, &proposer, now(), frozen.is_some(), record, status).await?;
             }
-            if let Some(why) = session.gate().halted() {
+            if killed {
+                // Already halted by hand; the loop stays up to book the exits.
+            } else if let Some(why) = session.gate().halted() {
                 halt(status, record, events, why);
                 return Ok(());
             }
@@ -860,6 +924,16 @@ mod tests {
         assert_eq!(stopped.state, "failed");
         assert!(stopped.last_error.is_some());
         assert_eq!(sessions.list().len(), 1);
+    }
+
+    #[test]
+    fn only_a_live_session_takes_the_kill_switch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sessions = Sessions::new(dir.path(), broadcast::channel(16).0);
+        let started = sessions.start("nope", "alpaca-paper").expect("starts");
+        sessions.stop(&started.id).expect("joins");
+        let refused = sessions.halt(&started.id, "").expect_err("not running");
+        assert!(refused.contains("nothing to halt"), "{refused}");
     }
 
     #[test]

@@ -36,7 +36,7 @@ use proto::research::{
     ReplayView, ReportFigure, ReportRequest, RiskModel, Rules, Ruleset, RulesetForm, RulesetPath, Rulesets,
     RunRequest, SharedExperiment, Strategies, StudyRequest, StudyView, TradeExport, WalkForwardView,
 };
-use proto::session::{SessionId, SessionList, SessionStatus, StartRequest};
+use proto::session::{HaltRequest, SessionId, SessionList, SessionStatus, StartRequest};
 use arvo_api::EventView;
 
 /// The keys of a summary that have their own fields; everything else is
@@ -576,6 +576,17 @@ impl sessions_server::Sessions for Control {
         let id = request.into_inner().id;
         let sessions = self.sessions.clone();
         tokio::task::spawn_blocking(move || sessions.resume(&id))
+            .await
+            .map_err(|err| Status::internal(err.to_string()))?
+            .map(|status| Response::new(session_status(status)))
+            .map_err(Status::failed_precondition)
+    }
+
+    async fn halt_session(&self, request: Request<HaltRequest>) -> Result<Response<SessionStatus>, Status> {
+        let request = request.into_inner();
+        let sessions = self.sessions.clone();
+        // Waits for the exits to be sent, up to a pause step.
+        tokio::task::spawn_blocking(move || sessions.halt(&request.id, &request.reason))
             .await
             .map_err(|err| Status::internal(err.to_string()))?
             .map(|status| Response::new(session_status(status)))
