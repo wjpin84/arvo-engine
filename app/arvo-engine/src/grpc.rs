@@ -37,7 +37,7 @@ use proto::research::{
     ReplayView, ReportFigure, ReportRequest, RiskModel, Rules, Ruleset, RulesetForm, RulesetPath, Rulesets,
     RunRequest, SharedExperiment, Strategies, StudyRequest, StudyView, TradeExport, WalkForwardView,
 };
-use proto::session::{HaltRequest, PromotionView, SessionId, SessionList, SessionStatus, StartRequest};
+use proto::session::{Divergence, HaltRequest, PromotionView, SessionId, SessionList, SessionStatus, StartRequest};
 use arvo_api::EventView;
 
 /// The keys of a summary that have their own fields; everything else is
@@ -211,6 +211,15 @@ fn session_status(status: crate::session::Status) -> SessionStatus {
         verdict: status.verdict,
         verdict_reason: status.verdict_reason,
         warnings: status.warnings,
+        divergence: status.divergence.map(|(measured, assumed)| Divergence {
+            fills: u32::try_from(measured.fills).unwrap_or(u32::MAX),
+            unfilled: u32::try_from(measured.unfilled).unwrap_or(u32::MAX),
+            mean_slippage_bps: measured.mean_slippage_bps,
+            worst_slippage_bps: measured.worst_slippage_bps,
+            mean_latency_ms: measured.mean_latency_ms,
+            worst_latency_ms: measured.worst_latency_ms,
+            assumed_slippage_bps: assumed,
+        }),
     }
 }
 

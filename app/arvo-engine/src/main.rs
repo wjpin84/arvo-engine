@@ -191,7 +191,7 @@ async fn session_command(dir: Option<PathBuf>, args: &[String]) -> Result<(), St
     }
     let show = |status: &SessionStatus| {
         println!(
-            "{}  {}  {} {}  signals {}  submitted {}  refused {}  fills {}  {}{}{}{}{}{}",
+            "{}  {}  {} {}  signals {}  submitted {}  refused {}  fills {}  {}{}{}{}{}{}{}",
             status.id,
             status.state,
             status.instrument,
@@ -206,6 +206,16 @@ async fn session_command(dir: Option<PathBuf>, args: &[String]) -> Result<(), St
             },
             status.last_bar.as_ref().map_or(String::new(), |at| format!("  last bar {at}")),
             if status.warnings.is_empty() { String::new() } else { format!("  NEAR: {}", status.warnings.join("; ")) },
+            status.divergence.as_ref().map_or(String::new(), |measured| {
+                format!(
+                    "  slippage {:.1} bps (worst {:.1}{}), latency {:.0} ms{}",
+                    measured.mean_slippage_bps,
+                    measured.worst_slippage_bps,
+                    measured.assumed_slippage_bps.map_or(String::new(), |assumed| format!("; assumed {assumed:.1}")),
+                    measured.mean_latency_ms,
+                    if measured.unfilled > 0 { format!(", {} unfilled", measured.unfilled) } else { String::new() },
+                )
+            }),
             status.halted.as_ref().map_or(String::new(), |why| format!("  HALTED: {why}")),
             status.frozen.as_ref().map_or(String::new(), |why| {
                 format!("  FROZEN: {why}{}", if status.reconciled { " (reconciled; resume when ready)" } else { " (reconcile first)" })

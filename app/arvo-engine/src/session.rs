@@ -238,6 +238,9 @@ pub struct Status {
     /// The gate's limits this session is near (#191), in the gate's words.
     /// Empty when it is near none, and while halted.
     pub warnings: Vec<String>,
+    /// What the fills cost against the decision prices (#18), once anything
+    /// has filled, with the slippage the finding assumed beside it.
+    pub divergence: Option<(Divergence, Option<f64>)>,
 }
 
 /// What a person can ask of a running session.
@@ -370,6 +373,7 @@ impl Sessions {
             verdict: "inconclusive".to_owned(),
             verdict_reason: None,
             warnings: Vec::new(),
+            divergence: None,
         }));
         let stop = Arc::new(AtomicBool::new(false));
         let mailbox: Mailbox = Arc::default();
@@ -885,7 +889,12 @@ async fn drive<E: Executor>(
                     trouble(status, record, events, "settle_failed", &err);
                 }
             }
-            watch.settle(session.executions(), &session.divergence(), last_close);
+            let divergence = session.divergence();
+            watch.settle(session.executions(), &divergence, last_close);
+            if divergence.fills > 0 {
+                status.lock().unwrap_or_else(std::sync::PoisonError::into_inner).divergence =
+                    Some((divergence, Some(experiment.costs.slippage_bps)));
+            }
             session.mark(watch.equity());
             if let Some(changed) = watch.warned(&session.gate().warnings(now().date())) {
                 warned(status, record, events, changed);
