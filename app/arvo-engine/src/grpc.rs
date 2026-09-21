@@ -209,6 +209,7 @@ fn session_status(status: crate::session::Status) -> SessionStatus {
         reconciled: status.reconciled,
         verdict: status.verdict,
         verdict_reason: status.verdict_reason,
+        warnings: status.warnings,
     }
 }
 

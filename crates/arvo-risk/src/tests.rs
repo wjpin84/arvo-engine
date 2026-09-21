@@ -970,3 +970,50 @@ fn a_workable_limit_passes_validation() {
     };
     assert!(model.check().is_ok());
 }
+
+#[test]
+fn the_gate_warns_at_four_fifths_of_a_limit_and_not_before() {
+    let today = chrono::NaiveDate::from_ymd_opt(2026, 9, 21).unwrap();
+    let model = RiskModel {
+        max_drawdown: Some(0.10),
+        max_daily_loss: Some(0.05),
+        max_concurrent_positions: Some(5),
+        ..RiskModel::default()
+    };
+    let mut gate = RiskGate::new(model, 10_000.0, today);
+    assert!(gate.warnings(today).is_empty(), "a fresh account is near nothing");
+
+    // 7.9% below peak: under the band. 8.1%: in it, and the gate still accepts.
+    gate.mark(9_210.0);
+    assert!(gate.warnings(today).is_empty());
+    gate.mark(9_190.0);
+    let near = gate.warnings(today);
+    assert_eq!(near.len(), 1, "{near:?}");
+    assert_eq!(near[0].limit, "drawdown");
+    assert!(near[0].to_string().starts_with("drawdown 8.1% of a 10.0% limit"), "{}", near[0]);
+    assert!(gate.halted().is_none());
+
+    // Four of five positions is 80% of the cap.
+    for name in ["A.SIM", "B.SIM", "C.SIM", "D.SIM"] {
+        gate.opened(name, 1.0, 1.0, today);
+    }
+    let names: Vec<String> = gate.warnings(today).into_iter().map(|warning| warning.limit).collect();
+    assert_eq!(names, vec!["drawdown".to_owned(), "positions".to_owned()]);
+
+    // Recovered to the peak: the drawdown warning clears, as a warning must.
+    gate.mark(10_000.0);
+    assert!(!gate.warnings(today).iter().any(|warning| warning.limit == "drawdown"));
+
+    // A loss of 400 today is 80% of the 500 allowed; it lifts tomorrow.
+    gate.closed("A.SIM", -400.0, today);
+    let names: Vec<String> = gate.warnings(today).into_iter().map(|warning| warning.limit).collect();
+    assert!(names.contains(&"daily loss".to_owned()), "{names:?}");
+    let tomorrow = today.succ_opt().unwrap();
+    let names: Vec<String> = gate.warnings(tomorrow).into_iter().map(|warning| warning.limit).collect();
+    assert!(!names.contains(&"daily loss".to_owned()), "{names:?}");
+
+    // Past the limit the gate halts, and a halt is past warning.
+    gate.mark(8_000.0);
+    assert!(gate.halted().is_some());
+    assert!(gate.warnings(today).is_empty());
+}

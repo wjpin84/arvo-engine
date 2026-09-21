@@ -43,6 +43,38 @@ pub struct RiskGate {
     costs: Option<crate::CostModel>,
 }
 
+/// How close to a limit counts as near it (#191).
+///
+/// One band, not a scale: at four fifths of any limit the gate says so,
+/// on the record and on the status, so a session can be watched before it
+/// is stopped. Below it there is nothing to say; at the limit the gate
+/// refuses or halts, which is the record's business already.
+pub const WARNING_FRACTION: f64 = 0.8;
+
+/// A limit the account is near, with how much of it is used (#191).
+///
+/// Not a refusal and not a halt: the gate keeps accepting. It is the one
+/// thing a person can act on before the gate acts for them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Warning {
+    /// `drawdown`, `daily loss`, `positions` or `day trades`.
+    pub limit: String,
+    /// What is used, in the limit's own unit: a fraction for the drawdown,
+    /// money for the daily loss, a count for the rest.
+    pub used: f64,
+    pub allowed: f64,
+}
+
+impl std::fmt::Display for Warning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.limit.as_str() {
+            "drawdown" => write!(f, "drawdown {:.1}% of a {:.1}% limit", self.used * 100.0, self.allowed * 100.0),
+            "daily loss" => write!(f, "daily loss {:.2} of a {:.2} limit", self.used, self.allowed),
+            other => write!(f, "{other} {} of {}", self.used, self.allowed),
+        }
+    }
+}
+
 /// Why an account stopped trading, and whether it can be started again.
 ///
 /// Two halts share one field because [`decide`] must treat them identically —
@@ -296,6 +328,50 @@ impl RiskGate {
                 }
             }
         }
+    }
+
+    /// The limits the account is within [`WARNING_FRACTION`] of, on `day`
+    /// (#191). Empty while halted: a halt is past warning.
+    ///
+    /// Read against the same numbers [`decide`] refuses on, so a warning
+    /// here and a refusal there cannot disagree about where the line is.
+    #[must_use]
+    pub fn warnings(&self, day: NaiveDate) -> Vec<Warning> {
+        let mut found = Vec::new();
+        if self.halted.is_some() {
+            return found;
+        }
+        // A hair under the band counts as in it, so 8% of 10% is not decided by
+        // the last bit of a float.
+        let near = |used: f64, allowed: f64| allowed > 0.0 && used >= allowed * WARNING_FRACTION - 1e-9;
+        if let Some(limit) = self.model.max_drawdown {
+            if self.peak_equity > 0.0 {
+                let depth = (self.peak_equity - self.equity) / self.peak_equity;
+                if near(depth, limit) {
+                    found.push(Warning { limit: "drawdown".to_owned(), used: depth, allowed: limit });
+                }
+            }
+        }
+        if let Some(limit) = self.model.max_daily_loss {
+            let allowed = self.starting_cash * limit;
+            let lost = -self.realised_on(day);
+            if near(lost, allowed) {
+                found.push(Warning { limit: "daily loss".to_owned(), used: lost, allowed });
+            }
+        }
+        if self.model.day_trading == super::pdt::DayTradingRule::PatternDayTrader && self.equity < super::pdt::PDT_EQUITY_FLOOR {
+            let used = self.day_trades_used(day);
+            if near(used as f64, super::pdt::PDT_DAY_TRADES as f64) {
+                found.push(Warning { limit: "day trades".to_owned(), used: used as f64, allowed: super::pdt::PDT_DAY_TRADES as f64 });
+            }
+        }
+        if let Some(limit) = self.model.max_concurrent_positions {
+            let held = self.positions.len();
+            if near(held as f64, limit as f64) {
+                found.push(Warning { limit: "positions".to_owned(), used: held as f64, allowed: limit as f64 });
+            }
+        }
+        found
     }
 
     /// What was realised on `day`, which is zero for any day but the booked one.

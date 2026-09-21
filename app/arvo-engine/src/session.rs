@@ -73,7 +73,7 @@ use arvo_execution::{Divergence, Execution, Executor, Session};
 use arvo_nautilus::{NautilusSimulation, Shadow, Side, Signal};
 use arvo_research::live::{judge, Expectation, Live, Observed};
 use arvo_research::{DateRange, EvidenceStore, Experiment, Record, RiskGate, Verdict};
-use arvo_risk::Proposal;
+use arvo_risk::{Proposal, Warning};
 use arvo_api::{EventKindView, EventView, SeverityView};
 use serde::Serialize;
 use tokio::sync::broadcast;
@@ -206,6 +206,9 @@ pub struct Status {
     pub verdict: String,
     /// What was seen against what was expected, while diverging.
     pub verdict_reason: Option<String>,
+    /// The gate's limits this session is near (#191), in the gate's words.
+    /// Empty when it is near none, and while halted.
+    pub warnings: Vec<String>,
 }
 
 /// What a person can ask of a running session.
@@ -318,6 +321,7 @@ impl Sessions {
             reconciled: false,
             verdict: "inconclusive".to_owned(),
             verdict_reason: None,
+            warnings: Vec::new(),
         }));
         let stop = Arc::new(AtomicBool::new(false));
         let mailbox: Mailbox = Arc::default();
@@ -785,6 +789,13 @@ async fn drive<E: Executor>(
             last_pushed = Some(bar.at);
             last_close = Some(bar.close);
             watch.bar(bar.close);
+            // Marked to market before the signals are acted on, so an open
+            // loss reaches the drawdown halt and the warning band on the bar
+            // that made it, not on the next fill.
+            session.mark(watch.equity());
+            if let Some(changed) = watch.warned(&session.gate().warnings(now().date())) {
+                warned(status, record, events, changed);
+            }
             record.write("bar", Some(serde_json::json!({ "at": bar.at, "close": bar.close, "signals": signals.len() })));
             {
                 let mut status = status.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -827,6 +838,10 @@ async fn drive<E: Executor>(
                 }
             }
             watch.settle(session.executions(), &session.divergence(), last_close);
+            session.mark(watch.equity());
+            if let Some(changed) = watch.warned(&session.gate().warnings(now().date())) {
+                warned(status, record, events, changed);
+            }
             if let Some(verdict) = watch.judge() {
                 judged(status, record, events, verdict);
             }
@@ -1012,6 +1027,34 @@ fn judged(status: &Mutex<Status>, record: &Recorder, events: &broadcast::Sender<
     }
 }
 
+/// What changed about the limits a session is near.
+struct Warned {
+    entered: Vec<String>,
+    cleared: Vec<String>,
+    /// Everything the session is near now, in the gate's words.
+    now: Vec<String>,
+}
+
+/// The warning band moved (#191): on the record, on the status, and raised
+/// as an alert when a limit was entered, so someone can look before the
+/// gate stops the account. Clearing is recorded and not raised.
+fn warned(status: &Mutex<Status>, record: &Recorder, events: &broadcast::Sender<EventView>, changed: Warned) {
+    record.write(
+        "warning",
+        Some(serde_json::json!({ "entered": changed.entered, "cleared": changed.cleared, "near": changed.now })),
+    );
+    let mut status = status.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    status.warnings = changed.now;
+    if !changed.entered.is_empty() {
+        let _ = events.send(EventView::new(
+            EventKindView::session(status.id.clone(), status.state.clone()),
+            "Session near a limit".to_owned(),
+            format!("{}: {}", status.id, status.warnings.join("; ")),
+            SeverityView::Warning,
+        ));
+    }
+}
+
 /// The session's own ledger, kept for its verdict (#221).
 ///
 /// Built from the fills as they settle: a buy opens or adds to the one
@@ -1035,7 +1078,11 @@ struct Watch {
     round_trip: f64,
     peak: f64,
     starting_cash: f64,
+    /// What the account is worth at the last mark.
+    equity: f64,
     verdict: Live,
+    /// The limits the session was near at the last look, by name (#191).
+    near: Vec<String>,
 }
 
 impl Watch {
@@ -1051,8 +1098,28 @@ impl Watch {
             round_trip: 0.0,
             peak: starting_cash,
             starting_cash,
+            equity: starting_cash,
             verdict: Live::Inconclusive,
+            near: Vec::new(),
         }
+    }
+
+    fn equity(&self) -> f64 {
+        self.equity
+    }
+
+    /// The change in which limits the session is near, if any. Compared
+    /// by limit, not by figure: the figure moves on every bar, and a record
+    /// that logged each move would bury the one line that matters.
+    fn warned(&mut self, warnings: &[Warning]) -> Option<Warned> {
+        let names: Vec<String> = warnings.iter().map(|warning| warning.limit.clone()).collect();
+        if names == self.near {
+            return None;
+        }
+        let entered = names.iter().filter(|name| !self.near.contains(name)).cloned().collect();
+        let cleared = self.near.iter().filter(|name| !names.contains(name)).cloned().collect();
+        self.near = names;
+        Some(Warned { entered, cleared, now: warnings.iter().map(ToString::to_string).collect() })
     }
 
     fn entered(&mut self, order: String, regime: Option<String>) {
@@ -1105,6 +1172,7 @@ impl Watch {
     /// loss and not only realised ones.
     fn mark(&mut self, close: f64) {
         let equity = self.starting_cash + self.realised + self.quantity * (close - self.entry);
+        self.equity = equity;
         self.peak = self.peak.max(equity);
         if self.starting_cash > 0.0 {
             self.seen.drawdown = self.seen.drawdown.max((self.peak - equity) / self.starting_cash);
@@ -1304,6 +1372,26 @@ mod tests {
         assert_eq!(watch.seen.entries, vec![Some("ranging".to_owned()), Some("trending up".to_owned())]);
         assert_eq!(watch.seen.fills, 4);
         assert!(watch.judge().is_none(), "still diverging on the drawdown; no change to announce");
+    }
+
+    #[test]
+    fn the_watch_reports_a_warning_once_per_limit_entered_or_cleared() {
+        let mut watch = Watch::new(None, 10_000.0);
+        let near = |limit: &str, used: f64| Warning { limit: limit.to_owned(), used, allowed: 0.10 };
+        assert!(watch.warned(&[]).is_none(), "near nothing, as before");
+        let first = watch.warned(&[near("drawdown", 0.081)]).expect("entered");
+        assert_eq!(first.entered, vec!["drawdown".to_owned()]);
+        assert!(first.cleared.is_empty());
+        assert!(first.now[0].starts_with("drawdown 8.1%"), "{:?}", first.now);
+        // The figure moved; the limit did not. Nothing to record.
+        assert!(watch.warned(&[near("drawdown", 0.085)]).is_none());
+        let second = watch.warned(&[near("positions", 4.0)]).expect("one in, one out");
+        assert_eq!(second.entered, vec!["positions".to_owned()]);
+        assert_eq!(second.cleared, vec!["drawdown".to_owned()]);
+        let last = watch.warned(&[]).expect("cleared");
+        assert!(last.entered.is_empty());
+        assert_eq!(last.cleared, vec!["positions".to_owned()]);
+        assert!(last.now.is_empty());
     }
 
     #[test]
