@@ -459,13 +459,6 @@ fn run(
             |expected| serde_json::to_value(expected).unwrap_or_default(),
         )),
     );
-    record.write(
-        "expectation",
-        Some(expected.as_ref().map_or_else(
-            || serde_json::json!({ "none": "the finding is not a study, or has no closed out-of-sample trade; the verdict stays inconclusive" }),
-            |expected| serde_json::to_value(expected).unwrap_or_default(),
-        )),
-    );
 
     match executor {
         "alpaca-paper" => runtime.block_on(drive(
