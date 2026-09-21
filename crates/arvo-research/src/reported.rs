@@ -362,7 +362,15 @@ mod tests {
         // after a round trip and were never meant to be.
         assert_eq!(back.verdict, evidence.verdict);
         assert_eq!(back.reasons, evidence.reasons);
-        assert_eq!(back.selection, evidence.selection);
+        // The Sharpe is a float written at the stored format's precision; at
+        // this fixture's magnitude (no volatility to speak of) the last
+        // decimal differs by platform after a round trip, so it is compared
+        // within a tolerance and the rest of the selection exactly.
+        assert!((back.selection.best_sharpe - evidence.selection.best_sharpe).abs() <= evidence.selection.best_sharpe.abs() * 1e-9);
+        let (mut back_selection, mut selection) = (back.selection.clone(), evidence.selection.clone());
+        back_selection.best_sharpe = 0.0;
+        selection.best_sharpe = 0.0;
+        assert_eq!(back_selection, selection);
         assert_eq!(back.claim, evidence.claim);
         assert_eq!(back.reported.engine, evidence.reported.engine);
         assert_eq!(back.reported.experiment.dataset, evidence.reported.experiment.dataset);
