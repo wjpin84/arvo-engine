@@ -1,0 +1,36 @@
+# The engine's suite, on the two platforms it is developed and shipped on
+# first. protoc is vendored (arvo-plugin-host/build.rs), so nothing beyond a
+# Rust toolchain is installed; the one test that clones and builds a plugin
+# is #[ignore] and stays that way here.
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: build everything, tests included
+        run: cargo build --workspace --all-targets --locked
+      - name: the suite
+        run: cargo test --workspace --locked
+      - name: clippy
+        run: cargo clippy --workspace --all-targets --locked

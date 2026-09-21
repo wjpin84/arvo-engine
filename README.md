@@ -42,13 +42,28 @@ afterwards: both contracts are submodules and the build reads them.
 
 ## What ships
 
-Three binaries, released together as one archive per platform:
+Two binaries, released together as one archive per platform:
 
 | Binary | What it is |
 |---|---|
-| `arvo-engine` | The daemon. Serves the API on loopback, writes `engine.json` and `control.json` to the app data directory, and is what the window starts and what a script reaches |
+| `arvo-engine` | The daemon. Serves the API on loopback, writes `engine.json` and `control.json` to the app data directory, and is what the window starts and what a script reaches. It is also the command line: `arvo-engine session list \| start \| stop \| reconcile \| resume \| halt \| explain`, and `arvo-engine help` |
 | `arvo-mcp-server` | Arvo as a stdio MCP server: an agent reads research memory and runs studies, and cannot fetch or trade ([ADR-0016](https://github.com/wjpin84/arvo-adrs/blob/main/0016-an-agent-reaches-arvo-through-a-tool-list-that-cannot-trade.md)) |
-| `arvo` | The command line. Not written yet; it is a thin client over `arvo-client` and belongs here |
+
+There is no separate `arvo` binary by decision (2026-09-20): a client
+binary would hold the same control token the window holds, so the daemon
+doubles as the CLI.
+
+## Releasing
+
+A release is a tag. Bump `version` under `[workspace.package]` in
+`Cargo.toml`, commit, tag `vX.Y.Z`, push the tag; `.github/workflows/release.yml`
+builds the two binaries for Windows (x86_64), Linux (x86_64) and macOS
+(aarch64) and attaches `arvo-engine-vX.Y.Z-<triple>.zip` with a `.sha256` to
+the GitHub release for the tag. The desktop pins the engine it ships with in
+`app/arvo-runtime/engine-version` and fetches that archive with
+`tools/fetch_engine.py`, so a new engine release is followed by a bump there.
+A tag that already existed before the workflow can be released by hand:
+Actions → Release → Run workflow, with the tag.
 
 ## Building
 

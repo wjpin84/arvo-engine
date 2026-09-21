@@ -315,6 +315,17 @@ mod tests {
         panic!("the plugin never came up on {port}");
     }
 
+    /// A port nothing is listening on right now. Bound to 0 and released,
+    /// as the engine's own gRPC tests do (#209): a fixed number failed the
+    /// moment two test binaries, or a stale process, held it.
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("a loopback port")
+            .local_addr()
+            .expect("addressed")
+            .port()
+    }
+
     fn configured(id: &str, port: u16) -> PluginsConfig {
         PluginsConfig {
             plugin: vec![PluginConfigEntry {
@@ -327,8 +338,9 @@ mod tests {
 
     #[tokio::test]
     async fn reachable_plugin_returns_its_manifest() {
-        let _serving = manifest_only(50061).await;
-        let registry = PluginRegistry::connect(&configured("one", 50061)).await;
+        let port = free_port();
+        let _serving = manifest_only(port).await;
+        let registry = PluginRegistry::connect(&configured("one", port)).await;
         let snapshot = registry.snapshot().await;
         assert_eq!(snapshot.len(), 1);
         match &snapshot[0].status {
@@ -341,7 +353,7 @@ mod tests {
     async fn dead_address_is_unreachable_not_an_error() {
         // ponytail: a port picked to almost certainly have nothing listening;
         // a collision would fail loudly, not silently.
-        let registry = PluginRegistry::connect(&configured("nothing-here", 50062)).await;
+        let registry = PluginRegistry::connect(&configured("nothing-here", free_port())).await;
         let snapshot = registry.snapshot().await;
         assert_eq!(snapshot.len(), 1);
         assert!(matches!(snapshot[0].status, PluginStatus::Unreachable(_)));
@@ -351,8 +363,9 @@ mod tests {
     async fn refresh_publishes_only_on_status_change() {
         use tokio::sync::broadcast::error::TryRecvError;
 
-        let serving = manifest_only(50063).await;
-        let registry = PluginRegistry::connect(&configured("events", 50063)).await;
+        let port = free_port();
+        let serving = manifest_only(port).await;
+        let registry = PluginRegistry::connect(&configured("events", port)).await;
         let mut events = registry.subscribe();
 
         // connect() itself must not have published anything.
@@ -394,8 +407,9 @@ mod tests {
         assert!(matches!(events.try_recv(), Err(TryRecvError::Empty)), "not yet up is not a change");
         assert_eq!(registry.snapshot().await[0].address, "", "no address until it says so");
 
-        let _serving = manifest_only(50064).await;
-        registry.add("mine", "http://127.0.0.1:50064".into(), None).await;
+        let port = free_port();
+        let _serving = manifest_only(port).await;
+        registry.add("mine", format!("http://127.0.0.1:{port}").into(), None).await;
         assert!(matches!(events.try_recv(), Ok(Event::PluginStatusChanged { status: StatusKind::Reachable, .. })));
 
         registry.set_unreachable("mine", "exited".into()).await;
