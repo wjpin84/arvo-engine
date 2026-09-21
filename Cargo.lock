@@ -79,7 +79,7 @@ checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 
 [[package]]
 name = "arvo-alpaca"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "arvo-core",
  "arvo-data",
@@ -99,7 +99,7 @@ dependencies = [
 
 [[package]]
 name = "arvo-api"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "prost",
  "serde",
@@ -107,7 +107,7 @@ dependencies = [
 
 [[package]]
 name = "arvo-client"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "arvo-api",
  "prost",
@@ -120,7 +120,7 @@ dependencies = [
 
 [[package]]
 name = "arvo-core"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "keyring",
  "serde",
@@ -132,7 +132,7 @@ dependencies = [
 
 [[package]]
 name = "arvo-data"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "async-trait",
  "blake3",
@@ -147,7 +147,7 @@ dependencies = [
 
 [[package]]
 name = "arvo-engine"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "arvo-alpaca",
  "arvo-api",
@@ -176,7 +176,7 @@ dependencies = [
 
 [[package]]
 name = "arvo-execution"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "arvo-risk",
  "async-trait",
@@ -188,7 +188,7 @@ dependencies = [
 
 [[package]]
 name = "arvo-mcp"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "reqwest",
  "serde",
@@ -199,7 +199,7 @@ dependencies = [
 
 [[package]]
 name = "arvo-mcp-server"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "arvo-api",
  "arvo-client",
@@ -217,7 +217,7 @@ dependencies = [
 
 [[package]]
 name = "arvo-nautilus"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "arvo-data",
@@ -237,7 +237,7 @@ dependencies = [
 
 [[package]]
 name = "arvo-oauth"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "base64 0.21.7",
  "rand 0.8.8",
@@ -252,7 +252,7 @@ dependencies = [
 
 [[package]]
 name = "arvo-plugin-host"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "arvo-core",
@@ -275,7 +275,7 @@ dependencies = [
 
 [[package]]
 name = "arvo-portfolio"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "chrono",
  "serde",
@@ -286,7 +286,7 @@ dependencies = [
 
 [[package]]
 name = "arvo-research"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "arvo-data",
  "arvo-risk",
@@ -302,7 +302,7 @@ dependencies = [
 
 [[package]]
 name = "arvo-risk"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "arvo-data",
  "chrono",
@@ -312,7 +312,7 @@ dependencies = [
 
 [[package]]
 name = "arvo-robinhood"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "arvo-core",
  "arvo-data",
@@ -330,7 +330,7 @@ dependencies = [
 
 [[package]]
 name = "arvo-schedule"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "arvo-api",
  "chrono",
@@ -341,7 +341,7 @@ dependencies = [
 
 [[package]]
 name = "arvo-service"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "arvo-alpaca",
  "arvo-api",
@@ -377,7 +377,7 @@ dependencies = [
 
 [[package]]
 name = "arvo-yfinance"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "arvo-data",
  "async-trait",
