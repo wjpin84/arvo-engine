@@ -241,16 +241,16 @@ impl Source for Alpaca {
         })
     }
 
-    /// Alpaca streams one-minute bars and nothing else, so that is the one
-    /// interval this offers; a 5-minute rule keeps polling. The feed is the
-    /// one this source fetches from, so a streamed bar and a fetched one are
-    /// the same venue's print.
+    /// Alpaca streams one-minute bars; a rule on any number of minutes that
+    /// divides the hour gets them aggregated as they close. Anything else
+    /// keeps polling. The feed is the one this source fetches from, so a
+    /// streamed bar and a fetched one are the same venue's print.
     fn stream(&self, symbol: &str, interval: BarInterval) -> Option<Box<dyn arvo_data::source::BarFeed>> {
-        if interval != BarInterval::new(1, arvo_data::IntervalUnit::Minute) {
+        if interval.unit != arvo_data::IntervalUnit::Minute || interval.step == 0 || 60 % interval.step != 0 {
             return None;
         }
         let keys = self.keys().ok().flatten()?;
-        Some(Box::new(crate::stream::open(self.feed, symbol.to_owned(), keys)))
+        Some(Box::new(crate::stream::open(self.feed, symbol.to_owned(), keys, interval.step)))
     }
 
     async fn dividends(

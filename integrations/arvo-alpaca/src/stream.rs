@@ -42,24 +42,93 @@ const BACKOFF: Duration = Duration::from_secs(3);
 
 type Socket = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
+/// Five one-minute bars into one five-minute bar, and so on: Alpaca streams
+/// minutes and Arvo's intraday rules read five of them.
+///
+/// A bucket is `step` minutes from the top of the hour, the way the fetched
+/// bars are aligned. The bucket's bar goes out the moment its last minute
+/// arrives — one second after the close, not five minutes after — and, when
+/// a minute never printed (IEX skips a quiet one), when the next bucket's
+/// first bar shows the old one is over. A bucket still open when the feed
+/// goes quiet waits; the poll underneath the session catches it up.
+struct Aggregator {
+    step: u32,
+    partial: Option<Bar>,
+}
+
+impl Aggregator {
+    fn bucket_of(&self, at: chrono::NaiveDateTime) -> chrono::NaiveDateTime {
+        use chrono::Timelike as _;
+        let minute = at.minute() - at.minute() % self.step;
+        at.with_minute(minute).and_then(|t| t.with_second(0)).and_then(|t| t.with_nanosecond(0)).unwrap_or(at)
+    }
+
+    /// Feeds one minute; returns a completed bucket when one is.
+    fn push(&mut self, bar: Bar) -> Option<Bar> {
+        use chrono::Timelike as _;
+        let bucket = self.bucket_of(bar.at);
+        let mut done = None;
+        match &mut self.partial {
+            Some(partial) if partial.at == bucket => {
+                partial.high = partial.high.max(bar.high);
+                partial.low = partial.low.min(bar.low);
+                partial.close = bar.close;
+                partial.volume += bar.volume;
+            }
+            Some(partial) => {
+                done = Some(*partial);
+                *partial = Bar { at: bucket, ..bar };
+            }
+            None => self.partial = Some(Bar { at: bucket, ..bar }),
+        }
+        // The last minute of the bucket closes it right away.
+        if bar.at.minute() % self.step == self.step - 1 {
+            if let Some(partial) = self.partial.take() {
+                return Some(match done {
+                    // Cannot happen — a bar that closed one bucket is the first
+                    // of the next — but if it did, the older one goes first.
+                    Some(older) => {
+                        self.partial = Some(partial);
+                        older
+                    }
+                    None => partial,
+                });
+            }
+        }
+        done
+    }
+}
+
 /// The receiving end of one subscription.
 pub struct AlpacaFeed {
     events: mpsc::Receiver<FeedEvent>,
+    aggregate: Option<Aggregator>,
 }
 
 #[async_trait::async_trait]
 impl BarFeed for AlpacaFeed {
     async fn next(&mut self) -> Option<FeedEvent> {
-        self.events.recv().await
+        loop {
+            let event = self.events.recv().await?;
+            match (&mut self.aggregate, event) {
+                (Some(aggregate), FeedEvent::Bar(minute)) => {
+                    if let Some(bar) = aggregate.push(minute) {
+                        return Some(FeedEvent::Bar(bar));
+                    }
+                }
+                (_, event) => return Some(event),
+            }
+        }
     }
 }
 
-/// Opens the stream for `symbol` on `feed` (`iex` or `sip`). The socket
-/// lives on a task of the current runtime and dies with the receiver.
-pub(crate) fn open(feed: &'static str, symbol: String, keys: Keys) -> AlpacaFeed {
+/// Opens the stream for `symbol` on `feed` (`iex` or `sip`), delivering
+/// bars of `minutes` each. The socket lives on a task of the current
+/// runtime and dies with the receiver.
+pub(crate) fn open(feed: &'static str, symbol: String, keys: Keys, minutes: u32) -> AlpacaFeed {
     let (events, receiver) = mpsc::channel(64);
     tokio::spawn(run(feed, symbol, keys, events));
-    AlpacaFeed { events: receiver }
+    AlpacaFeed { events: receiver, aggregate: (minutes > 1).then_some(Aggregator { step: minutes, partial: None }) }
 }
 
 async fn run(feed: &'static str, symbol: String, keys: Keys, events: mpsc::Sender<FeedEvent>) {
@@ -243,6 +312,32 @@ mod tests {
     fn half_a_bar_is_refused_rather_than_filled_in() {
         let refused = decode(&frame(r#"[{"T":"b","S":"AAPL","o":1,"h":1,"t":"2026-09-15T14:30:00Z"}]"#)).expect_err("refused");
         assert!(refused.contains("o/h/l/c"), "{refused}");
+    }
+
+    #[test]
+    fn five_minutes_become_one_bar_the_moment_the_fifth_closes() {
+        let minute = |m: u32, o: f64, h: f64, l: f64, c: f64, v: f64| Bar {
+            at: chrono::NaiveDate::from_ymd_opt(2026, 9, 21).unwrap().and_hms_opt(13, m, 0).unwrap(),
+            open: o,
+            high: h,
+            low: l,
+            close: c,
+            volume: v,
+        };
+        let mut five = Aggregator { step: 5, partial: None };
+        assert!(five.push(minute(30, 10.0, 11.0, 9.0, 10.5, 100.0)).is_none());
+        assert!(five.push(minute(31, 10.5, 12.0, 10.0, 11.0, 50.0)).is_none());
+        assert!(five.push(minute(32, 11.0, 11.5, 8.0, 9.0, 25.0)).is_none());
+        assert!(five.push(minute(33, 9.0, 9.5, 8.5, 9.2, 25.0)).is_none());
+        let bar = five.push(minute(34, 9.2, 9.9, 9.1, 9.8, 100.0)).expect("the fifth minute closes the bucket");
+        assert_eq!(bar.at, minute(30, 0.0, 0.0, 0.0, 0.0, 0.0).at);
+        assert_eq!((bar.open, bar.high, bar.low, bar.close, bar.volume), (10.0, 12.0, 8.0, 9.8, 300.0));
+        // A quiet minute never printed: the bucket closes when the next one starts.
+        assert!(five.push(minute(35, 9.8, 9.9, 9.7, 9.8, 10.0)).is_none());
+        assert!(five.push(minute(36, 9.8, 9.9, 9.7, 9.8, 10.0)).is_none());
+        let late = five.push(minute(40, 9.8, 9.9, 9.7, 9.8, 10.0)).expect("the old bucket is over");
+        assert_eq!(late.at, minute(35, 0.0, 0.0, 0.0, 0.0, 0.0).at);
+        assert!((late.volume - 20.0).abs() < 1e-9);
     }
 
     #[test]

@@ -244,6 +244,21 @@ mod tests {
     /// How many credentials a secret actually occupies, asked of the
     /// platform rather than of [`get_token`] — which stops at the first gap
     /// and so cannot see pieces orphaned past one.
+    /// Whether this machine has a keychain to test against. A headless Linux
+    /// runner has no secret service, and `keyring` answers `NoDefaultStore`;
+    /// the tests then say so and return rather than fail a suite over a
+    /// platform that was never going to hold a credential.
+    fn keychain_available() -> bool {
+        let Ok(probe) = entry("test-plugin-secrets-probe", 0) else { return false };
+        match probe.get_password() {
+            Ok(_) | Err(keyring::Error::NoEntry) => true,
+            Err(err) => {
+                eprintln!("no keychain here ({err}); skipping");
+                false
+            }
+        }
+    }
+
     fn stored_pieces(plugin_id: &str) -> usize {
         (0..16)
             .filter(|index| entry(plugin_id, *index).unwrap().get_password().is_ok())
@@ -253,6 +268,9 @@ mod tests {
     #[test]
     fn round_trips_a_token() {
         let _guard = exclusive();
+        if !keychain_available() {
+            return;
+        }
         let plugin_id = "test-plugin-secrets-round-trip";
         // Never assume a clean slate from a prior failed run.
         let _ = delete_token(plugin_id);
@@ -277,6 +295,9 @@ mod tests {
     #[test]
     fn a_token_far_larger_than_one_keychain_entry_round_trips() {
         let _guard = exclusive();
+        if !keychain_available() {
+            return;
+        }
         let plugin_id = "test-plugin-secrets-oversized";
         let _ = delete_token(plugin_id);
 
@@ -303,6 +324,9 @@ mod tests {
     #[test]
     fn shrinking_a_token_does_not_leave_a_tail_behind() {
         let _guard = exclusive();
+        if !keychain_available() {
+            return;
+        }
         let plugin_id = "test-plugin-secrets-shrink";
         let _ = delete_token(plugin_id);
 
@@ -349,6 +373,9 @@ mod tests {
     #[test]
     fn a_spliced_secret_reads_back_as_a_whole_one_which_is_why_it_must_not_exist() {
         let _guard = exclusive();
+        if !keychain_available() {
+            return;
+        }
         let plugin_id = "test-plugin-secrets-spliced";
         let _ = delete_token(plugin_id);
 
@@ -378,6 +405,9 @@ mod tests {
         // runs after every write rather than only when one is expected to
         // shrink.
         let _guard = exclusive();
+        if !keychain_available() {
+            return;
+        }
         let plugin_id = "test-plugin-secrets-replace";
         let _ = delete_token(plugin_id);
 
@@ -393,6 +423,9 @@ mod tests {
     #[test]
     fn getting_a_never_stored_token_is_not_an_error() {
         let _guard = exclusive();
+        if !keychain_available() {
+            return;
+        }
         let result = get_token("test-plugin-secrets-never-stored");
         assert_eq!(result.unwrap(), None);
     }
