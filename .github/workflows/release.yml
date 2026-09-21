@@ -41,8 +41,6 @@ jobs:
         with:
           ref: ${{ github.event.inputs.tag || github.ref_name }}
           submodules: recursive
-          # See ci.yml: the contract submodules are private.
-          token: ${{ secrets.ARVO_REPOS_TOKEN || github.token }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.triple }}

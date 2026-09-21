@@ -24,11 +24,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-          # The contracts are submodules of private repositories, which the
-          # job's own token cannot clone: ARVO_REPOS_TOKEN is a fine-grained
-          # PAT with Contents: read on arvo-engine, arvo-engine-api and
-          # arvo-extension-api. Falls back to the job's token when unset.
-          token: ${{ secrets.ARVO_REPOS_TOKEN || github.token }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
