@@ -20,6 +20,8 @@ tonic.workspace = true
 # An engine in process, for the tests that need one to talk to. A test
 # dependency only: the server itself does not link the engine.
 arvo-engine = { path = "../arvo-engine" }
+arvo-data.workspace = true
 arvo-schedule.workspace = true
 arvo-service.workspace = true
+chrono.workspace = true
 tempfile = "3"

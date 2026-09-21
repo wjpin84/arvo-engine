@@ -71,6 +71,12 @@ impl Research {
     }
 
     /// The project folder this research runs over.
+    /// The bar library.
+    #[must_use]
+    pub fn data(&self) -> &Path {
+        &self.data
+    }
+
     #[must_use]
     pub fn root(&self) -> &Path {
         self.data.parent().unwrap_or(&self.data)

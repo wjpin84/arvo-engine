@@ -31,7 +31,8 @@ use proto::platform::{
 };
 use proto::portfolio::{PortfolioLibraryView, PortfolioName};
 use proto::research::{
-    Advice, AttachRequest, Attachment, AttachmentRef, Attachments, BookRequest, ComparisonView, Finding,
+    Advice, AttachRequest, Attachment, AttachmentRef, Attachments, BarView, BarsRequest, BarsView, BookRequest,
+    ComparisonView, Finding, RegimePointView, RegimeView,
     FindingId, FindingIds, FindingSummary, Findings, HistoryView, PanelView, Point, ProblemsView, RecordView,
     ReplayView, ReportFigure, ReportRequest, RiskModel, Rules, Ruleset, RulesetForm, RulesetPath, Rulesets,
     RunRequest, SharedExperiment, Strategies, StudyRequest, StudyView, TradeExport, WalkForwardView,
@@ -650,6 +651,45 @@ fn text(value: Option<&Value>) -> String {
     }
 }
 
+const DEFAULT_BARS: u32 = 60;
+const MAX_BARS: u32 = 2000;
+
+/// The library's bars a [`BarsRequest`] asks for: the instrument as given,
+/// the interval it parsed to, and at most `last` bars from the end of the
+/// window (#195).
+fn bars_in(data: &std::path::Path, asked: &BarsRequest) -> Result<(String, arvo_data::BarInterval, Vec<arvo_data::Bar>), Status> {
+    use arvo_data::BarProvider as _;
+    let instrument = required(&asked.instrument, "instrument")?.to_owned();
+    let interval: arvo_data::BarInterval = asked
+        .interval
+        .as_deref()
+        .filter(|text| !text.trim().is_empty())
+        .unwrap_or("1day")
+        .parse()
+        .map_err(|err| Status::invalid_argument(format!("interval: {err}")))?;
+    let day = |field: &Option<String>, name: &str, or: chrono::NaiveDate| -> Result<chrono::NaiveDate, Status> {
+        match field.as_deref().filter(|text| !text.trim().is_empty()) {
+            Some(text) => text
+                .trim()
+                .parse()
+                .map_err(|err| Status::invalid_argument(format!("{name} is YYYY-MM-DD: {err}"))),
+            None => Ok(or),
+        }
+    };
+    let from = day(&asked.from, "from", chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap_or_default())?;
+    let to = day(&asked.to, "to", chrono::Utc::now().date_naive())?;
+    let mut bars = arvo_data::CsvBars::new(data)
+        .bars(&instrument, interval, from, to)
+        .map_err(|err| Status::not_found(format!("{instrument} at {interval}: {err}")))?;
+    if bars.is_empty() {
+        return Err(Status::not_found(format!("{instrument} has no {interval} bars between {from} and {to}")));
+    }
+    let keep = asked.last.unwrap_or(DEFAULT_BARS).min(MAX_BARS) as usize;
+    let skip = bars.len().saturating_sub(keep);
+    bars.drain(..skip);
+    Ok((instrument, interval, bars))
+}
+
 fn required<'a>(field: &'a str, name: &str) -> Result<&'a str, Status> {
     let trimmed = field.trim();
     if trimmed.is_empty() {
@@ -861,6 +901,60 @@ impl research_server::Research for Service {
         let view = arvo_service::research::history::compare_records(&self.workbench, &request.get_ref().ids)
             .map_err(refused)?;
         Ok(Response::new(view))
+    }
+
+    async fn read_bars(&self, request: Request<BarsRequest>) -> Result<Response<BarsView>, Status> {
+        let (instrument, interval, bars) = bars_in(self.research.data(), request.get_ref())?;
+        Ok(Response::new(BarsView {
+            instrument,
+            interval: interval.to_string(),
+            bars: bars
+                .into_iter()
+                .map(|bar| BarView {
+                    at: bar.at.to_string(),
+                    open: bar.open,
+                    high: bar.high,
+                    low: bar.low,
+                    close: bar.close,
+                    volume: bar.volume,
+                })
+                .collect(),
+        }))
+    }
+
+    async fn view_regime(&self, request: Request<BarsRequest>) -> Result<Response<RegimeView>, Status> {
+        use arvo_research::regime::{label, LOOKBACK};
+        // Labelled over the window plus the lookback before it, so the first
+        // bar asked for has a label rather than the first twenty saying
+        // nothing; then only the window is answered.
+        let asked = request.get_ref();
+        let wider = BarsRequest { last: asked.last.map(|last| last.saturating_add(LOOKBACK as u32)), ..asked.clone() };
+        let (instrument, interval, bars) = bars_in(self.research.data(), &wider)?;
+        let keep = asked.last.unwrap_or(DEFAULT_BARS).min(MAX_BARS) as usize;
+        let curve: Vec<arvo_research::EquityPoint> =
+            bars.iter().map(|bar| arvo_research::EquityPoint { at: bar.at, equity: bar.close }).collect();
+        let labels = label(&curve, LOOKBACK);
+        let skip = bars.len().saturating_sub(keep);
+        let points: Vec<RegimePointView> = bars
+            .iter()
+            .zip(labels)
+            .skip(skip)
+            .map(|(bar, regime)| RegimePointView { at: bar.at.to_string(), regime: regime.map(|regime| regime.label().to_owned()) })
+            .collect();
+        let mut shares = std::collections::HashMap::new();
+        for point in &points {
+            if let Some(regime) = &point.regime {
+                *shares.entry(regime.clone()).or_insert(0) += 1;
+            }
+        }
+        Ok(Response::new(RegimeView {
+            instrument,
+            interval: interval.to_string(),
+            lookback: LOOKBACK as u32,
+            current: points.last().and_then(|point| point.regime.clone()),
+            points,
+            shares,
+        }))
     }
 
     async fn view_problems(&self, _: Request<Empty>) -> Result<Response<ProblemsView>, Status> {
@@ -1549,14 +1643,16 @@ mod tests {
         // of the same runs and the same memory RunStudy and ListFindings
         // reach; ViewBook takes instruments and caps, and its sector labels
         // come from a session this machine already holds, never from the
-        // caller. Subscribe only listens.
+        // caller. Subscribe only listens. ReadBars and ViewRegime read the
+        // library the studies read, and nothing else: an agent that can run
+        // a study on those bars can look at them (#195).
         assert_eq!(
             calls,
             [
                 "ListStrategies", "ListInstruments", "ListFindings", "OpenFinding", "RunStudy", "RunWalkForward",
                 "RecordFinding", "AttachFile", "ListRulesets", "ReadRuleset", "WriteRuleset", "ListRules", "GetRiskModel",
                 "ViewStudy", "ViewWalkForward", "ViewPanel", "ViewBook", "ViewHistory", "ViewRecord", "ViewReplay",
-                "ViewComparison", "ViewProblems", "ListAttachments", "Subscribe",
+                "ViewComparison", "ReadBars", "ViewRegime", "ViewProblems", "ListAttachments", "Subscribe",
             ]
         );
         for forbidden in ["Fetch", "Order", "Trade", "Share", "Import", "Key", "Sign", "Session", "Halt"] {

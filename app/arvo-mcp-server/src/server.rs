@@ -36,7 +36,7 @@ use std::time::{Duration, Instant};
 
 use arvo_client::discovery::{self, Discovery};
 use arvo_client::proto::common::Empty;
-use arvo_client::proto::research::{Finding, FindingId, Param, RulesetForm, RunRequest};
+use arvo_client::proto::research::{BarsRequest, Finding, FindingId, FindingIds, Param, RulesetForm, RunRequest};
 use arvo_client::proto::services::research_client::ResearchClient;
 use serde_json::{json, Value};
 use tonic::transport::Channel;
@@ -242,6 +242,39 @@ impl Server {
                 let found = self.runtime.block_on(self.research.open_finding(request)).map_err(refused)?;
                 Ok(finding_json(found.into_inner()))
             }
+            "query_market_data" | "inspect_regime" => {
+                let optional = |key: &str| arguments.get(key).and_then(Value::as_str).map(ToOwned::to_owned);
+                let asked = BarsRequest {
+                    instrument: text("instrument")?,
+                    interval: optional("interval"),
+                    from: optional("from"),
+                    to: optional("to"),
+                    last: arguments.get("last").and_then(Value::as_u64).and_then(|last| u32::try_from(last).ok()),
+                };
+                let request = self.request(asked)?;
+                if name == "query_market_data" {
+                    let bars = self.runtime.block_on(self.research.read_bars(request)).map_err(refused)?;
+                    encode(&bars.into_inner())
+                } else {
+                    let regimes = self.runtime.block_on(self.research.view_regime(request)).map_err(refused)?;
+                    encode(&regimes.into_inner())
+                }
+            }
+            "compare_experiments" => {
+                let ids: Vec<String> = match arguments.get("ids") {
+                    Some(Value::Array(ids)) => ids.iter().filter_map(Value::as_str).map(ToOwned::to_owned).collect(),
+                    _ => Vec::new(),
+                };
+                if ids.len() < 2 {
+                    return Err("compare_experiments needs ids: a list of at least two finding ids".to_owned());
+                }
+                let request = self.request(FindingIds { ids })?;
+                let mut compared = self.runtime.block_on(self.research.view_comparison(request)).map_err(refused)?.into_inner();
+                // The curves are for drawing; the rows and the deflation of
+                // the comparison itself are what an agent reasons from.
+                compared.curves.clear();
+                encode(&compared)
+            }
             "run_study" | "run_walk_forward" => {
                 let asked = RunRequest {
                     instrument: text("instrument")?,
@@ -437,6 +470,45 @@ fn tools() -> Value {
             },
         },
         {
+            "name": "query_market_data",
+            "description": "The library's bars for an instrument over a window: open, high, low, close, volume per bar. Read-only; nothing is fetched. What a study saw, for reading why it did what it did.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "instrument": { "type": "string", "description": "An instrument id from list_instruments, e.g. AAPL.RH" },
+                    "interval": { "type": "string", "description": "1day (default), or 5minute and other minute steps the library holds" },
+                    "from": { "type": "string", "description": "YYYY-MM-DD, inclusive; the library's start when absent" },
+                    "to": { "type": "string", "description": "YYYY-MM-DD, inclusive; today when absent" },
+                    "last": { "type": "integer", "description": "At most this many bars from the end of the window. 60 when absent, 2000 at most" }
+                },
+                "required": ["instrument"]
+            },
+        },
+        {
+            "name": "inspect_regime",
+            "description": "The regime each bar closed in over a window: trending up, trending down or ranging, labelled after the fact over the closes. Says what the market was doing, not what a rule could have known. Compare with the regime on each trade in open_finding.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "instrument": { "type": "string", "description": "An instrument id from list_instruments" },
+                    "interval": { "type": "string", "description": "1day (default), or a minute step the library holds" },
+                    "from": { "type": "string", "description": "YYYY-MM-DD, inclusive" },
+                    "to": { "type": "string", "description": "YYYY-MM-DD, inclusive" },
+                    "last": { "type": "integer", "description": "At most this many bars from the end of the window. 60 when absent" }
+                },
+                "required": ["instrument"]
+            },
+        },
+        {
+            "name": "compare_experiments",
+            "description": "Two or more findings read against each other: one row each with verdict, return, excess return, Sharpe, drawdown, trades, win rate, and whether its data has changed since; then the comparison's own deflation, because keeping the best of six is a search of size six. Explains why two findings differ without reading their files.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "ids": { "type": "array", "items": { "type": "string" }, "description": "Finding ids from list_findings; at least two" } },
+                "required": ["ids"]
+            },
+        },
+        {
             "name": "run_study",
             "description": "Search a strategy's parameter grid on one instrument, choose in-sample, judge out-of-sample. Saved as your finding and deflated against every run you have made, so running until something passes does not make it pass. Takes seconds to a minute.",
             "inputSchema": instrument_and_strategy,
@@ -574,6 +646,9 @@ mod tests {
                 "list_instruments",
                 "list_findings",
                 "open_finding",
+                "query_market_data",
+                "inspect_regime",
+                "compare_experiments",
                 "run_study",
                 "run_walk_forward"
             ]
@@ -661,6 +736,67 @@ mod tests {
         );
         assert_eq!(reply["result"]["isError"], json!(true));
         assert!(reply["result"]["content"][0]["text"].as_str().expect("text").contains("instrument"));
+    }
+
+    #[test]
+    fn the_read_tools_look_at_the_library_and_at_findings_side_by_side() {
+        let engine = engine();
+        // Sixty daily bars that climb, so the tail is labelled trending up.
+        let start = chrono::NaiveDate::from_ymd_opt(2026, 1, 5).expect("date").and_hms_opt(0, 0, 0).expect("time");
+        let bars: Vec<arvo_data::Bar> = (0..60)
+            .map(|i| {
+                let close = 100.0 + f64::from(i) * 0.8;
+                arvo_data::Bar {
+                    at: start + chrono::Duration::days(i64::from(i)),
+                    open: close - 0.3,
+                    high: close + 0.5,
+                    low: close - 0.5,
+                    close,
+                    volume: 1_000.0,
+                }
+            })
+            .collect();
+        arvo_data::CsvBars::new(engine.dir.path().join("data"))
+            .write("UP.SIM", arvo_data::BarInterval::DAILY, &bars)
+            .expect("written");
+        let mut server = server(&engine, None);
+
+        let reply = call(
+            &mut server,
+            json!({ "jsonrpc": "2.0", "id": 7, "method": "tools/call",
+                    "params": { "name": "query_market_data", "arguments": { "instrument": "UP.SIM", "last": 5 } } }),
+        );
+        assert_ne!(reply["result"]["isError"], json!(true), "{reply}");
+        let read = &reply["result"]["structuredContent"];
+        assert_eq!(read["interval"], json!("1day"));
+        assert_eq!(read["bars"].as_array().map(Vec::len), Some(5), "the last five: {read}");
+        assert_eq!(read["bars"][4]["close"], json!(100.0 + 59.0 * 0.8));
+
+        let reply = call(
+            &mut server,
+            json!({ "jsonrpc": "2.0", "id": 8, "method": "tools/call",
+                    "params": { "name": "inspect_regime", "arguments": { "instrument": "UP.SIM", "last": 10 } } }),
+        );
+        assert_ne!(reply["result"]["isError"], json!(true), "{reply}");
+        let regimes = &reply["result"]["structuredContent"];
+        assert_eq!(regimes["current"], json!("trending up"), "{regimes}");
+        assert_eq!(regimes["points"].as_array().map(Vec::len), Some(10));
+        assert_eq!(regimes["shares"]["trending up"], json!(10), "the lookback was read before the window: {regimes}");
+
+        // Nothing there says so by name; a comparison of one is not one.
+        let reply = call(
+            &mut server,
+            json!({ "jsonrpc": "2.0", "id": 9, "method": "tools/call",
+                    "params": { "name": "query_market_data", "arguments": { "instrument": "NOPE.SIM" } } }),
+        );
+        assert_eq!(reply["result"]["isError"], json!(true));
+        assert!(reply["result"]["content"][0]["text"].as_str().expect("text").contains("NOPE.SIM"));
+        let reply = call(
+            &mut server,
+            json!({ "jsonrpc": "2.0", "id": 10, "method": "tools/call",
+                    "params": { "name": "compare_experiments", "arguments": { "ids": ["one"] } } }),
+        );
+        assert!(reply["result"]["content"][0]["text"].as_str().expect("text").contains("at least two"));
     }
 
     /// No engine answers and none can be started: the error names what to do.
