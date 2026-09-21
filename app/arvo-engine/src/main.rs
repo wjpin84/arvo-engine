@@ -30,16 +30,23 @@ async fn main() {
 
 const USAGE: &str = "usage:
   arvo-engine [<data-dir>]                       serve; the app data directory when none is given
-  arvo-engine session list
-  arvo-engine session start <finding> <executor>
-  arvo-engine session stop|reconcile|resume <id>
-  arvo-engine session halt <id>|--all [reason...] the kill switch: arm the gate, flatten, stay halted
-  arvo-engine session explain <id> <time>        the chain behind every position held then";
+  arvo-engine [<data-dir>] session list          the verbs reach the engine serving <data-dir>,
+  arvo-engine [<data-dir>] session start <finding> <executor>   or the app data one when none is given
+  arvo-engine [<data-dir>] session stop|reconcile|resume <id>
+  arvo-engine [<data-dir>] session halt <id>|--all [reason...] the kill switch: arm the gate, flatten, stay halted
+  arvo-engine [<data-dir>] session explain <id> <time>        the chain behind every position held then";
 
 async fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(String::as_str) == Some("session") {
-        return session_command(&args[1..]).await;
+        return session_command(None, &args[1..]).await;
+    }
+    // `arvo-engine <data-dir> session …`: the verbs against the engine that
+    // serves that directory, which wrote its engine.json there (#223).
+    if let [dir, verb, rest @ ..] = args.as_slice() {
+        if verb == "session" && std::path::Path::new(dir).is_dir() {
+            return session_command(Some(PathBuf::from(dir)), rest).await;
+        }
     }
     // A positional argument is a data directory that exists. Anything else
     // is a mistake to say so about, not a directory to create and serve: an
@@ -143,10 +150,11 @@ async fn run() -> Result<(), String> {
     served.map_err(|err| format!("serving: {err}"))
 }
 
-/// `session list|start|stop|reconcile|resume`, against the engine
-/// `engine.json` names; `session explain <id> <time>` reads the record on
-/// disk and needs no engine.
-async fn session_command(args: &[String]) -> Result<(), String> {
+/// `session list|start|stop|reconcile|resume`, against the engine whose
+/// `engine.json` is in `dir` — the app data directory when none is given,
+/// with the project it remembers as the data directory; `session explain
+/// <id> <time>` reads the record on disk and needs no engine.
+async fn session_command(dir: Option<PathBuf>, args: &[String]) -> Result<(), String> {
     use arvo_engine::grpc::proto::common::Empty;
     use arvo_engine::grpc::proto::services::sessions_client::SessionsClient;
     use arvo_engine::grpc::proto::session::{HaltRequest, SessionId, SessionStatus, StartRequest};
@@ -154,14 +162,22 @@ async fn session_command(args: &[String]) -> Result<(), String> {
     if let [verb, id, when] = args {
         if verb == "explain" {
             let when = arvo_engine::explain::parse_when(when)?;
-            let path = session::record_path(&research::default_root()?, id);
+            let data = match &dir {
+                Some(dir) => dir.clone(),
+                None => research::default_root()?,
+            };
+            let path = session::record_path(&data, id);
             let record = std::fs::read_to_string(&path).map_err(|err| format!("{}: {err}", path.display()))?;
             print!("{}", arvo_engine::explain::explain(&record, when));
             return Ok(());
         }
     }
-    let root = arvo_service::project::app_data_root().map_err(|err| format!("no app data directory: {err}"))?;
-    let found = discovery::running(&root).ok_or("no engine is running; open Arvo or start arvo-engine")?;
+    let root = match dir {
+        Some(dir) => dir,
+        None => arvo_service::project::app_data_root().map_err(|err| format!("no app data directory: {err}"))?,
+    };
+    let found = discovery::running(&root)
+        .ok_or_else(|| format!("no engine is running for {}; open Arvo or start arvo-engine", root.display()))?;
     let token = discovery::read_control(&root).ok_or("no control.json beside engine.json")?;
     let mut client = SessionsClient::connect(format!("http://{}", found.address))
         .await
