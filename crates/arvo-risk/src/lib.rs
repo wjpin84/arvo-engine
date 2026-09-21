@@ -63,6 +63,7 @@ pub mod trade;
 pub use costs::{CostModel, OptionSpread};
 pub use decide::{decide, AccountState, Decision, Position, Proposal, Rejection};
 pub use gate::{Halt, RiskGate, Warning, WARNING_FRACTION};
+pub use costs::CostTier;
 pub use model::RiskModel;
 pub use pdt::{
     business_days_before, day_trades_in_window, DayTradingRule, PDT_DAY_TRADES, PDT_EQUITY_FLOOR,

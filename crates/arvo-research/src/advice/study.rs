@@ -41,6 +41,40 @@ pub fn recommend(found: &FamilyEvidence) -> Vec<Recommendation> {
         ));
     }
 
+    if let Some(costly) = found.under_conservative_costs.filter(|costly| *costly != Verdict::Supported) {
+        let stated = &found.selected.costs;
+        let worse = stated.at(crate::risk::CostTier::Conservative);
+        out.push(Recommendation::new(
+            Severity::Blocking,
+            "Supported only under the stated costs.",
+            "Do not promote this. Widen the edge or trade less often until the \
+             rule survives fills that cost twice what was assumed; a result \
+             that holds only when fills are cheap is a result about the cost \
+             assumption.",
+            format!(
+                "Supported at {:.1} bps commission and {:.1} bps slippage; {costly:?} at {:.1} and {:.1}",
+                stated.commission_bps, stated.slippage_bps, worse.commission_bps, worse.slippage_bps
+            ),
+        ));
+    }
+
+    if let Some(costly) = found.under_conservative_costs.filter(|costly| *costly != Verdict::Supported) {
+        let stated = &found.selected.costs;
+        let worse = stated.at(crate::risk::CostTier::Conservative);
+        out.push(Recommendation::new(
+            Severity::Blocking,
+            "Supported only under the stated costs.",
+            "Do not promote this. Widen the edge or trade less often until the \
+             rule survives fills that cost twice what was assumed; a result \
+             that holds only when fills are cheap is a result about the cost \
+             assumption.",
+            format!(
+                "Supported at {:.1} bps commission and {:.1} bps slippage; {costly:?} at {:.1} and {:.1}",
+                stated.commission_bps, stated.slippage_bps, worse.commission_bps, worse.slippage_bps
+            ),
+        ));
+    }
+
     if let Some(item) = refusals(evaluation.refused_orders) {
         out.push(item);
     }

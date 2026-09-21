@@ -831,6 +831,8 @@ mod tests {
             failures: Vec::new(),
             verdict: Verdict::Inconclusive,
             reasons: Vec::new(),
+        
+            under_conservative_costs: None,
         }
     }
 

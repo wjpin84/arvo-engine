@@ -1017,3 +1017,24 @@ fn the_gate_warns_at_four_fifths_of_a_limit_and_not_before() {
     assert!(gate.halted().is_some());
     assert!(gate.warnings(today).is_empty());
 }
+
+#[test]
+fn the_conservative_tier_is_never_cheaper_than_the_model() {
+    use crate::CostTier;
+    let stated = CostModel { per_fill: 1.0, per_unit_sold: 0.001, sell_notional_bps: 0.3, ..CostModel::proportional(2.0, 1.0) };
+    assert_eq!(stated.at(CostTier::Realistic), stated);
+    let worse = stated.at(CostTier::Conservative);
+    assert!((worse.commission_bps - 3.0).abs() < 1e-12);
+    assert!((worse.slippage_bps - 5.0).abs() < 1e-12, "twice one basis point is still under the five-point floor");
+    assert!((worse.per_fill - 2.0).abs() < 1e-12);
+    assert!(worse.check().is_ok());
+    let cheap = stated.at(CostTier::Optimistic);
+    assert_eq!(cheap.slippage_bps, 0.0);
+    assert_eq!(cheap.per_fill, 0.0);
+    assert!((cheap.commission_bps - 1.0).abs() < 1e-12);
+    // An option model's spread widens with it.
+    let option = CostModel { option_spread: Some(OptionSpread::MEASURED), ..CostModel::proportional(0.0, 0.0) };
+    let spread = option.at(CostTier::Conservative).option_spread.unwrap();
+    assert!((spread.min_half_spread - OptionSpread::MEASURED.min_half_spread * 2.0).abs() < 1e-12);
+    assert!((option.at(CostTier::Conservative).slippage_bps - 5.0).abs() < 1e-12);
+}

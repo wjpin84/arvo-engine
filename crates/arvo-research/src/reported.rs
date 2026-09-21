@@ -319,6 +319,8 @@ mod tests {
             failures: Vec::new(),
             verdict,
             reasons,
+        
+            under_conservative_costs: None,
         }
     }
 

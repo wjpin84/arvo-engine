@@ -109,6 +109,8 @@ fn study(recorded: &[f64], trades: u32) -> Record {
         failures: Vec::new(),
         verdict: crate::Verdict::Supported,
         reasons: Vec::new(),
+    
+        under_conservative_costs: None,
     }))
 }
 

@@ -1099,6 +1099,8 @@ pub(crate) mod tests {
             failures: Vec::new(),
             verdict: Verdict::NotSupported,
             reasons: vec!["because".to_owned()],
+        
+            under_conservative_costs: None,
         }))
     }
 

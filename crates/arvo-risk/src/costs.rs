@@ -108,7 +108,59 @@ impl OptionSpread {
     }
 }
 
+/// Three named cost models, as multiples of the one the experiment states
+/// (#192).
+///
+/// The experiment's own model is the *realistic* one: what a fill is
+/// expected to cost at the venue it was studied for. A finding is read
+/// under that model and then asked whether it survives the conservative one,
+/// because a result that only holds when fills are cheap is a result about
+/// the cost assumption, not about the rule. The optimistic tier exists so
+/// the question "how much of this is costs" has a floor to be asked against;
+/// nothing is ever judged under it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CostTier {
+    /// Half the commission, no slippage, no fees: a floor, never a judgement.
+    Optimistic,
+    /// The model as stated.
+    Realistic,
+    /// Half again the commission, twice the slippage and never under five
+    /// basis points, twice the fees, twice the option spread's floor.
+    Conservative,
+}
+
 impl CostModel {
+    /// This model at a [`CostTier`]. `Realistic` is the model itself.
+    #[must_use]
+    pub fn at(self, tier: CostTier) -> Self {
+        match tier {
+            CostTier::Realistic => self,
+            CostTier::Optimistic => Self {
+                commission_bps: self.commission_bps * 0.5,
+                slippage_bps: 0.0,
+                per_fill: 0.0,
+                per_unit_sold: 0.0,
+                sell_notional_bps: 0.0,
+                option_spread: self.option_spread.map(|spread| OptionSpread {
+                    min_half_spread: spread.min_half_spread * 0.5,
+                    half_spread_fraction: spread.half_spread_fraction * 0.5,
+                }),
+            },
+            CostTier::Conservative => Self {
+                commission_bps: self.commission_bps * 1.5,
+                slippage_bps: (self.slippage_bps * 2.0).max(5.0),
+                per_fill: self.per_fill * 2.0,
+                per_unit_sold: self.per_unit_sold * 2.0,
+                sell_notional_bps: self.sell_notional_bps * 2.0,
+                option_spread: self.option_spread.map(|spread| OptionSpread {
+                    min_half_spread: spread.min_half_spread * 2.0,
+                    half_spread_fraction: spread.half_spread_fraction * 2.0,
+                }),
+            },
+        }
+    }
+
     /// Only the two proportional costs — what the model was before venue and
     /// regulatory fees existed.
     ///

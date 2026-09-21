@@ -188,6 +188,13 @@ pub struct FamilyEvidence {
     pub failures: Vec<String>,
     pub verdict: Verdict,
     pub reasons: Vec<String>,
+    /// What the winner's out-of-sample run said under the conservative cost
+    /// tier (#192), when it was asked: `None` for a finding recorded before
+    /// the question existed. A verdict Supported only under the stated
+    /// costs is refused, never upgraded; this keeps what the other tier said
+    /// so the reader can see how far the edge is from the costs.
+    #[serde(default)]
+    pub under_conservative_costs: Option<Verdict>,
 }
 
 /// Expected maximum of `n` independent draws, given the spread of what was
@@ -484,8 +491,29 @@ fn search(
     let selected = variant(&family.template, &best_params, out_of_sample, "oos");
     let out_of_sample_evidence = evaluate_against_benchmark(provider, &selected, criteria)?;
 
+    // The same winner, the same window, fills that cost more (#192). Asked
+    // only of a result that would otherwise be Supported: a result already
+    // refused has nothing to lose, and the run is not free.
+    let under_conservative_costs = if survived_deflation && out_of_sample_evidence.evaluation.verdict == Verdict::Supported {
+        let mut costly = selected.clone();
+        costly.costs = costly.costs.at(arvo_risk::CostTier::Conservative);
+        costly.id = crate::ExperimentId(format!("{}-conservative", selected.id));
+        Some(evaluate_against_benchmark(provider, &costly, criteria)?.evaluation.verdict)
+    } else {
+        None
+    };
+
     let mut reasons = Vec::new();
-    let verdict = if survived_deflation {
+    let verdict = if let Some(costly) = under_conservative_costs.filter(|costly| *costly != Verdict::Supported) {
+        reasons.push(format!(
+            "Supported under the stated costs ({:.1} bps commission, {:.1} bps slippage) and {costly:?} under the              conservative tier ({:.1} bps, {:.1} bps): the edge is the cost assumption's, not the rule's",
+            selected.costs.commission_bps,
+            selected.costs.slippage_bps,
+            selected.costs.at(arvo_risk::CostTier::Conservative).commission_bps,
+            selected.costs.at(arvo_risk::CostTier::Conservative).slippage_bps,
+        ));
+        Verdict::NotSupported
+    } else if survived_deflation {
         out_of_sample_evidence.evaluation.verdict
     } else {
         let elsewhere = if prior_trials > 0 {
@@ -523,6 +551,7 @@ fn search(
         failures,
         verdict,
         reasons,
+        under_conservative_costs,
     })
 }
 
@@ -770,6 +799,72 @@ mod tests {
                 refused: Default::default(),
             })
         }
+    }
+
+    /// A provider whose curve is a steady edge minus the stated slippage,
+    /// so a winner that is Supported at one basis point is not at five.
+    struct Costly {
+        edge_bps: f64,
+    }
+
+    impl crate::SimulationProvider for Costly {
+        fn engine(&self) -> &str {
+            "costly 0"
+        }
+
+        fn run(&self, experiment: &Experiment) -> Result<crate::SimulationResult, crate::SimulationError> {
+            let benchmark = experiment.strategy.name == crate::evaluation::BUY_AND_HOLD;
+            let net = if benchmark { 0.0 } else { (self.edge_bps - experiment.costs.slippage_bps) / 10_000.0 };
+            let start = date(2023, 1, 2).and_time(chrono::NaiveTime::MIN);
+            let equity_curve = (0..300)
+                .map(|i| crate::EquityPoint {
+                    at: start + chrono::Duration::days(i),
+                    equity: 100_000.0 * (1.0 + net).powi(i as i32) * (1.0 + 0.001 * ((i as f64) * 0.7).sin()),
+                })
+                .collect();
+            Ok(crate::SimulationResult {
+                experiment: experiment.id.clone(),
+                engine: "costly 0".to_owned(),
+                trades: 40,
+                equity_curve,
+                ledger: Vec::new(),
+                refused: Default::default(),
+            })
+        }
+    }
+
+    #[test]
+    fn a_finding_supported_only_under_the_stated_costs_is_refused() {
+        let crate::memory::Record::Study(seed) = crate::memory::tests::study("AAPL.NASDAQ", "hash-a") else { unreachable!() };
+        let mut template = seed.selected.clone();
+        template.costs = crate::CostModel::proportional(0.0, 1.0);
+        let grid = ParameterGrid::new().axis("fast", vec![5.0, 10.0]).axis("slow", vec![20.0, 30.0]);
+        let family = ExperimentFamily {
+            hypothesis: template.hypothesis.clone(),
+            template,
+            grid,
+            in_sample_fraction: 0.7,
+            prior_trials: 0,
+        };
+        let criteria = EvaluationCriteria { min_trades: 10, ..EvaluationCriteria::default() };
+
+        // Three basis points of edge: positive at one point of slippage,
+        // negative at the conservative five.
+        let thin = run_family(&Costly { edge_bps: 3.0 }, &family, &criteria).expect("runs");
+        assert_eq!(thin.out_of_sample_evidence.evaluation.verdict, Verdict::Supported, "under the stated costs");
+        assert_eq!(thin.under_conservative_costs, Some(Verdict::NotSupported));
+        assert_eq!(thin.verdict, Verdict::NotSupported, "refused, never upgraded");
+        assert!(thin.reasons.iter().any(|why| why.contains("conservative tier")), "{:?}", thin.reasons);
+
+        // Ten basis points survives both, and the record says so.
+        let wide = run_family(&Costly { edge_bps: 10.0 }, &family, &criteria).expect("runs");
+        assert_eq!(wide.under_conservative_costs, Some(Verdict::Supported));
+        assert_eq!(wide.verdict, Verdict::Supported);
+
+        // A result refused on its own terms is not asked the question.
+        let none = run_family(&Costly { edge_bps: -3.0 }, &family, &criteria).expect("runs");
+        assert_eq!(none.under_conservative_costs, None);
+        assert_ne!(none.verdict, Verdict::Supported);
     }
 
     /// The sweep runs across the cores (#212); nothing about which trial wins
