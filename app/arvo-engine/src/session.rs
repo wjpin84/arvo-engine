@@ -800,7 +800,12 @@ async fn act<E: Executor>(
     let proposal = Proposal {
         instrument: signal.instrument.clone(),
         proposer: proposer.to_owned(),
-        signalled_at: signal.signalled_at,
+        // The instant the shadow produced it — now — not the bar's own time.
+        // The gate's staleness limit measures the hop from signal to gate;
+        // a bar is stamped at its open, so a 5-minute bar would read as five
+        // minutes old and a daily one as a night old, and both were refused.
+        // The bar's time is on the record's `signal` event beside this.
+        signalled_at: now,
         reference_price: signal.reference_price,
         stop_distance: signal.stop_distance,
         desired_quantity: Some(signal.quantity),

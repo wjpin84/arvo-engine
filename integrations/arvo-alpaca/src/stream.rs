@@ -105,11 +105,35 @@ pub struct AlpacaFeed {
     aggregate: Option<Aggregator>,
 }
 
+/// How long after a bucket's close to wait for its last minute before
+/// closing it on the clock: the minute that never printed (no IEX trade in
+/// it) would otherwise hold the bar until the next one showed, which the
+/// first live run measured at seven seconds — the poll got there first.
+const CLOSE_GRACE: Duration = Duration::from_millis(1500);
+
 #[async_trait::async_trait]
 impl BarFeed for AlpacaFeed {
     async fn next(&mut self) -> Option<FeedEvent> {
         loop {
-            let event = self.events.recv().await?;
+            // A bucket that is over on the clock goes out even if its last
+            // minute never printed; the deadline is that instant plus grace.
+            let deadline = self.aggregate.as_ref().and_then(|aggregate| aggregate.partial.as_ref()).map(|partial| {
+                let closes = (partial.at + chrono::Duration::minutes(i64::from(self.aggregate.as_ref().map_or(1, |a| a.step)))).and_utc();
+                let wait = (closes - chrono::Utc::now()).to_std().unwrap_or(Duration::ZERO) + CLOSE_GRACE;
+                tokio::time::Instant::now() + wait
+            });
+            let event = match deadline {
+                Some(deadline) => match tokio::time::timeout_at(deadline, self.events.recv()).await {
+                    Ok(event) => event?,
+                    Err(_) => {
+                        if let Some(bar) = self.aggregate.as_mut().and_then(|aggregate| aggregate.partial.take()) {
+                            return Some(FeedEvent::Bar(bar));
+                        }
+                        continue;
+                    }
+                },
+                None => self.events.recv().await?,
+            };
             match (&mut self.aggregate, event) {
                 (Some(aggregate), FeedEvent::Bar(minute)) => {
                     if let Some(bar) = aggregate.push(minute) {
