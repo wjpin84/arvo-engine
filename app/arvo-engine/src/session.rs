@@ -72,7 +72,7 @@ use arvo_data::{BarProvider as _, CsvBars};
 use arvo_execution::{Divergence, Execution, Executor, Session};
 use arvo_nautilus::{NautilusSimulation, Shadow, Side, Signal};
 use arvo_research::live::{judge, Expectation, Live, Observed};
-use arvo_research::{DateRange, EvidenceStore, Experiment, Record, RiskGate};
+use arvo_research::{DateRange, EvidenceStore, Experiment, Record, RiskGate, Verdict};
 use arvo_risk::Proposal;
 use arvo_api::{EventKindView, EventView, SeverityView};
 use serde::Serialize;
@@ -86,6 +86,82 @@ pub const SUBDIR: &str = "sessions";
 /// `robinhood-<last four of the account>`, since a Robinhood login holds
 /// more than one account and a session trades exactly one.
 pub const EXECUTORS: &[&str] = &["alpaca-paper", "alpaca-live", "robinhood-<last4>"];
+
+/// How long a finding must have run on paper before real money (#194).
+///
+/// Calendar days between the paper session's start and its last event.
+/// Five is one trading week: long enough for a daily rule to have seen a
+/// few bars and for the feed, the fills and the reconciliation to have
+/// been exercised, and short enough that it is done rather than skipped.
+/// The session verdict (#221) is what says whether those days looked like
+/// the finding; this only says they happened.
+pub const PAPER_MINIMUM_DAYS: i64 = 5;
+
+/// The one executor that is not real money.
+fn is_paper(executor: &str) -> bool {
+    executor == "alpaca-paper"
+}
+
+/// Why a finding may not go to real money: every reason, so the person
+/// fixes them all at once rather than one per attempt. Empty when it may.
+///
+/// The promotion gate (#194): a live executor accepts only a finding whose
+/// verdict is Supported and which has run on paper for
+/// [`PAPER_MINIMUM_DAYS`] without diverging from itself. The check is here,
+/// on the start, for people and agents alike; nothing else creates a
+/// session.
+fn promotion_refusals(data: &Path, finding: &str) -> Vec<String> {
+    let mut reasons = Vec::new();
+    let store = EvidenceStore::new(data.join("evidence"));
+    match store.open(finding) {
+        Ok(stored) => {
+            let verdict = stored.record.verdict();
+            if verdict != Verdict::Supported {
+                reasons.push(format!("the finding's verdict is {verdict:?}, not Supported"));
+            }
+        }
+        Err(err) => reasons.push(format!("the finding cannot be opened: {err}")),
+    }
+
+    let paper = record_path(data, &format!("{finding}@alpaca-paper"));
+    let Ok(text) = std::fs::read_to_string(&paper) else {
+        reasons.push(format!("no paper session on this finding; run it on alpaca-paper for {PAPER_MINIMUM_DAYS} days first"));
+        return reasons;
+    };
+    let mut started: Option<chrono::DateTime<chrono::Utc>> = None;
+    let mut last: Option<chrono::DateTime<chrono::Utc>> = None;
+    let mut verdict: Option<(String, Option<String>)> = None;
+    for line in text.lines() {
+        let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        let at = event["at"].as_str().and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok()).map(|at| at.with_timezone(&chrono::Utc));
+        match event["event"].as_str() {
+            Some("started") if started.is_none() => started = at,
+            Some("verdict") => {
+                verdict = event["detail"]["verdict"].as_str().map(|name| {
+                    (name.to_owned(), event["detail"]["reason"].as_str().map(str::to_owned))
+                });
+            }
+            _ => {}
+        }
+        last = at.or(last);
+    }
+    match (started, last) {
+        (Some(started), Some(last)) => {
+            let days = (last - started).num_days();
+            if days < PAPER_MINIMUM_DAYS {
+                reasons.push(format!("the paper session ran {days} day(s); {PAPER_MINIMUM_DAYS} are needed"));
+            }
+        }
+        _ => reasons.push("the paper session's record has no start".to_owned()),
+    }
+    if let Some(("diverging", why)) = verdict.as_ref().map(|(name, why)| (name.as_str(), why)) {
+        reasons.push(format!(
+            "the paper session was diverging from the finding when last judged{}",
+            why.as_ref().map_or(String::new(), |why| format!(" ({why})"))
+        ));
+    }
+    reasons
+}
 
 fn executor_is_known(executor: &str) -> bool {
     matches!(executor, "alpaca-paper" | "alpaca-live")
@@ -208,6 +284,12 @@ impl Sessions {
     pub fn start(&self, finding: &str, executor: &str) -> Result<Status, String> {
         if !executor_is_known(executor) {
             return Err(format!("no executor {executor:?}; one of {}", EXECUTORS.join(", ")));
+        }
+        if !is_paper(executor) {
+            let refusals = promotion_refusals(&self.data, finding);
+            if !refusals.is_empty() {
+                return Err(format!("promotion gate: {}", refusals.join("; ")));
+            }
         }
         let mut running = self.running.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let id = format!("{finding}@{executor}");
@@ -1094,6 +1176,61 @@ mod tests {
         assert!(sessions.list().is_empty());
         assert!(executor_is_known("robinhood-8591"));
         assert!(!executor_is_known("robinhood"), "which account?");
+    }
+
+    /// A paper record spanning `days`, ending on the given verdict.
+    fn paper_record(data: &Path, finding: &str, days: i64, verdict: Option<&str>) {
+        let path = record_path(data, &format!("{finding}@alpaca-paper"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let start = chrono::Utc::now() - chrono::Duration::days(days);
+        let mut lines = vec![
+            format!(r#"{{"at":"{}","event":"started","detail":null}}"#, start.to_rfc3339()),
+            format!(r#"{{"at":"{}","event":"bar","detail":null}}"#, (start + chrono::Duration::days(1)).to_rfc3339()),
+        ];
+        if let Some(verdict) = verdict {
+            lines.push(format!(
+                r#"{{"at":"{}","event":"verdict","detail":{{"verdict":"{verdict}","reason":"drawdown"}}}}"#,
+                chrono::Utc::now().to_rfc3339()
+            ));
+        }
+        lines.push(format!(r#"{{"at":"{}","event":"stopped","detail":null}}"#, chrono::Utc::now().to_rfc3339()));
+        std::fs::write(path, lines.join("\n") + "\n").unwrap();
+    }
+
+    #[test]
+    fn real_money_is_refused_without_a_paper_session_and_the_refusal_names_the_gate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sessions = Sessions::new(dir.path(), broadcast::channel(16).0);
+        let refused = sessions.start("f-1", "alpaca-live").expect_err("no paper session");
+        assert!(refused.starts_with("promotion gate:"), "{refused}");
+        assert!(refused.contains("no paper session"), "{refused}");
+        assert!(refused.contains("cannot be opened"), "every reason, not the first: {refused}");
+        assert!(sessions.list().is_empty(), "refused before a thread starts");
+        // Paper needs no promotion: this one fails in its thread on the
+        // missing finding, which is the next test's business.
+        assert!(sessions.start("f-1", "alpaca-paper").is_ok());
+    }
+
+    #[test]
+    fn a_paper_session_too_short_or_diverging_does_not_promote() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sessions = Sessions::new(dir.path(), broadcast::channel(16).0);
+        paper_record(dir.path(), "f-1", PAPER_MINIMUM_DAYS - 1, Some("holding"));
+        let short = sessions.start("f-1", "robinhood-1234").expect_err("too short");
+        assert!(short.contains(&format!("ran {} day(s); {PAPER_MINIMUM_DAYS} are needed", PAPER_MINIMUM_DAYS - 1)), "{short}");
+        assert!(!short.contains("diverging"), "{short}");
+
+        paper_record(dir.path(), "f-1", PAPER_MINIMUM_DAYS + 2, Some("diverging"));
+        let diverging = sessions.start("f-1", "robinhood-1234").expect_err("diverging");
+        assert!(diverging.contains("was diverging from the finding when last judged (drawdown)"), "{diverging}");
+        assert!(!diverging.contains("day(s)"), "long enough: {diverging}");
+
+        // Long enough and holding: only the finding itself stands in the way
+        // here, since this store has none.
+        paper_record(dir.path(), "f-1", PAPER_MINIMUM_DAYS, Some("holding"));
+        let only_the_finding = sessions.start("f-1", "robinhood-1234").expect_err("no finding");
+        assert!(only_the_finding.contains("cannot be opened"), "{only_the_finding}");
+        assert!(!only_the_finding.contains("paper"), "the paper record passed: {only_the_finding}");
     }
 
     #[test]
