@@ -32,7 +32,7 @@ use proto::platform::{
 use proto::portfolio::{PortfolioLibraryView, PortfolioName};
 use proto::research::{
     Advice, AttachRequest, Attachment, AttachmentRef, Attachments, BarView, BarsRequest, BarsView, BookRequest,
-    ComparisonView, Finding, RegimePointView, RegimeView,
+    ComparisonView, Finding, RegimePointView, RegimeView, ReviewRequest, ReviewView,
     FindingId, FindingIds, FindingSummary, Findings, HistoryView, PanelView, Point, ProblemsView, RecordView,
     ReplayView, ReportFigure, ReportRequest, RiskModel, Rules, Ruleset, RulesetForm, RulesetPath, Rulesets,
     RunRequest, SharedExperiment, Strategies, StudyRequest, StudyView, TradeExport, WalkForwardView,
@@ -966,6 +966,23 @@ impl research_server::Research for Service {
         }))
     }
 
+    async fn view_review(&self, request: Request<ReviewRequest>) -> Result<Response<ReviewView>, Status> {
+        let day = match request.get_ref().day.as_deref().filter(|text| !text.trim().is_empty()) {
+            Some(text) => text.trim().parse().map_err(|err| Status::invalid_argument(format!("day is YYYY-MM-DD: {err}")))?,
+            None => chrono::Utc::now().date_naive(),
+        };
+        let root = self.research.root().to_path_buf();
+        let (path, markdown, written_now) = match arvo_service::review::read(&root, day) {
+            Some((path, text)) => (path, text, false),
+            None => {
+                let reviewed = arvo_service::review::review(&root, day);
+                let path = arvo_service::review::write(&root, &reviewed).map_err(Status::internal)?;
+                (path, arvo_service::review::markdown(&reviewed), true)
+            }
+        };
+        Ok(Response::new(ReviewView { day: day.to_string(), markdown, path: path.display().to_string(), written_now }))
+    }
+
     async fn view_problems(&self, _: Request<Empty>) -> Result<Response<ProblemsView>, Status> {
         let view = arvo_service::research::history::list_research_problems(&self.workbench, self.research.root())
             .map_err(refused)?;
@@ -1654,14 +1671,16 @@ mod tests {
         // come from a session this machine already holds, never from the
         // caller. Subscribe only listens. ReadBars and ViewRegime read the
         // library the studies read, and nothing else: an agent that can run
-        // a study on those bars can look at them (#195).
+        // a study on those bars can look at them (#195). ViewReview reads
+        // the day's session records back as a report and reaches no session
+        // (#217).
         assert_eq!(
             calls,
             [
                 "ListStrategies", "ListInstruments", "ListFindings", "OpenFinding", "RunStudy", "RunWalkForward",
                 "RecordFinding", "AttachFile", "ListRulesets", "ReadRuleset", "WriteRuleset", "ListRules", "GetRiskModel",
                 "ViewStudy", "ViewWalkForward", "ViewPanel", "ViewBook", "ViewHistory", "ViewRecord", "ViewReplay",
-                "ViewComparison", "ReadBars", "ViewRegime", "ViewProblems", "ListAttachments", "Subscribe",
+                "ViewComparison", "ReadBars", "ViewRegime", "ViewReview", "ViewProblems", "ListAttachments", "Subscribe",
             ]
         );
         for forbidden in ["Fetch", "Order", "Trade", "Share", "Import", "Key", "Sign", "Session", "Halt"] {

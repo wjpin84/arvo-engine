@@ -36,7 +36,7 @@ use std::time::{Duration, Instant};
 
 use arvo_client::discovery::{self, Discovery};
 use arvo_client::proto::common::Empty;
-use arvo_client::proto::research::{BarsRequest, Finding, FindingId, FindingIds, Param, RulesetForm, RunRequest};
+use arvo_client::proto::research::{BarsRequest, Finding, FindingId, FindingIds, Param, ReviewRequest, RulesetForm, RunRequest};
 use arvo_client::proto::services::research_client::ResearchClient;
 use serde_json::{json, Value};
 use tonic::transport::Channel;
@@ -259,6 +259,12 @@ impl Server {
                     let regimes = self.runtime.block_on(self.research.view_regime(request)).map_err(refused)?;
                     encode(&regimes.into_inner())
                 }
+            }
+            "read_review" => {
+                let day = arguments.get("day").and_then(Value::as_str).map(ToOwned::to_owned);
+                let request = self.request(ReviewRequest { day })?;
+                let reviewed = self.runtime.block_on(self.research.view_review(request)).map_err(refused)?;
+                encode(&reviewed.into_inner())
             }
             "compare_experiments" => {
                 let ids: Vec<String> = match arguments.get("ids") {
@@ -500,6 +506,14 @@ fn tools() -> Value {
             },
         },
         {
+            "name": "read_review",
+            "description": "The review after the close for a day: what every session did (bars, signals, what the gate refused and why, fills against their decision prices, round trips with the rule and regime they opened in, losses grouped by condition, regime and exit, freezes, halts, verdict and warning changes) and what a person did (positions adopted, halts by hand, resumes, stops). Written after the close, or on first ask.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "day": { "type": "string", "description": "YYYY-MM-DD (UTC); today when absent" } }
+            },
+        },
+        {
             "name": "compare_experiments",
             "description": "Two or more findings read against each other: one row each with verdict, return, excess return, Sharpe, drawdown, trades, win rate, and whether its data has changed since; then the comparison's own deflation, because keeping the best of six is a search of size six. Explains why two findings differ without reading their files.",
             "inputSchema": {
@@ -648,6 +662,7 @@ mod tests {
                 "open_finding",
                 "query_market_data",
                 "inspect_regime",
+                "read_review",
                 "compare_experiments",
                 "run_study",
                 "run_walk_forward"
@@ -797,6 +812,19 @@ mod tests {
                     "params": { "name": "compare_experiments", "arguments": { "ids": ["one"] } } }),
         );
         assert!(reply["result"]["content"][0]["text"].as_str().expect("text").contains("at least two"));
+
+        // A day with no session record reviews an empty day, and is written.
+        let reply = call(
+            &mut server,
+            json!({ "jsonrpc": "2.0", "id": 11, "method": "tools/call",
+                    "params": { "name": "read_review", "arguments": { "day": "2026-09-21" } } }),
+        );
+        assert_ne!(reply["result"]["isError"], json!(true), "{reply}");
+        let reviewed = &reply["result"]["structuredContent"];
+        assert_eq!(reviewed["day"], json!("2026-09-21"));
+        assert_eq!(reviewed["written_now"], json!(true));
+        assert!(reviewed["markdown"].as_str().expect("text").starts_with("# Review · 2026-09-21"));
+        assert!(engine.dir.path().join("reviews").join("2026-09-21.md").exists());
     }
 
     /// No engine answers and none can be started: the error names what to do.

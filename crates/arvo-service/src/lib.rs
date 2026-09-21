@@ -17,6 +17,7 @@ pub mod portfolio;
 pub mod jobs;
 pub mod project;
 pub mod research;
+pub mod review;
 pub mod risk;
 pub mod rulesets;
 pub mod scripts;

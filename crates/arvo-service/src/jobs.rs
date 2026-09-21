@@ -56,6 +56,7 @@ pub fn register(jobs: &Jobs, root: &Path, research: Arc<ResearchService>, raise:
     // at startup, which is when "while you were away" is true.
     let reported = root.join(crate::research::staleness::FILE);
     let raise = Arc::new(raise);
+    let announce = raise.clone();
     let checking = research.clone();
     jobs.every("staleness", "Check findings for staleness", crate::research::staleness::EVERY, move || {
         let reported = reported.clone();
@@ -72,6 +73,39 @@ pub fn register(jobs: &Jobs, root: &Path, research: Arc<ResearchService>, raise:
             .await
             .map_err(|err| format!("the check did not finish: {err}"))?;
             Ok(raised.unwrap_or_else(|| "nothing newly stale".to_owned()))
+        }
+    });
+
+    // The review after the close (#217): once a day, a quarter of an hour
+    // after the regular close, when the day's sessions have settled their
+    // last fills. Checked every ten minutes so a restart in the evening
+    // still writes it; never rewritten, so a person's reading of it stays
+    // what they read.
+    let reviewing = root.to_path_buf();
+    jobs.every("review", "Write the review after the close", std::time::Duration::from_secs(10 * 60), move || {
+        let root = reviewing.clone();
+        let raise = announce.clone();
+        async move {
+            let now = chrono::Utc::now().naive_utc();
+            let today = now.date();
+            if matches!(chrono::Datelike::weekday(&today), chrono::Weekday::Sat | chrono::Weekday::Sun) {
+                return Ok("not a trading day".to_owned());
+            }
+            if now < arvo_data::session::regular_close(today) + chrono::Duration::minutes(15) {
+                return Ok("before the close".to_owned());
+            }
+            if crate::review::read(&root, today).is_some() {
+                return Ok("already written".to_owned());
+            }
+            let reviewed = crate::review::review(&root, today);
+            let path = crate::review::write(&root, &reviewed)?;
+            raise(EventView::new(
+                arvo_api::EventKindView::findings(0),
+                "The day's review is written".to_owned(),
+                format!("{}: {} session(s), realised {:+.2}", path.display(), reviewed.sessions.len(), reviewed.realised()),
+                arvo_api::SeverityView::Info,
+            ));
+            Ok(format!("written to {}", path.display()))
         }
     });
 

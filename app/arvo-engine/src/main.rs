@@ -34,7 +34,8 @@ const USAGE: &str = "usage:
   arvo-engine [<data-dir>] session start <finding> <executor>   or the app data one when none is given
   arvo-engine [<data-dir>] session stop|reconcile|resume <id>
   arvo-engine [<data-dir>] session halt <id>|--all [reason...] the kill switch: arm the gate, flatten, stay halted
-  arvo-engine [<data-dir>] session explain <id> <time>        the chain behind every position held then";
+  arvo-engine [<data-dir>] session explain <id> <time>        the chain behind every position held then
+  arvo-engine [<data-dir>] review [YYYY-MM-DD]   the review after the close: written under reviews/, and printed";
 
 async fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -47,6 +48,12 @@ async fn run() -> Result<(), String> {
         if verb == "session" && std::path::Path::new(dir).is_dir() {
             return session_command(Some(PathBuf::from(dir)), rest).await;
         }
+        if verb == "review" && std::path::Path::new(dir).is_dir() {
+            return review_command(PathBuf::from(dir), rest);
+        }
+    }
+    if args.first().map(String::as_str) == Some("review") {
+        return review_command(research::default_root()?, &args[1..]);
     }
     // A positional argument is a data directory that exists. Anything else
     // is a mistake to say so about, not a directory to create and serve: an
@@ -148,6 +155,28 @@ async fn run() -> Result<(), String> {
     stopping.stop_all().await;
     discovery::remove_if_ours(&root, pid);
     served.map_err(|err| format!("serving: {err}"))
+}
+
+/// `review [YYYY-MM-DD]`: the day's review from the session records under
+/// `root`, written under `reviews/` and printed. Needs no engine (#217).
+/// A day already reviewed is printed as it was written, not rewritten.
+fn review_command(root: PathBuf, args: &[String]) -> Result<(), String> {
+    let day = match args {
+        [] => chrono::Utc::now().date_naive(),
+        [day] => day.parse().map_err(|err| format!("{day:?} is not a date (YYYY-MM-DD): {err}"))?,
+        _ => return Err(USAGE.to_owned()),
+    };
+    let text = match arvo_service::review::read(&root, day) {
+        Some((_, text)) => text,
+        None => {
+            let reviewed = arvo_service::review::review(&root, day);
+            let path = arvo_service::review::write(&root, &reviewed)?;
+            eprintln!("arvo-engine: written to {}", path.display());
+            arvo_service::review::markdown(&reviewed)
+        }
+    };
+    print!("{text}");
+    Ok(())
 }
 
 /// `session list|start|stop|reconcile|resume`, against the engine whose
