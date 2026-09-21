@@ -102,6 +102,20 @@ fn is_paper(executor: &str) -> bool {
     executor == "alpaca-paper"
 }
 
+/// The promotion gate's answer for one finding (#194): whether it may go to
+/// real money, every reason it may not, and what the gate looked at.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Promotion {
+    pub allowed: bool,
+    pub reasons: Vec<String>,
+    /// The finding's own verdict, when it can be opened.
+    pub verdict: Option<String>,
+    /// Days on paper, by the paper record; `None` without one.
+    pub paper_days: Option<i64>,
+    /// The paper session's last verdict against the finding, when it has one.
+    pub paper_verdict: Option<String>,
+}
+
 /// Why a finding may not go to real money: every reason, so the person
 /// fixes them all at once rather than one per attempt. Empty when it may.
 ///
@@ -110,23 +124,34 @@ fn is_paper(executor: &str) -> bool {
 /// [`PAPER_MINIMUM_DAYS`] without diverging from itself. The check is here,
 /// on the start, for people and agents alike; nothing else creates a
 /// session.
-fn promotion_refusals(data: &Path, finding: &str) -> Vec<String> {
+fn promotion(data: &Path, finding: &str) -> Promotion {
     let mut reasons = Vec::new();
+    let answer = |reasons: Vec<String>, verdict: Option<String>, paper_days: Option<i64>, paper_verdict: Option<String>| Promotion {
+        allowed: reasons.is_empty(),
+        reasons,
+        verdict,
+        paper_days,
+        paper_verdict,
+    };
     let store = EvidenceStore::new(data.join("evidence"));
-    match store.open(finding) {
+    let found = match store.open(finding) {
         Ok(stored) => {
             let verdict = stored.record.verdict();
             if verdict != Verdict::Supported {
                 reasons.push(format!("the finding's verdict is {verdict:?}, not Supported"));
             }
+            Some(format!("{verdict:?}"))
         }
-        Err(err) => reasons.push(format!("the finding cannot be opened: {err}")),
-    }
+        Err(err) => {
+            reasons.push(format!("the finding cannot be opened: {err}"));
+            None
+        }
+    };
 
     let paper = record_path(data, &format!("{finding}@alpaca-paper"));
     let Ok(text) = std::fs::read_to_string(&paper) else {
         reasons.push(format!("no paper session on this finding; run it on alpaca-paper for {PAPER_MINIMUM_DAYS} days first"));
-        return reasons;
+        return answer(reasons, found, None, None);
     };
     let mut started: Option<chrono::DateTime<chrono::Utc>> = None;
     let mut last: Option<chrono::DateTime<chrono::Utc>> = None;
@@ -145,22 +170,26 @@ fn promotion_refusals(data: &Path, finding: &str) -> Vec<String> {
         }
         last = at.or(last);
     }
-    match (started, last) {
+    let paper_days = match (started, last) {
         (Some(started), Some(last)) => {
             let days = (last - started).num_days();
             if days < PAPER_MINIMUM_DAYS {
                 reasons.push(format!("the paper session ran {days} day(s); {PAPER_MINIMUM_DAYS} are needed"));
             }
+            Some(days)
         }
-        _ => reasons.push("the paper session's record has no start".to_owned()),
-    }
+        _ => {
+            reasons.push("the paper session's record has no start".to_owned());
+            None
+        }
+    };
     if let Some(("diverging", why)) = verdict.as_ref().map(|(name, why)| (name.as_str(), why)) {
         reasons.push(format!(
             "the paper session was diverging from the finding when last judged{}",
             why.as_ref().map_or(String::new(), |why| format!(" ({why})"))
         ));
     }
-    reasons
+    answer(reasons, found, paper_days, verdict.map(|(name, _)| name))
 }
 
 fn executor_is_known(executor: &str) -> bool {
@@ -281,6 +310,25 @@ impl Sessions {
     /// [`Self::list`] rather than as an error here — a session is something
     /// you watch, not something you await.
     ///
+    /// What the promotion gate would say to [`Self::start`], without
+    /// starting (#199). Paper is always allowed; the answer still says what
+    /// the gate saw, so a window can show the road ahead.
+    ///
+    /// # Errors
+    ///
+    /// An executor not in [`EXECUTORS`].
+    pub fn promotion(&self, finding: &str, executor: &str) -> Result<Promotion, String> {
+        if !executor_is_known(executor) {
+            return Err(format!("no executor {executor:?}; one of {}", EXECUTORS.join(", ")));
+        }
+        let mut gate = promotion(&self.data, finding);
+        if is_paper(executor) {
+            gate.allowed = true;
+            gate.reasons.clear();
+        }
+        Ok(gate)
+    }
+
     /// # Errors
     ///
     /// An executor not in [`EXECUTORS`], or a finding already running.
@@ -289,9 +337,9 @@ impl Sessions {
             return Err(format!("no executor {executor:?}; one of {}", EXECUTORS.join(", ")));
         }
         if !is_paper(executor) {
-            let refusals = promotion_refusals(&self.data, finding);
-            if !refusals.is_empty() {
-                return Err(format!("promotion gate: {}", refusals.join("; ")));
+            let gate = promotion(&self.data, finding);
+            if !gate.allowed {
+                return Err(format!("promotion gate: {}", gate.reasons.join("; ")));
             }
         }
         let mut running = self.running.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1299,6 +1347,18 @@ mod tests {
         let only_the_finding = sessions.start("f-1", "robinhood-1234").expect_err("no finding");
         assert!(only_the_finding.contains("cannot be opened"), "{only_the_finding}");
         assert!(!only_the_finding.contains("paper"), "the paper record passed: {only_the_finding}");
+
+        // Asked rather than tried: the same answer, with what the gate saw.
+        let asked = sessions.promotion("f-1", "robinhood-1234").unwrap();
+        assert!(!asked.allowed);
+        assert_eq!(asked.reasons.len(), 1, "{:?}", asked.reasons);
+        assert_eq!(asked.paper_days, Some(PAPER_MINIMUM_DAYS));
+        assert_eq!(asked.paper_verdict.as_deref(), Some("holding"));
+        assert_eq!(asked.verdict, None, "no finding to open");
+        let paper = sessions.promotion("f-1", "alpaca-paper").unwrap();
+        assert!(paper.allowed && paper.reasons.is_empty(), "paper needs no promotion");
+        assert_eq!(paper.paper_days, Some(PAPER_MINIMUM_DAYS), "but the road ahead is still shown");
+        assert!(sessions.promotion("f-1", "etrade").is_err());
     }
 
     #[test]

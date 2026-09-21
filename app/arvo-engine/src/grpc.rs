@@ -36,7 +36,7 @@ use proto::research::{
     ReplayView, ReportFigure, ReportRequest, RiskModel, Rules, Ruleset, RulesetForm, RulesetPath, Rulesets,
     RunRequest, SharedExperiment, Strategies, StudyRequest, StudyView, TradeExport, WalkForwardView,
 };
-use proto::session::{HaltRequest, SessionId, SessionList, SessionStatus, StartRequest};
+use proto::session::{HaltRequest, PromotionView, SessionId, SessionList, SessionStatus, StartRequest};
 use arvo_api::EventView;
 
 /// The keys of a summary that have their own fields; everything else is
@@ -594,6 +594,20 @@ impl sessions_server::Sessions for Control {
             .map_err(|err| Status::internal(err.to_string()))?
             .map(|status| Response::new(session_status(status)))
             .map_err(Status::failed_precondition)
+    }
+
+    async fn check_promotion(&self, request: Request<StartRequest>) -> Result<Response<PromotionView>, Status> {
+        let request = request.into_inner();
+        let finding = required(&request.finding, "finding")?;
+        let executor = required(&request.executor, "executor")?;
+        let gate = self.sessions.promotion(finding, executor).map_err(Status::invalid_argument)?;
+        Ok(Response::new(PromotionView {
+            allowed: gate.allowed,
+            reasons: gate.reasons,
+            verdict: gate.verdict.unwrap_or_default(),
+            paper_days: gate.paper_days,
+            paper_verdict: gate.paper_verdict,
+        }))
     }
 
     async fn list_sessions(&self, _: Request<Empty>) -> Result<Response<SessionList>, Status> {
