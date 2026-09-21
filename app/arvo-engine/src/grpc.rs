@@ -207,6 +207,8 @@ fn session_status(status: crate::session::Status) -> SessionStatus {
         last_bar: status.last_bar,
         frozen: status.frozen,
         reconciled: status.reconciled,
+        verdict: status.verdict,
+        verdict_reason: status.verdict_reason,
     }
 }
 

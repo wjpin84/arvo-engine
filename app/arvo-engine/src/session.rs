@@ -69,11 +69,12 @@ use std::time::Duration;
 
 use arvo_data::source::FeedEvent;
 use arvo_data::{BarProvider as _, CsvBars};
-use arvo_execution::{Executor, Session};
+use arvo_execution::{Divergence, Execution, Executor, Session};
 use arvo_nautilus::{NautilusSimulation, Shadow, Side, Signal};
+use arvo_research::live::{judge, Expectation, Live, Observed};
 use arvo_research::{DateRange, EvidenceStore, Experiment, Record, RiskGate};
 use arvo_risk::Proposal;
-use arvo_api::EventView;
+use arvo_api::{EventKindView, EventView, SeverityView};
 use serde::Serialize;
 use tokio::sync::broadcast;
 
@@ -123,6 +124,12 @@ pub struct Status {
     pub frozen: Option<String>,
     /// Whether the disagreement has been reconciled, so a resume is allowed.
     pub reconciled: bool,
+    /// Whether the rule is still the rule its finding described (#221):
+    /// `holding`, `diverging` or `inconclusive`. A judgement, not a limit;
+    /// it changes nothing at the gate.
+    pub verdict: String,
+    /// What was seen against what was expected, while diverging.
+    pub verdict_reason: Option<String>,
 }
 
 /// What a person can ask of a running session.
@@ -227,6 +234,8 @@ impl Sessions {
             last_bar: None,
             frozen: None,
             reconciled: false,
+            verdict: "inconclusive".to_owned(),
+            verdict_reason: None,
         }));
         let stop = Arc::new(AtomicBool::new(false));
         let mailbox: Mailbox = Arc::default();
@@ -371,12 +380,25 @@ impl Sessions {
 }
 
 /// The experiment a finding ran, for a session to run again from today.
-fn experiment_of(store: &EvidenceStore, finding: &str) -> Result<Experiment, String> {
+/// The experiment a finding names, and what its out-of-sample trades lead a
+/// session to expect (#221). Only a study has an out-of-sample ledger to
+/// draw the expectation from; a session on anything else is Inconclusive
+/// for as long as it runs, and its record says so at the start.
+fn experiment_of(store: &EvidenceStore, finding: &str) -> Result<(Experiment, Option<Expectation>), String> {
     let stored = store.open(finding).map_err(|err| err.to_string())?;
     match stored.record {
-        Record::Study(study) => Ok(study.selected),
-        Record::WalkForward(walk) => Ok(walk.template),
-        Record::Reported(reported) => Ok(reported.reported.experiment),
+        Record::Study(study) => {
+            let evaluation = &study.out_of_sample_evidence.evaluation;
+            let expected = Expectation::of(
+                &evaluation.strategy_ledger,
+                evaluation.strategy.max_drawdown,
+                evaluation.strategy_curve.len(),
+                study.selected.costs.slippage_bps,
+            );
+            Ok((study.selected, expected))
+        }
+        Record::WalkForward(walk) => Ok((walk.template, None)),
+        Record::Reported(reported) => Ok((reported.reported.experiment, None)),
         // ponytail: a panel selects one parameter set over many instruments;
         // add when someone wants to trade a panel rather than one of its members.
         Record::Panel(_) => Err("a panel finding names no single experiment to run".to_owned()),
@@ -393,7 +415,7 @@ fn run(
     events: &broadcast::Sender<EventView>,
 ) -> Result<(), String> {
     let store = EvidenceStore::new(&data.join("evidence"));
-    let mut experiment = experiment_of(&store, finding)?;
+    let (mut experiment, expected) = experiment_of(&store, finding)?;
     if experiment.instruments().len() != 1 {
         return Err("a session runs one instrument; a book is not hosted yet".to_owned());
     }
@@ -430,6 +452,20 @@ fn run(
         .map(|bar| bar.at);
     let mut shadow = NautilusSimulation::new(library).shadow(&experiment).map_err(|err| err.to_string())?;
     record.write("started", Some(serde_json::json!({ "experiment": experiment.id.to_string(), "warm_until": last_in_library })));
+    record.write(
+        "expectation",
+        Some(expected.as_ref().map_or_else(
+            || serde_json::json!({ "none": "the finding is not a study, or has no closed out-of-sample trade; the verdict stays inconclusive" }),
+            |expected| serde_json::to_value(expected).unwrap_or_default(),
+        )),
+    );
+    record.write(
+        "expectation",
+        Some(expected.as_ref().map_or_else(
+            || serde_json::json!({ "none": "the finding is not a study, or has no closed out-of-sample trade; the verdict stays inconclusive" }),
+            |expected| serde_json::to_value(expected).unwrap_or_default(),
+        )),
+    );
 
     match executor {
         "alpaca-paper" => runtime.block_on(drive(
@@ -440,6 +476,7 @@ fn run(
             symbol,
             venue,
             last_in_library,
+            expected.clone(),
             &record,
             status,
             stop,
@@ -454,6 +491,7 @@ fn run(
             symbol,
             venue,
             last_in_library,
+            expected.clone(),
             &record,
             status,
             stop,
@@ -477,6 +515,7 @@ fn run(
                 symbol,
                 venue,
                 last_in_library,
+                expected.clone(),
                 &record,
                 status,
                 stop,
@@ -499,6 +538,7 @@ async fn drive<E: Executor>(
     symbol: &str,
     venue: &str,
     mut last_pushed: Option<chrono::NaiveDateTime>,
+    expected: Option<Expectation>,
     record: &Recorder,
     status: &Mutex<Status>,
     stop: &AtomicBool,
@@ -506,6 +546,7 @@ async fn drive<E: Executor>(
     events: &broadcast::Sender<EventView>,
 ) -> Result<(), String> {
     let now = || chrono::Utc::now().naive_utc();
+    let mut watch = Watch::new(expected, experiment.starting_cash);
     let instrument = experiment.instrument.clone();
     let proposer = format!("shadow:{}", experiment.strategy.name);
     // The source that serves the bars says what the instrument is — its
@@ -668,6 +709,7 @@ async fn drive<E: Executor>(
             let signals = shadow.push(&[(instrument.clone(), bar)]).map_err(|err| err.to_string())?;
             last_pushed = Some(bar.at);
             last_close = Some(bar.close);
+            watch.bar(bar.close);
             record.write("bar", Some(serde_json::json!({ "at": bar.at, "close": bar.close, "signals": signals.len() })));
             {
                 let mut status = status.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -678,7 +720,7 @@ async fn drive<E: Executor>(
                 // The bar's instant and the signal's place in it: unique in
                 // the record, and readable back to the bar without a lookup.
                 let id = format!("{}#{n}", bar.at);
-                act(&mut session, &id, signal, &proposer, now(), frozen.is_some(), record, status).await?;
+                act(&mut session, &mut watch, &id, signal, &proposer, now(), frozen.is_some(), record, status).await?;
             }
             if killed {
                 // Already halted by hand; the loop stays up to book the exits.
@@ -708,6 +750,10 @@ async fn drive<E: Executor>(
                 Err(err) => {
                     trouble(status, record, events, "settle_failed", &err);
                 }
+            }
+            watch.settle(session.executions(), &session.divergence(), last_close);
+            if let Some(verdict) = watch.judge() {
+                judged(status, record, events, verdict);
             }
             if frozen.is_none() {
                 match session.audit(venue).await {
@@ -754,6 +800,7 @@ async fn pause(stop: &AtomicBool, mailbox: &Mailbox) {
 #[expect(clippy::too_many_arguments, reason = "one call site; a struct would only rename the arguments")]
 async fn act<E: Executor>(
     session: &mut Session<E>,
+    watch: &mut Watch,
     id: &str,
     signal: &Signal,
     proposer: &str,
@@ -813,6 +860,7 @@ async fn act<E: Executor>(
     };
     match session.propose(&proposal, now, None).await.map_err(|err| err.to_string())? {
         Some(order) => {
+            watch.entered(order.to_string(), signal.regime.clone());
             record.write("submitted", Some(serde_json::json!({ "signal": id, "order": order.to_string() })));
             status.lock().unwrap_or_else(std::sync::PoisonError::into_inner).submitted += 1;
         }
@@ -868,6 +916,135 @@ fn halt(status: &Mutex<Status>, record: &Recorder, events: &broadcast::Sender<Ev
     status.halted = Some(why.to_owned());
     record.write("halted", Some(serde_json::json!(why)));
     announce(events, &status);
+}
+
+/// The verdict changed: on the record, on the status, and — when the rule
+/// has left what its finding described — raised as an alert, since nothing
+/// else will change. The state does not: a Diverging session keeps trading
+/// until a person or the agent decides otherwise (#221).
+fn judged(status: &Mutex<Status>, record: &Recorder, events: &broadcast::Sender<EventView>, verdict: &Live) {
+    record.write("verdict", Some(serde_json::to_value(verdict).unwrap_or_default()));
+    let mut status = status.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    status.verdict = verdict.name().to_owned();
+    status.verdict_reason = verdict.reason();
+    if let Live::Diverging(reason) = verdict {
+        let _ = events.send(EventView::new(
+            EventKindView::session(status.id.clone(), status.state.clone()),
+            "Session diverging from its finding".to_owned(),
+            format!("{}: {reason}", status.id),
+            SeverityView::Warning,
+        ));
+    }
+}
+
+/// The session's own ledger, kept for its verdict (#221).
+///
+/// Built from the fills as they settle: a buy opens or adds to the one
+/// position a session holds, a sell realises against its average entry,
+/// and the position going flat closes a round trip. The regime on each
+/// entry is the one its signal carried, remembered by order id when the
+/// order was sent. A sell of something this session did not open (an
+/// adopted position) is not a round trip of the rule's and is not counted.
+struct Watch {
+    expected: Option<Expectation>,
+    seen: Observed,
+    /// Order id to the regime its signal was decided in.
+    regimes: BTreeMap<String, Option<String>>,
+    /// How many of the session's executions are already folded in.
+    folded: usize,
+    quantity: f64,
+    /// Average entry of what is held.
+    entry: f64,
+    realised: f64,
+    /// Realised so far in the open round trip.
+    round_trip: f64,
+    peak: f64,
+    starting_cash: f64,
+    verdict: Live,
+}
+
+impl Watch {
+    fn new(expected: Option<Expectation>, starting_cash: f64) -> Self {
+        Self {
+            expected,
+            seen: Observed::default(),
+            regimes: BTreeMap::new(),
+            folded: 0,
+            quantity: 0.0,
+            entry: 0.0,
+            realised: 0.0,
+            round_trip: 0.0,
+            peak: starting_cash,
+            starting_cash,
+            verdict: Live::Inconclusive,
+        }
+    }
+
+    fn entered(&mut self, order: String, regime: Option<String>) {
+        self.regimes.insert(order, regime);
+    }
+
+    fn bar(&mut self, close: f64) {
+        self.seen.bars += 1;
+        self.mark(close);
+    }
+
+    fn settle(&mut self, executions: &[Execution], divergence: &Divergence, close: Option<f64>) {
+        for execution in &executions[self.folded.min(executions.len())..] {
+            match execution.side {
+                arvo_execution::Side::Buy => {
+                    if self.quantity <= 0.0 {
+                        self.seen.entries.push(self.regimes.remove(&execution.order.to_string()).flatten());
+                        self.round_trip = 0.0;
+                    }
+                    let total = self.quantity + execution.quantity;
+                    self.entry = (self.entry * self.quantity + execution.fill_price * execution.quantity) / total;
+                    self.quantity = total;
+                }
+                arvo_execution::Side::Sell => {
+                    if self.quantity <= 0.0 {
+                        continue;
+                    }
+                    let sold = execution.quantity.min(self.quantity);
+                    let pnl = (execution.fill_price - self.entry) * sold;
+                    self.realised += pnl;
+                    self.round_trip += pnl;
+                    self.quantity -= sold;
+                    if self.quantity <= 1e-9 {
+                        self.quantity = 0.0;
+                        self.seen.pnls.push(self.round_trip);
+                        self.round_trip = 0.0;
+                    }
+                }
+            }
+        }
+        self.folded = executions.len();
+        self.seen.fills = divergence.fills;
+        self.seen.mean_slippage_bps = divergence.mean_slippage_bps;
+        if let Some(close) = close {
+            self.mark(close);
+        }
+    }
+
+    /// Marks what is held at the last close, so the drawdown sees an open
+    /// loss and not only realised ones.
+    fn mark(&mut self, close: f64) {
+        let equity = self.starting_cash + self.realised + self.quantity * (close - self.entry);
+        self.peak = self.peak.max(equity);
+        if self.starting_cash > 0.0 {
+            self.seen.drawdown = self.seen.drawdown.max((self.peak - equity) / self.starting_cash);
+        }
+    }
+
+    /// The verdict, when it changed.
+    fn judge(&mut self) -> Option<&Live> {
+        let now = self.expected.as_ref().map_or(Live::Inconclusive, |expected| judge(expected, &self.seen));
+        if now == self.verdict {
+            return None;
+        }
+        self.verdict = now;
+        Some(&self.verdict)
+    }
 }
 
 /// Tells whoever is listening what state a session is in now. A send with
@@ -946,6 +1123,57 @@ mod tests {
         sessions.stop(&started.id).expect("joins");
         let refused = sessions.halt(&started.id, "").expect_err("not running");
         assert!(refused.contains("nothing to halt"), "{refused}");
+    }
+
+    #[test]
+    fn the_watch_builds_round_trips_from_fills_and_marks_the_open_loss() {
+        use arvo_execution::{OrderId, Side};
+        use arvo_research::live::Reason;
+        let at = chrono::NaiveDate::from_ymd_opt(2026, 9, 21).unwrap().and_hms_opt(14, 0, 0).unwrap();
+        let fill = |order: &str, side: Side, quantity: f64, price: f64| Execution {
+            order: OrderId(order.to_owned()),
+            instrument: "AAPL.AIEX".to_owned(),
+            side,
+            proposer: "shadow:test".to_owned(),
+            quantity,
+            decision_price: price,
+            fill_price: price,
+            decision_at: at,
+            filled_at: at,
+        };
+        let expected = Expectation {
+            trades: 40,
+            expectancy: 10.0,
+            deviation: 4.0,
+            max_drawdown: 0.05,
+            entries_per_bar: 0.05,
+            regimes: ["ranging".to_owned()].into_iter().collect(),
+            slippage_bps: 5.0,
+        };
+        let mut watch = Watch::new(Some(expected), 10_000.0);
+        assert!(watch.judge().is_none(), "inconclusive is where it starts, so nothing changed");
+
+        watch.entered("a".to_owned(), Some("ranging".to_owned()));
+        watch.entered("b".to_owned(), Some("trending up".to_owned()));
+        let mut fills = vec![fill("a", Side::Buy, 10.0, 100.0)];
+        watch.settle(&fills, &Divergence::of(&fills, 0, Some(5.0)), Some(100.0));
+        assert_eq!(watch.seen.entries, vec![Some("ranging".to_owned())]);
+        assert!(watch.seen.pnls.is_empty(), "still open");
+
+        // The open position falls 8% of the account before it is sold: the
+        // drawdown sees it while it is open, and that alone is a verdict.
+        watch.bar(20.0);
+        assert!(watch.seen.drawdown > 0.079, "{}", watch.seen.drawdown);
+        assert!(matches!(watch.judge(), Some(Live::Diverging(Reason::Drawdown { .. }))));
+
+        fills.push(fill("x", Side::Sell, 10.0, 90.0));
+        fills.push(fill("b", Side::Buy, 5.0, 50.0));
+        fills.push(fill("y", Side::Sell, 5.0, 52.0));
+        watch.settle(&fills, &Divergence::of(&fills, 0, Some(5.0)), Some(52.0));
+        assert_eq!(watch.seen.pnls, vec![-100.0, 10.0]);
+        assert_eq!(watch.seen.entries, vec![Some("ranging".to_owned()), Some("trending up".to_owned())]);
+        assert_eq!(watch.seen.fills, 4);
+        assert!(watch.judge().is_none(), "still diverging on the drawdown; no change to announce");
     }
 
     #[test]

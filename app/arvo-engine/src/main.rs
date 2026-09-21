@@ -175,7 +175,7 @@ async fn session_command(args: &[String]) -> Result<(), String> {
     }
     let show = |status: &SessionStatus| {
         println!(
-            "{}  {}  {} {}  signals {}  submitted {}  refused {}  fills {}{}{}{}{}",
+            "{}  {}  {} {}  signals {}  submitted {}  refused {}  fills {}  {}{}{}{}{}",
             status.id,
             status.state,
             status.instrument,
@@ -184,6 +184,10 @@ async fn session_command(args: &[String]) -> Result<(), String> {
             status.submitted,
             status.refused,
             status.fills,
+            match status.verdict_reason.as_ref() {
+                Some(why) => format!("{} ({why})", status.verdict),
+                None => status.verdict.clone(),
+            },
             status.last_bar.as_ref().map_or(String::new(), |at| format!("  last bar {at}")),
             status.halted.as_ref().map_or(String::new(), |why| format!("  HALTED: {why}")),
             status.frozen.as_ref().map_or(String::new(), |why| {
