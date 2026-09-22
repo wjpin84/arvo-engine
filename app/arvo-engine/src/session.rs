@@ -552,7 +552,7 @@ fn run(
     mailbox: &Mailbox,
     events: &broadcast::Sender<EventView>,
 ) -> Result<(), String> {
-    let store = EvidenceStore::new(&data.join("evidence"));
+    let store = EvidenceStore::new(data.join("evidence"));
     let (mut experiment, expected) = experiment_of(&store, finding)?;
     if experiment.instruments().len() != 1 {
         return Err("a session runs one instrument; a book is not hosted yet".to_owned());
@@ -582,7 +582,7 @@ fn run(
         .map_err(|err| err.to_string())?;
 
     let record = Recorder::open(data, &format!("{finding}@{executor}"))?;
-    let library = CsvBars::new(&data.join("data"));
+    let library = CsvBars::new(data.join("data"));
     let last_in_library = library
         .bars(&instrument, experiment.interval, experiment.window.from, today)
         .map_err(|err| err.to_string())?
@@ -677,6 +677,7 @@ async fn drive<E: Executor>(
     events: &broadcast::Sender<EventView>,
 ) -> Result<(), String> {
     let now = || chrono::Utc::now().naive_utc();
+    let started = now();
     let mut watch = Watch::new(expected, experiment.starting_cash);
     let instrument = experiment.instrument.clone();
     let proposer = format!("shadow:{}", experiment.strategy.name);
@@ -858,7 +859,14 @@ async fn drive<E: Executor>(
                 // The bar's instant and the signal's place in it: unique in
                 // the record, and readable back to the bar without a lookup.
                 let id = format!("{}#{n}", bar.at);
-                act(&mut session, &mut watch, &id, signal, &proposer, now(), frozen.is_some(), record, status).await?;
+                let held = if frozen.is_some() {
+                    Some("frozen: the book disagrees with the venue; reconcile and resume")
+                } else if caught_up(bar.at, experiment.interval.duration(), started) {
+                    Some("catch-up: the bar closed before this session started; the rule is warmed on it, not traded")
+                } else {
+                    None
+                };
+                act(&mut session, &mut watch, &id, signal, &proposer, now(), held, record, status).await?;
             }
             if killed {
                 // Already halted by hand; the loop stays up to book the exits.
@@ -942,8 +950,19 @@ async fn pause(stop: &AtomicBool, mailbox: &Mailbox) {
     }
 }
 
-/// One signal, to the gate or to the venue. While `frozen`, an entry is
-/// refused before it reaches the gate; an exit is never refused.
+/// Whether a bar closed before the session started (#224). The shadow is
+/// warmed on such a bar so the rule stands where it would have, and its
+/// signals are on the record, but nothing is traded on it: a session that
+/// started at 14:11 must not send yesterday's 13:45 entry to today's market,
+/// which it did on 2026-09-22 at 108 bps of slippage.
+fn caught_up(bar_at: chrono::NaiveDateTime, interval: chrono::Duration, started: chrono::NaiveDateTime) -> bool {
+    bar_at + interval <= started
+}
+
+/// One signal, to the gate or to the venue. With `held` set, an entry is
+/// refused before it reaches the gate, for that reason: the session is
+/// frozen, or the bar is one it caught up on (#224). An exit is never
+/// refused.
 #[expect(clippy::too_many_arguments, reason = "one call site; a struct would only rename the arguments")]
 async fn act<E: Executor>(
     session: &mut Session<E>,
@@ -952,7 +971,7 @@ async fn act<E: Executor>(
     signal: &Signal,
     proposer: &str,
     now: chrono::NaiveDateTime,
-    frozen: bool,
+    held: Option<&str>,
     record: &Recorder,
     status: &Mutex<Status>,
 ) -> Result<(), String> {
@@ -986,8 +1005,8 @@ async fn act<E: Executor>(
         record.write("ignored", Some(serde_json::json!({ "signal": id, "why": "a sell to open is not hosted" })));
         return Ok(());
     }
-    if frozen {
-        record.write("refused", Some(serde_json::json!({ "signal": id, "why": "frozen: the book disagrees with the venue; reconcile and resume" })));
+    if let Some(why) = held {
+        record.write("refused", Some(serde_json::json!({ "signal": id, "why": why })));
         status.lock().unwrap_or_else(std::sync::PoisonError::into_inner).refused += 1;
         return Ok(());
     }
@@ -1291,6 +1310,19 @@ impl Recorder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_bar_that_closed_before_the_session_started_is_caught_up_not_traded() {
+        let five = chrono::Duration::minutes(5);
+        let started = "2026-09-22T14:11:30".parse().expect("time");
+        let at = |text: &str| text.parse().expect("time");
+        // Yesterday's entry bar, and this morning's bars before the start.
+        assert!(caught_up(at("2026-09-21T13:45:00"), five, started));
+        assert!(caught_up(at("2026-09-22T14:05:00"), five, started));
+        // The bar open at the start closes after it: live.
+        assert!(!caught_up(at("2026-09-22T14:10:00"), five, started));
+        assert!(!caught_up(at("2026-09-22T14:15:00"), five, started));
+    }
 
     #[test]
     fn an_unknown_executor_is_refused_before_a_thread_starts() {
