@@ -72,7 +72,11 @@ pub struct SessionReview {
     pub instrument: String,
     pub bars: u32,
     pub signals: u32,
+    /// Entries and exits that went to the venue.
     pub submitted: u32,
+    /// Orders that ended at the venue without a fill (#231).
+    #[serde(default)]
+    pub unfilled: u32,
     /// Refusals by the gate's reason.
     pub refused: BTreeMap<String, u32>,
     /// Exits by reason.
@@ -217,7 +221,16 @@ pub fn review_record(id: &str, record: &str, day: NaiveDate) -> Option<SessionRe
             "signal" if today => out.signals += 1,
             "submitted" if today => out.submitted += 1,
             "refused" if today => *out.refused.entry(reason_of(&text(&line.detail, "why"))).or_default() += 1,
-            "exit" if today => *out.exits.entry(text(&line.detail, "why")).or_default() += 1,
+            "exit" if today => {
+                *out.exits.entry(text(&line.detail, "why")).or_default() += 1;
+                // An exit that carried an order went to the venue (#231).
+                if line.detail.get("order").is_some_and(|order| !order.is_null()) {
+                    out.submitted += 1;
+                }
+            }
+            "unfilled" if today => {
+                out.unfilled += line.detail.get("count").and_then(serde_json::Value::as_u64).and_then(|n| u32::try_from(n).ok()).unwrap_or(0);
+            }
             "filled" => {
                 let side = text(&line.detail, "side");
                 let quantity = number(&line.detail, "quantity").unwrap_or_default();
@@ -396,6 +409,9 @@ pub fn markdown(review: &Review) -> String {
         if !session.exits.is_empty() {
             let _ = writeln!(out, "Exits: {}.", session.exits.iter().map(|(why, n)| format!("{why} ×{n}")).collect::<Vec<_>>().join(", "));
         }
+        if session.unfilled > 0 {
+            let _ = writeln!(out, "Unfilled: {} order(s) ended at the venue without a fill.", session.unfilled);
+        }
         if !session.round_trips.is_empty() {
             let _ = writeln!(out, "\n| opened | closed | qty | entry | exit | pnl | rule | regime | exit |\n|---|---|---|---|---|---|---|---|---|");
             for trip in &session.round_trips {
@@ -493,6 +509,7 @@ mod tests {
             line("2026-09-21T13:35:00Z", "bar", serde_json::json!({ "at": "2026-09-21T13:30:00" })),
             line("2026-09-21T13:36:00Z", "signal", serde_json::json!({ "id": "x1", "exit": "stop" })),
             line("2026-09-21T13:36:00Z", "exit", serde_json::json!({ "signal": "x1", "why": "stop", "order": "o2" })),
+            line("2026-09-21T13:37:00Z", "unfilled", serde_json::json!({ "count": 1, "why": "ended at the venue without a fill" })),
             line("2026-09-21T13:36:03Z", "filled", serde_json::json!({ "order": "o2", "instrument": "AAPL.AIEX", "side": "sell", "quantity": 10.0, "decision_price": 98.0, "fill_price": 97.9, "decision_at": "2026-09-21T13:36:00", "filled_at": "2026-09-21T13:36:03" })),
             line("2026-09-21T14:00:00Z", "signal", serde_json::json!({ "id": "s2", "rule": "close above the opening range", "regime": "trending up" })),
             line("2026-09-21T14:00:00Z", "refused", serde_json::json!({ "signal": "s2", "why": "Stale { age_ms: 900, limit_ms: 500 }" })),
@@ -515,7 +532,9 @@ mod tests {
         let day = NaiveDate::from_ymd_opt(2026, 9, 21).unwrap();
         let reviewed = review_record("f@alpaca-paper", &record(), day).expect("something happened");
         assert_eq!(reviewed.instrument, "AAPL.AIEX");
-        assert_eq!((reviewed.bars, reviewed.signals, reviewed.submitted), (1, 4, 1));
+        // The entry and both exits carried orders to the venue (#231).
+        assert_eq!((reviewed.bars, reviewed.signals, reviewed.submitted), (1, 4, 3));
+        assert_eq!(reviewed.unfilled, 1);
         assert_eq!(reviewed.refused.get("Stale"), Some(&1));
         assert_eq!(reviewed.exits.get("stop"), Some(&1));
         assert_eq!(reviewed.fills.len(), 3, "the day's fills only");

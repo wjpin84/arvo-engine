@@ -406,6 +406,10 @@ pub struct Session<E: Executor> {
     executor: E,
     executions: Vec<Execution>,
     unfilled: usize,
+    /// Orders sent, and orders that ended at the venue without a fill, as of
+    /// the last settle (#231).
+    sent: usize,
+    gone: usize,
     /// Refusals, kept rather than logged. A pipeline refused for staleness
     /// nine times in ten has a latency problem, and one refused on the daily
     /// limit had a bad day; those want different responses.
@@ -421,6 +425,8 @@ impl<E: Executor> Session<E> {
             executor,
             executions: Vec::new(),
             unfilled: 0,
+            sent: 0,
+            gone: 0,
             refusals: Vec::new(),
             assumed_slippage_bps: None,
         }
@@ -492,7 +498,7 @@ impl<E: Executor> Session<E> {
                     decision_at: proposal.signalled_at,
                     proposer: proposal.proposer.clone(),
                 };
-                self.executor.submit(&order).await.map(Some)
+                self.send(&order).await
             }
         }
     }
@@ -510,6 +516,11 @@ impl<E: Executor> Session<E> {
     pub async fn settle(&mut self) -> Result<usize, ExecutionError> {
         let (executions, outstanding) = self.executor.drain().await?;
         self.unfilled = outstanding;
+        // What was sent and is neither filled nor still working is over
+        // without a fill: cancelled, rejected or expired (#231). The venue
+        // never says which in one word; the count is here and the record
+        // says when.
+        self.gone = self.sent.saturating_sub(self.executions.len() + executions.len() + outstanding);
 
         let settled = executions.len();
         for execution in executions {
@@ -540,6 +551,23 @@ impl<E: Executor> Session<E> {
             self.executions.push(execution);
         }
         Ok(settled)
+    }
+
+    /// Sends an order the gate approved, or an exit (which asks nobody), and
+    /// counts it so [`Self::gone`] can say what never filled.
+    async fn send(&mut self, order: &Order) -> Result<Option<OrderId>, ExecutionError> {
+        let id = self.executor.submit(order).await?;
+        self.sent += 1;
+        Ok(Some(id))
+    }
+
+    /// Orders this session sent that ended at the venue without a fill, as of
+    /// the last [`Self::settle`] (#231). An exit stamped with its bar's time
+    /// went stale at once and was cancelled by the next poll, twice in one
+    /// day, and nothing counted it; this does.
+    #[must_use]
+    pub fn gone(&self) -> usize {
+        self.gone
     }
 
     /// Marks the account to market, which is what the drawdown halt watches.
@@ -588,7 +616,7 @@ impl<E: Executor> Session<E> {
             decision_at: at,
             proposer: "exit".to_owned(),
         };
-        self.executor.submit(&order).await.map(Some)
+        self.send(&order).await
     }
 
     /// Squares this session against what the venue already has.
@@ -814,7 +842,7 @@ impl<E: Executor> Session<E> {
     /// What this session measured that a backtest could not.
     #[must_use]
     pub fn divergence(&self) -> Divergence {
-        Divergence::of(&self.executions, self.unfilled, self.assumed_slippage_bps)
+        Divergence::of(&self.executions, self.unfilled + self.gone, self.assumed_slippage_bps)
     }
 
     #[must_use]

@@ -214,6 +214,29 @@ fn stocked(state: VenueState, immovable: Vec<&'static str>) -> Session<Stocked> 
     )
 }
 
+#[tokio::test]
+async fn an_order_that_ends_without_a_fill_is_counted_as_gone() {
+    let mut session = stocked(VenueState::default(), vec![]);
+    let now = day().and_time(NaiveTime::from_hms_opt(14, 0, 0).expect("valid"));
+    let proposal = Proposal {
+        instrument: "AAPL.X".to_owned(),
+        proposer: "test".to_owned(),
+        signalled_at: now,
+        reference_price: 100.0,
+        stop_distance: Some(1.0),
+        desired_quantity: Some(10.0),
+        opens_short: false,
+    };
+    let sent = session.propose(&proposal, now, None).await.expect("venue up");
+    assert!(sent.is_some(), "{:?}", session.refusals());
+    assert_eq!(session.gone(), 0, "nothing is gone until the venue has answered");
+    // The venue lists nothing filled and nothing working: the order is over.
+    session.settle().await.expect("venue up");
+    assert_eq!(session.gone(), 1);
+    assert_eq!(session.divergence().unfilled, 1);
+    assert!(session.executions().is_empty());
+}
+
 fn holding(symbol: &str, quantity: f64) -> Holding {
     Holding {
         symbol: symbol.to_owned(),

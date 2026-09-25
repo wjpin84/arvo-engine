@@ -679,6 +679,7 @@ async fn drive<E: Executor>(
     let now = || chrono::Utc::now().naive_utc();
     let started = now();
     let mut watch = Watch::new(expected, experiment.starting_cash);
+    let mut seen_gone = 0usize;
     let instrument = experiment.instrument.clone();
     let proposer = format!("shadow:{}", experiment.strategy.name);
     // The source that serves the bars says what the instrument is — its
@@ -897,6 +898,16 @@ async fn drive<E: Executor>(
                     trouble(status, record, events, "settle_failed", &err);
                 }
             }
+            let gone = session.gone();
+            if gone > seen_gone {
+                // An order that ended without a fill is on the record (#231),
+                // so a sell that never happened is not a silence.
+                record.write("unfilled", Some(serde_json::json!({
+                    "count": gone - seen_gone,
+                    "why": "ended at the venue without a fill: cancelled, rejected or expired",
+                })));
+                seen_gone = gone;
+            }
             let divergence = session.divergence();
             watch.settle(session.executions(), &divergence, last_close);
             if divergence.fills > 0 {
@@ -989,8 +1000,12 @@ async fn act<E: Executor>(
     })));
     if let Some(why) = &signal.exit {
         // Exits do not ask the gate (ADR-0009).
+        // Stamped now, as an entry is: the stale rule measures from the
+        // decision, and a bar is stamped at its open, so an exit carrying its
+        // bar's time was five minutes old when sent and the next poll
+        // cancelled it (#231). The bar's time is on the `signal` event above.
         let sent = session
-            .close(&signal.instrument, signal.reference_price, signal.signalled_at)
+            .close(&signal.instrument, signal.reference_price, now)
             .await
             .map_err(|err| err.to_string())?;
         record.write("exit", Some(serde_json::json!({ "signal": id, "why": why, "order": sent.as_ref().map(ToString::to_string) })));
