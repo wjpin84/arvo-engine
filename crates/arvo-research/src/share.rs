@@ -164,6 +164,8 @@ pub fn export(record: &Record) -> Result<SharedExperiment, ShareError> {
         version: VERSION,
         hypothesis: found.hypothesis.clone(),
         strategy: StrategySpec {
+            // A rule written as data travels with every trial (#225).
+            rule: template.strategy.rule.clone(),
             name: template.strategy.name.clone(),
             params: fixed,
         },
@@ -213,7 +215,9 @@ pub fn import(text: &str, known: &[&str]) -> Result<SharedExperiment, ShareError
     let shared: SharedExperiment =
         serde_json::from_value(value).map_err(|err| ShareError::Invalid(err.to_string()))?;
 
-    if !known.contains(&shared.strategy.name.as_str()) {
+    // A rule written as data (#225) travels inside the experiment and needs
+    // no name in the library.
+    if shared.strategy.rule.is_none() && !known.contains(&shared.strategy.name.as_str()) {
         return Err(ShareError::UnknownStrategy {
             name: shared.strategy.name,
             known: known.join(", "),

@@ -322,6 +322,7 @@ pub fn template_for(
             adjustment,
         },
         strategy: StrategySpec {
+            rule: plan.definition().cloned(),
             // The engine's rule, not the picker's name: a contributed
             // document (#162) searches one of Arvo's rules under its own
             // name, and a finding has to record what ran so it can be

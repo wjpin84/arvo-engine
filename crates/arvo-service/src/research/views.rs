@@ -1146,6 +1146,7 @@ mod member_tests {
                 adjustment: arvo_data::source::Adjustment::Split,
             },
             strategy: arvo_research::StrategySpec {
+                rule: None,
                 name: "sma_cross".to_owned(),
                 params: std::collections::BTreeMap::new(),
             },

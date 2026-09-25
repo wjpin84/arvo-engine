@@ -28,3 +28,5 @@ ustr = "1.1.0"
 # The dividend path is only exercisable against a real library on disk:
 # `InMemoryBars` has no distribution series and reports so.
 tempfile = "3.27.0"
+# The ledger-equality test for a rule written as data (#225) compares JSON.
+serde_json = "1"

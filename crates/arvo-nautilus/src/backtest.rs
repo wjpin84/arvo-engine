@@ -466,6 +466,14 @@ fn add_each(
         });
 
         match *plan {
+            Plan::Data { ref rule, .. } => engine.add_strategy(strategy::DataRule::new(
+                core,
+                bar_type,
+                trade_size,
+                rule.as_ref().clone(),
+                risk.clone(),
+                correlations.clone(),
+            )),
             Plan::SmaCross {
                 fast_period,
                 slow_period,

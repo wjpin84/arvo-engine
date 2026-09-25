@@ -19,6 +19,7 @@ pub mod project;
 pub mod research;
 pub mod review;
 pub mod risk;
+pub mod rules;
 pub mod rulesets;
 pub mod scripts;
 pub mod source;

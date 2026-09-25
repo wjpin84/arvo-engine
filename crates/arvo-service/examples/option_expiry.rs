@@ -62,6 +62,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             adjustment: arvo_data::source::Adjustment::Split,
         },
         strategy: StrategySpec {
+            rule: None,
             name: strategy.to_owned(),
             params: [("trade_size".to_owned(), 100.0)].into_iter().collect(),
         },

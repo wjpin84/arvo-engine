@@ -62,6 +62,7 @@ fn study(recorded: &[f64], trades: u32) -> Record {
             adjustment: arvo_data::source::Adjustment::Split,
         },
         strategy: StrategySpec {
+            rule: None,
             name: "sma_cross".to_owned(),
             params: std::collections::BTreeMap::new(),
         },

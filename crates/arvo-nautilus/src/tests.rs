@@ -115,6 +115,7 @@ fn experiment(params: BTreeMap<String, f64>, bars: &[arvo_data::Bar]) -> Experim
             adjustment: arvo_data::source::Adjustment::Split,
         },
         strategy: StrategySpec {
+            rule: None,
             name: SMA_CROSS.to_owned(),
             params,
         },
@@ -333,6 +334,45 @@ fn a_ranking_rule_over_one_instrument_is_a_field_of_one() {
     );
 }
 
+/// The compiled control, written down (#225).
+const TWIN_CROSS: &str = r#"{
+  "name": "twin_cross",
+  "label": "Moving-average crossover, as data",
+  "premise": "The control, written down instead of compiled.",
+  "interval": { "step": 1, "unit": "day" },
+  "params": { "fast": 10, "slow": 30 },
+  "indicators": {
+    "fast": { "kind": "SMA", "period": "fast" },
+    "slow": { "kind": "SMA", "period": "slow" }
+  },
+  "entry": { "cross_above": [ { "var": "fast" }, { "var": "slow" } ] },
+  "exit":  { "cross_below": [ { "var": "fast" }, { "var": "slow" } ] }
+}"#;
+
+#[test]
+fn a_rule_written_as_data_reproduces_the_compiled_control_to_the_cent() {
+    let bars = sawtooth(200);
+    let compiled = experiment(params(10.0, 30.0), &bars);
+    let mut twin = experiment(params(10.0, 30.0), &bars);
+    twin.strategy.name = "twin_cross".to_owned();
+    twin.strategy.rule = Some(serde_json::from_str(TWIN_CROSS).expect("the documented shape parses"));
+
+    let control = provider(bars.clone()).run(&compiled).expect("the control runs");
+    let data = provider(bars).run(&twin).expect("the data rule runs");
+
+    assert!(control.trades > 0, "a crossing path should trade");
+    assert_eq!(data.trades, control.trades);
+    assert_eq!(data.equity_curve.len(), control.equity_curve.len());
+    for (theirs, ours) in control.equity_curve.iter().zip(&data.equity_curve) {
+        assert!((theirs.equity - ours.equity).abs() < 1e-9, "{} vs {} at {:?}", theirs.equity, ours.equity, theirs.at);
+    }
+    assert_eq!(
+        serde_json::to_value(&data.ledger).expect("json"),
+        serde_json::to_value(&control.ledger).expect("json"),
+        "every fill, and every journal line, the same"
+    );
+}
+
 #[test]
 fn an_experiment_runs_end_to_end_through_nautilus() {
     let bars = sawtooth(200);
@@ -402,7 +442,7 @@ fn a_shadow_signals_every_entry_the_backtest_took() {
         .expect("the shadow should start");
     let mut signals = Vec::new();
     for bar in live {
-        signals.extend(shadow.push(&[("AAPL.NASDAQ".to_owned(), bar.clone())]).expect("push"));
+        signals.extend(shadow.push(&[("AAPL.NASDAQ".to_owned(), *bar)]).expect("push"));
     }
 
     // A fill lands at the next bar's open (ADR-0010), so the backtest's entry
@@ -438,6 +478,7 @@ fn every_advertised_strategy_can_actually_be_planned() {
     let intraday = arvo_data::BarInterval::new(5, arvo_data::IntervalUnit::Minute);
     for name in STRATEGIES {
         let spec = StrategySpec {
+            rule: None,
             name: (*name).to_owned(),
             params: BTreeMap::from([
                 ("fast".to_owned(), 5.0),

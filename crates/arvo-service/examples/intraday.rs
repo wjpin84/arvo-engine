@@ -88,6 +88,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             adjustment: arvo_service::source::adjustment_across([instrument.as_str()]),
         },
         strategy: StrategySpec {
+            rule: None,
             name: strategy.clone(),
             // Every rule's parameters at once. A strategy takes the ones it
             // names and ignores the rest, so one example can drive all of

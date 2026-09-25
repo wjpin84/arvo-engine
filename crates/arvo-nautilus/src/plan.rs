@@ -13,6 +13,11 @@ use crate::{
 /// A strategy request, parsed out of the untyped spec and validated before
 /// anything expensive starts.
 pub(crate) enum Plan {
+    /// A rule written as data (#225), resolved against the spec's params.
+    Data {
+        rule: Box<arvo_research::rule::Resolved>,
+        trade_size: f64,
+    },
     SmaCross {
         fast_period: usize,
         slow_period: usize,
@@ -104,6 +109,20 @@ impl Plan {
             }
             Ok(value)
         };
+
+        // A rule written as data carries its definition; the name is its own.
+        if let Some(definition) = &spec.rule {
+            let resolved = definition
+                .resolve(&spec.params)
+                .map_err(|err| SimulationError::Rejected(err.to_string()))?;
+            if resolved.interval != interval {
+                return Err(SimulationError::Rejected(format!(
+                    "{} is defined at {}, and the run says {interval}",
+                    resolved.name, resolved.interval
+                )));
+            }
+            return Ok(Self::Data { rule: Box::new(resolved), trade_size: trade_size()? });
+        }
 
         if SESSION_ANCHORED.contains(&spec.name.as_str()) && !interval.is_intraday() {
             return Err(SimulationError::Rejected(format!(
@@ -310,8 +329,9 @@ impl Plan {
     }
 
     /// Bars needed before the strategy can act at all.
-    pub(crate) const fn min_bars(&self) -> usize {
+    pub(crate) fn min_bars(&self) -> usize {
         match self {
+            Self::Data { rule, .. } => rule.min_bars(),
             Self::SmaCross { slow_period, .. } => *slow_period,
             // The range itself. A window that only covers the range has not
             // given the rule a single bar to break out on.
@@ -335,7 +355,8 @@ impl Plan {
 
     pub(crate) const fn trade_size(&self) -> f64 {
         match self {
-            Self::SmaCross { trade_size, .. }
+            Self::Data { trade_size, .. }
+            | Self::SmaCross { trade_size, .. }
             | Self::OpeningRange { trade_size, .. }
             | Self::VolatilityBreakout { trade_size, .. }
             | Self::VwapReversion { trade_size, .. }

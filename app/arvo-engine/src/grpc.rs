@@ -1203,7 +1203,11 @@ fn reported_from(request: &ReportRequest) -> Result<(arvo_research::Reported, St
         window,
         interval,
         dataset,
-        strategy: StrategySpec { name: strategy, params: request.params.iter().map(|(k, v)| (k.clone(), *v)).collect() },
+        strategy: StrategySpec {
+            rule: arvo_service::research::StrategyPlan::find(&strategy).and_then(|plan| plan.definition().cloned()),
+            name: strategy,
+            params: request.params.iter().map(|(k, v)| (k.clone(), *v)).collect(),
+        },
         costs: {
             // The three the wire carries; the rest are what a run assumes
             // when it says nothing, exactly as a study's would.

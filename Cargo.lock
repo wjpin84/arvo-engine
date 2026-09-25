@@ -230,6 +230,7 @@ dependencies = [
  "nautilus-model",
  "nautilus-trading",
  "rust_decimal",
+ "serde_json",
  "tempfile",
  "thiserror",
  "ustr",

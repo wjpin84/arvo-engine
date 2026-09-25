@@ -757,6 +757,7 @@ pub fn benchmark_for(experiment: &Experiment) -> Experiment {
     Experiment {
         id: ExperimentId(format!("{}-benchmark", experiment.id)),
         strategy: StrategySpec {
+            rule: None,
             name: BUY_AND_HOLD.to_owned(),
             // Same trade size, so the two curves are the same size of bet and
             // the difference between them is the strategy rather than the
@@ -1039,6 +1040,7 @@ mod tests {
                 adjustment: arvo_data::source::Adjustment::Split,
             },
             strategy: StrategySpec {
+                rule: None,
                 name: "sma_cross".to_owned(),
                 params: BTreeMap::from([("trade_size".to_owned(), 100.0)]),
             },

@@ -325,10 +325,34 @@ impl StrategyPlan {
     /// then what an extension contributed (#162).
     #[must_use]
     pub fn find(name: &str) -> Option<&'static Self> {
-        Self::find_shipped(name).or_else(|| {
-            let table = CONTRIBUTED.lock().ok()?;
-            table.get(name).map(|(_, plan)| *plan)
-        })
+        Self::find_shipped(name)
+            .or_else(|| {
+                let table = CONTRIBUTED.lock().ok()?;
+                table.get(name).map(|(_, plan)| *plan)
+            })
+            .or_else(|| Self::find_rule(name))
+    }
+
+    /// One of the project's rules written as data (#225), by name.
+    #[must_use]
+    pub fn find_rule(name: &str) -> Option<&'static Self> {
+        let table = RULES.lock().ok()?;
+        table.get(name).map(|(_, _, plan)| *plan)
+    }
+
+    /// Every rule the project wrote as data, for the picker.
+    #[must_use]
+    pub fn project_rules() -> Vec<&'static Self> {
+        RULES.lock().map_or_else(|_| Vec::new(), |table| table.values().map(|(_, _, plan)| *plan).collect())
+    }
+
+    /// The definition behind the rule this plan runs, when that rule is data
+    /// (#225): the bare rule's own, or the one a ruleset over it names. What
+    /// the experiment carries so a finding replays without the file.
+    #[must_use]
+    pub fn definition(&self) -> Option<&'static arvo_research::rule::RuleDefinition> {
+        let table = RULES.lock().ok()?;
+        table.get(self.rule()).map(|(_, definition, _)| *definition)
     }
 
     /// Looks up one of Arvo's own, which is what a contributed document has
@@ -344,8 +368,11 @@ impl StrategyPlan {
     /// hold. What a finding is stamped with, and what it is checked against.
     #[must_use]
     pub fn ruleset_version(name: &str) -> Option<String> {
-        let table = CONTRIBUTED.lock().ok()?;
-        table.get(name).map(|(version, _)| version.clone())
+        if let Some(version) = CONTRIBUTED.lock().ok().and_then(|table| table.get(name).map(|(version, _)| version.clone())) {
+            return Some(version);
+        }
+        let table = RULES.lock().ok()?;
+        table.get(name).map(|(version, _, _)| version.clone())
     }
 
     /// Every rule Arvo implements, in menu order.
@@ -357,6 +384,9 @@ impl StrategyPlan {
     /// The resolution this rule is defined at, and so the bars it runs on.
     #[must_use]
     pub fn interval(&self) -> arvo_data::BarInterval {
+        if let Some(definition) = self.definition() {
+            return definition.interval;
+        }
         if self.intraday {
             INTRADAY
         } else {
@@ -436,6 +466,51 @@ impl StrategyPlan {
 static CONTRIBUTED: std::sync::Mutex<BTreeMap<String, (String, &'static StrategyPlan)>> =
     std::sync::Mutex::new(BTreeMap::new());
 
+/// The project's rules written as data (#225), by name: the definition's
+/// version, the definition, and the plan that offers it under its own name.
+static RULES: std::sync::Mutex<
+    BTreeMap<String, (String, &'static arvo_research::rule::RuleDefinition, &'static StrategyPlan)>,
+> = std::sync::Mutex::new(BTreeMap::new());
+
+/// Replaces the project's rules with what its `rules/` folder says now (#225).
+///
+/// Each is offered under its own name with its defaults as the fixed
+/// parameters, plus Arvo's sizing convention when the file does not restate
+/// it, and nothing varied: a study on the bare rule runs its defaults, and a
+/// ruleset over it is where the search is.
+pub fn set_project_rules(definitions: &[arvo_research::rule::RuleDefinition]) {
+    let Ok(mut table) = RULES.lock() else { return };
+    let mut next = BTreeMap::new();
+    for definition in definitions {
+        let version = definition.version();
+        let entry = match table.get(&definition.name) {
+            Some((held, leaked, plan)) if *held == version => (version, *leaked, *plan),
+            _ => {
+                let text = |value: &str| -> &'static str { Box::leak(value.to_owned().into_boxed_str()) };
+                let mut fixed: Vec<(&'static str, f64)> =
+                    definition.params.iter().map(|(name, value)| (text(name), *value)).collect();
+                if !definition.params.contains_key("trade_size") {
+                    fixed.push(("trade_size", TRADE_SIZE));
+                }
+                let leaked: &'static arvo_research::rule::RuleDefinition = Box::leak(Box::new(definition.clone()));
+                let plan: &'static StrategyPlan = Box::leak(Box::new(StrategyPlan {
+                    name: text(&definition.name),
+                    rule: None,
+                    label: text(&definition.label),
+                    premise: text(&definition.premise),
+                    fixed: Box::leak(fixed.into_boxed_slice()),
+                    axes: &[],
+                    intraday: definition.interval.is_intraday(),
+                    options: false,
+                }));
+                (version, leaked, plan)
+            }
+        };
+        next.insert(definition.name.clone(), entry);
+    }
+    *table = next;
+}
+
 /// Whether a contributed document is one this build can put in the picker,
 /// or the reason it is not (#162).
 ///
@@ -456,7 +531,8 @@ pub fn offerable(document: &StrategyDocument) -> Result<&'static StrategyPlan, S
         return Err("a rules strategy: this build can read one but has no runner for it yet (#125)".to_owned());
     };
     let rule = StrategyPlan::find_shipped(&grid.rule)
-        .ok_or_else(|| format!("no rule called {:?}; this build implements {}", grid.rule, shipped_names()))?;
+        .or_else(|| StrategyPlan::find_rule(&grid.rule))
+        .ok_or_else(|| format!("no rule called {:?}; this build implements {}, and the project's rules/ folder may add more", grid.rule, shipped_names()))?;
     if grid.configurations() == 0 {
         return Err("searches nothing: an axis with no values in it".to_owned());
     }
@@ -478,7 +554,7 @@ pub fn offerable(document: &StrategyDocument) -> Result<&'static StrategyPlan, S
         .next()
         .ok_or_else(|| "searches nothing".to_owned())?;
     params.extend(first);
-    let spec = arvo_research::StrategySpec { name: rule.rule().to_owned(), params };
+    let spec = arvo_research::StrategySpec { rule: rule.definition().cloned(), name: rule.rule().to_owned(), params };
     arvo_nautilus::check_plan(&spec, rule.interval())
         .map_err(|err| format!("the engine will not run it: {err}"))?;
     Ok(rule)
@@ -583,6 +659,7 @@ pub fn offered() -> Vec<&'static StrategyPlan> {
     if let Ok(table) = CONTRIBUTED.lock() {
         all.extend(table.values().map(|(_, plan)| *plan));
     }
+    all.extend(StrategyPlan::project_rules());
     all
 }
 

@@ -89,6 +89,11 @@ pub struct DatasetRef {
 pub struct StrategySpec {
     pub name: String,
     pub params: BTreeMap<String, f64>,
+    /// The rule as data when `name` is one (#225), so a finding on it
+    /// replays without the file. `None` for a rule compiled into the engine.
+    /// `default` because this is a persisted format.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule: Option<crate::rule::RuleDefinition>,
 }
 
 /// A closed date range, inclusive at both ends.

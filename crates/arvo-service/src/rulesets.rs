@@ -90,6 +90,8 @@ pub fn read_one(path: &Path) -> Result<StrategyDocument, String> {
 /// Always for a root the caller names: an engine runs over the folder it
 /// was given, never over whichever one the app data happens to remember.
 pub fn refresh_at(root: &Path) {
+    // Rules first: a ruleset may name one (#225).
+    crate::rules::refresh_at(root);
     let mut documents = crate::extensions::contributed();
     documents.extend(
         read_all(root)
@@ -134,6 +136,7 @@ pub fn write(
         return Err(format!("{name:?} is one of Arvo's own names; choose another"));
     }
     let plan = StrategyPlan::find_shipped(rule)
+        .or_else(|| StrategyPlan::find_rule(rule))
         .ok_or_else(|| format!("no rule called {rule:?}; list_strategies says what there is"))?;
     let mut document = template(plan, name);
     if let Some(label) = label {
@@ -233,6 +236,7 @@ pub fn write_form(root: &Path, form: RulesetForm) -> Result<Ruleset, String> {
 pub fn list_rules() -> Vec<Rule> {
     StrategyPlan::shipped()
         .iter()
+        .chain(StrategyPlan::project_rules())
         .map(|plan| Rule {
             name: plan.name().to_owned(),
             label: plan.label.to_owned(),

@@ -39,6 +39,7 @@
 //! never sees the type.
 
 mod cross_sectional;
+mod data_rule;
 mod indicator;
 mod breakout;
 mod put_spread;
@@ -52,6 +53,7 @@ use nautilus_model::{data::Bar, enums::OrderSide, identifiers::InstrumentId, typ
 use nautilus_trading::strategy::{Strategy, StrategyNative};
 
 pub(crate) use cross_sectional::CrossSectionalMomentum;
+pub(crate) use data_rule::DataRule;
 pub(crate) use breakout::{Rule as BreakoutRule, ZeroDteBreakout};
 pub(crate) use put_spread::{PutSpread, Rule as PutSpreadRule};
 pub(crate) use rules::{
@@ -79,15 +81,20 @@ pub(crate) const ENTRY_REGIME: &str = "arvo:regime=";
 pub(crate) const ENTRY_ASKED: &str = "arvo:asked=";
 
 /// The condition that fired and the value it was judged on.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Trigger {
-    pub rule: &'static str,
+    pub rule: std::borrow::Cow<'static, str>,
     pub signal: f64,
 }
 
 impl Trigger {
     pub(crate) const fn new(rule: &'static str, signal: f64) -> Self {
-        Self { rule, signal }
+        Self { rule: std::borrow::Cow::Borrowed(rule), signal }
+    }
+
+    /// A rule written as data (#225) names its own trigger.
+    pub(crate) fn named(rule: String, signal: f64) -> Self {
+        Self { rule: std::borrow::Cow::Owned(rule), signal }
     }
 
     /// The tags an entry order carries for it, plus the regime and the ask.

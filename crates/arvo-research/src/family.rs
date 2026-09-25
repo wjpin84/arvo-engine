@@ -579,6 +579,8 @@ fn variant(
         id: ExperimentId(format!("{}-{phase}-{signature}", template.id)),
         window,
         strategy: StrategySpec {
+            // A rule written as data travels with every trial (#225).
+            rule: template.strategy.rule.clone(),
             name: template.strategy.name.clone(),
             params: merged,
         },

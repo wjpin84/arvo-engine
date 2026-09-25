@@ -36,6 +36,7 @@ mod experiment;
 pub mod family;
 pub mod greeks;
 pub mod live;
+pub mod rule;
 pub mod memory;
 pub mod overnight;
 pub mod panel;

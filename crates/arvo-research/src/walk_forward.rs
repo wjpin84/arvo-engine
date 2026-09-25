@@ -687,6 +687,7 @@ mod tests {
                 adjustment: arvo_data::source::Adjustment::Split,
             },
             strategy: crate::StrategySpec {
+                rule: None,
                 name: "sma_cross".to_owned(),
                 params: BTreeMap::new(),
             },
