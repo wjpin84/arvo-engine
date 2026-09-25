@@ -112,6 +112,8 @@ fn study(recorded: &[f64], trades: u32) -> Record {
         reasons: Vec::new(),
     
         under_conservative_costs: None,
+    
+        conservative: None,
     }))
 }
 

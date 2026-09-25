@@ -35,7 +35,8 @@ const USAGE: &str = "usage:
   arvo-engine [<data-dir>] session stop|reconcile|resume <id>
   arvo-engine [<data-dir>] session halt <id>|--all [reason...] the kill switch: arm the gate, flatten, stay halted
   arvo-engine [<data-dir>] session explain <id> <time>        the chain behind every position held then
-  arvo-engine [<data-dir>] review [YYYY-MM-DD]   the review after the close: written under reviews/, and printed";
+  arvo-engine [<data-dir>] review [YYYY-MM-DD]   the review after the close: written under reviews/, and printed
+  arvo-engine [<data-dir>] rank [--rule R] [--instrument I]   the leaderboard: every comparable finding, in the one order";
 
 async fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -51,9 +52,15 @@ async fn run() -> Result<(), String> {
         if verb == "review" && std::path::Path::new(dir).is_dir() {
             return review_command(PathBuf::from(dir), rest);
         }
+        if verb == "rank" && std::path::Path::new(dir).is_dir() {
+            return rank_command(PathBuf::from(dir), rest);
+        }
     }
     if args.first().map(String::as_str) == Some("review") {
         return review_command(research::default_root()?, &args[1..]);
+    }
+    if args.first().map(String::as_str) == Some("rank") {
+        return rank_command(research::default_root()?, &args[1..]);
     }
     // A positional argument is a data directory that exists. Anything else
     // is a mistake to say so about, not a directory to create and serve: an
@@ -155,6 +162,47 @@ async fn run() -> Result<(), String> {
     stopping.stop_all().await;
     discovery::remove_if_ours(&root, pid);
     served.map_err(|err| format!("serving: {err}"))
+}
+
+/// `rank [--rule R] [--instrument I]`: the leaderboard over the findings under
+/// `root`, in the one order (#226). Needs no engine.
+fn rank_command(root: PathBuf, args: &[String]) -> Result<(), String> {
+    let (mut rule, mut instrument) = (None, None);
+    let mut rest = args.iter();
+    while let Some(flag) = rest.next() {
+        match flag.as_str() {
+            "--rule" => rule = rest.next().cloned(),
+            "--instrument" => instrument = rest.next().cloned(),
+            _ => return Err(USAGE.to_owned()),
+        }
+    }
+    let service = arvo_service::research::ResearchService::new(
+        root.join(arvo_service::research::DATA_SUBDIR),
+        root.join(arvo_service::research::EVIDENCE_SUBDIR),
+    );
+    arvo_service::rulesets::refresh_at(&root);
+    let ranking = arvo_service::research::rank::rank(&service, rule.as_deref(), instrument.as_deref()).map_err(|err| err.to_string())?;
+    println!("{:>3}  {:<34} {:<12} {:<24} {:<13} {:<13} {:>10} {:>8} {:>7} {:>6}", "#", "finding", "instrument", "rule", "verdict", "conservative", "expectancy", "return", "dd", "trades");
+    for (n, row) in ranking.rows.iter().enumerate() {
+        println!(
+            "{:>3}  {:<34} {:<12} {:<24} {:<13} {:<13} {:>10} {:>7.1}% {:>6.1}% {:>6}{}",
+            n + 1,
+            row.id,
+            row.subject,
+            row.rule,
+            row.verdict,
+            if row.conservative_verdict.is_empty() { "not measured" } else { &row.conservative_verdict },
+            format!("{:+.2} {}", row.expectancy, if row.expectancy_costs == "conservative" { "c" } else { "s" }),
+            row.total_return * 100.0,
+            row.max_drawdown * 100.0,
+            row.trades,
+            if row.stale == Some(true) { "  stale" } else { "" },
+        );
+    }
+    for note in &ranking.notes {
+        eprintln!("arvo-engine: {note}");
+    }
+    Ok(())
 }
 
 /// `review [YYYY-MM-DD]`: the day's review from the session records under

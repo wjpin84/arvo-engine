@@ -63,7 +63,7 @@ pub use dividend::{measure_dividend_gap, DividendGap};
 pub use evaluation::{
     evaluate_against_benchmark, Evaluation, EvaluationCriteria, Evidence, Metrics, Verdict,
 };
-pub use family::{
+pub use family::{Costed, 
     run_family, ExperimentFamily, FamilyEvidence, ParameterGrid, ScoredTrial, Selection,
 };
 pub use memory::{

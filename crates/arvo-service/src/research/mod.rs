@@ -22,6 +22,7 @@
 
 pub mod data;
 pub mod history;
+pub mod rank;
 pub mod report;
 pub mod staleness;
 pub mod study;

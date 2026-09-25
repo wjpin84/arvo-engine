@@ -1102,6 +1102,8 @@ pub(crate) mod tests {
             reasons: vec!["because".to_owned()],
         
             under_conservative_costs: None,
+        
+            conservative: None,
         }))
     }
 

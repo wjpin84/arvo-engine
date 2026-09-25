@@ -554,6 +554,8 @@ fn with_folds(mut walk: WalkForwardEvidence) -> WalkForwardEvidence {
             reasons: Vec::new(),
         
             under_conservative_costs: None,
+        
+            conservative: None,
         })
         .collect();
     walk

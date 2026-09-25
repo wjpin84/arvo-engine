@@ -36,7 +36,7 @@ use std::time::{Duration, Instant};
 
 use arvo_client::discovery::{self, Discovery};
 use arvo_client::proto::common::Empty;
-use arvo_client::proto::research::{BarsRequest, Finding, FindingId, FindingIds, Param, ReviewRequest, RulesetForm, RunRequest};
+use arvo_client::proto::research::{BarsRequest, Finding, FindingId, FindingIds, Param, RankRequest, ReviewRequest, RulesetForm, RunRequest};
 use arvo_client::proto::services::research_client::ResearchClient;
 use serde_json::{json, Value};
 use tonic::transport::Channel;
@@ -265,6 +265,12 @@ impl Server {
                 let request = self.request(ReviewRequest { day })?;
                 let reviewed = self.runtime.block_on(self.research.view_review(request)).map_err(refused)?;
                 encode(&reviewed.into_inner())
+            }
+            "rank_findings" => {
+                let text = |key: &str| arguments.get(key).and_then(Value::as_str).map(ToOwned::to_owned);
+                let request = self.request(RankRequest { rule: text("rule"), instrument: text("instrument") })?;
+                let ranking = self.runtime.block_on(self.research.rank_findings(request)).map_err(refused)?;
+                encode(&ranking.into_inner())
             }
             "compare_experiments" => {
                 let ids: Vec<String> = match arguments.get("ids") {
@@ -514,6 +520,17 @@ fn tools() -> Value {
             },
         },
         {
+            "name": "rank_findings",
+            "description": "The leaderboard: every comparable finding in the one order Arvo ranks by. Supported under the conservative cost tier first, by mean profit per trade under that tier; then Supported under the stated costs where the conservative tier was never measured; then everything else whatever its return. Ties by drawdown, then trades. Each row: rule, instrument, interval, verdict, conservative verdict, expectancy and which costs it is under, return, drawdown, trades, regimes traded in, search size, whether its data has changed. Filter by rule or instrument.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "rule": { "type": "string", "description": "A rule's name, as findings record it" },
+                    "instrument": { "type": "string", "description": "SYMBOL.VENUE" }
+                }
+            },
+        },
+        {
             "name": "compare_experiments",
             "description": "Two or more findings read against each other: one row each with verdict, return, excess return, Sharpe, drawdown, trades, win rate, and whether its data has changed since; then the comparison's own deflation, because keeping the best of six is a search of size six. Explains why two findings differ without reading their files.",
             "inputSchema": {
@@ -663,6 +680,7 @@ mod tests {
                 "query_market_data",
                 "inspect_regime",
                 "read_review",
+                "rank_findings",
                 "compare_experiments",
                 "run_study",
                 "run_walk_forward"

@@ -195,6 +195,23 @@ pub struct FamilyEvidence {
     /// so the reader can see how far the edge is from the costs.
     #[serde(default)]
     pub under_conservative_costs: Option<Verdict>,
+    /// What the winner did under the conservative tier (#226): the figures
+    /// the leaderboard ranks by, so a finding is ordered by what survives
+    /// the costs and not by what the stated costs let it show. `None` when
+    /// the tier was not asked, and for findings older than this field.
+    #[serde(default)]
+    pub conservative: Option<Costed>,
+}
+
+/// The out-of-sample result under the conservative cost tier (#192, #226).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Costed {
+    pub verdict: Verdict,
+    /// Mean profit per closed out-of-sample trade.
+    pub expectancy: f64,
+    pub total_return: f64,
+    pub max_drawdown: f64,
+    pub trades: u32,
 }
 
 /// Expected maximum of `n` independent draws, given the spread of what was
@@ -494,14 +511,23 @@ fn search(
     // The same winner, the same window, fills that cost more (#192). Asked
     // only of a result that would otherwise be Supported: a result already
     // refused has nothing to lose, and the run is not free.
-    let under_conservative_costs = if survived_deflation && out_of_sample_evidence.evaluation.verdict == Verdict::Supported {
+    let conservative = if survived_deflation && out_of_sample_evidence.evaluation.verdict == Verdict::Supported {
         let mut costly = selected.clone();
         costly.costs = costly.costs.at(arvo_risk::CostTier::Conservative);
         costly.id = crate::ExperimentId(format!("{}-conservative", selected.id));
-        Some(evaluate_against_benchmark(provider, &costly, criteria)?.evaluation.verdict)
+        let costed = evaluate_against_benchmark(provider, &costly, criteria)?.evaluation;
+        let closed: Vec<f64> = costed.strategy_ledger.iter().filter(|trade| trade.closed.is_some()).map(|trade| trade.pnl).collect();
+        Some(Costed {
+            verdict: costed.verdict,
+            expectancy: if closed.is_empty() { 0.0 } else { closed.iter().sum::<f64>() / closed.len() as f64 },
+            total_return: costed.strategy.total_return,
+            max_drawdown: costed.strategy.max_drawdown,
+            trades: costed.strategy.trades,
+        })
     } else {
         None
     };
+    let under_conservative_costs = conservative.as_ref().map(|costed| costed.verdict);
 
     let mut reasons = Vec::new();
     let verdict = if let Some(costly) = under_conservative_costs.filter(|costly| *costly != Verdict::Supported) {
@@ -552,6 +578,7 @@ fn search(
         verdict,
         reasons,
         under_conservative_costs,
+        conservative,
     })
 }
 
@@ -855,12 +882,16 @@ mod tests {
         let thin = run_family(&Costly { edge_bps: 3.0 }, &family, &criteria).expect("runs");
         assert_eq!(thin.out_of_sample_evidence.evaluation.verdict, Verdict::Supported, "under the stated costs");
         assert_eq!(thin.under_conservative_costs, Some(Verdict::NotSupported));
+        // The costed figures are what the leaderboard ranks by (#226). The fixture provider
+        // fabricates a curve without closed trades, so the return carries the sign here.
+        assert!(thin.conservative.as_ref().is_some_and(|costed| costed.verdict == Verdict::NotSupported && costed.total_return < 0.0), "{:?}", thin.conservative);
         assert_eq!(thin.verdict, Verdict::NotSupported, "refused, never upgraded");
         assert!(thin.reasons.iter().any(|why| why.contains("conservative tier")), "{:?}", thin.reasons);
 
         // Ten basis points survives both, and the record says so.
         let wide = run_family(&Costly { edge_bps: 10.0 }, &family, &criteria).expect("runs");
         assert_eq!(wide.under_conservative_costs, Some(Verdict::Supported));
+        assert!(wide.conservative.as_ref().is_some_and(|costed| costed.verdict == Verdict::Supported && costed.total_return > 0.0), "{:?}", wide.conservative);
         assert_eq!(wide.verdict, Verdict::Supported);
 
         // A result refused on its own terms is not asked the question.

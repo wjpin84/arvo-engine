@@ -834,6 +834,8 @@ mod tests {
             reasons: Vec::new(),
         
             under_conservative_costs: None,
+        
+            conservative: None,
         }
     }
 

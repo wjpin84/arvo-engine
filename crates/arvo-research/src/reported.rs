@@ -321,6 +321,8 @@ mod tests {
             reasons,
         
             under_conservative_costs: None,
+        
+            conservative: None,
         }
     }
 
