@@ -376,8 +376,9 @@ pub fn run_panel(
         .max_by(|a, b| a.0.total_cmp(&b.0))
         .ok_or_else(|| {
             SimulationError::Rejected(format!(
-                "no configuration ran across the whole panel ({} failures)",
-                failures.len()
+                "no configuration ran across the whole panel ({} failures; the first: {})",
+                failures.len(),
+                failures.first().map_or("none recorded", String::as_str)
             ))
         })?;
 

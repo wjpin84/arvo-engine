@@ -165,16 +165,14 @@ pub async fn refresh(service: &ResearchService, universe: &Universe, report: cra
             done.failed.push((id.clone(), format!("no source serves venue {venue:?}")));
             continue;
         };
-        // Back to `since` when the library has nothing, else from a little
-        // before the last bar so a revised bar is caught; never past the
-        // source's own reach.
+        // The whole reach every time: the library's write replaces a series
+        // with what was fetched, so a short refetch would truncate years of
+        // history to a week. Back to `since` when the file says, never past
+        // the source's own reach.
         let reach = arvo_data::source::default_days(&[source.as_ref()], universe.interval);
-        let days = match service.bars.coverage(id, universe.interval) {
-            Ok(Some((_, last))) => u32::try_from((today - last).num_days() + 5).unwrap_or(reach).min(reach),
-            _ => universe
-                .since
-                .map_or(reach, |since| u32::try_from((today - since).num_days().max(1)).unwrap_or(reach).min(reach)),
-        };
+        let days = universe
+            .since
+            .map_or(reach, |since| u32::try_from((today - since).num_days().max(1)).unwrap_or(reach).min(reach));
         let from = today - chrono::Duration::days(i64::from(days));
         match arvo_data::source::ingest(&service.data_dir, source.as_ref(), symbol, universe.interval, from, today).await {
             Ok(_) => done.fetched.push(id.clone()),
