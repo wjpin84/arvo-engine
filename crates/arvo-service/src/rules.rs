@@ -151,6 +151,7 @@ mod tests {
 
     #[test]
     fn a_rule_is_written_checked_and_listed_and_a_bad_one_is_refused_before_anything_is_written() {
+        let _picker = crate::research::PICKER.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = tempfile::tempdir().expect("tempdir");
         let twin: RuleDefinition = serde_json::from_str(TWIN_CROSS).expect("parses");
 
@@ -190,6 +191,7 @@ mod tests {
 
     #[test]
     fn a_rule_file_is_offered_and_a_ruleset_may_name_it() {
+        let _picker = crate::research::PICKER.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(dir.path().join(SUBDIR)).expect("rules/");
         std::fs::create_dir_all(dir.path().join(crate::rulesets::SUBDIR)).expect("rulesets/");

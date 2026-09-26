@@ -469,6 +469,13 @@ static CONTRIBUTED: std::sync::Mutex<BTreeMap<String, (String, &'static Strategy
 
 /// The project's rules written as data (#225), by name: the definition's
 /// version, the definition, and the plan that offers it under its own name.
+/// Held by any test that writes into the picker's process-wide tables and
+/// then reads them back (#225). Each test has a project root of its own, and
+/// a refresh from another root replaces the table between the write and the
+/// read.
+#[cfg(test)]
+pub(crate) static PICKER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 static RULES: std::sync::Mutex<
     BTreeMap<String, (String, &'static arvo_research::rule::RuleDefinition, &'static StrategyPlan)>,
 > = std::sync::Mutex::new(BTreeMap::new());

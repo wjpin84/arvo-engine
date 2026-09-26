@@ -630,7 +630,15 @@ mod tests {
     struct TestEngine {
         dir: tempfile::TempDir,
         _stop: tokio::sync::oneshot::Sender<()>,
+        /// The engine's picker tables — the project's rules (#225) and what
+        /// extensions contribute — are process-wide, and every engine here
+        /// has a project root of its own. Two of them at once would replace
+        /// each other's table between a write and the read that checks it, so
+        /// an engine in this module is held one at a time.
+        _picker: std::sync::MutexGuard<'static, ()>,
     }
+
+    static PICKER: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn engine() -> TestEngine {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -667,7 +675,7 @@ mod tests {
             });
         });
         ready_rx.recv().expect("the engine came up");
-        TestEngine { dir, _stop: stop }
+        TestEngine { dir, _stop: stop, _picker: PICKER.lock().unwrap_or_else(std::sync::PoisonError::into_inner) }
     }
 
     fn server(engine: &TestEngine, agent: Option<&str>) -> Server {

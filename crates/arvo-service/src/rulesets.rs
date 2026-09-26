@@ -260,6 +260,7 @@ mod tests {
 
     #[test]
     fn a_template_from_a_shipped_rule_is_offerable_and_a_bad_file_says_why() {
+        let _picker = crate::research::PICKER.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = tempfile::tempdir().expect("tempdir");
         let plan = StrategyPlan::find_shipped("sma_cross").expect("shipped");
         let document = template(plan, "my_cross");
@@ -291,6 +292,7 @@ mod tests {
 
     #[test]
     fn an_agent_writes_a_ruleset_only_if_the_engine_would_run_it() {
+        let _picker = crate::research::PICKER.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         use std::collections::BTreeMap;
         let dir = tempfile::tempdir().expect("tempdir");
         let axes = BTreeMap::from([("fast".to_owned(), vec![5.0, 10.0]), ("slow".to_owned(), vec![50.0])]);
