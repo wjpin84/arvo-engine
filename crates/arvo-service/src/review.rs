@@ -363,6 +363,12 @@ pub fn review_record(id: &str, record: &str, day: NaiveDate) -> Option<SessionRe
                     span.until = Some(line.at.to_rfc3339());
                 }
             }
+            // A feed gap is noticed only when the next message lands, so the
+            // silence it names is already over: the session freezes and thaws
+            // in the same instant. It happened, and the counts say so, but it
+            // was never a stretch the session spent refusing entries — and
+            // drawing it as one on a chart says something untrue about the
+            // day. Such a span is dropped when the day is finished.
             "feed_down" if today => out.feed_gaps += 1,
             "halted" if today => {
                 let why = if line.detail.is_string() {
@@ -411,6 +417,15 @@ pub fn review_record(id: &str, record: &str, day: NaiveDate) -> Option<SessionRe
     if !out.fills.is_empty() {
         out.mean_slippage_bps = Some(out.fills.iter().map(|fill| fill.slippage_bps).sum::<f64>() / out.fills.len() as f64);
     }
+    // See the note at "resumed": a span that closed in the instant it opened
+    // was a silence that had already ended, not a stretch of the day.
+    out.spans.retain(|span| {
+        let stamp = |text: &str| chrono::DateTime::parse_from_rfc3339(text).ok();
+        let (Some(from), Some(until)) = (stamp(&span.from), span.until.as_deref().and_then(stamp)) else {
+            return true;
+        };
+        (until - from).num_seconds() >= 1
+    });
     Some(out)
 }
 
@@ -582,6 +597,11 @@ mod tests {
             line("2026-09-21T14:05:01Z", "filled", serde_json::json!({ "order": "o3", "instrument": "AAPL.AIEX", "side": "buy", "quantity": 5.0, "decision_price": 100.0, "fill_price": 100.0, "decision_at": "2026-09-21T14:05:00", "filled_at": "2026-09-21T14:05:01" })),
             line("2026-09-21T14:30:00Z", "frozen", serde_json::json!({ "stale": "nothing heard for 900s" })),
             line("2026-09-21T14:40:00Z", "resumed", serde_json::json!("the feed is back")),
+            // A gap noticed only once it had ended: frozen and thawed in the
+            // same instant, which is not a stretch of the day.
+            line("2026-09-21T16:00:00Z", "feed_down", serde_json::json!("nothing heard for 7200s")),
+            line("2026-09-21T16:00:00Z", "frozen", serde_json::json!({ "stale": "nothing heard for 7200s" })),
+            line("2026-09-21T16:00:00Z", "resumed", serde_json::json!("the feed is back")),
             line("2026-09-21T15:00:00Z", "warning", serde_json::json!({ "entered": ["drawdown"], "cleared": [], "near": ["drawdown 8.1% of a 10.0% limit"] })),
             line("2026-09-21T16:00:00Z", "signal", serde_json::json!({ "id": "x2", "exit": "signal" })),
             line("2026-09-21T16:00:00Z", "exit", serde_json::json!({ "signal": "x2", "why": "signal", "order": "o4" })),
@@ -611,6 +631,11 @@ mod tests {
         assert!(frozen.from.starts_with("2026-09-21T14:30:00"), "{}", frozen.from);
         assert!(frozen.until.as_deref().is_some_and(|until| until.starts_with("2026-09-21T14:40:00")), "{:?}", frozen.until);
         assert!(frozen.why.contains("nothing heard"), "{}", frozen.why);
+        // The gap that had already ended is counted but is not a stretch: two
+        // freezes happened, and only one of them was a span of the day.
+        assert_eq!(reviewed.freezes, 2, "both froze the session");
+        assert_eq!(reviewed.spans.iter().filter(|span| span.kind == "frozen").count(), 1, "{:?}", reviewed.spans);
+
         let halted = reviewed.spans.iter().find(|span| span.kind == "halted").expect("the halt");
         assert_eq!(halted.until, None, "a halt stays until someone releases it");
         assert_eq!(halted.why, "enough for today");
