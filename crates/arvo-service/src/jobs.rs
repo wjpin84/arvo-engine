@@ -139,22 +139,50 @@ pub fn register(jobs: &Jobs, root: &Path, research: Arc<ResearchService>, raise:
     // Only in the regular session, and only with Alpaca keys: without them
     // there is nothing to record and nothing to say.
     let quotes: PathBuf = root.join(OPTION_QUOTES_SUBDIR);
+    let listing = root.to_path_buf();
     jobs.every(
         "option-quotes",
-        "Record SPY option quotes",
+        "Record option quotes",
         std::time::Duration::from_secs(15 * 60),
         move || {
             let dir = quotes.clone();
+            let root = listing.clone();
             async move {
                 let now = chrono::Utc::now();
                 if !arvo_data::session::in_regular_session(now.naive_utc()) {
                     return Ok("outside the regular session".to_owned());
                 }
-                match crate::source::alpaca::options::record_chain("SPY", &dir, now).await {
-                    Ok(recorded) => Ok(format!("{} contracts recorded", recorded.contracts)),
-                    Err(arvo_data::source::SourceError::NoSession { .. }) => Ok("no Alpaca session".to_owned()),
-                    Err(err) => Err(format!("could not record option quotes: {err}")),
+                // Every underlying the project asked for (#230). One that
+                // fails is named and the rest are still recorded: a chain
+                // missed today cannot be fetched tomorrow (#83).
+                let (symbols, complaint) = crate::option_quotes::wanted(&root);
+                let mut said: Vec<String> = complaint.into_iter().collect();
+                let (mut recorded, mut asleep) = (0usize, 0usize);
+                for symbol in &symbols {
+                    match crate::source::alpaca::options::record_chain(symbol, &dir, now).await {
+                        Ok(chain) => {
+                            recorded += 1;
+                            said.push(format!("{symbol} {}", chain.contracts));
+                        }
+                        Err(arvo_data::source::SourceError::NoSession { .. }) => asleep += 1,
+                        Err(err) => said.push(format!("{symbol}: {err}")),
+                    }
                 }
+                if asleep == symbols.len() {
+                    return Ok("no Alpaca session".to_owned());
+                }
+                // The day's cost on disk, which is one of the three numbers
+                // that decide whether the library needs a different store.
+                let bytes: u64 = symbols
+                    .iter()
+                    .map(|symbol| crate::option_quotes::bytes_today(&root, symbol, now.date_naive()))
+                    .sum();
+                Ok(format!(
+                    "{recorded} of {} recorded, {:.1} MB today: {}",
+                    symbols.len(),
+                    bytes as f64 / (1024.0 * 1024.0),
+                    said.join("; ")
+                ))
             }
         },
     );

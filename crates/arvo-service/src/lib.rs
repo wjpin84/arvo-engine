@@ -15,6 +15,7 @@ pub mod extensions;
 pub mod plugins;
 pub mod portfolio;
 pub mod jobs;
+pub mod option_quotes;
 pub mod project;
 pub mod research;
 pub mod review;
