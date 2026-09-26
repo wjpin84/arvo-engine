@@ -21,17 +21,23 @@ use arvo_research::live::Expectation;
 use arvo_research::{DateRange, EvidenceStore, Experiment, RiskGate};
 use tokio::sync::broadcast;
 
-use crate::bar::{act, caught_up};
+use crate::bar::{act, held_for};
 use crate::record::Recorder;
 use crate::sessions::experiment_of;
 use crate::state::{freeze, halt, judged, recovered, thaw, trouble, warned};
 use crate::status::{announce, Command, Freeze, Mailbox, Status, POLL};
+use crate::venues::Venues;
 use crate::watch::Watch;
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one call site; a struct would only rename the arguments"
+)]
 pub(crate) fn run(
     data: &Path,
     finding: &str,
     executor: &str,
+    venues: &dyn Venues,
     status: &Mutex<Status>,
     stop: &AtomicBool,
     mailbox: &Mailbox,
@@ -60,10 +66,7 @@ pub(crate) fn run(
         status.strategy = experiment.strategy.name.clone();
     }
 
-    let source = arvo_service::source::all()
-        .into_iter()
-        .find(|source| source.venue() == venue)
-        .ok_or_else(|| format!("no source serves venue {venue}"))?;
+    let source = venues.source(venue)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -93,64 +96,25 @@ pub(crate) fn run(
         )),
     );
 
-    match executor {
-        "alpaca-paper" => runtime.block_on(drive(
-            arvo_alpaca::AlpacaExecutor::paper(),
-            &experiment,
-            &mut shadow,
-            source.as_ref(),
-            symbol,
-            venue,
-            last_in_library,
-            expected.clone(),
-            &record,
-            status,
-            stop,
-            mailbox,
-            events,
-        )),
-        "alpaca-live" => runtime.block_on(drive(
-            arvo_alpaca::AlpacaExecutor::live(),
-            &experiment,
-            &mut shadow,
-            source.as_ref(),
-            symbol,
-            venue,
-            last_in_library,
-            expected.clone(),
-            &record,
-            status,
-            stop,
-            mailbox,
-            events,
-        )),
-        robinhood if robinhood.starts_with("robinhood-") => {
-            let last4 = &robinhood["robinhood-".len()..];
-            let account = runtime
-                .block_on(arvo_robinhood::Robinhood.holdings())
-                .map_err(|err| err.to_string())?
-                .into_iter()
-                .map(|held| held.account_number)
-                .find(|number| number.ends_with(last4))
-                .ok_or_else(|| format!("no Robinhood account ends in {last4}"))?;
-            runtime.block_on(drive(
-                arvo_robinhood::RobinhoodExecutor::new(account),
-                &experiment,
-                &mut shadow,
-                source.as_ref(),
-                symbol,
-                venue,
-                last_in_library,
-                expected.clone(),
-                &record,
-                status,
-                stop,
-                mailbox,
-                events,
-            ))
-        }
-        other => Err(format!("no executor {other:?}")),
-    }
+    // Which venue this is, decided by whoever built the `Venues` — the engine
+    // for a broker, a test for a fake. The loop below is the same either way,
+    // which is the point: it is now reachable without a brokerage account.
+    let executor = runtime.block_on(venues.executor(executor))?;
+    runtime.block_on(drive(
+        executor,
+        &experiment,
+        &mut shadow,
+        source.as_ref(),
+        symbol,
+        venue,
+        last_in_library,
+        expected.clone(),
+        &record,
+        status,
+        stop,
+        mailbox,
+        events,
+    ))
 }
 
 /// The loop: reconcile, then poll for bars until asked to stop or halted,
@@ -411,13 +375,12 @@ pub(crate) async fn drive<E: Executor>(
                 // The bar's instant and the signal's place in it: unique in
                 // the record, and readable back to the bar without a lookup.
                 let id = format!("{}#{n}", bar.at);
-                let held = if frozen.is_some() {
-                    Some("frozen: the book disagrees with the venue; reconcile and resume")
-                } else if caught_up(bar.at, experiment.interval.duration(), started) {
-                    Some("catch-up: the bar closed before this session started; the rule is warmed on it, not traded")
-                } else {
-                    None
-                };
+                let held = held_for(
+                    frozen.is_some(),
+                    bar.at,
+                    experiment.interval.duration(),
+                    started,
+                );
                 act(
                     &mut session,
                     &mut watch,

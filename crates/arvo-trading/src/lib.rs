@@ -84,6 +84,7 @@ mod run;
 mod sessions;
 mod state;
 mod status;
+mod venues;
 mod watch;
 
 #[cfg(test)]
@@ -93,3 +94,4 @@ pub use promotion::{Promotion, EXECUTORS, PAPER_MINIMUM_DAYS, SUBDIR};
 pub use record::record_path;
 pub use sessions::Sessions;
 pub use status::Status;
+pub use venues::Venues;

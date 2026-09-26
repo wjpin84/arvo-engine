@@ -17,6 +17,7 @@ use tokio::sync::broadcast;
 
 use crate::promotion::{executor_is_known, is_paper, promotion, Promotion, EXECUTORS};
 use crate::run::run;
+use crate::venues::Venues;
 use crate::status::{announce, Command, Mailbox, Running, Status};
 
 /// Every session this engine is hosting.
@@ -26,6 +27,9 @@ pub struct Sessions {
     /// Where state changes go, for whoever is listening (#150). Sent, never
     /// awaited: a session does not wait for the window.
     events: broadcast::Sender<EventView>,
+    /// The venues a session may run against. Supplied rather than chosen here,
+    /// so the loop can be driven against a fake (see [`crate::venues`]).
+    venues: Arc<dyn Venues>,
 }
 
 impl std::fmt::Debug for Sessions {
@@ -38,11 +42,12 @@ impl std::fmt::Debug for Sessions {
 
 impl Sessions {
     #[must_use]
-    pub fn new(data: &Path, events: broadcast::Sender<EventView>) -> Self {
+    pub fn new(data: &Path, events: broadcast::Sender<EventView>, venues: Arc<dyn Venues>) -> Self {
         Self {
             data: data.to_path_buf(),
             running: Mutex::new(BTreeMap::new()),
             events,
+            venues,
         }
     }
 
@@ -142,6 +147,7 @@ impl Sessions {
             let stop = stop.clone();
             let mailbox = mailbox.clone();
             let events = self.events.clone();
+            let venues = Arc::clone(&self.venues);
             // Its own thread: the shadow's message bus is thread-local
             // (ADR-0001), and a session is a loop that sleeps.
             std::thread::Builder::new()
@@ -149,7 +155,8 @@ impl Sessions {
                 .spawn(move || {
                     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         run(
-                            &data, &finding, &executor, &status, &stop, &mailbox, &events,
+                            &data, &finding, &executor, venues.as_ref(), &status, &stop,
+                            &mailbox, &events,
                         )
                     }));
                     let mut status = status

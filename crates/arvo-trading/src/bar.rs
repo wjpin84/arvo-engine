@@ -27,6 +27,29 @@ pub(crate) fn caught_up(
     bar_at + interval <= started
 }
 
+/// Why an entry on this bar must not be sent, if it must not.
+///
+/// The two reasons an entry is refused before it reaches the gate, decided in
+/// one place because #224 was not a wrong answer from [`caught_up`] — that was
+/// correct and tested — but nothing *asking* it. A named function can be tested;
+/// an `if` buried in the poll loop could only be found in a live session, and
+/// was.
+#[must_use]
+pub(crate) fn held_for(
+    frozen: bool,
+    bar_at: chrono::NaiveDateTime,
+    interval: chrono::Duration,
+    started: chrono::NaiveDateTime,
+) -> Option<&'static str> {
+    if frozen {
+        Some("frozen: the book disagrees with the venue; reconcile and resume")
+    } else if caught_up(bar_at, interval, started) {
+        Some("catch-up: the bar closed before this session started; the rule is warmed on it, not traded")
+    } else {
+        None
+    }
+}
+
 /// One signal, to the gate or to the venue. With `held` set, an entry is
 /// refused before it reaches the gate, for that reason: the session is
 /// frozen, or the bar is one it caught up on (#224). An exit is never

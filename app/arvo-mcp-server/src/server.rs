@@ -673,7 +673,7 @@ mod tests {
                 let address = listener.local_addr().expect("address");
                 let research = arvo_engine::research::Research::new(&root);
                 let events = tokio::sync::broadcast::channel(256).0;
-                let sessions = std::sync::Arc::new(arvo_trading::Sessions::new(&root, events.clone()));
+                let sessions = std::sync::Arc::new(arvo_trading::Sessions::new(&root, events.clone(), std::sync::Arc::new(arvo_engine::venues::Brokers)));
                 let tokens = arvo_engine::grpc::Tokens { research: "research-token".to_owned(), control: "control-token".to_owned() };
                 let jobs = arvo_schedule::Jobs::new(std::sync::Arc::new(|future| {
                     let handle = tokio::spawn(future);

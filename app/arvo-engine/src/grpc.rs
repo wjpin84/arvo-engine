@@ -1313,7 +1313,7 @@ mod tests {
         let (stop, stopped) = tokio::sync::oneshot::channel();
         let research = Research::new(dir.path());
         let events = tokio::sync::broadcast::channel(256).0;
-        let sessions = std::sync::Arc::new(Sessions::new(dir.path(), events.clone()));
+        let sessions = std::sync::Arc::new(Sessions::new(dir.path(), events.clone(), std::sync::Arc::new(crate::venues::Brokers)));
         let tokens = Tokens { research: TOKEN.to_owned(), control: CONTROL.to_owned() };
         // The path, not the handle: `dir` is returned to the test so the
         // directory outlives the server.

@@ -163,6 +163,7 @@ dependencies = [
  "arvo-schedule",
  "arvo-service",
  "arvo-trading",
+ "async-trait",
  "chrono",
  "prost",
  "rand 0.8.8",
@@ -382,15 +383,14 @@ dependencies = [
 name = "arvo-trading"
 version = "0.7.0"
 dependencies = [
- "arvo-alpaca",
  "arvo-api",
  "arvo-data",
  "arvo-execution",
  "arvo-nautilus",
  "arvo-research",
  "arvo-risk",
- "arvo-robinhood",
  "arvo-service",
+ "async-trait",
  "chrono",
  "serde",
  "serde_json",

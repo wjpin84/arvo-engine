@@ -18,7 +18,7 @@
 
 use std::path::PathBuf;
 
-use arvo_engine::{discovery, grpc, research};
+use arvo_engine::{discovery, grpc, research, venues};
 
 #[tokio::main]
 async fn main() {
@@ -117,7 +117,7 @@ async fn run() -> Result<(), String> {
     // One hub for everything the engine raises, shared by the sessions and the
     // data tier and handed out by Subscribe (#150).
     let events = tokio::sync::broadcast::channel(256).0;
-    let sessions = std::sync::Arc::new(arvo_trading::Sessions::new(&data, events.clone()));
+    let sessions = std::sync::Arc::new(arvo_trading::Sessions::new(&data, events.clone(), std::sync::Arc::new(venues::Brokers)));
     arvo_service::jobs::prepare(&data);
 
     // The engine's own jobs, on its own runtime: this is `#[tokio::main]`, so

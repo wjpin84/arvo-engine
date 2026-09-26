@@ -91,6 +91,7 @@ Three groups, one rule each.
 
 ```
 crates/        the platform, including the one crate that runs a backtest
+               and the one that sends live orders
 integrations/  talks to a vendor
 app/           the daemon and the MCP server
 ```
@@ -103,6 +104,9 @@ app/           the daemon and the MCP server
 | `crates/arvo-risk` | The risk gate, costs, collateral and trades — what the live path shares with the backtest, without the research |
 | `crates/arvo-portfolio` | Holdings imported from a statement |
 | `crates/arvo-execution` | The `Executor` trait, the paper executor, divergence |
+| `crates/arvo-trading` | The live session: a finding's rule running against a venue. Sits *above* `arvo-service` because it composes — it turns `finding@executor` into a source and an executor through the `Venues` trait |
+| `crates/arvo-service` | The logic every front end shares: the source registry, jobs, rules, universes, reviews |
+| `crates/arvo-schedule` | When recurring work runs |
 | `crates/arvo-mcp`, `crates/arvo-oauth` | Protocol and authorization, both vendor-agnostic |
 | `crates/arvo-plugin-host` | Out-of-process plugins over gRPC |
 | `crates/arvo-nautilus` | The only crate permitted to name a Nautilus type |
@@ -130,6 +134,7 @@ crate — see [ADR-0005](https://github.com/wjpin84/arvo-adrs/blob/main/0005-pro
 | `BarProvider` | `arvo-data`, next to `CsvBars` |
 | `Source` | `arvo-data`, next to the library it fills |
 | `Executor` | `arvo-execution`, next to `PaperExecutor` |
+| `Venues` | `arvo-trading`, so the brokers stay *out* of it and a test can put a fake where a broker was |
 | `SimulationProvider` | `arvo-research`, to invert the dependency |
 | `Correlations` | `arvo-risk`, next to the gate that consumes it |
 

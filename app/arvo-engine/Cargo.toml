@@ -19,6 +19,7 @@ arvo-nautilus.workspace = true
 arvo-plugin-host.workspace = true
 arvo-research.workspace = true
 arvo-trading.workspace = true
+async-trait = "0.1.92"
 arvo-risk.workspace = true
 arvo-robinhood.workspace = true
 arvo-schedule.workspace = true
