@@ -170,6 +170,20 @@ pub struct PooledOutcome {
     /// The worst single instrument, kept because an average hides it.
     pub worst_max_drawdown: f64,
 }
+/// The universe a panel ran over (#227), as the finding records it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UniverseRef {
+    pub name: String,
+    pub reason: String,
+    /// How many the universe lists; the search that keeping its best member
+    /// would be.
+    pub size: usize,
+    /// Members that had no series at the universe's interval and were left
+    /// out of the run.
+    #[serde(default)]
+    pub missing: Vec<String>,
+}
+
 
 /// What a panel study concluded.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -197,6 +211,11 @@ pub struct PanelEvidence {
     /// this existed loads as one that does not know its own breadth.
     #[serde(default)]
     pub breadth: Option<crate::Breadth>,
+    /// The universe this panel ran over (#227), when it ran over one: its
+    /// name, its reason, and its size, which is the search that picking one
+    /// member of it would be. `default` because this is a persisted format.
+    #[serde(default)]
+    pub universe: Option<UniverseRef>,
     /// What one account holding every member at equal weight would have done.
     ///
     /// [`PooledOutcome`] averages the members; this combines them. The two
@@ -452,6 +471,7 @@ pub fn run_panel(
     let (verdict, reasons) = judge(&pooled, &selection, criteria, &failures, &breadth);
 
     Ok(PanelEvidence {
+        universe: None,
         hypothesis: study.hypothesis.clone(),
         dataset: study.template.dataset.clone(),
         in_sample,
@@ -747,6 +767,7 @@ mod tests {
 
         let day = |d: u32| chrono::NaiveDate::from_ymd_opt(2024, 1, d).expect("valid");
         let stored = PanelEvidence {
+            universe: None,
             hypothesis: HypothesisId::from("h"),
             dataset: crate::DatasetRef {
                 id: "bars".to_owned(),

@@ -36,7 +36,8 @@ const USAGE: &str = "usage:
   arvo-engine [<data-dir>] session halt <id>|--all [reason...] the kill switch: arm the gate, flatten, stay halted
   arvo-engine [<data-dir>] session explain <id> <time>        the chain behind every position held then
   arvo-engine [<data-dir>] review [YYYY-MM-DD]   the review after the close: written under reviews/, and printed
-  arvo-engine [<data-dir>] rank [--rule R] [--instrument I]   the leaderboard: every comparable finding, in the one order";
+  arvo-engine [<data-dir>] rank [--rule R] [--instrument I]   the leaderboard: every comparable finding, in the one order
+  arvo-engine [<data-dir>] universes [refresh]   the project's universes and their coverage; `refresh` fetches what is missing or behind";
 
 async fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -55,6 +56,12 @@ async fn run() -> Result<(), String> {
         if verb == "rank" && std::path::Path::new(dir).is_dir() {
             return rank_command(PathBuf::from(dir), rest);
         }
+        if verb == "universes" && std::path::Path::new(dir).is_dir() {
+            return universes_command(PathBuf::from(dir), rest).await;
+        }
+    }
+    if args.first().map(String::as_str) == Some("universes") {
+        return universes_command(research::default_root()?, &args[1..]).await;
     }
     if args.first().map(String::as_str) == Some("review") {
         return review_command(research::default_root()?, &args[1..]);
@@ -162,6 +169,55 @@ async fn run() -> Result<(), String> {
     stopping.stop_all().await;
     discovery::remove_if_ours(&root, pid);
     served.map_err(|err| format!("serving: {err}"))
+}
+
+/// `universes [refresh]`: the project's universes with their members'
+/// coverage; `refresh` fetches what is missing or behind (#227). Needs no
+/// engine, but a venue's source may need its credentials.
+async fn universes_command(root: PathBuf, args: &[String]) -> Result<(), String> {
+    let refresh = match args {
+        [] => false,
+        [word] if word == "refresh" => true,
+        _ => return Err(USAGE.to_owned()),
+    };
+    let service = arvo_service::research::ResearchService::new(
+        root.join(arvo_service::research::DATA_SUBDIR),
+        root.join(arvo_service::research::EVIDENCE_SUBDIR),
+    );
+    let listed = arvo_service::universes::read_all(&root);
+    if listed.is_empty() {
+        println!("no universes under {}", root.join(arvo_service::universes::SUBDIR).display());
+    }
+    for (path, universe) in listed {
+        match universe {
+            Err(why) => println!("{path}: {why}"),
+            Ok(universe) => {
+                let covered = universe
+                    .instruments
+                    .iter()
+                    .filter(|id| matches!(arvo_data::BarProvider::coverage(&service.bars, id, universe.interval), Ok(Some(_))))
+                    .count();
+                println!(
+                    "{}  {} member(s), {} with a series at {}
+  {}",
+                    universe.name,
+                    universe.instruments.len(),
+                    covered,
+                    universe.interval,
+                    universe.reason
+                );
+                if refresh {
+                    let report: arvo_service::research::data::Report<'_> = &|_event| {};
+                    let done = arvo_service::universes::refresh(&service, &universe, report).await?;
+                    println!("  {}", done.describe());
+                    for (id, why) in &done.failed {
+                        println!("  {id}: {why}");
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// `rank [--rule R] [--instrument I]`: the leaderboard over the findings under

@@ -722,6 +722,21 @@ pub fn panel_view(found: &arvo_research::PanelEvidence, engine: &str) -> PanelVi
     PanelView {
         // Filled in when the finding is stored, or read back from it.
         id: String::new(),
+        universe: found.universe.as_ref().map(|universe| universe.name.clone()).unwrap_or_default(),
+        notes: found.universe.as_ref().map_or_else(Vec::new, |universe| {
+            let mut notes = vec![
+                format!("Universe {}: {}", universe.name, universe.reason),
+                format!(
+                    "{} member(s); keeping the best of them would be a search of {}, and the deflation here is over the grid, not the members",
+                    universe.size, universe.size
+                ),
+                "Membership is as listed today, not point-in-time (#9)".to_owned(),
+            ];
+            if !universe.missing.is_empty() {
+                notes.push(format!("{} member(s) had no series at this interval and were left out: {}", universe.missing.len(), universe.missing.join(", ")));
+            }
+            notes
+        }),
         verdict: verdict_label(found.verdict).to_owned(),
         reasons: found.reasons.clone(),
         // The same criteria the panel was judged against. Passed rather than

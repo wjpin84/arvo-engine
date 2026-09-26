@@ -178,6 +178,7 @@ fn severity_orders_blocking_before_warning_before_note() {
 fn clean_panel() -> PanelEvidence {
     let day = |d: u32| chrono::NaiveDate::from_ymd_opt(2024, 1, d).expect("valid");
     PanelEvidence {
+        universe: None,
         hypothesis: crate::HypothesisId("h".to_owned()),
         dataset: crate::DatasetRef {
             id: "bars".to_owned(),

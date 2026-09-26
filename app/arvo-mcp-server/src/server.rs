@@ -36,7 +36,7 @@ use std::time::{Duration, Instant};
 
 use arvo_client::discovery::{self, Discovery};
 use arvo_client::proto::common::Empty;
-use arvo_client::proto::research::{BarsRequest, Finding, FindingId, FindingIds, Param, RankRequest, ReviewRequest, RulesetForm, RunRequest};
+use arvo_client::proto::research::{BarsRequest, Finding, FindingId, FindingIds, PanelRequest, Param, RankRequest, ReviewRequest, RulesetForm, RunRequest};
 use arvo_client::proto::services::research_client::ResearchClient;
 use serde_json::{json, Value};
 use tonic::transport::Channel;
@@ -286,6 +286,15 @@ impl Server {
                 // the comparison itself are what an agent reasons from.
                 compared.curves.clear();
                 encode(&compared)
+            }
+            "run_panel" => {
+                let asked = PanelRequest {
+                    universe: text("universe")?,
+                    strategy: arguments.get("strategy").and_then(Value::as_str).map(ToOwned::to_owned),
+                };
+                let request = self.request(asked)?;
+                let view = self.runtime.block_on(self.research.run_panel(request)).map_err(refused)?;
+                encode(&view.into_inner())
             }
             "run_study" | "run_walk_forward" => {
                 let asked = RunRequest {
@@ -545,6 +554,18 @@ fn tools() -> Value {
             "inputSchema": instrument_and_strategy,
         },
         {
+            "name": "run_panel",
+            "description": "One rule, one parameter set, every member of a universe at once: does the rule hold across names? A universe is a file under the project's universes/ folder, chosen for a stated reason other than returns; the finding records the universe, its reason, its size as the search that keeping its best member would be, and that membership is today's. Members without a series yet are named and left out. Minutes for a hundred names.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "universe": { "type": "string", "description": "A universe's name: universes/<name>.json in the project" },
+                    "strategy": { "type": "string", "description": "A rule from list_strategies; the default rule when absent" }
+                },
+                "required": ["universe"]
+            },
+        },
+        {
             "name": "run_walk_forward",
             "description": "Re-select a strategy on a rolling schedule across an instrument's whole history, and judge the stitched out-of-sample record. Slower than run_study by roughly the number of folds. Saved as your finding and deflated the same way.",
             "inputSchema": instrument_and_strategy,
@@ -683,6 +704,7 @@ mod tests {
                 "rank_findings",
                 "compare_experiments",
                 "run_study",
+                "run_panel",
                 "run_walk_forward"
             ]
         );

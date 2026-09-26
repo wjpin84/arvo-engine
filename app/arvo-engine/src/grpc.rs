@@ -32,7 +32,7 @@ use proto::platform::{
 use proto::portfolio::{PortfolioLibraryView, PortfolioName};
 use proto::research::{
     Advice, AttachRequest, Attachment, AttachmentRef, Attachments, BarView, BarsRequest, BarsView, BookRequest,
-    ComparisonView, Finding, RankRequest, Ranking, RegimePointView, RegimeView, ReviewRequest, ReviewView,
+    ComparisonView, Finding, PanelRequest, RankRequest, Ranking, RegimePointView, RegimeView, ReviewRequest, ReviewView,
     FindingId, FindingIds, FindingSummary, Findings, HistoryView, PanelView, Point, ProblemsView, RecordView,
     ReplayView, ReportFigure, ReportRequest, RiskModel, Rules, Ruleset, RulesetForm, RulesetPath, Rulesets,
     RunRequest, SharedExperiment, Strategies, StudyRequest, StudyView, TradeExport, WalkForwardView,
@@ -863,6 +863,20 @@ impl research_server::Research for Service {
         Ok(Response::new(view))
     }
 
+    async fn run_panel(&self, request: Request<PanelRequest>) -> Result<Response<PanelView>, Status> {
+        let PanelRequest { universe, strategy } = request.into_inner();
+        let root = self.research.root().to_path_buf();
+        let found = arvo_service::universes::find(&root, &universe).map_err(Status::invalid_argument)?;
+        let workbench = self.workbench.clone();
+        let view = tokio::task::spawn_blocking(move || {
+            arvo_service::research::study::run_panel_over(&workbench, &found, strategy.as_deref())
+        })
+        .await
+        .map_err(|err| Status::internal(err.to_string()))?
+        .map_err(refused)?;
+        Ok(Response::new(view))
+    }
+
     async fn view_panel(&self, _: Request<Empty>) -> Result<Response<PanelView>, Status> {
         let view = blocking(&self.workbench, arvo_service::research::study::run_panel).await?;
         Ok(Response::new(view))
@@ -1690,7 +1704,7 @@ mod tests {
             [
                 "ListStrategies", "ListInstruments", "ListFindings", "OpenFinding", "RunStudy", "RunWalkForward",
                 "RecordFinding", "AttachFile", "ListRulesets", "ReadRuleset", "WriteRuleset", "ListRules", "GetRiskModel",
-                "ViewStudy", "ViewWalkForward", "ViewPanel", "ViewBook", "ViewHistory", "ViewRecord", "ViewReplay",
+                "ViewStudy", "ViewWalkForward", "ViewPanel", "RunPanel", "ViewBook", "ViewHistory", "ViewRecord", "ViewReplay",
                 "ViewComparison", "ReadBars", "ViewRegime", "ViewReview", "RankFindings", "ViewProblems", "ListAttachments", "Subscribe",
             ]
         );

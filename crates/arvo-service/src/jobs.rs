@@ -76,6 +76,32 @@ pub fn register(jobs: &Jobs, root: &Path, research: Arc<ResearchService>, raise:
         }
     });
 
+    // Universes kept fetched (#227): every six hours, each member whose
+    // series is missing or behind the last completed bar, through the source
+    // that serves its venue.
+    let fetching = research.clone();
+    let announce_fetch = announce.clone();
+    let universes_root = root.to_path_buf();
+    jobs.every("universes", "Keep the universes fetched", std::time::Duration::from_secs(6 * 60 * 60), move || {
+        let research = fetching.clone();
+        let raise = announce_fetch.clone();
+        let root = universes_root.clone();
+        async move {
+            let mut said = Vec::new();
+            for (path, universe) in crate::universes::read_all(&root) {
+                match universe {
+                    Ok(universe) => {
+                        let report: crate::research::data::Report<'_> = &|event| raise(event);
+                        let done = crate::universes::refresh(&research, &universe, report).await?;
+                        said.push(format!("{}: {}", universe.name, done.describe()));
+                    }
+                    Err(why) => said.push(format!("{path}: {why}")),
+                }
+            }
+            Ok(if said.is_empty() { "no universes".to_owned() } else { said.join("; ") })
+        }
+    });
+
     // The review after the close (#217): once a day, a quarter of an hour
     // after the regular close, when the day's sessions have settled their
     // last fills. Checked every ten minutes so a restart in the evening

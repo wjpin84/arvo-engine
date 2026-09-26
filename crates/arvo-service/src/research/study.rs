@@ -189,16 +189,26 @@ pub fn book_dataset_version(instruments: &[String], fingerprints: &[String]) -> 
 pub fn panel_dataset_version(
     bars: &CsvBars,
 ) -> Option<(String, Vec<String>, chrono::NaiveDate, chrono::NaiveDate)> {
+    panel_dataset_version_over(bars, &bars.instruments().ok()?, arvo_data::BarInterval::DAILY)
+}
+
+/// The same over a named list at an interval: a universe (#227). Members
+/// with no usable series are left out; the caller says which.
+pub fn panel_dataset_version_over(
+    bars: &CsvBars,
+    members: &[String],
+    interval: arvo_data::BarInterval,
+) -> Option<(String, Vec<String>, chrono::NaiveDate, chrono::NaiveDate)> {
     let mut from = chrono::NaiveDate::MIN;
     let mut to = chrono::NaiveDate::MAX;
     let mut hasher = blake3::Hasher::new();
     let mut instruments = Vec::new();
 
-    for id in bars.instruments().ok()? {
-        let Ok(Some((first, last))) = bars.coverage(&id, arvo_data::BarInterval::DAILY) else {
+    for id in members.iter().cloned() {
+        let Ok(Some((first, last))) = bars.coverage(&id, interval) else {
             continue;
         };
-        if let Ok(Some(fingerprint)) = bars.fingerprint(&id, arvo_data::BarInterval::DAILY) {
+        if let Ok(Some(fingerprint)) = bars.fingerprint(&id, interval) {
             hasher.update(fingerprint.as_bytes());
         }
         from = from.max(first);
@@ -262,6 +272,16 @@ pub fn panel_for(
     dataset_version: &str,
 ) -> arvo_research::PanelStudy {
     let plan = StrategyPlan::find(STRATEGY).expect("the default strategy is in PLANS");
+    panel_for_plan(instruments, window, dataset_version, plan)
+}
+
+/// A panel of `plan` over `instruments` (#227).
+pub fn panel_for_plan(
+    instruments: Vec<String>,
+    window: DateRange,
+    dataset_version: &str,
+    plan: &StrategyPlan,
+) -> arvo_research::PanelStudy {
     // The panel treats its instruments as one dataset, so the basis is read
     // across all of them rather than from the subject — which here is the word
     // "panel" and has no venue.
@@ -512,6 +532,60 @@ pub fn run_panel(service: &ResearchService) -> Result<PanelView, CommandError> {
 /// # Errors
 ///
 /// Robinhood could not classify every member.
+/// A panel over a universe (#227): the members that have a series at its
+/// interval, under `strategy` or the default, with the universe and its
+/// reason on the finding.
+///
+/// # Errors
+///
+/// No such strategy, a strategy defined at another interval, or no member
+/// with a series yet.
+pub fn run_panel_over(
+    service: &ResearchService,
+    universe: &crate::universes::Universe,
+    strategy: Option<&str>,
+) -> Result<PanelView, CommandError> {
+    service.load_risk()?;
+    let plan = match strategy {
+        Some(name) => StrategyPlan::find(name)
+            .ok_or_else(|| CommandError::Failed(format!("no strategy {name:?}; list_strategies says what there is")))?,
+        None => StrategyPlan::find(STRATEGY).expect("the default strategy is in PLANS"),
+    };
+    if plan.interval() != universe.interval {
+        return Err(CommandError::Failed(format!(
+            "{} is defined at {}, and universe {} is {}",
+            plan.name(),
+            plan.interval(),
+            universe.name,
+            universe.interval
+        )));
+    }
+    let (dataset, instruments, from, to) =
+        panel_dataset_version_over(&service.bars, &universe.instruments, universe.interval).ok_or_else(|| {
+            CommandError::Failed(format!(
+                "no member of {} has a series at {} yet; the universes job fetches them, or run `arvo-engine universes refresh`",
+                universe.name, universe.interval
+            ))
+        })?;
+    let missing: Vec<String> = universe.instruments.iter().filter(|id| !instruments.contains(id)).cloned().collect();
+    let window = DateRange::new(from, to).map_err(|err| CommandError::Failed(err.to_string()))?;
+    let study = panel_for_plan(instruments, window, &dataset, plan);
+    let mut found = arvo_research::run_panel(
+        service.simulation.as_ref(),
+        &study,
+        &arvo_research::EvaluationCriteria::default(),
+    )
+    .map_err(|err| CommandError::Failed(err.to_string()))?;
+    found.universe = Some(arvo_research::UniverseRef {
+        name: universe.name.clone(),
+        reason: universe.reason.clone(),
+        size: universe.instruments.len(),
+        missing,
+    });
+    let view = panel_view(&found, service.simulation.engine());
+    remember(service, Some(plan.name()), (view, Record::Panel(Box::new(found))))
+}
+
 pub async fn book_sector_cap(
     max_per_sector: Option<usize>,
     instruments: &[String],

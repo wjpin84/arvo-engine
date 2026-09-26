@@ -272,6 +272,7 @@ fn a_finding_that_kept_no_curve_says_so_rather_than_passing() {
 #[test]
 fn a_panel_says_why_it_cannot_be_checked_instead_of_reporting_success() {
     let record = Record::Panel(Box::new(crate::PanelEvidence {
+        universe: None,
         hypothesis: HypothesisId("h".to_owned()),
         dataset: DatasetRef {
             id: "bars".to_owned(),
@@ -358,6 +359,7 @@ fn a_panel_whose_data_changed_is_reported_before_the_expensive_part() {
 /// A panel with nothing in it, for the paths that never reach a run.
 fn panel_evidence() -> crate::PanelEvidence {
     crate::PanelEvidence {
+        universe: None,
         hypothesis: HypothesisId("h".to_owned()),
         dataset: DatasetRef {
             id: "bars".to_owned(),
