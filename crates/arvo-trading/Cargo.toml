@@ -1,0 +1,36 @@
+[package]
+name = "arvo-trading"
+description = "Live sessions: a finding's rule running against a venue, the loop that sends real orders."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# The trading side's own layers: the gate and the executor below it, the
+# shadow engine that replays the rule, and the research vocabulary the
+# finding is written in.
+arvo-data.workspace = true
+arvo-execution.workspace = true
+arvo-nautilus.workspace = true
+arvo-research.workspace = true
+arvo-risk.workspace = true
+# The event views a front end subscribes to. Shapes only; no transport, so
+# this crate is still runnable without a server.
+arvo-api.workspace = true
+# This crate composes rather than sits under: it turns the two names in a
+# session's id — `finding@executor` — into a real source and a real executor.
+# The source registry is service-level because the plugin host writes into it
+# (ADR-0022), and `events::session` is deliberately shared with the window, so
+# both are used rather than copied. Nothing in `arvo-service` depends back on
+# this crate, and if it ever needs to start a session, that is the moment to
+# invert this into a trait the caller supplies — see the note in `run`.
+arvo-service.workspace = true
+arvo-alpaca.workspace = true
+arvo-robinhood.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json = "1"
+tokio = { workspace = true, features = ["sync"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"

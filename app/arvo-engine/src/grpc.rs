@@ -7,7 +7,7 @@ use tokio::net::TcpListener;
 use tonic::{Request, Response, Status};
 
 use crate::research::Research;
-use crate::session::Sessions;
+use arvo_trading::Sessions;
 
 pub use arvo_client::proto as proto;
 
@@ -190,7 +190,7 @@ fn bearer(token: &str, file: &'static str) -> impl Fn(Request<()>) -> Result<Req
     }
 }
 
-fn session_status(status: crate::session::Status) -> SessionStatus {
+fn session_status(status: arvo_trading::Status) -> SessionStatus {
     SessionStatus {
         id: status.id,
         finding: status.finding,
