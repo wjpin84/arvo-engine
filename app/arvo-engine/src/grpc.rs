@@ -1017,15 +1017,24 @@ impl research_server::Research for Service {
             None => chrono::Utc::now().date_naive(),
         };
         let root = self.research.root().to_path_buf();
+        // The structured review is what a chart reads (#229); the markdown is
+        // what a person reads. Both come off the same review, so they cannot
+        // disagree about the day.
+        let reviewed = arvo_service::review::review(&root, day);
         let (path, markdown, written_now) = match arvo_service::review::read(&root, day) {
             Some((path, text)) => (path, text, false),
             None => {
-                let reviewed = arvo_service::review::review(&root, day);
                 let path = arvo_service::review::write(&root, &reviewed).map_err(Status::internal)?;
                 (path, arvo_service::review::markdown(&reviewed), true)
             }
         };
-        Ok(Response::new(ReviewView { day: day.to_string(), markdown, path: path.display().to_string(), written_now }))
+        Ok(Response::new(ReviewView {
+            day: day.to_string(),
+            markdown,
+            path: path.display().to_string(),
+            written_now,
+            json: serde_json::to_string(&reviewed).map_err(|err| Status::internal(err.to_string()))?,
+        }))
     }
 
     async fn rank_findings(&self, request: Request<RankRequest>) -> Result<Response<Ranking>, Status> {
