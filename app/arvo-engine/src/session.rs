@@ -222,7 +222,14 @@ pub struct Status {
     pub fills: u32,
     /// Why the gate halted, when it did.
     pub halted: Option<String>,
+    /// What failed and has not succeeded since. A fetch, a settle, an audit
+    /// or a reconcile: the one that failed clears it by succeeding, so a blip
+    /// at one in the morning stops being reported at nine as though it were
+    /// current. Another call's success does not clear it, or a settle that
+    /// keeps failing would be hidden by the next bar that arrived.
     pub last_error: Option<String>,
+    /// Which call [`Self::last_error`] came from, in the record's words.
+    pub error_from: Option<&'static str>,
     /// When the last bar was pushed, if any.
     pub last_bar: Option<String>,
     /// What the gate and the venue disagreed about, while frozen.
@@ -367,6 +374,7 @@ impl Sessions {
             fills: 0,
             halted: None,
             last_error: None,
+            error_from: None,
             last_bar: None,
             frozen: None,
             reconciled: false,
@@ -404,10 +412,12 @@ impl Sessions {
                         Ok(Err(reason)) => {
                             status.state = "failed".to_owned();
                             status.last_error = Some(reason);
+                            status.error_from = Some("failed");
                         }
                         Err(_) => {
                             status.state = "failed".to_owned();
                             status.last_error = Some("the session thread panicked".to_owned());
+                            status.error_from = Some("panicked");
                         }
                     }
                     announce(&events, &status);
@@ -739,6 +749,7 @@ async fn drive<E: Executor>(
                             *reconciled = true;
                         }
                         status.lock().unwrap_or_else(std::sync::PoisonError::into_inner).reconciled = true;
+                        recovered(status, events, "reconcile_failed");
                     }
                     Err(err) => {
                         trouble(status, record, events, "reconcile_failed", &err);
@@ -826,7 +837,10 @@ async fn drive<E: Executor>(
             // back otherwise, so a Monday still sees Friday's bar.
             let from = last_pushed.map_or(today - chrono::Duration::days(3), |last| last.date());
             match source.bars(symbol, experiment.interval, from, today).await {
-                Ok(fetched) => fresh.extend(fetched.bars),
+                Ok(fetched) => {
+                    fresh.extend(fetched.bars);
+                    recovered(status, events, "fetch_failed");
+                }
                 Err(err) => {
                     trouble(status, record, events, "fetch_failed", &err);
                 }
@@ -892,8 +906,9 @@ async fn drive<E: Executor>(
                     }
                     status.lock().unwrap_or_else(std::sync::PoisonError::into_inner).fills +=
                         u32::try_from(filled).unwrap_or(u32::MAX);
+                    recovered(status, events, "settle_failed");
                 }
-                Ok(_) => {}
+                Ok(_) => recovered(status, events, "settle_failed"),
                 Err(err) => {
                     trouble(status, record, events, "settle_failed", &err);
                 }
@@ -932,7 +947,7 @@ async fn drive<E: Executor>(
                             .join("; ");
                         freeze(status, record, events, "frozen", serde_json::json!({ "discrepancies": found }), why, false);
                     }
-                    Ok(_) => {}
+                    Ok(_) => recovered(status, events, "audit_failed"),
                     Err(err) => {
                         trouble(status, record, events, "audit_failed", &err);
                     }
@@ -1088,7 +1103,35 @@ fn trouble(status: &Mutex<Status>, record: &Recorder, events: &broadcast::Sender
     record.write(event, Some(serde_json::json!(err.to_string())));
     let mut status = status.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     status.last_error = Some(err.to_string());
+    status.error_from = Some(event_name(event));
     announce(events, &status);
+}
+
+/// The record's event names are `&'static str` literals at every call site;
+/// this narrows one to the set [`recovered`] compares against, so a typo is a
+/// compile error rather than an error that never clears.
+fn event_name(event: &str) -> &'static str {
+    match event {
+        "reconcile_failed" => "reconcile_failed",
+        "fetch_failed" => "fetch_failed",
+        "settle_failed" => "settle_failed",
+        "audit_failed" => "audit_failed",
+        other => {
+            debug_assert!(false, "{other} is not one of the four calls that can fail");
+            "failed"
+        }
+    }
+}
+
+/// The call named by `event` succeeded: if that is what the status is holding
+/// an error from, it is over and the row stops saying so.
+fn recovered(status: &Mutex<Status>, events: &broadcast::Sender<EventView>, event: &'static str) {
+    let mut status = status.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if status.error_from == Some(event) {
+        status.last_error = None;
+        status.error_from = None;
+        announce(events, &status);
+    }
 }
 
 fn halt(status: &Mutex<Status>, record: &Recorder, events: &broadcast::Sender<EventView>, why: &str) {
@@ -1337,6 +1380,51 @@ mod tests {
         // The bar open at the start closes after it: live.
         assert!(!caught_up(at("2026-09-22T14:10:00"), five, started));
         assert!(!caught_up(at("2026-09-22T14:15:00"), five, started));
+    }
+
+    #[test]
+    fn an_error_is_cleared_by_the_call_that_raised_it_and_by_no_other() {
+        let events = broadcast::channel(16).0;
+        let status = Mutex::new(Status {
+            id: "s".to_owned(),
+            finding: "f".to_owned(),
+            executor: "alpaca-paper".to_owned(),
+            instrument: String::new(),
+            strategy: String::new(),
+            state: "running".to_owned(),
+            signals: 0,
+            submitted: 0,
+            refused: 0,
+            fills: 0,
+            halted: None,
+            last_error: None,
+            error_from: None,
+            last_bar: None,
+            frozen: None,
+            reconciled: false,
+            started_at: String::new(),
+            verdict: "inconclusive".to_owned(),
+            verdict_reason: None,
+            warnings: Vec::new(),
+            divergence: None,
+        });
+        let read = || {
+            let status = status.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            (status.last_error.clone(), status.error_from)
+        };
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let record = Recorder::open(dir.path(), "f@alpaca-paper").expect("record");
+        trouble(&status, &record, &events, "settle_failed", &"the venue timed out");
+        assert_eq!(read(), (Some("the venue timed out".to_owned()), Some("settle_failed")));
+
+        // A bar arriving does not mean the settle is working again.
+        recovered(&status, &events, "fetch_failed");
+        assert_eq!(read().0, Some("the venue timed out".to_owned()), "another call's success hides nothing");
+
+        // Its own success does.
+        recovered(&status, &events, "settle_failed");
+        assert_eq!(read(), (None, None));
     }
 
     #[test]

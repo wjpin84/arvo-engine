@@ -32,7 +32,7 @@ use proto::platform::{
 use proto::portfolio::{PortfolioLibraryView, PortfolioName};
 use proto::research::{
     Advice, AttachRequest, Attachment, AttachmentRef, Attachments, BarView, BarsRequest, BarsView, BookRequest,
-    ComparisonView, Finding, PanelRequest, RankRequest, Ranking, RegimePointView, RuleFile, RuleFiles, RuleText, RegimeView, ReviewRequest, ReviewView,
+    ComparisonView, Finding, PanelRequest, RankRequest, Ranking, RegimePointView, PineScript, PineTranslation, RuleFile, RuleFiles, RuleText, RegimeView, ReviewRequest, ReviewView,
     FindingId, FindingIds, FindingSummary, Findings, HistoryView, PanelView, Point, ProblemsView, RecordView,
     ReplayView, ReportFigure, ReportRequest, RiskModel, Rules, Ruleset, RulesetForm, RulesetPath, Rulesets,
     RunRequest, SharedExperiment, Strategies, StudyRequest, StudyView, TradeExport, WalkForwardView,
@@ -845,6 +845,24 @@ impl research_server::Research for Service {
         Ok(Response::new(RuleFiles { rules: arvo_service::rules::list(self.research.root()) }))
     }
 
+    async fn translate_pine(&self, request: Request<PineScript>) -> Result<Response<PineTranslation>, Status> {
+        let PineScript { text, interval } = request.into_inner();
+        let text = required(&text, "text")?.to_owned();
+        let interval: arvo_data::BarInterval = match interval.as_deref().filter(|text| !text.trim().is_empty()) {
+            Some(named) => named.parse().map_err(|err| Status::invalid_argument(format!("{named:?}: {err}")))?,
+            None => arvo_data::BarInterval::DAILY,
+        };
+        let translated = arvo_research::pine::translate(&text, interval).map_err(|err| Status::invalid_argument(err.to_string()))?;
+        let translated = arvo_research::pine::attributed(translated, &text);
+        Ok(Response::new(PineTranslation {
+            rule: serde_json::to_string_pretty(&translated.rule).map_err(|err| Status::internal(err.to_string()))?,
+            ignored: translated.ignored,
+            name: translated.rule.name.clone(),
+            entry: translated.rule.entry.describe(),
+            exit: translated.rule.exit.as_ref().map(arvo_research::rule::Condition::describe).unwrap_or_default(),
+        }))
+    }
+
     async fn write_rule(&self, request: Request<RuleText>) -> Result<Response<RuleFile>, Status> {
         let json = required(&request.get_ref().json, "json")?;
         let rule: arvo_research::rule::RuleDefinition =
@@ -999,15 +1017,24 @@ impl research_server::Research for Service {
             None => chrono::Utc::now().date_naive(),
         };
         let root = self.research.root().to_path_buf();
+        // The structured review is what a chart reads (#229); the markdown is
+        // what a person reads. Both come off the same review, so they cannot
+        // disagree about the day.
+        let reviewed = arvo_service::review::review(&root, day);
         let (path, markdown, written_now) = match arvo_service::review::read(&root, day) {
             Some((path, text)) => (path, text, false),
             None => {
-                let reviewed = arvo_service::review::review(&root, day);
                 let path = arvo_service::review::write(&root, &reviewed).map_err(Status::internal)?;
                 (path, arvo_service::review::markdown(&reviewed), true)
             }
         };
-        Ok(Response::new(ReviewView { day: day.to_string(), markdown, path: path.display().to_string(), written_now }))
+        Ok(Response::new(ReviewView {
+            day: day.to_string(),
+            markdown,
+            path: path.display().to_string(),
+            written_now,
+            json: serde_json::to_string(&reviewed).map_err(|err| Status::internal(err.to_string()))?,
+        }))
     }
 
     async fn rank_findings(&self, request: Request<RankRequest>) -> Result<Response<Ranking>, Status> {
@@ -1716,7 +1743,7 @@ mod tests {
             calls,
             [
                 "ListStrategies", "ListInstruments", "ListFindings", "OpenFinding", "RunStudy", "RunWalkForward",
-                "RecordFinding", "AttachFile", "ListRulesets", "ReadRuleset", "WriteRuleset", "ListRules", "ListRuleFiles", "WriteRule", "GetRiskModel",
+                "RecordFinding", "AttachFile", "ListRulesets", "ReadRuleset", "WriteRuleset", "ListRules", "ListRuleFiles", "WriteRule", "TranslatePine", "GetRiskModel",
                 "ViewStudy", "ViewWalkForward", "ViewPanel", "RunPanel", "ViewBook", "ViewHistory", "ViewRecord", "ViewReplay",
                 "ViewComparison", "ReadBars", "ViewRegime", "ViewReview", "RankFindings", "ViewProblems", "ListAttachments", "Subscribe",
             ]

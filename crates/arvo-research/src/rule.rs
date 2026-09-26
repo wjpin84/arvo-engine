@@ -68,6 +68,28 @@ pub struct RuleDefinition {
     /// Absent is a rule that leaves on its stop alone.
     #[serde(default)]
     pub exit: Option<Condition>,
+    /// Where the rule came from, when it was not written here (#228). A
+    /// finding on an imported rule can then be traced to the text it was
+    /// translated from, which is the only way to tell later whether the
+    /// translation was faithful.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<Source>,
+}
+
+/// What a rule was translated from (#228).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Source {
+    /// The language it was written in: `pine`.
+    pub kind: String,
+    /// The script's own title, as written.
+    pub title: String,
+    /// The author, as the script gives it. Empty when it names none: a
+    /// guess here would be an attribution nobody made.
+    #[serde(default)]
+    pub author: String,
+    /// A hash of the original text, so the same script is recognisable and
+    /// an edited one is a different source.
+    pub hash: String,
 }
 
 /// One indicator, by its TA-Lib name.

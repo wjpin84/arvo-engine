@@ -64,6 +64,31 @@ pub struct LossGroup {
     pub total: f64,
 }
 
+/// One signal the gate refused, with when and why (#229). The counts in
+/// [`SessionReview::refused`] say how often; this says where on the day, so
+/// a chart can put it on the bar it happened at.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Refusal {
+    pub at: String,
+    /// The gate's reason, grouped the way the counts group it.
+    pub reason: String,
+    /// The reason in full, as the record has it.
+    pub detail: String,
+}
+
+/// A stretch of the day the session was not taking entries (#229): frozen on
+/// a discrepancy or a dark feed, or halted. `until` is absent when it had not
+/// ended by the last event of the day.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Span {
+    pub from: String,
+    #[serde(default)]
+    pub until: Option<String>,
+    /// "frozen" or "halted".
+    pub kind: String,
+    pub why: String,
+}
+
 /// One session's day.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct SessionReview {
@@ -94,6 +119,13 @@ pub struct SessionReview {
     pub losses: BTreeMap<String, LossGroup>,
     pub freezes: u32,
     pub feed_gaps: u32,
+    /// Each refusal with its time (#229), for a chart. `default` because a
+    /// review written before this had none.
+    #[serde(default)]
+    pub refusals: Vec<Refusal>,
+    /// The stretches the session was not taking entries (#229).
+    #[serde(default)]
+    pub spans: Vec<Span>,
     /// Halts, in the record's words: the gate's, or a person's.
     pub halts: Vec<String>,
     /// The verdict each time it changed, with its reason.
@@ -220,7 +252,12 @@ pub fn review_record(id: &str, record: &str, day: NaiveDate) -> Option<SessionRe
             "bar" if today => out.bars += 1,
             "signal" if today => out.signals += 1,
             "submitted" if today => out.submitted += 1,
-            "refused" if today => *out.refused.entry(reason_of(&text(&line.detail, "why"))).or_default() += 1,
+            "refused" if today => {
+                let detail = text(&line.detail, "why");
+                let reason = reason_of(&detail);
+                *out.refused.entry(reason.clone()).or_default() += 1;
+                out.refusals.push(Refusal { at: line.at.to_rfc3339(), reason, detail });
+            }
             "exit" if today => {
                 *out.exits.entry(text(&line.detail, "why")).or_default() += 1;
                 // An exit that carried an order went to the venue (#231).
@@ -306,9 +343,42 @@ pub fn review_record(id: &str, record: &str, day: NaiveDate) -> Option<SessionRe
                     held = total;
                 }
             }
-            "frozen" if today => out.freezes += 1,
+            "frozen" if today => {
+                out.freezes += 1;
+                // The record says what it froze on; the shape of the detail
+                // differs by cause, so whichever field is there is the why.
+                let why = if line.detail.is_string() {
+                    line.detail.as_str().unwrap_or_default().to_owned()
+                } else {
+                    let stale = text(&line.detail, "stale");
+                    if stale.is_empty() { "the book disagrees with the venue".to_owned() } else { format!("stale feed: {stale}") }
+                };
+                out.spans.push(Span { from: line.at.to_rfc3339(), until: None, kind: "frozen".to_owned(), why });
+            }
+            // A resume ends the last span that has not ended. Openly by time
+            // rather than by matching a cause: a session is frozen once at a
+            // time, and the record is in order.
+            "resumed" if today => {
+                if let Some(span) = out.spans.iter_mut().rev().find(|span| span.until.is_none()) {
+                    span.until = Some(line.at.to_rfc3339());
+                }
+            }
+            // A feed gap is noticed only when the next message lands, so the
+            // silence it names is already over: the session freezes and thaws
+            // in the same instant. It happened, and the counts say so, but it
+            // was never a stretch the session spent refusing entries — and
+            // drawing it as one on a chart says something untrue about the
+            // day. Such a span is dropped when the day is finished.
             "feed_down" if today => out.feed_gaps += 1,
             "halted" if today => {
+                let why = if line.detail.is_string() {
+                    line.detail.as_str().unwrap_or_default().to_owned()
+                } else {
+                    text(&line.detail, "reason")
+                };
+                // A halt does not lift on its own, so the span runs to the
+                // end of the day unless a person released it.
+                out.spans.push(Span { from: line.at.to_rfc3339(), until: None, kind: "halted".to_owned(), why });
                 if line.detail.is_string() {
                     out.halts.push(format!("the gate: {}", line.detail.as_str().unwrap_or_default()));
                 } else {
@@ -347,6 +417,15 @@ pub fn review_record(id: &str, record: &str, day: NaiveDate) -> Option<SessionRe
     if !out.fills.is_empty() {
         out.mean_slippage_bps = Some(out.fills.iter().map(|fill| fill.slippage_bps).sum::<f64>() / out.fills.len() as f64);
     }
+    // See the note at "resumed": a span that closed in the instant it opened
+    // was a silence that had already ended, not a stretch of the day.
+    out.spans.retain(|span| {
+        let stamp = |text: &str| chrono::DateTime::parse_from_rfc3339(text).ok();
+        let (Some(from), Some(until)) = (stamp(&span.from), span.until.as_deref().and_then(stamp)) else {
+            return true;
+        };
+        (until - from).num_seconds() >= 1
+    });
     Some(out)
 }
 
@@ -516,6 +595,13 @@ mod tests {
             line("2026-09-21T14:05:00Z", "signal", serde_json::json!({ "id": "s3", "rule": "close above the opening range", "regime": "trending up" })),
             line("2026-09-21T14:05:00Z", "submitted", serde_json::json!({ "signal": "s3", "order": "o3" })),
             line("2026-09-21T14:05:01Z", "filled", serde_json::json!({ "order": "o3", "instrument": "AAPL.AIEX", "side": "buy", "quantity": 5.0, "decision_price": 100.0, "fill_price": 100.0, "decision_at": "2026-09-21T14:05:00", "filled_at": "2026-09-21T14:05:01" })),
+            line("2026-09-21T14:30:00Z", "frozen", serde_json::json!({ "stale": "nothing heard for 900s" })),
+            line("2026-09-21T14:40:00Z", "resumed", serde_json::json!("the feed is back")),
+            // A gap noticed only once it had ended: frozen and thawed in the
+            // same instant, which is not a stretch of the day.
+            line("2026-09-21T16:00:00Z", "feed_down", serde_json::json!("nothing heard for 7200s")),
+            line("2026-09-21T16:00:00Z", "frozen", serde_json::json!({ "stale": "nothing heard for 7200s" })),
+            line("2026-09-21T16:00:00Z", "resumed", serde_json::json!("the feed is back")),
             line("2026-09-21T15:00:00Z", "warning", serde_json::json!({ "entered": ["drawdown"], "cleared": [], "near": ["drawdown 8.1% of a 10.0% limit"] })),
             line("2026-09-21T16:00:00Z", "signal", serde_json::json!({ "id": "x2", "exit": "signal" })),
             line("2026-09-21T16:00:00Z", "exit", serde_json::json!({ "signal": "x2", "why": "signal", "order": "o4" })),
@@ -525,6 +611,34 @@ mod tests {
             line("2026-09-21T17:01:00Z", "stopped", Value::Null),
         ]
         .join("\n")
+    }
+
+    #[test]
+    fn a_refusal_keeps_its_time_and_a_freeze_becomes_a_span_that_closes() {
+        let day = NaiveDate::from_ymd_opt(2026, 9, 21).unwrap();
+        let reviewed = review_record("f@alpaca-paper", &record(), day).expect("something happened");
+
+        // The counts say how often; these say where on the day (#229).
+        assert_eq!(reviewed.refusals.len(), 1);
+        let refusal = &reviewed.refusals[0];
+        assert!(refusal.at.starts_with("2026-09-21T14:00:00"), "{}", refusal.at);
+        assert_eq!(refusal.reason, "Stale");
+        assert!(refusal.detail.contains("age_ms"), "the reason in full: {}", refusal.detail);
+
+        // A freeze that was resumed is a closed span; a halt is not lifted by
+        // anything the record holds, so its span stays open.
+        let frozen = reviewed.spans.iter().find(|span| span.kind == "frozen").expect("the freeze");
+        assert!(frozen.from.starts_with("2026-09-21T14:30:00"), "{}", frozen.from);
+        assert!(frozen.until.as_deref().is_some_and(|until| until.starts_with("2026-09-21T14:40:00")), "{:?}", frozen.until);
+        assert!(frozen.why.contains("nothing heard"), "{}", frozen.why);
+        // The gap that had already ended is counted but is not a stretch: two
+        // freezes happened, and only one of them was a span of the day.
+        assert_eq!(reviewed.freezes, 2, "both froze the session");
+        assert_eq!(reviewed.spans.iter().filter(|span| span.kind == "frozen").count(), 1, "{:?}", reviewed.spans);
+
+        let halted = reviewed.spans.iter().find(|span| span.kind == "halted").expect("the halt");
+        assert_eq!(halted.until, None, "a halt stays until someone releases it");
+        assert_eq!(halted.why, "enough for today");
     }
 
     #[test]

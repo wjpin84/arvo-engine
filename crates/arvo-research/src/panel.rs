@@ -324,24 +324,61 @@ pub fn run_panel(
     let mut failures = Vec::new();
 
     // --- Selection: one configuration, scored across the whole panel --------
-    let mut scored: Vec<(f64, BTreeMap<String, f64>)> = Vec::with_capacity(combinations.len());
-    for combination in combinations {
-        let mut sharpes = Vec::new();
-        for instrument in &study.instruments {
-            let trial = variant(&study.template, instrument, &combination, in_sample, "is");
-            match provider.run(&trial) {
-                Ok(result) => {
-                    if let Some(sharpe) = Metrics::from_curve(
+    // Every in-sample run is independent of every other, so the whole
+    // `configurations x instruments` product is one flat job list run across
+    // the cores (#234), not a loop inside a loop. Flat rather than two nested
+    // pools: the product is already wide enough to fill the machine on its
+    // own, so nesting would add scheduling without adding work to schedule.
+    //
+    // The outcomes come back in job order — rayon's collect keeps an indexed
+    // iterator's order — and are scored below in that order, so a re-run
+    // produces the same trials in the same order and a tie between two
+    // configurations breaks exactly as the sequential loops broke it. Only
+    // how fast the panel runs changes; never which configuration wins.
+    use rayon::prelude::*;
+    let jobs: Vec<(&BTreeMap<String, f64>, &String)> = combinations
+        .iter()
+        .flat_map(|combination| {
+            study
+                .instruments
+                .iter()
+                .map(move |instrument| (combination, instrument))
+        })
+        .collect();
+    let ran: Vec<Result<Option<f64>, String>> = jobs
+        .par_iter()
+        .map(|(combination, instrument)| {
+            let trial = variant(&study.template, instrument, combination, in_sample, "is");
+            provider
+                .run(&trial)
+                .map_err(|err| format!("{instrument} {combination:?}: {err}"))
+                .map(|result| {
+                    Metrics::from_curve(
                         &result.equity_curve,
                         result.trades,
                         study.template.interval.periods_per_year(),
                     )
                     .and_then(|metrics| metrics.sharpe)
-                    {
-                        sharpes.push(sharpe);
-                    }
-                }
-                Err(err) => failures.push(format!("{instrument} {combination:?}: {err}")),
+                })
+        })
+        .collect();
+
+    let mut scored: Vec<(f64, BTreeMap<String, f64>)> = Vec::with_capacity(combinations.len());
+    // One chunk per configuration, in grid order, because the jobs above were
+    // laid out configuration-major.
+    for (combination, outcomes) in combinations
+        .iter()
+        .zip(ran.chunks(study.instruments.len()))
+    {
+        let mut sharpes = Vec::new();
+        for outcome in outcomes {
+            match outcome {
+                Ok(Some(sharpe)) => sharpes.push(*sharpe),
+                // A flat curve is a run that never traded. It did not lose
+                // the panel, it did not enter it, and the count below is what
+                // refuses the configuration for it.
+                Ok(None) => {}
+                Err(err) => failures.push(err.clone()),
             }
         }
 
@@ -350,7 +387,7 @@ pub fn run_panel(
         // generalises, which is the entire reason for testing many.
         if sharpes.len() == study.instruments.len() {
             let mean = sharpes.iter().sum::<f64>() / sharpes.len() as f64;
-            scored.push((mean, combination));
+            scored.push((mean, combination.clone()));
         } else {
             failures.push(format!(
                 "{combination:?}: ran on {} of {} instruments, so it was not considered",
@@ -394,12 +431,15 @@ pub fn run_panel(
     };
 
     // --- Judgement: that one configuration, on data it never saw -----------
-    let mut per_instrument = Vec::new();
-    // Kept only long enough to measure how much the members moved together.
-    // Storing N curves in a panel record would add megabytes to say something
-    // the correlation matrix says in a few numbers.
-    let mut curves: Vec<(String, Vec<crate::EquityPoint>)> = Vec::new();
-    for instrument in &study.instruments {
+    // A member's out-of-sample pair — the rule and its benchmark — is
+    // independent of every other member's, so the members run across the
+    // cores as well (#234). Collected in instrument order, so the pooled
+    // figures and the correlation matrix are built from the same sequence a
+    // sequential run built them from.
+    let judged: Vec<Result<(InstrumentOutcome, Vec<crate::EquityPoint>), String>> = study
+        .instruments
+        .par_iter()
+        .map(|instrument| {
         let experiment = variant(
             &study.template,
             instrument,
@@ -440,12 +480,22 @@ pub fn run_panel(
             }
         });
 
+        outcome.map_err(|err| format!("{instrument} out-of-sample: {err}"))
+        })
+        .collect();
+
+    let mut per_instrument = Vec::new();
+    // Kept only long enough to measure how much the members moved together.
+    // Storing N curves in a panel record would add megabytes to say something
+    // the correlation matrix says in a few numbers.
+    let mut curves: Vec<(String, Vec<crate::EquityPoint>)> = Vec::new();
+    for outcome in judged {
         match outcome {
             Ok((outcome, curve)) => {
                 curves.push((outcome.instrument.clone(), curve));
                 per_instrument.push(outcome);
             }
-            Err(err) => failures.push(format!("{instrument} out-of-sample: {err}")),
+            Err(err) => failures.push(err),
         }
     }
 
@@ -746,6 +796,123 @@ mod tests {
             prior_trials: 0,
             scored: Vec::new(),
         }
+    }
+
+    /// A provider whose score is deliberately *not* injective in the
+    /// parameter: two configurations tie for best, so which one wins is
+    /// decided by ordering alone. That is the property parallelising the
+    /// panel could quietly break, and the only one worth a test here.
+    struct Stepped;
+
+    impl SimulationProvider for Stepped {
+        fn engine(&self) -> &str {
+            "stepped"
+        }
+
+        fn run(&self, experiment: &Experiment) -> Result<crate::SimulationResult, SimulationError> {
+            // Odd `fast` drifts up, even `fast` does not, so `fast` 5 and 7
+            // score the same and so do 6 and 8. The instrument shifts the
+            // level without touching the ranking, so every member agrees on
+            // which configuration is best and the panel selects one.
+            let fast = experiment.strategy.params.get("fast").copied().unwrap_or(0.0);
+            #[expect(clippy::cast_possible_truncation, reason = "grid values are small integers")]
+            let drift = if (fast as i64) % 2 == 1 { 0.002 } else { 0.0 };
+            let level = 100.0 + f64::from(u32::from(experiment.instrument.starts_with("MSFT")));
+            let mut equity = level;
+            let points = (0..40)
+                .map(|i| {
+                    // Alternating either side of the drift, so volatility is
+                    // finite and the Sharpe is a real number.
+                    equity *= 1.0 + drift + if i % 2 == 0 { 0.01 } else { -0.01 };
+                    crate::EquityPoint {
+                        at: chrono::NaiveDate::from_ymd_opt(2024, 1, 1)
+                            .expect("a date")
+                            .checked_add_signed(chrono::Duration::days(i))
+                            .expect("in range")
+                            .and_hms_opt(0, 0, 0)
+                            .expect("midnight"),
+                        equity,
+                    }
+                })
+                .collect();
+            Ok(crate::SimulationResult {
+                experiment: experiment.id.clone(),
+                engine: "stepped".to_owned(),
+                trades: 40,
+                equity_curve: points,
+                ledger: Vec::new(),
+                refused: crate::Refused::default(),
+            })
+        }
+    }
+
+    fn tied_study() -> PanelStudy {
+        PanelStudy::new(
+            Experiment {
+                id: crate::ExperimentId::from("panel"),
+                hypothesis: HypothesisId::from("h"),
+                instrument: "AAPL.NASDAQ".to_owned(),
+                alongside: Vec::new(),
+                underlying: None,
+                window: DateRange::new(
+                    chrono::NaiveDate::from_ymd_opt(2024, 1, 1).expect("a date"),
+                    chrono::NaiveDate::from_ymd_opt(2024, 12, 31).expect("a date"),
+                )
+                .expect("ordered"),
+                interval: arvo_data::BarInterval::DAILY,
+                dataset: crate::DatasetRef {
+                    id: "fixture".to_owned(),
+                    version: "1".to_owned(),
+                    adjustment: arvo_data::source::Adjustment::Split,
+                },
+                strategy: crate::StrategySpec {
+                    rule: None,
+                    name: "sma_cross".to_owned(),
+                    params: BTreeMap::new(),
+                },
+                costs: crate::CostModel::proportional(1.0, 1.0),
+                risk: crate::RiskModel::default(),
+                starting_cash: 100_000.0,
+                seed: 1,
+            },
+            vec!["AAPL.NASDAQ".to_owned(), "MSFT.NASDAQ".to_owned()],
+            ParameterGrid::new().axis("fast", vec![5.0, 6.0, 7.0, 8.0]),
+        )
+    }
+
+    #[test]
+    fn running_the_panel_across_the_cores_does_not_change_which_configuration_wins() {
+        // The product runs on the thread pool now (#234), so the outcomes
+        // arrive in whatever order the cores finish in. What must not change
+        // is the order they are *scored* in: with `fast` 5 and 7 tied for
+        // best, the sequential loop took the later one, and so must this.
+        let study = tied_study();
+        let evidence = run_panel(&Stepped, &study, &crate::EvaluationCriteria::default())
+            .expect("every trial runs");
+        assert_eq!(
+            evidence.selected_params.get("fast"),
+            Some(&7.0),
+            "the last of the tied configurations wins, as the sequential loop had it"
+        );
+
+        // Every trial scored, none lost to the threading, and the members
+        // came back in the order they were asked for rather than the order
+        // they finished in.
+        assert_eq!(evidence.selection.trials, 4, "one score per configuration");
+        assert!(evidence.failures.is_empty(), "{:?}", evidence.failures);
+        let members: Vec<&str> = evidence
+            .per_instrument
+            .iter()
+            .map(|outcome| outcome.instrument.as_str())
+            .collect();
+        assert_eq!(members, study.instruments, "members stay in panel order");
+
+        // And a second run agrees with the first, which a pool that leaked
+        // its completion order into the scoring would not.
+        let again = run_panel(&Stepped, &study, &crate::EvaluationCriteria::default())
+            .expect("every trial runs");
+        assert_eq!(evidence.selection.scored, again.selection.scored);
+        assert_eq!(evidence.selected_params, again.selected_params);
     }
 
     #[test]

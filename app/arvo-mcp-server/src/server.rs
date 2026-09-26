@@ -36,7 +36,7 @@ use std::time::{Duration, Instant};
 
 use arvo_client::discovery::{self, Discovery};
 use arvo_client::proto::common::Empty;
-use arvo_client::proto::research::{BarsRequest, Finding, FindingId, FindingIds, PanelRequest, Param, RankRequest, RuleText, ReviewRequest, RulesetForm, RunRequest};
+use arvo_client::proto::research::{BarsRequest, Finding, FindingId, FindingIds, PanelRequest, Param, PineScript, RankRequest, RuleText, ReviewRequest, RulesetForm, RunRequest};
 use arvo_client::proto::services::research_client::ResearchClient;
 use serde_json::{json, Value};
 use tonic::transport::Channel;
@@ -206,6 +206,15 @@ impl Server {
                 let request = self.request(Empty {})?;
                 let listed = self.runtime.block_on(self.research.list_rule_files(request)).map_err(refused)?;
                 encode(&listed.into_inner().rules)
+            }
+            "translate_pine" => {
+                let asked = PineScript {
+                    text: text("script")?,
+                    interval: arguments.get("interval").and_then(Value::as_str).map(ToOwned::to_owned),
+                };
+                let request = self.request(asked)?;
+                let translated = self.runtime.block_on(self.research.translate_pine(request)).map_err(refused)?;
+                encode(&translated.into_inner())
             }
             "write_rule" => {
                 // The definition's own JSON: the engine is the one parser.
@@ -477,6 +486,18 @@ fn tools() -> Value {
             "inputSchema": { "type": "object", "properties": {} },
         },
         {
+            "name": "translate_pine",
+            "description": "Translates a Pine v5 strategy into a rule this engine can study. Translates the subset the rule language says — ta.sma, ta.atr, ta.highest, ta.lowest, ta.crossover, ta.crossunder, comparisons, and/or/not, input.* as parameters, strategy.entry and strategy.close — and refuses every other construct by name, listing all of them at once so the script can be rewritten. Drawing (plot and its neighbours) is read, set aside and listed, never silently dropped. It writes nothing: read the rule it returns, then pass it to write_rule to keep it. Reading many scripts and keeping one is a search of many, and your findings are deflated against it.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "script": { "type": "string", "description": "The Pine v5 source" },
+                    "interval": { "type": "string", "description": "The resolution the rule runs at, e.g. 1day or 5minute; Pine takes it from the chart. 1day when absent." }
+                },
+                "required": ["script"]
+            },
+        },
+        {
             "name": "write_rule",
             "description": "Writes a rule as data the engine evaluates exactly as it evaluates a compiled rule: named indicators (SMA, ATR, MAX, MIN; period a number or a parameter name) and entry and exit conditions in JSON Logic over them, with cross_above and cross_below as the two stateful operators, plus defaults for every number a ruleset's grid may vary. Refuses anything the engine would not run and says which construct. Then write_ruleset naming this rule, or run_study on the rule itself.",
             "inputSchema": {
@@ -738,6 +759,7 @@ mod tests {
                 "list_strategies",
                 "list_rulesets",
                 "list_rules",
+                "translate_pine",
                 "write_rule",
                 "write_ruleset",
                 "list_instruments",
