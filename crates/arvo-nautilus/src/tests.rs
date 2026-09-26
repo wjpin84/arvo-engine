@@ -373,6 +373,62 @@ fn a_rule_written_as_data_reproduces_the_compiled_control_to_the_cent() {
     );
 }
 
+/// The classic, as TradingView's documentation writes it (#228).
+const TWO_SMA_PINE: &str = r#"//@version=5
+strategy("Two SMA cross", overlay=true)
+fast = input.int(10, "Fast")
+slow = input.int(30, "Slow")
+fastMa = ta.sma(close, fast)
+slowMa = ta.sma(close, slow)
+plot(fastMa)
+if ta.crossover(fastMa, slowMa)
+    strategy.entry("long", strategy.long)
+if ta.crossunder(fastMa, slowMa)
+    strategy.close("long")
+"#;
+
+#[test]
+fn a_pine_script_imports_to_a_rule_that_books_the_compiled_controls_trades() {
+    // The point of the import (#228): TradingView's own tester cannot deflate
+    // this script or walk it forward, and Arvo can — but only if what it runs
+    // is the strategy the script describes, to the cent.
+    let bars = sawtooth(200);
+    let translated = arvo_research::pine::translate(TWO_SMA_PINE, arvo_data::BarInterval::DAILY)
+        .expect("the classic translates");
+    assert_eq!(translated.rule.name, "two_sma_cross");
+
+    let compiled = experiment(params(10.0, 30.0), &bars);
+    let mut translated_experiment = experiment(params(10.0, 30.0), &bars);
+    translated_experiment.strategy.name = translated.rule.name.clone();
+    translated_experiment.strategy.rule = Some(translated.rule);
+
+    let control = provider(bars.clone()).run(&compiled).expect("the control runs");
+    let theirs = provider(bars).run(&translated_experiment).expect("the imported rule runs");
+
+    assert!(control.trades > 0, "a crossing path should trade");
+    assert_eq!(theirs.trades, control.trades);
+    for (a, b) in control.equity_curve.iter().zip(&theirs.equity_curve) {
+        assert!((a.equity - b.equity).abs() < 1e-9, "{} vs {}", a.equity, b.equity);
+    }
+    // Every fill the same, to the cent. The journal is the one difference,
+    // and it should differ: it records what the rule saw in the rule's own
+    // words, and the script calls its averages fastMa and slowMa.
+    let strip = |ledger: &[arvo_research::Trade]| -> serde_json::Value {
+        let mut value = serde_json::to_value(ledger).expect("json");
+        for trade in value.as_array_mut().expect("an array") {
+            if let Some(journal) = trade.get_mut("journal").and_then(|journal| journal.as_object_mut()) {
+                journal.remove("rule");
+            }
+        }
+        value
+    };
+    assert_eq!(strip(&theirs.ledger), strip(&control.ledger), "every fill the script describes, as the compiled control books them");
+    for trade in &theirs.ledger {
+        let journal = trade.journal.as_ref().expect("a journal");
+        assert_eq!(journal.rule, "fastMa crossed above slowMa", "the journal speaks the script's own names");
+    }
+}
+
 #[test]
 fn an_experiment_runs_end_to_end_through_nautilus() {
     let bars = sawtooth(200);

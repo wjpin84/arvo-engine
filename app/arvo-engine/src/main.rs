@@ -37,7 +37,8 @@ const USAGE: &str = "usage:
   arvo-engine [<data-dir>] session explain <id> <time>        the chain behind every position held then
   arvo-engine [<data-dir>] review [YYYY-MM-DD]   the review after the close: written under reviews/, and printed
   arvo-engine [<data-dir>] rank [--rule R] [--instrument I]   the leaderboard: every comparable finding, in the one order
-  arvo-engine [<data-dir>] universes [refresh]   the project's universes and their coverage; `refresh` fetches what is missing or behind";
+  arvo-engine [<data-dir>] universes [refresh]   the project's universes and their coverage; `refresh` fetches what is missing or behind
+  arvo-engine [<data-dir>] pine <file> [--interval 1day] [--keep]   read a Pine v5 strategy as a rule; --keep writes it under rules/";
 
 async fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -59,6 +60,12 @@ async fn run() -> Result<(), String> {
         if verb == "universes" && std::path::Path::new(dir).is_dir() {
             return universes_command(PathBuf::from(dir), rest).await;
         }
+        if verb == "pine" && std::path::Path::new(dir).is_dir() {
+            return pine_command(PathBuf::from(dir), rest);
+        }
+    }
+    if args.first().map(String::as_str) == Some("pine") {
+        return pine_command(research::default_root()?, &args[1..]);
     }
     if args.first().map(String::as_str) == Some("universes") {
         return universes_command(research::default_root()?, &args[1..]).await;
@@ -169,6 +176,46 @@ async fn run() -> Result<(), String> {
     stopping.stop_all().await;
     discovery::remove_if_ours(&root, pid);
     served.map_err(|err| format!("serving: {err}"))
+}
+
+/// `pine <file> [--interval I] [--keep]`: reads a Pine v5 strategy as a rule
+/// (#228) and prints it, with everything the reader set aside. `--keep`
+/// writes it under `rules/`, which is the same decision `write_rule` makes.
+/// Needs no engine.
+fn pine_command(root: PathBuf, args: &[String]) -> Result<(), String> {
+    let (mut file, mut interval, mut keep) = (None, arvo_data::BarInterval::DAILY, false);
+    let mut rest = args.iter();
+    while let Some(argument) = rest.next() {
+        match argument.as_str() {
+            "--keep" => keep = true,
+            "--interval" => {
+                let named = rest.next().ok_or_else(|| USAGE.to_owned())?;
+                interval = named.parse().map_err(|err| format!("{named:?}: {err}"))?;
+            }
+            _ if file.is_none() => file = Some(PathBuf::from(argument)),
+            _ => return Err(USAGE.to_owned()),
+        }
+    }
+    let file = file.ok_or_else(|| USAGE.to_owned())?;
+    let text = std::fs::read_to_string(&file).map_err(|err| format!("reading {}: {err}", file.display()))?;
+    let translated = arvo_research::pine::translate(&text, interval).map_err(|err| err.to_string())?;
+    let translated = arvo_research::pine::attributed(translated, &text);
+    for line in &translated.ignored {
+        eprintln!("arvo-engine: set aside  {line}");
+    }
+    eprintln!(
+        "arvo-engine: {} — enter when {}{}",
+        translated.rule.name,
+        translated.rule.entry.describe(),
+        translated.rule.exit.as_ref().map_or_else(String::new, |exit| format!("; leave when {}", exit.describe()))
+    );
+    if keep {
+        let written = arvo_service::rules::write(&root, &translated.rule)?;
+        eprintln!("arvo-engine: written to {}", written.path);
+    } else {
+        println!("{}", serde_json::to_string_pretty(&translated.rule).map_err(|err| err.to_string())?);
+    }
+    Ok(())
 }
 
 /// `universes [refresh]`: the project's universes with their members'
