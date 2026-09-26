@@ -32,7 +32,7 @@ use proto::platform::{
 use proto::portfolio::{PortfolioLibraryView, PortfolioName};
 use proto::research::{
     Advice, AttachRequest, Attachment, AttachmentRef, Attachments, BarView, BarsRequest, BarsView, BookRequest,
-    ComparisonView, Finding, PanelRequest, RankRequest, Ranking, RegimePointView, RegimeView, ReviewRequest, ReviewView,
+    ComparisonView, Finding, PanelRequest, RankRequest, Ranking, RegimePointView, RuleFile, RuleFiles, RuleText, RegimeView, ReviewRequest, ReviewView,
     FindingId, FindingIds, FindingSummary, Findings, HistoryView, PanelView, Point, ProblemsView, RecordView,
     ReplayView, ReportFigure, ReportRequest, RiskModel, Rules, Ruleset, RulesetForm, RulesetPath, Rulesets,
     RunRequest, SharedExperiment, Strategies, StudyRequest, StudyView, TradeExport, WalkForwardView,
@@ -839,6 +839,19 @@ impl research_server::Research for Service {
 
     async fn list_rules(&self, _: Request<Empty>) -> Result<Response<Rules>, Status> {
         Ok(Response::new(Rules { rules: arvo_service::rulesets::list_rules() }))
+    }
+
+    async fn list_rule_files(&self, _: Request<Empty>) -> Result<Response<RuleFiles>, Status> {
+        Ok(Response::new(RuleFiles { rules: arvo_service::rules::list(self.research.root()) }))
+    }
+
+    async fn write_rule(&self, request: Request<RuleText>) -> Result<Response<RuleFile>, Status> {
+        let json = required(&request.get_ref().json, "json")?;
+        let rule: arvo_research::rule::RuleDefinition =
+            serde_json::from_str(json).map_err(|err| Status::invalid_argument(format!("not a rule definition: {err}")))?;
+        arvo_service::rules::write(self.research.root(), &rule)
+            .map(Response::new)
+            .map_err(Status::invalid_argument)
     }
 
     async fn get_risk_model(&self, _: Request<Empty>) -> Result<Response<RiskModel>, Status> {
@@ -1703,7 +1716,7 @@ mod tests {
             calls,
             [
                 "ListStrategies", "ListInstruments", "ListFindings", "OpenFinding", "RunStudy", "RunWalkForward",
-                "RecordFinding", "AttachFile", "ListRulesets", "ReadRuleset", "WriteRuleset", "ListRules", "GetRiskModel",
+                "RecordFinding", "AttachFile", "ListRulesets", "ReadRuleset", "WriteRuleset", "ListRules", "ListRuleFiles", "WriteRule", "GetRiskModel",
                 "ViewStudy", "ViewWalkForward", "ViewPanel", "RunPanel", "ViewBook", "ViewHistory", "ViewRecord", "ViewReplay",
                 "ViewComparison", "ReadBars", "ViewRegime", "ViewReview", "RankFindings", "ViewProblems", "ListAttachments", "Subscribe",
             ]

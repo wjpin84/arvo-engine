@@ -36,7 +36,7 @@ use std::time::{Duration, Instant};
 
 use arvo_client::discovery::{self, Discovery};
 use arvo_client::proto::common::Empty;
-use arvo_client::proto::research::{BarsRequest, Finding, FindingId, FindingIds, PanelRequest, Param, RankRequest, ReviewRequest, RulesetForm, RunRequest};
+use arvo_client::proto::research::{BarsRequest, Finding, FindingId, FindingIds, PanelRequest, Param, RankRequest, RuleText, ReviewRequest, RulesetForm, RunRequest};
 use arvo_client::proto::services::research_client::ResearchClient;
 use serde_json::{json, Value};
 use tonic::transport::Channel;
@@ -201,6 +201,22 @@ impl Server {
                 let request = self.request(Empty {})?;
                 let listed = self.runtime.block_on(self.research.list_rulesets(request)).map_err(refused)?;
                 encode(&listed.into_inner().rulesets)
+            }
+            "list_rules" => {
+                let request = self.request(Empty {})?;
+                let listed = self.runtime.block_on(self.research.list_rule_files(request)).map_err(refused)?;
+                encode(&listed.into_inner().rules)
+            }
+            "write_rule" => {
+                // The definition's own JSON: the engine is the one parser.
+                let json = match arguments.get("rule") {
+                    Some(Value::String(text)) => text.clone(),
+                    Some(value) => serde_json::to_string(value).map_err(|err| err.to_string())?,
+                    None => return Err("write_rule needs rule: the definition, as an object or its JSON".to_owned()),
+                };
+                let request = self.request(RuleText { json })?;
+                let written = self.runtime.block_on(self.research.write_rule(request)).map_err(refused)?;
+                encode(&written.into_inner())
             }
             "write_ruleset" => {
                 let numbers = |key: &str| -> Result<std::collections::BTreeMap<String, f64>, String> {
@@ -456,6 +472,25 @@ fn tools() -> Value {
             "inputSchema": { "type": "object", "properties": {} },
         },
         {
+            "name": "list_rules",
+            "description": "The project's rules written as data: each file's name, interval, indicators, parameter defaults, entry and exit read back as a sentence, and its content hash. A file that cannot run is listed with the reason instead. These are the rules a ruleset may name, beside Arvo's own from list_strategies.",
+            "inputSchema": { "type": "object", "properties": {} },
+        },
+        {
+            "name": "write_rule",
+            "description": "Writes a rule as data the engine evaluates exactly as it evaluates a compiled rule: named indicators (SMA, ATR, MAX, MIN; period a number or a parameter name) and entry and exit conditions in JSON Logic over them, with cross_above and cross_below as the two stateful operators, plus defaults for every number a ruleset's grid may vary. Refuses anything the engine would not run and says which construct. Then write_ruleset naming this rule, or run_study on the rule itself.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "rule": {
+                        "type": "object",
+                        "description": "The definition: name, label, premise, interval {step, unit}, params, indicators, entry, exit. E.g. {\"name\":\"twin_cross\",\"interval\":{\"step\":1,\"unit\":\"day\"},\"params\":{\"fast\":10,\"slow\":30},\"indicators\":{\"fast\":{\"kind\":\"SMA\",\"period\":\"fast\"},\"slow\":{\"kind\":\"SMA\",\"period\":\"slow\"}},\"entry\":{\"cross_above\":[{\"var\":\"fast\"},{\"var\":\"slow\"}]},\"exit\":{\"cross_below\":[{\"var\":\"fast\"},{\"var\":\"slow\"}]}}"
+                    }
+                },
+                "required": ["rule"]
+            },
+        },
+        {
             "name": "write_ruleset",
             "description": "Writes a ruleset the project can study and a person can open in the editor: one of Arvo's rules from list_strategies, the parameters fixed, the axes searched. Refuses anything the engine would not run and says why. Replaces a ruleset of the same name. Then run_study with strategy set to the ruleset's name.",
             "inputSchema": {
@@ -694,6 +729,8 @@ mod tests {
             [
                 "list_strategies",
                 "list_rulesets",
+                "list_rules",
+                "write_rule",
                 "write_ruleset",
                 "list_instruments",
                 "list_findings",
@@ -755,6 +792,63 @@ mod tests {
         assert_eq!(refused["result"]["isError"], json!(true));
         assert!(refused["result"]["content"][0]["text"].as_str().expect("text").contains("fast"));
         assert!(!engine.dir.path().join("rulesets/nothing.json").exists());
+    }
+
+    #[test]
+    fn an_agent_can_write_a_rule_as_data_then_a_ruleset_over_it() {
+        let engine = engine();
+        let mut server = server(&engine, None);
+        let definition = json!({
+            "name": "agent_twin",
+            "label": "The twin, written by an agent",
+            "premise": "the control, written down",
+            "interval": { "step": 1, "unit": "day" },
+            "params": { "fast": 10, "slow": 30 },
+            "indicators": {
+                "fast": { "kind": "SMA", "period": "fast" },
+                "slow": { "kind": "SMA", "period": "slow" }
+            },
+            "entry": { "cross_above": [ { "var": "fast" }, { "var": "slow" } ] },
+            "exit": { "cross_below": [ { "var": "fast" }, { "var": "slow" } ] }
+        });
+        let written = call(
+            &mut server,
+            json!({ "jsonrpc": "2.0", "id": 20, "method": "tools/call",
+                    "params": { "name": "write_rule", "arguments": { "rule": definition } } }),
+        );
+        assert_eq!(written["result"]["isError"], json!(false), "{written}");
+        let file = &written["result"]["structuredContent"];
+        assert_eq!(file["path"], json!("rules/agent_twin.json"));
+        assert_eq!(file["entry"], json!("fast crossed above slow"));
+        assert!(engine.dir.path().join("rules/agent_twin.json").exists());
+
+        let listed = call(&mut server, json!({ "jsonrpc": "2.0", "id": 21, "method": "tools/call",
+                                               "params": { "name": "list_rules", "arguments": {} } }));
+        assert_eq!(listed["result"]["structuredContent"]["items"][0]["name"], json!("agent_twin"));
+
+        // The rule is offered, so a ruleset may search it.
+        let over = call(
+            &mut server,
+            json!({ "jsonrpc": "2.0", "id": 22, "method": "tools/call",
+                    "params": { "name": "write_ruleset", "arguments": {
+                        "name": "agent_twin_grid", "rule": "agent_twin",
+                        "axes": { "fast": [5, 10], "slow": [20, 30] } } } }),
+        );
+        assert_eq!(over["result"]["isError"], json!(false), "{over}");
+        assert_eq!(over["result"]["structuredContent"]["searches"], json!(4));
+
+        // A rule the engine could not evaluate is refused, and nothing is written.
+        let mut broken = definition.clone();
+        broken["name"] = json!("agent_broken");
+        broken["entry"] = json!({ "cross_above": [ { "var": "rsi" }, { "var": "slow" } ] });
+        let refused = call(
+            &mut server,
+            json!({ "jsonrpc": "2.0", "id": 23, "method": "tools/call",
+                    "params": { "name": "write_rule", "arguments": { "rule": broken } } }),
+        );
+        assert_eq!(refused["result"]["isError"], json!(true));
+        assert!(refused["result"]["content"][0]["text"].as_str().expect("text").contains("rsi"), "{refused}");
+        assert!(!engine.dir.path().join("rules/agent_broken.json").exists());
     }
 
     #[test]

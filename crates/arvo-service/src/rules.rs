@@ -56,6 +56,72 @@ pub fn refresh_at(root: &Path) {
     crate::research::set_project_rules(&rules);
 }
 
+/// Every rule file as the picker sees it (#225): what it says, or why it
+/// cannot run. The listing a person or an agent reads before writing one.
+#[must_use]
+pub fn list(root: &Path) -> Vec<arvo_api::research::RuleFile> {
+    read_all(root)
+        .into_iter()
+        .map(|(path, rule)| match rule {
+            Ok(rule) => arvo_api::research::RuleFile {
+                path,
+                name: rule.name.clone(),
+                label: rule.label.clone(),
+                premise: rule.premise.clone(),
+                interval: rule.interval.to_string(),
+                indicators: rule.indicators.keys().cloned().collect(),
+                params: rule
+                    .params
+                    .iter()
+                    .map(|(name, value)| arvo_api::Fixed { name: name.clone(), value: *value })
+                    .collect(),
+                entry: rule.entry.describe(),
+                exit: rule.exit.as_ref().map(arvo_research::rule::Condition::describe).unwrap_or_default(),
+                version: rule.version(),
+                problem: None,
+            },
+            Err(problem) => arvo_api::research::RuleFile { path, problem: Some(problem), ..Default::default() },
+        })
+        .collect()
+}
+
+/// Writes `rules/<name>.json` from a definition, refusing anything the engine
+/// would not run and saying why (#225).
+///
+/// The name is the definition's own and must not be one of Arvo's: a rule
+/// that shadowed `sma_cross` would make every finding on it ambiguous.
+/// Replaces a rule of the same name, and the picker re-reads at once, so a
+/// ruleset written next may name it.
+///
+/// # Errors
+///
+/// A bad name, a name Arvo already uses, a definition whose defaults cannot
+/// run, or a file that cannot be written.
+pub fn write(root: &Path, rule: &arvo_research::rule::RuleDefinition) -> Result<arvo_api::research::RuleFile, String> {
+    let name = rule.name.trim();
+    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+        return Err("a rule name is letters, digits, _ and -".to_owned());
+    }
+    if crate::research::StrategyPlan::find_shipped(name).is_some() {
+        return Err(format!("{name:?} is one of Arvo's own rules; choose another name"));
+    }
+    // What the engine will be handed, checked before anything is written.
+    rule.resolve(&BTreeMap::new()).map_err(|err| err.to_string())?;
+    let dir = root.join(SUBDIR);
+    std::fs::create_dir_all(&dir).map_err(|err| format!("{}: {err}", dir.display()))?;
+    let path = dir.join(format!("{name}.json"));
+    let text = serde_json::to_string_pretty(rule).map_err(|err| err.to_string())?;
+    std::fs::write(&path, text + "
+").map_err(|err| format!("{}: {err}", path.display()))?;
+    // The picker re-reads, so a ruleset written next may name this rule.
+    refresh_at(root);
+    let relative = format!("{SUBDIR}/{name}.json");
+    list(root)
+        .into_iter()
+        .find(|listed| listed.path == relative)
+        .ok_or_else(|| format!("{relative} was written but cannot be read back"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -82,6 +148,45 @@ mod tests {
       "interval": { "step": 1, "unit": "day" },
       "kind": { "kind": "grid", "rule": "twin_cross", "fixed": {}, "axes": { "fast": [5, 10], "slow": [20, 30] } }
     }"#;
+
+    #[test]
+    fn a_rule_is_written_checked_and_listed_and_a_bad_one_is_refused_before_anything_is_written() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let twin: RuleDefinition = serde_json::from_str(TWIN_CROSS).expect("parses");
+
+        let written = write(dir.path(), &twin).expect("writes");
+        assert_eq!(written.path, "rules/twin_cross.json");
+        assert_eq!(written.version, twin.version());
+        assert_eq!(written.entry, "fast crossed above slow");
+        assert_eq!(written.exit, "fast crossed below slow");
+        assert_eq!(written.indicators, ["fast", "slow"]);
+        assert_eq!(written.problem, None);
+        assert_eq!(read_one(&dir.path().join(SUBDIR).join("twin_cross.json")).expect("reads back"), twin);
+        // Written, so the picker offers it and a ruleset may name it.
+        assert!(StrategyPlan::find("twin_cross").is_some());
+
+        // One of Arvo's own names would make every finding on it ambiguous.
+        let mut shadow = twin.clone();
+        shadow.name = "sma_cross".to_owned();
+        assert!(write(dir.path(), &shadow).expect_err("refused").contains("one of Arvo's own"));
+        let mut bad = twin.clone();
+        bad.name = "not a name".to_owned();
+        assert!(write(dir.path(), &bad).expect_err("refused").contains("letters, digits"));
+        // A definition whose defaults cannot run is refused before writing.
+        let mut broken = twin.clone();
+        broken.name = "broken".to_owned();
+        broken.params.remove("slow");
+        assert!(write(dir.path(), &broken).expect_err("refused").contains("slow"));
+        assert!(!dir.path().join(SUBDIR).join("broken.json").exists(), "nothing was written");
+
+        // A file that cannot run is listed with its reason, not dropped.
+        std::fs::write(dir.path().join(SUBDIR).join("torn.json"), r#"{ "name": "torn" }"#).expect("write");
+        let listed = list(dir.path());
+        assert_eq!(listed.len(), 2);
+        let torn = listed.iter().find(|file| file.path.ends_with("torn.json")).expect("listed");
+        assert!(torn.problem.as_deref().is_some_and(|why| why.contains("torn.json")), "{:?}", torn.problem);
+        assert!(torn.name.is_empty(), "a file that cannot be read says nothing else about itself");
+    }
 
     #[test]
     fn a_rule_file_is_offered_and_a_ruleset_may_name_it() {
