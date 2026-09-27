@@ -30,6 +30,33 @@ use crate::option::OptionContract;
 pub enum Kind {
     Stock,
     Option(OptionContract),
+    /// A coin pair: `base` is what is bought and sold, `quote` is what it is
+    /// priced and settled in. `BTC-USD` buys Bitcoin with dollars.
+    Crypto { base: String, quote: String },
+}
+
+/// The quote currencies a pair is recognised by.
+///
+/// A dash is not enough on its own — `BRK-B.YF` is a share class and is in the
+/// library today — so a pair is a symbol whose last dashed part is one of
+/// these. That is genuinely what the name tells, which is all
+/// [`Instrument::of`] is allowed to claim.
+const QUOTES: [&str; 5] = ["USD", "USDT", "USDC", "BTC", "ETH"];
+
+/// The finest step anything here is described in: one hundred-millionth, the
+/// smallest unit of a Bitcoin and as fine as [`MAX_DECIMALS`] allows.
+const SATOSHI: f64 = 0.000_000_01;
+
+/// The base and quote a pair-shaped symbol names, if it is one.
+///
+/// Takes the id's symbol — the part before the venue — so `BTC-USD.ALPACA`
+/// asks about `BTC-USD`.
+fn pair(symbol: &str) -> Option<(String, String)> {
+    let (base, quote) = symbol.rsplit_once('-')?;
+    if base.is_empty() || !QUOTES.contains(&quote) {
+        return None;
+    }
+    Some((base.to_owned(), quote.to_owned()))
 }
 
 /// When the instrument trades.
@@ -65,12 +92,28 @@ pub struct Instrument {
 
 impl Instrument {
     /// What the name alone says: an OCC symbol is a standard contract, in
-    /// lots of a hundred units; anything else is a stock, in single shares.
-    /// Both tick at a cent and trade the regular session.
+    /// lots of a hundred units; a symbol quoted in a currency from [`QUOTES`]
+    /// is a coin pair, around the clock; anything else is a stock, in single
+    /// shares. The first and last tick at a cent.
+    ///
+    /// # A pair is described finer than any venue, on purpose
+    ///
+    /// A coin's real tick and minimum order size are the venue's to say and
+    /// differ per pair — Bitcoin is not quoted like XRP. The name cannot tell,
+    /// so the fallback takes the finest step this crate describes rather than
+    /// guessing a coarser one. That errs in the one safe direction: carrying
+    /// more decimals than a venue needs loses nothing, while assuming a cent
+    /// would silently round XRP at 2.4567 to 2.46 and anything sub-cent to
+    /// zero. A size finer than the venue's minimum is refused by the venue,
+    /// out loud, which is the failure this platform prefers.
+    ///
+    /// ponytail: the real tick and lot arrive when a crypto source describes
+    /// what it serves (arvo-desktop #246); until then every pair is satoshis.
     #[must_use]
     pub fn of(id: &str) -> Self {
-        match OptionContract::parse(id) {
-            Some(contract) => Self {
+        let symbol = id.split_once('.').map_or(id, |(symbol, _)| symbol);
+        match (OptionContract::parse(id), pair(symbol)) {
+            (Some(contract), _) => Self {
                 id: id.to_owned(),
                 kind: Kind::Option(contract),
                 tick: 0.01,
@@ -79,7 +122,16 @@ impl Instrument {
                 hours: Hours::Regular,
                 margin: None,
             },
-            None => Self {
+            (None, Some((base, quote))) => Self {
+                id: id.to_owned(),
+                kind: Kind::Crypto { base, quote },
+                tick: SATOSHI,
+                lot: SATOSHI,
+                multiplier: 1.0,
+                hours: Hours::Continuous,
+                margin: None,
+            },
+            (None, None) => Self {
                 id: id.to_owned(),
                 kind: Kind::Stock,
                 tick: 0.01,
@@ -195,6 +247,52 @@ mod tests {
         let contract = Instrument::of("SPY260914C00760000.AOPT");
         assert_eq!(contract.price_precision(), 2);
         assert_eq!(contract.size_precision(), 0, "a hundred-share lot is still whole units");
+    }
+
+    #[test]
+    fn a_pair_is_a_pair_and_a_share_class_is_not() {
+        let coin = Instrument::of("BTC-USD.ALPACA");
+        assert_eq!(
+            coin.kind,
+            Kind::Crypto { base: "BTC".to_owned(), quote: "USD".to_owned() }
+        );
+        assert_eq!(coin.hours, Hours::Continuous);
+        assert_eq!(coin.price_precision(), 8, "a coin keeps its decimals");
+        assert_eq!(coin.size_precision(), 8, "and a fraction of one is a size");
+
+        // The reason a dash alone cannot mean "pair": this is in the library.
+        let class = Instrument::of("BRK-B.YF");
+        assert_eq!(class.kind, Kind::Stock);
+        assert_eq!(class.hours, Hours::Regular);
+        assert_eq!(class.price_precision(), 2);
+        assert_eq!(class.size_precision(), 0);
+    }
+
+    #[test]
+    fn a_pair_is_recognised_by_what_it_is_quoted_in() {
+        for id in ["ETH-USDT.ALPACA", "SOL-USDC", "ETH-BTC.ALPACA", "DOGE-USD"] {
+            assert!(
+                matches!(Instrument::of(id).kind, Kind::Crypto { .. }),
+                "{id} is a pair"
+            );
+        }
+        for id in ["BRK-B.YF", "AAPL.YF", "MSFT", "-USD.ALPACA", "SPY-GBP"] {
+            assert!(
+                !matches!(Instrument::of(id).kind, Kind::Crypto { .. }),
+                "{id} is not a pair"
+            );
+        }
+    }
+
+    /// The venue is not part of the symbol, and a coin's venue can be dashed
+    /// without making the instrument something else.
+    #[test]
+    fn the_venue_suffix_is_not_read_as_a_quote_currency() {
+        assert_eq!(Instrument::of("AAPL.ALPACA-IEX").kind, Kind::Stock);
+        assert!(matches!(
+            Instrument::of("BTC-USD.ALPACA-CRYPTO").kind,
+            Kind::Crypto { .. }
+        ));
     }
 
     #[test]

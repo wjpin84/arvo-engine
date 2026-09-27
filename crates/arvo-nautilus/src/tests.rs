@@ -2883,3 +2883,38 @@ fn a_member_with_no_data_fails_the_whole_book_by_name() {
         "the failure should name the member that caused it, got {err}"
     );
 }
+
+/// A coin's price reaches Nautilus with its decimals, and a share's does not
+/// gain any.
+///
+/// The two together are what #240 and #241 are for: the precision comes from
+/// the instrument rather than from a constant, and a pair is described as a
+/// pair. Before this, `XRP-USD` at 2.4567 was built at two places and settled
+/// as 2.46 — a fifth of a cent a unit, silently, on every bar.
+#[test]
+fn a_coins_price_keeps_its_decimals_and_a_shares_does_not_gain_any() {
+    use crate::convert::{to_nautilus_bar, Precision};
+    use nautilus_model::data::BarType;
+
+    let priced = |id: &str, close: f64, volume: f64| {
+        let bar = arvo_data::Bar {
+            at: date(2026, 9, 27).and_time(NaiveTime::MIN),
+            open: close,
+            high: close,
+            low: close,
+            close,
+            volume,
+        };
+        let bar_type = BarType::from(format!("{id}-1-DAY-LAST-EXTERNAL").as_str());
+        to_nautilus_bar(bar_type, &bar, arvo_data::BarInterval::DAILY, Precision::named(id))
+            .expect("the bar is representable")
+    };
+
+    let coin = priced("XRP-USD.ALPACA", 2.456_7, 1234.5);
+    assert_eq!(coin.close.to_string(), "2.45670000", "eight places, not 2.46");
+    assert_eq!(coin.volume.to_string(), "1234.50000000", "a fraction of a coin traded");
+
+    let share = priced("MSFT.RH", 512.34, 1_000.0);
+    assert_eq!(share.close.to_string(), "512.34", "a cent, exactly as before");
+    assert_eq!(share.volume.to_string(), "1000", "whole shares, exactly as before");
+}
