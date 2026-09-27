@@ -68,6 +68,22 @@ pub enum Hours {
     Continuous,
 }
 
+impl Hours {
+    /// The hours every one of `ids` trades, or `None` when they disagree.
+    ///
+    /// For anything pooled across instruments. A year is 252 sessions for an
+    /// equity and 365 days for a coin, so a curve combining both has no
+    /// annualisation that is right for either — and `None` here means the
+    /// pooled figure is reported as absent rather than as a number nobody
+    /// should read. An empty set has no hours to share.
+    #[must_use]
+    pub fn shared<'a>(ids: impl IntoIterator<Item = &'a str>) -> Option<Self> {
+        let mut hours = ids.into_iter().map(|id| Instrument::of(id).hours);
+        let first = hours.next()?;
+        hours.all(|next| next == first).then_some(first)
+    }
+}
+
 /// One instrument's trading facts.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Instrument {
@@ -293,6 +309,25 @@ mod tests {
             Instrument::of("BTC-USD.ALPACA-CRYPTO").kind,
             Kind::Crypto { .. }
         ));
+    }
+
+    /// What the pooled half of a panel depends on: instruments that do not
+    /// share a calendar have no shared annualisation, and saying so is the
+    /// point.
+    #[test]
+    fn hours_are_shared_only_when_every_instrument_agrees() {
+        assert_eq!(Hours::shared(["MSFT.RH", "AAPL.YF"]), Some(Hours::Regular));
+        assert_eq!(
+            Hours::shared(["BTC-USD.ALPACA", "ETH-USD.ALPACA"]),
+            Some(Hours::Continuous)
+        );
+        assert_eq!(
+            Hours::shared(["MSFT.RH", "BTC-USD.ALPACA"]),
+            None,
+            "252 sessions and 365 days have no average worth reporting"
+        );
+        assert_eq!(Hours::shared(["MSFT.RH"]), Some(Hours::Regular));
+        assert_eq!(Hours::shared([]), None, "nothing has no hours to share");
     }
 
     #[test]

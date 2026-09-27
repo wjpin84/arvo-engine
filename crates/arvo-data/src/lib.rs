@@ -33,7 +33,7 @@ mod in_memory;
 
 pub use crate::csv::CsvBars;
 pub use crate::in_memory::InMemoryBars;
-pub use crate::instrument::Instrument;
+pub use crate::instrument::{Hours, Instrument};
 pub use crate::interval::{BarInterval, IntervalUnit};
 pub use crate::signal::series::{Causality, History, SignalPoint, SignalSeries, SignalStore};
 pub use crate::signal::{Signal, SignalName, Signals};

@@ -1526,7 +1526,7 @@ fn a_drawdown_limit_stops_the_run_and_the_ledger_says_so() {
     let drawdown = arvo_research::Metrics::from_curve(
         &result.equity_curve,
         result.trades,
-        arvo_data::BarInterval::DAILY.periods_per_year(),
+        arvo_data::BarInterval::DAILY.periods_per_year(arvo_data::Hours::Regular),
     )
     .expect("a curve to measure")
     .max_drawdown;
@@ -1571,7 +1571,7 @@ fn without_a_limit_the_same_run_keeps_trading() {
     let drawdown = arvo_research::Metrics::from_curve(
         &result.equity_curve,
         result.trades,
-        arvo_data::BarInterval::DAILY.periods_per_year(),
+        arvo_data::BarInterval::DAILY.periods_per_year(arvo_data::Hours::Regular),
     )
     .expect("a curve to measure")
     .max_drawdown;

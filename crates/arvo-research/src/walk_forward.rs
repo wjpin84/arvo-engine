@@ -304,7 +304,10 @@ pub fn run_walk_forward(
             .map(|fold| &fold.out_of_sample_evidence.evaluation.strategy_trades),
     );
 
-    let periods = plan.template.interval.periods_per_year();
+    let periods = plan
+        .template
+        .interval
+        .periods_per_year(arvo_data::Instrument::of(&plan.template.instrument).hours);
     let measure = |curve: &[EquityPoint], trades: u32, what: &str| {
         Metrics::from_curve(curve, trades, periods).ok_or_else(|| {
             SimulationError::Rejected(format!(

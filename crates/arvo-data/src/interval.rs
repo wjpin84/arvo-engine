@@ -14,6 +14,8 @@
 use std::fmt;
 use std::str::FromStr;
 
+use crate::instrument::Hours;
+
 use serde::{Deserialize, Serialize};
 
 /// Trading days in a year. The conventional figure for US equities.
@@ -26,10 +28,18 @@ const TRADING_DAYS: f64 = 252.0;
 /// named here rather than buried in a constant so the day it is wrong, it is
 /// findable.
 ///
-/// Made true rather than hoped for: every source serves regular hours only,
-/// and [`crate::quality`] flags intraday bars outside them — see
-/// [`crate::session`].
+/// Made true rather than hoped for: a source that serves regular hours serves
+/// only those, and [`crate::quality`] flags intraday bars outside them — see
+/// [`crate::session`]. An instrument that trades around the clock says so with
+/// [`Hours::Continuous`] and is annualised on the two constants below instead.
 const SESSION_MINUTES: f64 = 390.0;
+
+/// Days in a year for something that never closes. Every one of them trades,
+/// weekends included, so this is the calendar's own figure.
+const CALENDAR_DAYS: f64 = 365.0;
+
+/// Minutes in one of those days: all of them.
+const DAY_MINUTES: f64 = 1_440.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -77,23 +87,33 @@ impl BarInterval {
         }
     }
 
-    /// Roughly how many of these bars occur in a year.
+    /// Roughly how many of these bars occur in a year, for something trading
+    /// `hours`.
     ///
     /// The number every annualised statistic is scaled by, so getting it
     /// wrong quietly rescales Sharpe and volatility rather than failing.
     ///
-    /// Intraday counts assume a regular US equity session — see
-    /// [`SESSION_MINUTES`]. A market that trades around the clock would need a
-    /// different figure, and the honest fix then is to make session length a
-    /// property of the dataset rather than a constant here.
+    /// The hours are the instrument's, which is what the old doc comment here
+    /// said the honest fix would be: 252 sessions of 390 minutes for a US
+    /// equity, 365 days of 1440 minutes for a coin. Volatility scales with the
+    /// square root of this count, so annualising a 5-minute crypto series on
+    /// the equity figure understates its volatility by more than a factor of
+    /// two — and an understated volatility is an *overstated* Sharpe, which is
+    /// what the leaderboard ranks on.
+    ///
+    /// A week is 52 either way: a calendar week is a calendar week.
     #[must_use]
-    pub fn periods_per_year(&self) -> f64 {
+    pub fn periods_per_year(&self, hours: Hours) -> f64 {
         let step = f64::from(self.step.max(1));
+        let (days, minutes) = match hours {
+            Hours::Regular => (TRADING_DAYS, SESSION_MINUTES),
+            Hours::Continuous => (CALENDAR_DAYS, DAY_MINUTES),
+        };
         match self.unit {
-            IntervalUnit::Second => TRADING_DAYS * SESSION_MINUTES * 60.0 / step,
-            IntervalUnit::Minute => TRADING_DAYS * SESSION_MINUTES / step,
-            IntervalUnit::Hour => TRADING_DAYS * (SESSION_MINUTES / 60.0) / step,
-            IntervalUnit::Day => TRADING_DAYS / step,
+            IntervalUnit::Second => days * minutes * 60.0 / step,
+            IntervalUnit::Minute => days * minutes / step,
+            IntervalUnit::Hour => days * (minutes / 60.0) / step,
+            IntervalUnit::Day => days / step,
             IntervalUnit::Week => 52.0 / step,
         }
     }
@@ -181,7 +201,7 @@ mod tests {
     fn a_daily_bar_still_annualises_at_252() {
         // The number every existing result was computed with. If this ever
         // changes, every stored finding silently becomes incomparable.
-        assert!((BarInterval::DAILY.periods_per_year() - 252.0).abs() < f64::EPSILON);
+        assert!((BarInterval::DAILY.periods_per_year(Hours::Regular) - 252.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -190,7 +210,8 @@ mod tests {
         // with 252 would be understated by about nine times.
         let five_minute = BarInterval::new(5, IntervalUnit::Minute);
         let daily = BarInterval::DAILY;
-        let ratio = five_minute.periods_per_year() / daily.periods_per_year();
+        let ratio = five_minute.periods_per_year(Hours::Regular)
+            / daily.periods_per_year(Hours::Regular);
         assert!(
             (ratio - 78.0).abs() < 1e-9,
             "78 five-minute bars a session: {ratio}"
@@ -200,7 +221,36 @@ mod tests {
     #[test]
     fn an_hourly_bar_is_six_and_a_half_a_day() {
         let hourly = BarInterval::new(1, IntervalUnit::Hour);
-        assert!((hourly.periods_per_year() - 252.0 * 6.5).abs() < 1e-9);
+        assert!((hourly.periods_per_year(Hours::Regular) - 252.0 * 6.5).abs() < 1e-9);
+    }
+
+    /// The whole point of #242: a coin's year is longer in days and much longer
+    /// in bars, and the ratio is what rescales a Sharpe.
+    #[test]
+    fn a_coin_annualises_on_the_calendar_and_a_share_on_the_session() {
+        let daily = BarInterval::DAILY;
+        assert!((daily.periods_per_year(Hours::Continuous) - 365.0).abs() < f64::EPSILON);
+
+        let five_minute = BarInterval::new(5, IntervalUnit::Minute);
+        let coin = five_minute.periods_per_year(Hours::Continuous);
+        assert!((coin - 365.0 * 288.0).abs() < 1e-9, "288 five-minute bars a day: {coin}");
+
+        // Volatility scales with the square root of the count, so annualising a
+        // coin on the equity figure understates it by this much — and an
+        // understated volatility is an overstated Sharpe.
+        let understated = (coin / five_minute.periods_per_year(Hours::Regular)).sqrt();
+        assert!(
+            (understated - 2.31).abs() < 0.01,
+            "over a factor of two, silently: {understated}"
+        );
+
+        // A week is a week on either calendar.
+        let weekly = BarInterval::new(1, IntervalUnit::Week);
+        assert!(
+            (weekly.periods_per_year(Hours::Regular) - weekly.periods_per_year(Hours::Continuous))
+                .abs()
+                < f64::EPSILON
+        );
     }
 
     #[test]

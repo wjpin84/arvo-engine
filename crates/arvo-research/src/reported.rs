@@ -84,7 +84,10 @@ impl Judgement {
 /// way a run's own count is derived, so the two cannot disagree.
 #[must_use]
 pub fn judge(reported: &Reported, criteria: &EvaluationCriteria) -> Judgement {
-    let periods = reported.experiment.interval.periods_per_year();
+    let periods = reported
+        .experiment
+        .interval
+        .periods_per_year(arvo_data::Instrument::of(&reported.experiment.instrument).hours);
     let trades = TradeStats::from_ledger(&reported.strategy_ledger).closed;
     let Some(strategy) = Metrics::from_curve(&reported.strategy_curve, trades, periods) else {
         return Judgement::Inconclusive {
@@ -281,7 +284,9 @@ mod tests {
     fn study(strategy_step: f64, benchmark_step: f64, trades: u32) -> FamilyEvidence {
         let criteria = EvaluationCriteria::default();
         let experiment = experiment();
-        let periods = experiment.interval.periods_per_year();
+        let periods = experiment
+            .interval
+            .periods_per_year(arvo_data::Instrument::of(&experiment.instrument).hours);
         let strategy_curve = curve(strategy_step, 300);
         let benchmark_curve = curve(benchmark_step, 300);
         let ledger: Vec<Trade> = (0..trades).map(|n| round_trip(n, 10.0)).collect();
@@ -407,7 +412,10 @@ mod tests {
     fn a_walk_forward_judged_from_its_contract_reproduces_its_numbers() {
         let fold_a = study(0.002, 0.0005, 20);
         let fold_b = study(0.0015, 0.0005, 20);
-        let periods = fold_a.selected.interval.periods_per_year();
+        let periods = fold_a
+            .selected
+            .interval
+            .periods_per_year(arvo_data::Instrument::of(&fold_a.selected.instrument).hours);
         let combined_curve = curve(0.0018, 600);
         let benchmark_curve = curve(0.0005, 600);
         let ledger_len = 40;
