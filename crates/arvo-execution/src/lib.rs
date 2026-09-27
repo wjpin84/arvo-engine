@@ -393,6 +393,40 @@ pub trait Executor: Send + Sync {
     }
 }
 
+/// A boxed executor is an executor.
+///
+/// So that a caller can decide *which* venue at run time — the engine picks
+/// one from a session's name, a test supplies a fake — while [`Session`] and
+/// everything above it stay generic and monomorphised. Without this the choice
+/// has to be a `match` inside the code that does the sending, which is what
+/// made the live session loop untestable until 2026-09-26.
+#[async_trait::async_trait]
+impl Executor for Box<dyn Executor> {
+    fn venue(&self) -> &str {
+        (**self).venue()
+    }
+
+    async fn submit(&self, order: &Order) -> Result<OrderId, ExecutionError> {
+        (**self).submit(order).await
+    }
+
+    async fn drain(&self) -> Result<(Vec<Execution>, usize), ExecutionError> {
+        (**self).drain().await
+    }
+
+    async fn at_venue(&self) -> Result<VenueState, ExecutionError> {
+        (**self).at_venue().await
+    }
+
+    async fn cancel(&self, order: &OrderId) -> Result<(), ExecutionError> {
+        (**self).cancel(order).await
+    }
+
+    async fn buying_power(&self) -> Result<Option<f64>, ExecutionError> {
+        (**self).buying_power().await
+    }
+}
+
 /// A live or paper trading session: one gate, one venue, many proposers.
 ///
 /// # The invariant

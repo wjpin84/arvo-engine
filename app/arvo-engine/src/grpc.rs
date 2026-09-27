@@ -7,7 +7,7 @@ use tokio::net::TcpListener;
 use tonic::{Request, Response, Status};
 
 use crate::research::Research;
-use crate::session::Sessions;
+use arvo_trading::Sessions;
 
 pub use arvo_client::proto as proto;
 
@@ -190,7 +190,7 @@ fn bearer(token: &str, file: &'static str) -> impl Fn(Request<()>) -> Result<Req
     }
 }
 
-fn session_status(status: crate::session::Status) -> SessionStatus {
+fn session_status(status: arvo_trading::Status) -> SessionStatus {
     SessionStatus {
         id: status.id,
         finding: status.finding,
@@ -1313,7 +1313,7 @@ mod tests {
         let (stop, stopped) = tokio::sync::oneshot::channel();
         let research = Research::new(dir.path());
         let events = tokio::sync::broadcast::channel(256).0;
-        let sessions = std::sync::Arc::new(Sessions::new(dir.path(), events.clone()));
+        let sessions = std::sync::Arc::new(Sessions::new(dir.path(), events.clone(), std::sync::Arc::new(crate::venues::Brokers)));
         let tokens = Tokens { research: TOKEN.to_owned(), control: CONTROL.to_owned() };
         // The path, not the handle: `dir` is returned to the test so the
         // directory outlives the server.

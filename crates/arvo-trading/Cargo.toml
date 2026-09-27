@@ -1,0 +1,38 @@
+[package]
+name = "arvo-trading"
+description = "Live sessions: a finding's rule running against a venue, the loop that sends real orders."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# The trading side's own layers: the gate and the executor below it, the
+# shadow engine that replays the rule, and the research vocabulary the
+# finding is written in.
+arvo-data.workspace = true
+arvo-execution.workspace = true
+arvo-nautilus.workspace = true
+arvo-research.workspace = true
+arvo-risk.workspace = true
+# The event views a front end subscribes to. Shapes only; no transport, so
+# this crate is still runnable without a server.
+arvo-api.workspace = true
+# Only for `events::session`, an eleven-line constructor over `arvo-api` types
+# that the window shares. The brokers are gone: `Venues` is a trait the caller
+# implements, so this crate no longer knows Alpaca or Robinhood exist. Moving
+# that one constructor into `arvo-api` would drop this dependency too and put
+# this crate below `arvo-service`; it is a contract change, so it waits.
+arvo-service.workspace = true
+# `Venues::executor` is async — resolving a Robinhood account takes a round
+# trip — and is held behind a trait object, as `arvo_execution::Executor` is.
+async-trait = "0.1.92"
+chrono.workspace = true
+serde.workspace = true
+serde_json = "1"
+tokio = { workspace = true, features = ["sync"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+# The regression tests for #224 and #231 drive `act` against a fake venue,
+# which means awaiting it.
+tokio = { workspace = true, features = ["macros", "rt"] }

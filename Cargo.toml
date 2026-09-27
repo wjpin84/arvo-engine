@@ -13,6 +13,7 @@ members = [
     "crates/arvo-nautilus",
     "crates/arvo-portfolio",
     "crates/arvo-execution",
+    "crates/arvo-trading",
     "integrations/arvo-alpaca",
     "integrations/arvo-robinhood",
     "integrations/arvo-yfinance",
@@ -33,6 +34,7 @@ license = "Apache-2.0"
 [workspace.dependencies]
 arvo-core = { path = "crates/arvo-core" }
 arvo-execution = { path = "crates/arvo-execution" }
+arvo-trading = { path = "crates/arvo-trading" }
 arvo-alpaca = { path = "integrations/arvo-alpaca" }
 arvo-robinhood = { path = "integrations/arvo-robinhood" }
 arvo-yfinance = { path = "integrations/arvo-yfinance" }

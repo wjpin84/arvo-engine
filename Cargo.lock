@@ -162,6 +162,8 @@ dependencies = [
  "arvo-robinhood",
  "arvo-schedule",
  "arvo-service",
+ "arvo-trading",
+ "async-trait",
  "chrono",
  "prost",
  "rand 0.8.8",
@@ -207,6 +209,7 @@ dependencies = [
  "arvo-engine",
  "arvo-schedule",
  "arvo-service",
+ "arvo-trading",
  "chrono",
  "serde",
  "serde_json",
@@ -374,6 +377,25 @@ dependencies = [
  "tracing",
  "trash",
  "walkdir",
+]
+
+[[package]]
+name = "arvo-trading"
+version = "0.7.0"
+dependencies = [
+ "arvo-api",
+ "arvo-data",
+ "arvo-execution",
+ "arvo-nautilus",
+ "arvo-research",
+ "arvo-risk",
+ "arvo-service",
+ "async-trait",
+ "chrono",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

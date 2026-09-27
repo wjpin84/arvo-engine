@@ -6,6 +6,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+arvo-trading.workspace = true
 # A front end of the engine, like the window and the Python client (#151):
 # it holds the research token and reaches nothing the `Research` service
 # does not offer. It links no engine crate, and that is the boundary.
