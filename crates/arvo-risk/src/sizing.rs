@@ -43,6 +43,15 @@ use crate::{CostModel, RiskModel};
 /// almost always; a gap past the slack is still refused, and now counted.
 /// The most contracts one proposal may sell, however much cash there is. A
 /// bound on the collateral search, not a trading limit anyone should meet.
+///
+/// Counted in whole lots as a `u32`, which is a ceiling in *units* as small as
+/// the lot is: ten thousand lots of a satoshi is a ten-thousandth of a coin.
+/// Nothing on a spot pair reaches it — this bound lives inside the short-option
+/// branch, and `Kind::Crypto` cannot match `Kind::Option(_)` — so the ordinary
+/// path below sizes a coin in `f64` all the way through (#244).
+///
+/// ponytail: if anything other than an option ever needs collateral sizing,
+/// this and `sellable` want counting in units rather than in whole lots.
 const MAX_CONTRACTS: u32 = 10_000;
 
 pub(super) fn size(

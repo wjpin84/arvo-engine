@@ -1038,3 +1038,61 @@ fn the_conservative_tier_is_never_cheaper_than_the_model() {
     assert!((spread.min_half_spread - OptionSpread::MEASURED.min_half_spread * 2.0).abs() < 1e-12);
     assert!((option.at(CostTier::Conservative).slippage_bps - 5.0).abs() < 1e-12);
 }
+
+/// A fraction of a coin is a size the gate passes, and half a satoshi is not.
+///
+/// #244. The gate was never the obstacle — sizing has always been `f64`, and
+/// `quantity = (wanted / lot).floor() * lot` carries a fraction fine. What was
+/// broken sat one step earlier: `is_whole_lots` compared against a fixed
+/// millionth of a lot, and with a satoshi lot the lot count is large enough
+/// that consecutive `f64` values are further apart than a millionth. So a
+/// quantity that is exactly a whole number of satoshis was refused as
+/// `NotWholeLot` — a refusal of a size the gate itself would have computed.
+#[test]
+fn a_fraction_of_a_coin_is_a_size_the_gate_passes() {
+    let cash = 5_000_000.0;
+    let gate = RiskGate::new(
+        RiskModel {
+            risk_per_trade: None,
+            max_position_fraction: Some(1.0),
+            ..model()
+        },
+        cash,
+        day(9),
+    );
+    let coin = |quantity: f64| {
+        let mut proposal = proposal("XRP-USD.ALPACA");
+        proposal.reference_price = 2.4567;
+        proposal.stop_distance = None;
+        proposal.desired_quantity = Some(quantity);
+        proposal
+    };
+
+    // An ordinary fractional size, asked for and accepted as asked.
+    let asked = 123.456_789_01;
+    let Decision::Accept { quantity } = gate.propose(&coin(asked), immediately(&coin(asked)), None)
+    else {
+        panic!("a fraction of a coin is a size");
+    };
+    assert!(
+        (quantity - asked).abs() < 1e-8,
+        "asked {asked}, got {quantity}"
+    );
+
+    // The case that exposed the bug: a whole number of satoshis whose lot count
+    // is too large for a fixed millionth to ever be met. 691358.0247 of a coin
+    // is 69 trillion satoshis, and 98765.4321 * 7 is how it arrives.
+    let large = 98_765.432_1 * 7.0;
+    let decision = gate.propose(&coin(large), immediately(&coin(large)), None);
+    assert!(
+        !matches!(decision, Decision::Reject(Rejection::NotWholeLot { .. })),
+        "a whole number of satoshis is whole lots: {decision:?}"
+    );
+
+    // And the check still discriminates at the coin's own scale: half a satoshi
+    // is not a size, however small the lot is.
+    assert!(matches!(
+        gate.propose(&coin(0.000_000_015), immediately(&coin(0.0)), None),
+        Decision::Reject(Rejection::NotWholeLot { .. })
+    ), "half a satoshi is still not whole lots");
+}

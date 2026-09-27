@@ -160,12 +160,28 @@ impl Instrument {
     }
 
     /// Whether `quantity` is a whole number of lots. A tolerance of a
-    /// millionth of a unit, so a float that arrived through arithmetic is
+    /// millionth of a lot, so a float that arrived through arithmetic is
     /// judged on what it means.
+    ///
+    /// # Why the tolerance is not just a millionth
+    ///
+    /// A millionth of a lot is meaningful while the lot count is small. With a
+    /// satoshi lot the count is enormous — 691358.0247 of a coin is 69 trillion
+    /// lots — and above about 4.5e9 lots consecutive `f64` values are already
+    /// further apart than a millionth, so a fixed millionth is a tolerance
+    /// nothing can satisfy. `98765.4321 * 7` is exactly that case: a whole
+    /// number of satoshis that missed by 8e-3 lots and was refused as
+    /// [`crate::Instrument::is_whole_lots`]` == false`, which the risk gate
+    /// turns into `NotWholeLot` on a size it computed itself.
+    ///
+    /// So the tolerance is a millionth of a lot *or* the float spacing at this
+    /// magnitude, whichever is coarser. It stays far below half a lot either
+    /// way, so a genuine two-and-a-half contracts is still refused.
     #[must_use]
     pub fn is_whole_lots(&self, quantity: f64) -> bool {
         let lots = quantity / self.lot;
-        (lots - lots.round()).abs() < 1e-6
+        let tolerance = 1e-6_f64.max(lots.abs() * f64::EPSILON * 4.0);
+        (lots - lots.round()).abs() < tolerance
     }
 
     /// `quantity` rounded down to whole lots.
@@ -250,6 +266,15 @@ mod tests {
         assert!(!contract.is_whole_lots(250.0));
         assert!((contract.whole_lots(250.0) - 200.0).abs() < 1e-9);
         assert!(Instrument::of("MSFT").is_whole_lots(7.0));
+
+        // A satoshi lot puts the lot count where a fixed millionth stops
+        // meaning anything: 691358.0247 of a coin is 69 trillion satoshis, and
+        // consecutive f64 values there are 8e-3 lots apart. Refusing it would
+        // be `NotWholeLot` on a size the risk gate itself computed (#244).
+        let coin = Instrument::of("XRP-USD.ALPACA");
+        assert!(coin.is_whole_lots(98_765.432_1 * 7.0), "a whole number of satoshis");
+        assert!(coin.is_whole_lots(123.456_789_01));
+        assert!(!coin.is_whole_lots(0.000_000_015), "half a satoshi is not a size");
     }
 
     /// The equality the rest of the crypto work rests on: what an equity and an
