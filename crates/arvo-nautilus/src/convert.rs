@@ -6,7 +6,7 @@ use nautilus_model::{
     data::{Bar, BarType},
     enums::{AssetClass, BarAggregation, OptionKind},
     identifiers::{InstrumentId, Symbol},
-    instruments::{Equity, InstrumentAny, OptionContract},
+    instruments::{CurrencyPair, Equity, InstrumentAny, OptionContract},
     types::{Currency, Price, Quantity},
 };
 use rust_decimal::Decimal;
@@ -42,6 +42,22 @@ impl Precision {
     pub(crate) fn named(id: &str) -> Self {
         Self::of(&arvo_data::Instrument::of(id))
     }
+}
+
+/// A quantity in one instrument's own units.
+///
+/// Every order quantity used to be built at precision 0, which is a whole share
+/// and was right while everything was one. Nautilus validates an order's
+/// quantity precision against the instrument's, so a coin's order was refused
+/// outright: "Invalid order quantity precision ... was 0 when XRP-USD.ALPACA
+/// size precision is 8". Keyed on the id rather than taken from the strategy,
+/// because a ranking rule sends orders for members that are not the instrument
+/// it was configured with.
+///
+/// `None` for a quantity Nautilus cannot represent, which every caller already
+/// treats as "do not send this order".
+pub(crate) fn sized(id: InstrumentId, quantity: f64) -> Option<Quantity> {
+    Quantity::new_checked(quantity, Precision::named(&id.to_string()).size).ok()
 }
 
 /// Builds the traded instrument, with the experiment's commission applied as
@@ -138,6 +154,76 @@ pub(crate) fn option(
         .build()?;
 
     Ok(InstrumentAny::OptionContract(option))
+}
+
+/// Builds a coin pair, in units of the base settled in the quote.
+///
+/// # Only a pair quoted in the account's currency, and the rest refused by name
+///
+/// The account is in one currency and the equity curve is in that currency, so
+/// `XRP-USD` on a dollar account is a position whose value is already dollars.
+/// `ETH-BTC` is not: its value is bitcoin, and turning that into the curve's
+/// currency needs a BTC/USD series at every bar — a second dataset, with its own
+/// gaps and its own fetch. A stablecoin quote is the same problem wearing a
+/// disguise: `USDT` is not `USD`, and treating it as one would bury a 1:1
+/// assumption in the one number the gates read.
+///
+/// So this refuses anything not quoted in the account's currency, and says which
+/// pair and which currency. [`SimulationError::Unsupported`] rather than
+/// `Rejected` on purpose: the experiment is well formed, the engine simply does
+/// not honour it yet, and that distinction is what keeps the reproducibility
+/// record honest.
+pub(crate) fn pair(
+    instrument_id: InstrumentId,
+    described: &arvo_data::Instrument,
+    base: &str,
+    quote: &str,
+    currency: Currency,
+    commission_bps: f64,
+) -> Result<InstrumentAny, SimulationError> {
+    if quote != currency.code.as_str() {
+        return Err(SimulationError::Unsupported(format!(
+            "{instrument_id} is quoted in {quote} and the account is in {}; a pair that does not \
+             settle in the account's currency needs a conversion series this engine does not hold",
+            currency.code
+        )));
+    }
+
+    let rejected = |what: &str, err: &dyn std::fmt::Display| {
+        SimulationError::Rejected(format!("{instrument_id}: {what}: {err}"))
+    };
+    let precision = Precision::of(described);
+    let fee = Decimal::try_from(commission_bps / 10_000.0)
+        .map_err(|err| rejected("commission", &err))?;
+
+    let currency_pair = CurrencyPair::builder()
+        .instrument_id(instrument_id)
+        .raw_symbol(Symbol::from(instrument_id.symbol.as_str()))
+        // The base is whatever the pair names. Nautilus registers a crypto
+        // currency it has not seen rather than refusing it, which is what a
+        // venue listing a new coin needs.
+        .base_currency(Currency::get_or_create_crypto(base))
+        .quote_currency(currency)
+        .price_precision(precision.price)
+        .size_precision(precision.size)
+        .price_increment(
+            Price::new_checked(described.tick, precision.price)
+                .map_err(|err| rejected("tick", &err))?,
+        )
+        .size_increment(
+            Quantity::new_checked(described.lot, precision.size)
+                .map_err(|err| rejected("lot", &err))?,
+        )
+        // Spot, bought outright: no margin, and no rounded lot unit beyond the
+        // size increment itself.
+        .maker_fee(fee)
+        .taker_fee(fee)
+        .ts_event(UnixNanos::default())
+        .ts_init(UnixNanos::default())
+        .build()
+        .map_err(|err| rejected("building the pair", &err))?;
+
+    Ok(InstrumentAny::CurrencyPair(currency_pair))
 }
 
 pub(crate) fn to_nautilus_bar(

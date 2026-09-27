@@ -2918,3 +2918,106 @@ fn a_coins_price_keeps_its_decimals_and_a_shares_does_not_gain_any() {
     assert_eq!(share.close.to_string(), "512.34", "a cent, exactly as before");
     assert_eq!(share.volume.to_string(), "1000", "whole shares, exactly as before");
 }
+
+/// A coin pair reaches the engine as a pair, and one that cannot settle in the
+/// account's currency is refused by name.
+///
+/// #245. Before this there were two arms — `Equity` and `OptionContract` — so a
+/// pair was either refused or built as a share of a company that does not exist,
+/// sized in whole units with an equity fee schedule.
+#[test]
+fn a_coin_pair_is_built_as_a_pair_and_a_foreign_quote_is_refused_by_name() {
+    use crate::convert::pair;
+    use nautilus_model::{identifiers::InstrumentId, instruments::Instrument as _, types::Currency};
+
+    let built = |id: &str| {
+        let described = arvo_data::Instrument::of(id);
+        let arvo_data::instrument::Kind::Crypto { base, quote } = &described.kind else {
+            panic!("{id} is not described as a pair");
+        };
+        pair(
+            InstrumentId::from(format!("{id}.ALPACA").as_str()),
+            &described,
+            base,
+            quote,
+            Currency::USD(),
+            5.0,
+        )
+    };
+
+    let coin = built("XRP-USD").expect("a dollar-quoted pair is supported");
+    assert_eq!(coin.base_currency().expect("a pair has a base").code.as_str(), "XRP");
+    assert_eq!(coin.quote_currency().code.as_str(), "USD");
+    assert_eq!(coin.price_precision(), 8, "sub-cent prices survive");
+    assert_eq!(coin.size_precision(), 8, "and a fraction of a coin is a size");
+
+    // Not a dollar, and not pretending to be one.
+    for foreign in ["ETH-BTC", "SOL-USDT"] {
+        let err = built(foreign).expect_err("a pair that does not settle in USD is unsupported");
+        assert!(
+            matches!(err, arvo_research::SimulationError::Unsupported(_)),
+            "{foreign} should be Unsupported, not Rejected: {err:?}"
+        );
+        let said = err.to_string();
+        assert!(said.contains(foreign), "the refusal names the pair: {said}");
+    }
+}
+
+/// A whole backtest runs on a coin, priced in satoshis and traded in fractions.
+///
+/// The integration #245 is actually for: the pair reaches the venue, the bars
+/// keep their decimals, a rule trades it, and the ledger's quantities and prices
+/// multiply out against a cash account. A sub-cent instrument would previously
+/// have been built as an `Equity` at two decimal places, which rounds a 2.4567
+/// close to 2.46 before any rule sees it.
+#[test]
+fn a_rule_trades_a_coin_in_fractions_at_sub_cent_prices() {
+    // A sawtooth an order of magnitude below a cent's resolution: every one of
+    // these closes rounds to the same two-decimal price.
+    let bars: Vec<arvo_data::Bar> = sawtooth(120)
+        .into_iter()
+        .map(|bar| arvo_data::Bar {
+            open: bar.open / 40_000.0,
+            high: bar.high / 40_000.0,
+            low: bar.low / 40_000.0,
+            close: bar.close / 40_000.0,
+            volume: bar.volume,
+            at: bar.at,
+        })
+        .collect();
+
+    let coin = "XRP-USD.ALPACA";
+    let mut experiment = experiment(params(5.0, 20.0), &bars);
+    experiment.instrument = coin.to_owned();
+    // A hundred thousand dollars of a coin priced near a cent: a fractional
+    // size a whole-unit instrument could not hold.
+    experiment.strategy.params.insert("trade_size".to_owned(), 1_234.567_89);
+
+    let provider = NautilusSimulation::new(InMemoryBars::new().with_instrument(coin, bars.clone()));
+    let result = arvo_research::SimulationProvider::run(&provider, &experiment)
+        .expect("a coin is a tradeable instrument");
+
+    assert!(
+        result.trades > 0,
+        "the rule traded the coin; refused {:?}",
+        result.refused
+    );
+    assert!(
+        result.equity_curve.len() > 1,
+        "and produced a curve to measure"
+    );
+
+    // The fractional size survived into the ledger, not rounded to a whole coin.
+    let sizes: Vec<f64> = result.ledger.iter().map(|trade| trade.quantity).collect();
+    assert!(
+        sizes.iter().any(|size| (size - size.round()).abs() > 1e-9),
+        "a fraction of a coin was traded, not a whole number: {sizes:?}"
+    );
+
+    // And the prices are the sub-cent ones, not rounded to a cent.
+    let prices: Vec<f64> = result.ledger.iter().map(|trade| trade.entry).collect();
+    assert!(
+        prices.iter().all(|price| *price > 0.0 && *price < 0.01),
+        "sub-cent entries survived: {prices:?}"
+    );
+}

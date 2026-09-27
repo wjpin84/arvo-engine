@@ -22,7 +22,7 @@ use nautilus_trading::strategy::{StrategyConfig, StrategyCore};
 
 use crate::chain::Settlement;
 use crate::convert::{
-    aggregation_of, equity, option, to_nautilus_bar, Precision,
+    aggregation_of, equity, option, pair, to_nautilus_bar, Precision,
 };
 use crate::plan::Plan;
 use crate::{fee, fill, ledger, strategy, ENGINE};
@@ -313,17 +313,30 @@ fn add_book(
         // Once per instrument, not once per bar: the described instrument is
         // parsed from its name and a panel walks millions of bars.
         let precision = Precision::named(&instrument_id.to_string());
-        let instrument = match arvo_data::option::OptionContract::parse(&instrument_id.to_string())
-        {
-            Some(contract) => option(
+        // Dispatched on what the instrument is described as, rather than on a
+        // second parse of its name: one answer about what a thing is (#241).
+        let described = arvo_data::Instrument::of(&instrument_id.to_string());
+        let instrument = match &described.kind {
+            arvo_data::instrument::Kind::Option(contract) => option(
                 *instrument_id,
-                &contract,
+                contract,
                 currency,
                 experiment.costs.commission_bps,
-            ),
-            None => equity(*instrument_id, currency, experiment.costs.commission_bps),
-        }
-        .map_err(|err| rejected("building the instrument", &err))?;
+            )
+            .map_err(|err| rejected("building the instrument", &err))?,
+            arvo_data::instrument::Kind::Crypto { base, quote } => pair(
+                *instrument_id,
+                &described,
+                base,
+                quote,
+                currency,
+                experiment.costs.commission_bps,
+            )?,
+            arvo_data::instrument::Kind::Stock => {
+                equity(*instrument_id, currency, experiment.costs.commission_bps)
+                    .map_err(|err| rejected("building the instrument", &err))?
+            }
+        };
         engine
             .add_instrument(&instrument)
             .map_err(|err| rejected("adding the instrument", &err))?;
