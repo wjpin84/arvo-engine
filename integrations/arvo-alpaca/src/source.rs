@@ -172,22 +172,30 @@ impl Alpaca {
     }
 }
 
+/// Alpaca's spelling of a coin pair.
+///
+/// Arvo files a pair as `XRP-USD` because `csv::safe_name` refuses a slash — that
+/// refusal is what stops an instrument id walking out of the data directory, and
+/// it is not worth trading for a spelling. Alpaca asks for `XRP/USD`, so the
+/// slash goes back on at the boundaries that want it: this one for market data,
+/// and the order body in `crate::execution`. Split on the last dash, the same way
+/// the instrument is described.
+///
+/// Returned with a literal slash. A query string encodes it; a JSON body does
+/// not, and encoding it there would send Alpaca a symbol it has never listed.
+pub(crate) fn pair_symbol(symbol: &str) -> String {
+    match symbol.rsplit_once('-') {
+        Some((base, quote)) => format!("{base}/{quote}"),
+        None => symbol.to_owned(),
+    }
+}
+
 impl Market {
-    /// Alpaca's spelling of an Arvo symbol.
-    ///
-    /// Arvo files a pair as `XRP-USD` because `csv::safe_name` refuses a slash —
-    /// that refusal is what stops an instrument id walking out of the data
-    /// directory, and it is not worth trading for a spelling. Alpaca asks for
-    /// `XRP/USD`, so the slash is put back here, at the one boundary that wants
-    /// it. Split on the last dash, the same way the instrument is described.
+    /// What this market calls the symbol Arvo asked for.
     fn symbol(self, symbol: &str) -> String {
         match self {
             Self::Equities => symbol.to_owned(),
-            Self::Crypto => match symbol.rsplit_once('-') {
-                // Encoded, because it is going in a query string.
-                Some((base, quote)) => format!("{base}%2F{quote}"),
-                None => symbol.to_owned(),
-            },
+            Self::Crypto => pair_symbol(symbol),
         }
     }
 }
@@ -284,8 +292,10 @@ impl Source for Alpaca {
                     self.feed,
                 ),
                 Market::Crypto => format!(
-                    "{DATA}/v1beta3/crypto/{CRYPTO_LOCATION}/bars?symbols={asked}\
+                    "{DATA}/v1beta3/crypto/{CRYPTO_LOCATION}/bars?symbols={}\
                      &timeframe={}&start={from}&end={to}&limit={PAGE}",
+                    // Encoded here, because this one is a query string.
+                    asked.replace('/', "%2F"),
                     spelling(interval)?,
                 ),
             };
@@ -296,7 +306,7 @@ impl Source for Alpaca {
             let body = get_with(self.keys()?, &url).await?;
             // Keyed by the symbol as the response spells it, which is the
             // slashed form for a pair.
-            bars.extend(parse_bars(&body, &asked.replace("%2F", "/"))?);
+            bars.extend(parse_bars(&body, &asked)?);
 
             page = body
                 .get("next_page_token")
@@ -424,19 +434,19 @@ mod tests {
     /// have to agree or the fetch writes an empty file and says nothing.
     #[test]
     fn a_pair_is_asked_for_with_a_slash_and_a_share_is_left_alone() {
-        assert_eq!(Market::Crypto.symbol("XRP-USD"), "XRP%2FUSD");
-        assert_eq!(Market::Crypto.symbol("BTC-USD"), "BTC%2FUSD");
+        assert_eq!(Market::Crypto.symbol("XRP-USD"), "XRP/USD");
+        assert_eq!(Market::Crypto.symbol("BTC-USD"), "BTC/USD");
         // Split on the last dash, as the instrument is described.
-        assert_eq!(Market::Crypto.symbol("ETH-BTC"), "ETH%2FBTC");
+        assert_eq!(Market::Crypto.symbol("ETH-BTC"), "ETH/BTC");
         // Nothing to split: asked for as it stands rather than mangled.
         assert_eq!(Market::Crypto.symbol("BTCUSD"), "BTCUSD");
         // An equity keeps its name, dash and all — BRK-B is a share class.
         assert_eq!(Market::Equities.symbol("BRK-B"), "BRK-B");
         assert_eq!(Market::Equities.symbol("MSFT"), "MSFT");
 
-        // And the response is keyed by what was asked, decoded: the fetch reads
-        // `bars["XRP/USD"]`, so a mismatch here is an empty series.
-        assert_eq!(Market::Crypto.symbol("XRP-USD").replace("%2F", "/"), "XRP/USD");
+        // The query string is what encodes it, not the spelling function: a
+        // JSON order body wants the literal slash.
+        assert_eq!(Market::Crypto.symbol("XRP-USD").replace('/', "%2F"), "XRP%2FUSD");
     }
 
     /// A coin files under its own venue, like every other dataset here.
