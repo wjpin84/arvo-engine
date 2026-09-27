@@ -52,7 +52,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("{instrument} at {interval}: {strategy}, slippage {slippage_bps} bps");
 
     // What is wrong with the bars, before anything is concluded from them.
-    let quality = arvo_data::quality::inspect(&series, interval);
+    let quality = arvo_data::quality::inspect(&series, interval, hours);
     if quality.is_clean() {
         println!("  data: nothing to report across {} bars", quality.bars);
     } else {

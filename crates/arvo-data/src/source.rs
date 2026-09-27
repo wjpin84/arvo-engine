@@ -596,7 +596,11 @@ pub async fn ingest(
 
     // Inspected before it is written, so a series that arrives wrong is said so
     // at the moment it arrives rather than the first time a verdict rests on it.
-    let quality = crate::quality::inspect(&bars, interval);
+    let quality = crate::quality::inspect(
+        &bars,
+        interval,
+        crate::Instrument::of(&instrument).hours,
+    );
 
     // Against what is already held, before it is overwritten. Reading after the
     // write would compare the new series against itself, which is the failure

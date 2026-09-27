@@ -24,7 +24,7 @@ use std::collections::BTreeMap;
 
 use serde::Serialize;
 
-use crate::{Bar, BarInterval};
+use crate::{Bar, BarInterval, Hours};
 
 /// Consecutive identical bars before the series is called stalled.
 ///
@@ -47,6 +47,13 @@ const OUTLIER: f64 = 10.0;
 /// hole is a trading week that is missing from the file, which a backtest will
 /// read as a single large move.
 const DAILY_GAP_DAYS: i64 = 5;
+
+/// The same, for something that never closes.
+///
+/// One. The five-day slack above exists to forgive a weekend, and a market
+/// that trades on Saturday has nothing to forgive: a missing day is a day the
+/// exchange was quoting and the file does not hold.
+const CONTINUOUS_GAP_DAYS: i64 = 1;
 
 /// How close a move must be to a whole-number split ratio to be suspected.
 ///
@@ -107,14 +114,20 @@ impl Report {
 /// Looks over a series and reports what is wrong with it.
 ///
 /// The bars are assumed sorted, which every [`crate::BarProvider`] guarantees.
+///
+/// `hours` is the instrument's, because two of these checks are about a
+/// calendar: what counts as a hole, and whether there is an outside-the-session
+/// to be outside of. Judging a coin on an equity's week reports most of its
+/// file as suspect, and the module's own rule is that a check firing on
+/// legitimate data is worse than no check.
 #[must_use]
-pub fn inspect(bars: &[Bar], interval: BarInterval) -> Report {
+pub fn inspect(bars: &[Bar], interval: BarInterval, hours: Hours) -> Report {
     let mut findings = Vec::new();
     duplicates(bars, &mut findings);
     stalls(bars, &mut findings);
     silent_movement(bars, &mut findings);
-    gaps(bars, interval, &mut findings);
-    outside_session(bars, interval, &mut findings);
+    gaps(bars, interval, hours, &mut findings);
+    outside_session(bars, interval, hours, &mut findings);
     splits(bars, &mut findings);
     outliers(bars, &mut findings);
 
@@ -207,17 +220,23 @@ fn silent_movement(bars: &[Bar], out: &mut Vec<Finding>) {
 /// weekend and a holiday. Intraday bars are checked only *within* a session —
 /// the overnight hole between one day's close and the next day's open is not a
 /// gap, and treating it as one would report every night.
-fn gaps(bars: &[Bar], interval: BarInterval, out: &mut Vec<Finding>) {
+///
+/// An instrument that never closes has neither excuse. There is no session
+/// boundary to forgive, so any hole longer than one bar is a hole; and no
+/// weekend to forgive, so a missing day is missing. The slack that makes this
+/// check honest for an equity is what would make it blind for a coin.
+fn gaps(bars: &[Bar], interval: BarInterval, hours: Hours, out: &mut Vec<Finding>) {
     let step = interval.duration();
     for pair in bars.windows(2) {
         let (previous, next) = (&pair[0], &pair[1]);
         let apart = next.at - previous.at;
 
-        let hole = if interval.is_intraday() {
+        let hole = match (hours, interval.is_intraday()) {
             // Same day only. A session boundary is not a gap.
-            previous.at.date() == next.at.date() && apart > step
-        } else {
-            apart > chrono::Duration::days(DAILY_GAP_DAYS)
+            (Hours::Regular, true) => previous.at.date() == next.at.date() && apart > step,
+            (Hours::Regular, false) => apart > chrono::Duration::days(DAILY_GAP_DAYS),
+            (Hours::Continuous, true) => apart > step,
+            (Hours::Continuous, false) => apart > chrono::Duration::days(CONTINUOUS_GAP_DAYS),
         };
 
         if hole {
@@ -241,8 +260,11 @@ fn gaps(bars: &[Bar], interval: BarInterval, out: &mut Vec<Finding>) {
 /// assumes regular hours: the annualisation, the opening range, the session
 /// VWAP. A file fetched before a source filtered them, or from one that never
 /// did, would otherwise be read as if it held none. See [`crate::session`].
-fn outside_session(bars: &[Bar], interval: BarInterval, out: &mut Vec<Finding>) {
-    if !interval.is_intraday() {
+fn outside_session(bars: &[Bar], interval: BarInterval, hours: Hours, out: &mut Vec<Finding>) {
+    // An instrument that trades around the clock has no outside to be outside
+    // of. Every bar of a coin's night would be reported otherwise, which is the
+    // gate rejecting its own data.
+    if !interval.is_intraday() || hours == Hours::Continuous {
         return;
     }
     let mut outside = bars
@@ -396,6 +418,12 @@ fn outliers(bars: &[Bar], out: &mut Vec<Finding>) {
 mod tests {
     use super::*;
 
+    /// Every test below this was written about a US equity, so they get an
+    /// equity's calendar. The continuous cases name their hours explicitly.
+    fn inspect(bars: &[Bar], interval: BarInterval) -> Report {
+        super::inspect(bars, interval, Hours::Regular)
+    }
+
     fn at(day: u32) -> chrono::NaiveDateTime {
         chrono::NaiveDate::from_ymd_opt(2024, 1, day)
             .expect("valid")
@@ -437,6 +465,59 @@ mod tests {
         let report = inspect(&bars, BarInterval::DAILY);
         assert_eq!(report.faults(), 1);
         assert!(kinds(&report).contains(&"duplicate"));
+    }
+
+    /// The gate stops rejecting its own crypto data.
+    ///
+    /// A coin's intraday file is mostly bars outside 09:30-16:00 New York. Read
+    /// with an equity's calendar it is nearly all suspect, which is the module's
+    /// stated worst case: a check that fires on legitimate data teaches people
+    /// to skip the warnings.
+    #[test]
+    fn a_continuous_intraday_series_has_no_outside_the_session() {
+        let minute = BarInterval::new(1, crate::IntervalUnit::Minute);
+        // Through a night: 23:58, 23:59, 00:00, 00:01 across two days.
+        let overnight: Vec<Bar> = [(1, 23, 58), (1, 23, 59), (2, 0, 0), (2, 0, 1)]
+            .into_iter()
+            .enumerate()
+            .map(|(n, (day, hour, min))| Bar {
+                at: chrono::NaiveDate::from_ymd_opt(2024, 1, day)
+                    .expect("valid")
+                    .and_hms_opt(hour, min, 0)
+                    .expect("valid"),
+                ..bar(1, 100.0 + n as f64)
+            })
+            .collect();
+
+        let coin = super::inspect(&overnight, minute, Hours::Continuous);
+        assert!(coin.is_clean(), "a coin trades at midnight: {:?}", kinds(&coin));
+
+        let share = super::inspect(&overnight, minute, Hours::Regular);
+        assert!(
+            kinds(&share).contains(&"outside-session"),
+            "the same bars are still suspect for an equity"
+        );
+    }
+
+    /// And the other half: the slack that makes the gap check honest for an
+    /// equity would make it blind for a coin.
+    #[test]
+    fn a_weekend_is_a_gap_for_a_coin_and_not_for_a_share() {
+        // Friday the 5th to Monday the 8th, the case an equity forgives.
+        let weekend = vec![bar(5, 100.0), bar(8, 101.0)];
+        assert!(
+            super::inspect(&weekend, BarInterval::DAILY, Hours::Regular).is_clean(),
+            "a weekend is not a gap in a five-day week"
+        );
+        assert!(
+            kinds(&super::inspect(&weekend, BarInterval::DAILY, Hours::Continuous))
+                .contains(&"gap"),
+            "a market that trades on Saturday has nothing to forgive"
+        );
+
+        // Consecutive days are still consecutive.
+        let daily = vec![bar(5, 100.0), bar(6, 101.0), bar(7, 102.0)];
+        assert!(super::inspect(&daily, BarInterval::DAILY, Hours::Continuous).is_clean());
     }
 
     #[test]

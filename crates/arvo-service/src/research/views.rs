@@ -62,7 +62,11 @@ pub fn data_findings(
         .bars(instrument, interval, window.from, window.to)
         .unwrap_or_default();
 
-    arvo_data::quality::inspect(&series, interval)
+    arvo_data::quality::inspect(
+        &series,
+        interval,
+        arvo_data::Instrument::of(instrument).hours,
+    )
         .findings
         .into_iter()
         .map(|finding| DataFindingView {
