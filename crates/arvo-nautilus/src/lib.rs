@@ -226,7 +226,11 @@ impl<P: BarProvider> NautilusSimulation<P> {
 
     /// Everything `run` checks and loads before it simulates.
     fn prepare(&self, experiment: &Experiment) -> Result<Prepared, SimulationError> {
-        let plan = Plan::from_spec(&experiment.strategy, experiment.interval)?;
+        let plan = Plan::from_spec(
+            &experiment.strategy,
+            experiment.interval,
+            arvo_data::Instrument::of(&experiment.instrument).hours,
+        )?;
         experiment
             .risk
             .check()
@@ -353,7 +357,12 @@ pub fn check_plan(
     spec: &StrategySpec,
     interval: arvo_data::BarInterval,
 ) -> Result<(), SimulationError> {
-    Plan::from_spec(spec, interval).map(|_| ())
+    // Against an equity calendar, because a ruleset is validated before any
+    // instrument is chosen and a rule is not the place an instrument lives. The
+    // hours check this skips is the one `prepare` makes when a run names its
+    // instrument, so a session-anchored rule pointed at a coin is still refused
+    // by name — just when the instrument is known rather than before.
+    Plan::from_spec(spec, interval, arvo_data::Hours::Regular).map(|_| ())
 }
 
 #[cfg(test)]

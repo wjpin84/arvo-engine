@@ -112,26 +112,31 @@ pub fn register(jobs: &Jobs, root: &Path, research: Arc<ResearchService>, raise:
         let root = reviewing.clone();
         let raise = announce.clone();
         async move {
-            let now = chrono::Utc::now().naive_utc();
-            let today = now.date();
-            if matches!(chrono::Datelike::weekday(&today), chrono::Weekday::Sat | chrono::Weekday::Sun) {
-                return Ok("not a trading day".to_owned());
+            let now = chrono::Utc::now();
+            // Today and yesterday, because a day is not always over when the
+            // equity market closes. A day that ran a session on a continuous
+            // instrument is finished at midnight UTC, so it becomes reviewable
+            // only after the date rolls over — reviewing just `today` would
+            // never write it at all.
+            let mut said = Vec::new();
+            for day in [now.naive_utc().date() - chrono::Duration::days(1), now.naive_utc().date()] {
+                if crate::review::read(&root, day).is_some() {
+                    continue;
+                }
+                let reviewed = crate::review::review(&root, day);
+                if !crate::review::is_finished(&reviewed, now) {
+                    continue;
+                }
+                let path = crate::review::write(&root, &reviewed)?;
+                raise(EventView::new(
+                    arvo_api::EventKindView::findings(0),
+                    "The day's review is written".to_owned(),
+                    format!("{}: {} session(s), realised {:+.2}", path.display(), reviewed.sessions.len(), reviewed.realised()),
+                    arvo_api::SeverityView::Info,
+                ));
+                said.push(format!("written to {}", path.display()));
             }
-            if now < arvo_data::session::regular_close(today) + chrono::Duration::minutes(15) {
-                return Ok("before the close".to_owned());
-            }
-            if crate::review::read(&root, today).is_some() {
-                return Ok("already written".to_owned());
-            }
-            let reviewed = crate::review::review(&root, today);
-            let path = crate::review::write(&root, &reviewed)?;
-            raise(EventView::new(
-                arvo_api::EventKindView::findings(0),
-                "The day's review is written".to_owned(),
-                format!("{}: {} session(s), realised {:+.2}", path.display(), reviewed.sessions.len(), reviewed.realised()),
-                arvo_api::SeverityView::Info,
-            ));
-            Ok(format!("written to {}", path.display()))
+            Ok(if said.is_empty() { "nothing finished to review".to_owned() } else { said.join("; ") })
         }
     });
 

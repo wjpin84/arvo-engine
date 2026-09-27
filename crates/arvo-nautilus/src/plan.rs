@@ -73,6 +73,7 @@ impl Plan {
     pub(crate) fn from_spec(
         spec: &StrategySpec,
         interval: arvo_data::BarInterval,
+        hours: arvo_data::Hours,
     ) -> Result<Self, SimulationError> {
         let param = |name: &str| -> Result<f64, SimulationError> {
             spec.params.get(name).copied().ok_or_else(|| {
@@ -129,6 +130,20 @@ impl Plan {
                 "{} is defined against a trading session and cannot run on {interval} bars; at \
                  that resolution a session is a single bar, so the rule would still produce a \
                  curve while measuring something nobody asked for",
+                spec.name
+            )));
+        }
+
+        // The same objection, for an instrument that has no session at all. An
+        // opening range formed from whatever bars follow midnight UTC, and a
+        // VWAP that never resets, both still produce a curve — and the curve
+        // describes a rule nobody meant to test. Refused by name rather than
+        // run, because a wrong finding outlives the run that made it.
+        if SESSION_ANCHORED.contains(&spec.name.as_str()) && hours == arvo_data::Hours::Continuous {
+            return Err(SimulationError::Rejected(format!(
+                "{} is defined against a trading session and this instrument trades around the \
+                 clock; there is no opening range to form and no close to flatten at, so the rule \
+                 would measure the hours either side of midnight UTC and call them a day",
                 spec.name
             )));
         }

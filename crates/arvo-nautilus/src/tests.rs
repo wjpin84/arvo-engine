@@ -566,8 +566,9 @@ fn every_advertised_strategy_can_actually_be_planned() {
         // At whichever resolution the rule is defined: the session rules
         // intraday, a put spread on daily closes.
         assert!(
-            Plan::from_spec(&spec, intraday).is_ok()
-                || Plan::from_spec(&spec, arvo_data::BarInterval::DAILY).is_ok(),
+            Plan::from_spec(&spec, intraday, arvo_data::Hours::Regular).is_ok()
+                || Plan::from_spec(&spec, arvo_data::BarInterval::DAILY, arvo_data::Hours::Regular)
+                    .is_ok(),
             "{name} is advertised but cannot be planned"
         );
     }
@@ -3020,4 +3021,68 @@ fn a_rule_trades_a_coin_in_fractions_at_sub_cent_prices() {
         prices.iter().all(|price| *price > 0.0 && *price < 0.01),
         "sub-cent entries survived: {prices:?}"
     );
+}
+
+/// A session-shaped rule refuses an instrument that has no session.
+///
+/// #247. `OpeningRange` documents the deviation it already lives with on
+/// equities: with no exchange calendar, a position open at day's end closes on
+/// the first bar of the next session. On a continuous series that is not a
+/// deviation, it is the whole behaviour — the range forms from whatever three
+/// bars follow midnight UTC and the day never ends. The rule would still produce
+/// a curve, and the curve would describe something nobody asked to test.
+#[test]
+fn a_session_shaped_rule_refuses_an_instrument_that_never_closes() {
+    let intraday = arvo_data::BarInterval::new(5, arvo_data::IntervalUnit::Minute);
+    let anchored = [
+        (crate::OPENING_RANGE, params_for_opening_range()),
+        (crate::VWAP_REVERSION, params_for_vwap()),
+    ];
+
+    for (name, params) in anchored {
+        let spec = arvo_research::StrategySpec {
+            rule: None,
+            name: name.to_owned(),
+            params: params.clone(),
+        };
+
+        // On an equity it plans, which is what makes the refusal meaningful.
+        Plan::from_spec(&spec, intraday, arvo_data::Hours::Regular)
+            .unwrap_or_else(|err| panic!("{name} should plan on an equity: {err}"));
+
+        // On a coin it is refused, by name, saying why.
+        let Err(err) = Plan::from_spec(&spec, intraday, arvo_data::Hours::Continuous) else {
+            panic!("{name} ran on an instrument with no session to anchor to");
+        };
+        let said = err.to_string();
+        assert!(said.contains(name), "the refusal names the rule: {said}");
+        assert!(
+            said.contains("around the clock"),
+            "and says what is wrong with the instrument: {said}"
+        );
+    }
+
+    // A rule that is not session-shaped is untouched: most rules are fine on a
+    // coin and a blanket refusal would be the wrong lesson.
+    let ordinary = arvo_research::StrategySpec {
+        rule: None,
+        name: SMA_CROSS.to_owned(),
+        params: params(5.0, 20.0),
+    };
+    assert!(Plan::from_spec(&ordinary, intraday, arvo_data::Hours::Continuous).is_ok());
+}
+
+fn params_for_opening_range() -> BTreeMap<String, f64> {
+    BTreeMap::from([
+        ("range_bars".to_owned(), 3.0),
+        ("target_range_multiple".to_owned(), 2.0),
+        ("trade_size".to_owned(), 10.0),
+    ])
+}
+
+fn params_for_vwap() -> BTreeMap<String, f64> {
+    BTreeMap::from([
+        ("entry_deviations".to_owned(), 2.0),
+        ("trade_size".to_owned(), 10.0),
+    ])
 }
