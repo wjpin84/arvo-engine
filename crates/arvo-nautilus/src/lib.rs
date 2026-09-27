@@ -58,6 +58,7 @@ use nautilus_model::identifiers::InstrumentId;
 use backtest::run_backtest;
 use plan::Plan;
 pub use shadow::{Shadow, Side, Signal};
+pub use strategy::indicator_series;
 
 /// The Nautilus version this crate is pinned to, recorded on every result.
 ///

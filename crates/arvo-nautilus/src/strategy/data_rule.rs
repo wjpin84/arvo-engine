@@ -24,7 +24,7 @@ use nautilus_model::{
 use nautilus_trading::strategy::StrategyCore;
 
 use super::{
-    indicator::{Atr, Sma},
+    indicator::{Atr, Ema, Macd, MacdLine, Rsi, Sma},
     managed_strategy, Managed, Position, Risk, Trigger, EXIT_SIGNAL,
 };
 
@@ -149,6 +149,10 @@ impl Fields {
         }
     }
 
+    const fn of_library(bar: &arvo_data::Bar) -> Self {
+        Self { open: bar.open, high: bar.high, low: bar.low, close: bar.close, volume: bar.volume }
+    }
+
     const fn get(&self, input: Input) -> f64 {
         match input {
             Input::Open => self.open,
@@ -160,18 +164,48 @@ impl Fields {
     }
 }
 
+/// One indicator over library bars, one value per bar, `None` while it is
+/// warming up. The same code a data rule runs, so a chart draws what the
+/// rule saw.
+#[must_use]
+pub fn indicator_series(indicator: ResolvedIndicator, bars: &[arvo_data::Bar]) -> Vec<Option<f64>> {
+    let mut series = Series::new(indicator);
+    bars.iter().map(|bar| series.update(&Fields::of_library(bar))).collect()
+}
+
 /// A live indicator.
 enum Series {
     Sma(Input, Sma),
+    Ema(Input, Ema),
     Atr(Atr),
+    Rsi(Input, Rsi),
+    Macd(Input, Macd),
     Extreme(Input, Rolling),
+}
+
+/// The rule language's choice of MACD series, as the indicator names it.
+///
+/// Two enums rather than one because the rule language is a persisted format
+/// and the indicator is an implementation detail; this is the one place they
+/// meet, so a new line has to be added here to compile.
+const fn macd_line(line: arvo_research::rule::MacdLine) -> MacdLine {
+    match line {
+        arvo_research::rule::MacdLine::Macd => MacdLine::Macd,
+        arvo_research::rule::MacdLine::Signal => MacdLine::Signal,
+        arvo_research::rule::MacdLine::Histogram => MacdLine::Histogram,
+    }
 }
 
 impl Series {
     fn new(indicator: ResolvedIndicator) -> Self {
         match indicator {
             ResolvedIndicator::Sma { input, period } => Self::Sma(input, Sma::new(period)),
+            ResolvedIndicator::Ema { input, period } => Self::Ema(input, Ema::new(period)),
             ResolvedIndicator::Atr { period } => Self::Atr(Atr::new(period)),
+            ResolvedIndicator::Rsi { input, period } => Self::Rsi(input, Rsi::new(period)),
+            ResolvedIndicator::Macd { input, fast, slow, signal, line } => {
+                Self::Macd(input, Macd::new(fast, slow, signal, macd_line(line)))
+            }
             ResolvedIndicator::Max { input, period } => Self::Extreme(input, Rolling::new(period, true)),
             ResolvedIndicator::Min { input, period } => Self::Extreme(input, Rolling::new(period, false)),
         }
@@ -180,7 +214,10 @@ impl Series {
     fn update(&mut self, fields: &Fields) -> Option<f64> {
         match self {
             Self::Sma(input, sma) => sma.update(fields.get(*input)),
+            Self::Ema(input, ema) => ema.update(fields.get(*input)),
             Self::Atr(atr) => atr.update(fields.high, fields.low, fields.close),
+            Self::Rsi(input, rsi) => rsi.update(fields.get(*input)),
+            Self::Macd(input, macd) => macd.update(fields.get(*input)),
             Self::Extreme(input, rolling) => rolling.update(fields.get(*input)),
         }
     }

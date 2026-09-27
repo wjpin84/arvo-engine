@@ -24,6 +24,10 @@
 
 use chrono::{Datelike, Duration, NaiveDate, NaiveDateTime, NaiveTime, Weekday};
 
+/// The IANA zone the session above is stated in, for a reader that draws
+/// bars in exchange time. Bars themselves are UTC.
+pub const ZONE: &str = "America/New_York";
+
 /// Whether a bar opening at `open` (UTC) falls inside the US regular session.
 #[must_use]
 pub fn in_regular_session(open: NaiveDateTime) -> bool {

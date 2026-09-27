@@ -46,6 +46,155 @@ impl Sma {
     }
 }
 
+/// Exponentially weighted moving average over `period` values.
+///
+/// Seeded with the simple average of the first `period` values rather than
+/// with the first value alone. Seeding on one value makes the early output
+/// depend almost entirely on whichever bar happened to be first, and a rule
+/// that enters on a cross would take that as signal — the same failure the
+/// `None`-until-warm rule above exists to stop, arriving by a different route.
+#[derive(Debug)]
+pub(crate) struct Ema {
+    /// `2 / (period + 1)`, the conventional weighting.
+    alpha: f64,
+    /// Decides when the first value appears, and what it is.
+    seed: Sma,
+    value: Option<f64>,
+}
+
+impl Ema {
+    pub(crate) fn new(period: usize) -> Self {
+        Self {
+            alpha: 2.0 / (period as f64 + 1.0),
+            seed: Sma::new(period),
+            value: None,
+        }
+    }
+
+    /// Feeds a value in, returning the average once `period` values are held.
+    pub(crate) fn update(&mut self, value: f64) -> Option<f64> {
+        match self.value {
+            // Warm: the ordinary recurrence.
+            Some(previous) => {
+                let next = self.alpha * value + (1.0 - self.alpha) * previous;
+                self.value = Some(next);
+                Some(next)
+            }
+            // Warming: the seed decides when, and what, the first value is.
+            None => {
+                let seeded = self.seed.update(value)?;
+                self.value = Some(seeded);
+                Some(seeded)
+            }
+        }
+    }
+
+}
+
+/// Wilder's relative strength index over `period` bars, as a percentage.
+///
+/// Needs `period + 1` values, not `period`: it is computed from *changes*, and
+/// n values hold n-1 changes. Reporting after `period` values would be an
+/// index over one change too few, which is the kind of off-by-one that never
+/// looks wrong on a chart.
+#[derive(Debug)]
+pub(crate) struct Rsi {
+    period: usize,
+    previous: Option<f64>,
+    /// Sums while warming; Wilder averages once warm.
+    gains: f64,
+    losses: f64,
+    seen: usize,
+    warm: bool,
+}
+
+impl Rsi {
+    pub(crate) fn new(period: usize) -> Self {
+        Self { period, previous: None, gains: 0.0, losses: 0.0, seen: 0, warm: false }
+    }
+
+    /// Feeds a value in, returning the index once `period + 1` are held.
+    pub(crate) fn update(&mut self, value: f64) -> Option<f64> {
+        // The first value has no change to measure, so there is nothing to
+        // report and nothing to accumulate.
+        let previous = self.previous.replace(value)?;
+        let change = value - previous;
+        let (gain, loss) = if change >= 0.0 { (change, 0.0) } else { (0.0, -change) };
+        let period = self.period as f64;
+
+        if self.warm {
+            // Wilder's smoothing: an EMA with alpha = 1 / period.
+            self.gains = (self.gains * (period - 1.0) + gain) / period;
+            self.losses = (self.losses * (period - 1.0) + loss) / period;
+        } else {
+            self.gains += gain;
+            self.losses += loss;
+            self.seen += 1;
+            if self.seen < self.period {
+                return None;
+            }
+            self.gains /= period;
+            self.losses /= period;
+            self.warm = true;
+        }
+
+        // No losses at all is 100 by definition, and dividing would be a NaN
+        // that every comparison against it reads as false.
+        if self.losses <= 0.0 {
+            return Some(if self.gains > 0.0 { 100.0 } else { 50.0 });
+        }
+        let strength = self.gains / self.losses;
+        Some(100.0 - 100.0 / (1.0 + strength))
+    }
+}
+
+/// Which of MACD's three series a rule is reading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MacdLine {
+    /// The fast EMA less the slow one.
+    Macd,
+    /// The EMA of the MACD line.
+    Signal,
+    /// MACD less signal — what a histogram draws.
+    Histogram,
+}
+
+/// Moving average convergence/divergence.
+///
+/// One declaration yields one series, chosen by [`MacdLine`], because a rule
+/// reads named numbers. Declare it twice under two names to compare the MACD
+/// line against its signal; the second copy costs two EMAs and keeps the rule
+/// language's shape — every indicator is a name and a number — intact.
+#[derive(Debug)]
+pub(crate) struct Macd {
+    fast: Ema,
+    slow: Ema,
+    signal: Ema,
+    line: MacdLine,
+}
+
+impl Macd {
+    pub(crate) fn new(fast: usize, slow: usize, signal: usize, line: MacdLine) -> Self {
+        Self { fast: Ema::new(fast), slow: Ema::new(slow), signal: Ema::new(signal), line }
+    }
+
+    /// Feeds a value in. `None` until every average it needs is warm — for the
+    /// signal and the histogram that is the slow period *plus* the signal
+    /// period, because the signal is an average of a series that does not
+    /// exist yet.
+    pub(crate) fn update(&mut self, value: f64) -> Option<f64> {
+        // Both are fed every bar, warm or not, so neither lags the other.
+        let fast = self.fast.update(value);
+        let slow = self.slow.update(value);
+        let macd = fast? - slow?;
+        match self.line {
+            MacdLine::Macd => Some(macd),
+            MacdLine::Signal => self.signal.update(macd),
+            MacdLine::Histogram => Some(macd - self.signal.update(macd)?),
+        }
+    }
+}
+
 /// Return over a fixed lookback: what this instrument did, as one number.
 ///
 /// The measure a cross-sectional rule ranks on. Deliberately the plainest one
@@ -284,6 +433,91 @@ fn date_of(at: UnixNanos) -> Option<NaiveDate> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_ema_is_none_until_its_window_fills_and_is_seeded_on_the_average() {
+        let mut ema = Ema::new(3);
+        assert_eq!(ema.update(10.0), None, "one value is not a three-bar average");
+        assert_eq!(ema.update(20.0), None);
+        // Seeded on the simple average of the first three, not on the first
+        // value: seeding on one makes the early output depend on whichever bar
+        // was first, and a cross rule would read that as signal.
+        assert_eq!(ema.update(30.0), Some(20.0));
+        // Then the recurrence, alpha = 2 / (3 + 1) = 0.5.
+        assert_eq!(ema.update(40.0), Some(30.0));
+        assert_eq!(ema.update(40.0), Some(35.0));
+    }
+
+    #[test]
+    fn an_rsi_needs_one_more_bar_than_its_period_and_pins_its_ends() {
+        // n values hold n-1 changes, so a 3-period index needs 4 bars. An index
+        // reported after 3 would be over one change too few — the kind of
+        // off-by-one that never looks wrong on a chart.
+        let mut rsi = Rsi::new(3);
+        assert_eq!(rsi.update(100.0), None, "no change yet");
+        assert_eq!(rsi.update(101.0), None, "one change");
+        assert_eq!(rsi.update(102.0), None, "two changes");
+        let first = rsi.update(103.0).expect("three changes is enough");
+        // Every change up: no losses at all, which is 100 by definition rather
+        // than a division by zero.
+        assert!((first - 100.0).abs() < 1e-9, "{first}");
+
+        // Every change down is the mirror.
+        let mut falling = Rsi::new(3);
+        for value in [100.0, 99.0, 98.0, 97.0] {
+            falling.update(value);
+        }
+        let low = falling.update(96.0).expect("warm");
+        assert!(low < 1e-9, "all losses is 0, got {low}");
+
+        // A flat series has neither gains nor losses; 50 is the honest answer
+        // and a NaN would be read as false by every comparison against it.
+        let mut flat = Rsi::new(3);
+        let mut last = None;
+        for _ in 0..6 {
+            last = flat.update(50.0);
+        }
+        assert_eq!(last, Some(50.0));
+    }
+
+    #[test]
+    fn a_macd_line_waits_for_its_slow_average_and_the_signal_waits_for_the_line() {
+        // The line is available once the slow EMA is: 3 bars here.
+        let mut line = Macd::new(2, 3, 2, MacdLine::Macd);
+        assert_eq!(line.update(1.0), None);
+        assert_eq!(line.update(2.0), None);
+        assert!(line.update(3.0).is_some(), "the slow average is warm at 3");
+
+        // The signal averages the line, which does not exist until then, so the
+        // two warmups add: 3 + 2 - 1 = 4.
+        let mut signal = Macd::new(2, 3, 2, MacdLine::Signal);
+        assert_eq!(signal.update(1.0), None);
+        assert_eq!(signal.update(2.0), None);
+        assert_eq!(signal.update(3.0), None, "the line exists but the signal has one value");
+        assert!(signal.update(4.0).is_some(), "the signal is warm at 4");
+
+        // On a rising series the fast average leads, so the line is positive.
+        let mut rising = Macd::new(2, 4, 2, MacdLine::Macd);
+        let mut last = None;
+        for step in 1..=10 {
+            last = rising.update(f64::from(step));
+        }
+        assert!(last.expect("warm") > 0.0, "fast leads slow while rising: {last:?}");
+
+        // The histogram is the line less its signal, which the two agree on.
+        let mut hist = Macd::new(2, 4, 2, MacdLine::Histogram);
+        let mut line_only = Macd::new(2, 4, 2, MacdLine::Macd);
+        let mut sig_only = Macd::new(2, 4, 2, MacdLine::Signal);
+        let mut seen = 0;
+        for step in 1..=12 {
+            let value = f64::from(step);
+            if let (Some(h), Some(l), Some(g)) = (hist.update(value), line_only.update(value), sig_only.update(value)) {
+                assert!((h - (l - g)).abs() < 1e-9, "histogram is line - signal, got {h} vs {}", l - g);
+                seen += 1;
+            }
+        }
+        assert!(seen > 0, "the three were never all warm at once");
+    }
 
     /// #160: an indicator that is not ready yet says so in the one way a
     /// rule cannot mistake for a number.
