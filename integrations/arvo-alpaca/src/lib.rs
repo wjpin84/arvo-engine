@@ -62,6 +62,7 @@ pub use auth::{forget, has, store, stored_keys, Env, Keys, LEGACY_CREDENTIAL_ID}
 pub use holdings::{holdings, AccountHoldings, Position};
 pub use execution::{AlpacaExecutor, DEFAULT_MAX_ORDER_AGE_SECS};
 pub use source::{
-    Alpaca, IEX_SOURCE_ID, IEX_TOTAL_RETURN_SOURCE_ID, IEX_TOTAL_RETURN_VENUE, IEX_VENUE,
+    Alpaca, CRYPTO_SOURCE_ID, CRYPTO_VENUE, IEX_SOURCE_ID, IEX_TOTAL_RETURN_SOURCE_ID,
+    IEX_TOTAL_RETURN_VENUE, IEX_VENUE,
     SIP_SOURCE_ID, SIP_TOTAL_RETURN_SOURCE_ID, SIP_TOTAL_RETURN_VENUE, SIP_VENUE,
 };

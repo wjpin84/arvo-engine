@@ -78,6 +78,10 @@ fn compiled_in() -> Vec<Box<dyn Source>> {
         // than one source configured two ways.
         Box::new(alpaca::Alpaca::iex()),
         Box::new(alpaca::Alpaca::sip()),
+        // Crypto, on the same key pair: a different endpoint under a venue of
+        // its own, because a coin's bars are a different dataset from a share's
+        // and file beside them.
+        Box::new(alpaca::Alpaca::crypto()),
         // Total return: each a separate dataset under its own venue, for the
         // same reason — ADR-0013.
         Box::new(yahoo::Yahoo::total_return()),
