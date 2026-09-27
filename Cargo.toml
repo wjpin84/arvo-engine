@@ -27,7 +27,7 @@ exclude = ["contract"]
 # Single source of truth for versions shared across crates, so a bump happens
 # once rather than per-manifest.
 [workspace.package]
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 license = "Apache-2.0"
 
