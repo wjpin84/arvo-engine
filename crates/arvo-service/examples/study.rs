@@ -68,6 +68,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let simulation = NautilusSimulation::new(CsvBars::new(&root));
     let criteria = EvaluationCriteria::default();
+    // The project's own rules and rulesets, as the view loads them: without
+    // this, `--strategy` could only name a rule compiled into the binary, and a
+    // rule the project wrote as data (#225) would report as unknown. The data
+    // directory is the project directory for this example's purposes, which is
+    // where `rules/` and `rulesets/` sit beside the library.
+    let project = std::path::Path::new(&root).parent().unwrap_or_else(|| std::path::Path::new(&root));
+    arvo_service::rules::refresh_at(project);
+    arvo_service::rulesets::refresh_at(project);
     let plan = arvo_service::research::StrategyPlan::find(strategy)
         .ok_or_else(|| format!("no strategy called {strategy:?}"))?;
     // The strategy's resolution, as the view uses. This read daily bars for
