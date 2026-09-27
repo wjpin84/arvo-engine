@@ -12,11 +12,37 @@ use nautilus_model::{
 use rust_decimal::Decimal;
 use ustr::Ustr;
 
-/// US equity conventions. Daily bars from the free exports are quoted in cents
-/// and traded in whole shares; nothing yet needs another instrument class, and
-/// guessing at one would mean guessing wrong.
-pub(crate) const PRICE_PRECISION: u8 = 2;
-pub(crate) const SIZE_PRECISION: u8 = 0;
+/// How many decimal places one instrument's prices and quantities need.
+///
+/// These were two module constants — two places of price, whole units of size —
+/// which is right for a US share and wrong for anything quoted finer. They are
+/// the instrument's own answer now, read from the tick and lot its source
+/// described (#240), and resolved once per instrument rather than once per bar.
+///
+/// A stock ticking at a cent in lots of one still resolves to 2 and 0, so every
+/// price and quantity the engine built before this is unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Precision {
+    pub(crate) price: u8,
+    pub(crate) size: u8,
+}
+
+impl Precision {
+    /// What the instrument's own tick and lot need.
+    pub(crate) fn of(described: &arvo_data::Instrument) -> Self {
+        Self {
+            price: described.price_precision(),
+            size: described.size_precision(),
+        }
+    }
+
+    /// What the name alone says, for a caller that has no described instrument
+    /// to hand — the same fallback [`arvo_data::Instrument::of`] is everywhere
+    /// else.
+    pub(crate) fn named(id: &str) -> Self {
+        Self::of(&arvo_data::Instrument::of(id))
+    }
+}
 
 /// Builds the traded instrument, with the experiment's commission applied as
 /// the venue fee.
@@ -30,7 +56,8 @@ pub(crate) fn equity(
 ) -> anyhow::Result<InstrumentAny> {
     let fee = Decimal::try_from(commission_bps / 10_000.0)?;
     let described = arvo_data::Instrument::of(&instrument_id.to_string());
-    let tick = Price::new_checked(described.tick, PRICE_PRECISION)?;
+    let precision = Precision::of(&described);
+    let tick = Price::new_checked(described.tick, precision.price)?;
 
     // Optional fields are left unset rather than passed as `None`: the builder
     // applies the same defaults checked construction would.
@@ -38,7 +65,7 @@ pub(crate) fn equity(
         .instrument_id(instrument_id)
         .raw_symbol(Symbol::from(instrument_id.symbol.as_str()))
         .currency(currency)
-        .price_precision(PRICE_PRECISION)
+        .price_precision(precision.price)
         .price_increment(tick)
         .maker_fee(fee)
         .taker_fee(fee)
@@ -74,7 +101,8 @@ pub(crate) fn option(
 ) -> anyhow::Result<InstrumentAny> {
     let fee = Decimal::try_from(commission_bps / 10_000.0)?;
     let described = arvo_data::Instrument::of(&instrument_id.to_string());
-    let tick = Price::new_checked(described.tick, PRICE_PRECISION)?;
+    let precision = Precision::of(&described);
+    let tick = Price::new_checked(described.tick, precision.price)?;
     let expires = contract
         .expires_at()
         .and_utc()
@@ -95,11 +123,11 @@ pub(crate) fn option(
             arvo_data::option::Right::Call => OptionKind::Call,
             arvo_data::option::Right::Put => OptionKind::Put,
         })
-        .strike_price(Price::new_checked(contract.strike, PRICE_PRECISION)?)
+        .strike_price(Price::new_checked(contract.strike, precision.price)?)
         .currency(currency)
         .activation_ns(UnixNanos::default())
         .expiration_ns(UnixNanos::from(u64::try_from(expires)?))
-        .price_precision(PRICE_PRECISION)
+        .price_precision(precision.price)
         .price_increment(tick)
         .multiplier(Quantity::from(1))
         .lot_size(Quantity::from(described.lot as u64))
@@ -116,13 +144,14 @@ pub(crate) fn to_nautilus_bar(
     bar_type: BarType,
     bar: &arvo_data::Bar,
     interval: arvo_data::BarInterval,
+    precision: Precision,
 ) -> Result<Bar, SimulationError> {
     let rejected = |what: &str, err: &dyn std::fmt::Display| {
         SimulationError::Rejected(format!("bar {}: {what}: {err}", bar.at))
     };
 
     let price = |name: &str, value: f64| {
-        Price::new_checked(value, PRICE_PRECISION).map_err(|err| rejected(name, &err))
+        Price::new_checked(value, precision.price).map_err(|err| rejected(name, &err))
     };
 
     // A bar is only knowable once its period has closed. Timestamping it at
@@ -143,7 +172,7 @@ pub(crate) fn to_nautilus_bar(
         price("high", bar.high)?,
         price("low", bar.low)?,
         price("close", bar.close)?,
-        Quantity::new_checked(bar.volume, SIZE_PRECISION)
+        Quantity::new_checked(bar.volume, precision.size)
             .map_err(|err| rejected("volume", &err))?,
         ts,
         ts,

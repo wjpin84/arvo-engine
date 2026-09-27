@@ -136,7 +136,12 @@ impl Shadow {
             let bar_type = *self.bar_types.get(name).ok_or_else(|| {
                 SimulationError::Rejected(format!("{name} is not in this run"))
             })?;
-            data.push(Data::Bar(to_nautilus_bar(bar_type, bar, self.interval)?));
+            data.push(Data::Bar(to_nautilus_bar(
+                bar_type,
+                bar,
+                self.interval,
+                crate::convert::Precision::named(&bar_type.instrument_id().to_string()),
+            )?));
         }
         if data.is_empty() {
             return Ok(Vec::new());
