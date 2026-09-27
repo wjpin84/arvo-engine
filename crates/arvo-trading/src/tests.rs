@@ -598,3 +598,74 @@ async fn a_held_entry_never_reaches_the_venue() {
         "and the refusal is counted, not silent"
     );
 }
+
+/// A coin's fraction survives the live path, not just the backtest.
+///
+/// #248. #245 proved a fraction reaches a Nautilus order inside a backtest.
+/// This is the other half: the same size through the session loop, the risk
+/// gate and out to a venue. A rounding anywhere along it would turn 0.0125 of a
+/// coin into nothing, and the session would look like it was refusing entries
+/// for a reason nobody could find.
+#[tokio::test]
+async fn a_coins_fraction_reaches_the_venue_through_the_session() {
+    let venue = FakeVenue::new();
+    let mut session = Session::new(
+        RiskGate::new(
+            RiskModel {
+                risk_per_trade: None,
+                max_position_fraction: Some(1.0),
+                ..RiskModel::default()
+            },
+            100_000.0,
+            chrono::Utc::now().date_naive(),
+        ),
+        venue.clone(),
+    );
+    let mut watch = Watch::new(None, 100_000.0);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let record = Recorder::open(dir.path(), "coin@fake").expect("record");
+    let status = Mutex::new(fresh_status());
+
+    let now = chrono::Utc::now().naive_utc();
+    let asked = 0.012_5;
+    let signal = Signal {
+        instrument: "BTC-USD.ACRYPTO".to_owned(),
+        side: Side::Buy,
+        quantity: asked,
+        reference_price: 84_000.0,
+        stop_distance: Some(2_000.0),
+        signalled_at: now,
+        exit: None,
+        rule: Some("test".to_owned()),
+        signal: None,
+        regime: None,
+    };
+
+    act(
+        &mut session,
+        &mut watch,
+        "s#0",
+        &signal,
+        "test",
+        now,
+        // Nothing holds it: not frozen, and the bar is this session's.
+        None,
+        &record,
+        &status,
+    )
+    .await
+    .expect("a coin is a tradeable instrument");
+
+    let orders = venue.orders();
+    assert_eq!(orders.len(), 1, "the entry reached the venue: {orders:?}");
+    assert!(
+        (orders[0].quantity - asked).abs() < 1e-9,
+        "the fraction survived the gate and the loop: asked {asked}, sent {}",
+        orders[0].quantity
+    );
+    assert_eq!(
+        status.lock().expect("status").refused,
+        0,
+        "and nothing refused it"
+    );
+}
