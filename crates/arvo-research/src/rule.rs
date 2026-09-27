@@ -274,6 +274,58 @@ pub struct Resolved {
     pub exit: Option<Condition>,
 }
 
+impl Indicator {
+    /// This indicator with its periods as counts of bars, the parameters
+    /// supplied. `rule` and `name` are for the message when they are not.
+    ///
+    /// # Errors
+    ///
+    /// A period naming a parameter `params` does not hold, or a period that
+    /// is not a whole number of bars from 1 to 10 000, or a MACD whose fast
+    /// average is not faster.
+    pub fn resolve(&self, rule: &str, name: &str, params: &BTreeMap<String, f64>) -> Result<ResolvedIndicator, RuleError> {
+        let number = |value: &Value| -> Result<f64, RuleError> {
+            match value {
+                Value::Literal(number) => Ok(*number),
+                Value::Param(param) => params
+                    .get(param)
+                    .copied()
+                    .ok_or_else(|| RuleError::MissingParam { rule: rule.to_owned(), param: param.clone() }),
+            }
+        };
+        let period = |what: &str, value: &Value| -> Result<usize, RuleError> {
+            let number = number(value)?;
+            if !number.is_finite() || number < 1.0 || number.fract() != 0.0 || number > MAX_PERIOD {
+                return Err(RuleError::BadPeriod { rule: rule.to_owned(), what: what.to_owned(), value: number.to_string() });
+            }
+            // Bounded above by MAX_PERIOD, so the cast is exact.
+            #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "checked just above")]
+            Ok(number as usize)
+        };
+        Ok(match self {
+            Self::Sma { input, period: value } => ResolvedIndicator::Sma { input: *input, period: period(name, value)? },
+            Self::Ema { input, period: value } => ResolvedIndicator::Ema { input: *input, period: period(name, value)? },
+            Self::Atr { period: value } => ResolvedIndicator::Atr { period: period(name, value)? },
+            Self::Rsi { input, period: value } => ResolvedIndicator::Rsi { input: *input, period: period(name, value)? },
+            Self::Macd { input, fast, slow, signal, line } => {
+                let (fast, slow) = (period(name, fast)?, period(name, slow)?);
+                // A fast average that is not faster says nothing: the line
+                // would be zero or inverted, and a cross on it is noise.
+                if fast >= slow {
+                    return Err(RuleError::BadPeriod {
+                        rule: rule.to_owned(),
+                        what: format!("{name}: fast"),
+                        value: format!("{fast}, which is not below slow {slow}"),
+                    });
+                }
+                ResolvedIndicator::Macd { input: *input, fast, slow, signal: period(name, signal)?, line: *line }
+            }
+            Self::Max { input, period: value } => ResolvedIndicator::Max { input: *input, period: period(name, value)? },
+            Self::Min { input, period: value } => ResolvedIndicator::Min { input: *input, period: period(name, value)? },
+        })
+    }
+}
+
 /// An indicator with its period as a count of bars.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResolvedIndicator {
@@ -287,6 +339,28 @@ pub enum ResolvedIndicator {
 }
 
 impl ResolvedIndicator {
+    /// The indicator as a chart legend names it: `EMA(close, 20)`,
+    /// `MACD(close, 12, 26, 9) histogram`.
+    #[must_use]
+    pub fn label(self) -> String {
+        match self {
+            Self::Sma { input, period } => format!("SMA({}, {period})", input.as_str()),
+            Self::Ema { input, period } => format!("EMA({}, {period})", input.as_str()),
+            Self::Atr { period } => format!("ATR({period})"),
+            Self::Rsi { input, period } => format!("RSI({}, {period})", input.as_str()),
+            Self::Macd { input, fast, slow, signal, line } => {
+                let which = match line {
+                    MacdLine::Macd => "",
+                    MacdLine::Signal => " signal",
+                    MacdLine::Histogram => " histogram",
+                };
+                format!("MACD({}, {fast}, {slow}, {signal}){which}", input.as_str())
+            }
+            Self::Max { input, period } => format!("MAX({}, {period})", input.as_str()),
+            Self::Min { input, period } => format!("MIN({}, {period})", input.as_str()),
+        }
+    }
+
     /// How many bars it needs before it reports a value — the warmup the
     /// caller must allow for.
     #[must_use]
@@ -345,49 +419,9 @@ impl RuleDefinition {
         let mut supplied = self.params.clone();
         supplied.extend(params.iter().map(|(name, value)| (name.clone(), *value)));
 
-        let number = |value: &Value| -> Result<f64, RuleError> {
-            match value {
-                Value::Literal(number) => Ok(*number),
-                Value::Param(name) => supplied
-                    .get(name)
-                    .copied()
-                    .ok_or_else(|| RuleError::MissingParam { rule: rule.clone(), param: name.clone() }),
-            }
-        };
-        let period = |what: &str, value: &Value| -> Result<usize, RuleError> {
-            let number = number(value)?;
-            if !number.is_finite() || number < 1.0 || number.fract() != 0.0 || number > MAX_PERIOD {
-                return Err(RuleError::BadPeriod { rule: rule.clone(), what: what.to_owned(), value: number.to_string() });
-            }
-            // Bounded above by MAX_PERIOD, so the cast is exact.
-            #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "checked just above")]
-            Ok(number as usize)
-        };
-
         let mut indicators = BTreeMap::new();
         for (name, indicator) in &self.indicators {
-            let resolved = match indicator {
-                Indicator::Sma { input, period: value } => ResolvedIndicator::Sma { input: *input, period: period(name, value)? },
-                Indicator::Ema { input, period: value } => ResolvedIndicator::Ema { input: *input, period: period(name, value)? },
-                Indicator::Atr { period: value } => ResolvedIndicator::Atr { period: period(name, value)? },
-                Indicator::Rsi { input, period: value } => ResolvedIndicator::Rsi { input: *input, period: period(name, value)? },
-                Indicator::Macd { input, fast, slow, signal, line } => {
-                    let (fast, slow) = (period(name, fast)?, period(name, slow)?);
-                    // A fast average that is not faster says nothing: the line
-                    // would be zero or inverted, and a cross on it is noise.
-                    if fast >= slow {
-                        return Err(RuleError::BadPeriod {
-                            rule: rule.clone(),
-                            what: format!("{name}: fast"),
-                            value: format!("{fast}, which is not below slow {slow}"),
-                        });
-                    }
-                    ResolvedIndicator::Macd { input: *input, fast, slow, signal: period(name, signal)?, line: *line }
-                }
-                Indicator::Max { input, period: value } => ResolvedIndicator::Max { input: *input, period: period(name, value)? },
-                Indicator::Min { input, period: value } => ResolvedIndicator::Min { input: *input, period: period(name, value)? },
-            };
-            indicators.insert(name.clone(), resolved);
+            indicators.insert(name.clone(), indicator.resolve(&rule, name, &supplied)?);
         }
 
         let entry = self.entry.resolved(&rule, &indicators, &supplied)?;

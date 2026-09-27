@@ -54,6 +54,7 @@ use nautilus_trading::strategy::{Strategy, StrategyNative};
 
 pub(crate) use cross_sectional::CrossSectionalMomentum;
 pub(crate) use data_rule::DataRule;
+pub use data_rule::indicator_series;
 pub(crate) use breakout::{Rule as BreakoutRule, ZeroDteBreakout};
 pub(crate) use put_spread::{PutSpread, Rule as PutSpreadRule};
 pub(crate) use rules::{

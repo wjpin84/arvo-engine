@@ -100,8 +100,40 @@ pub fn candles(
             high: bar.high,
             low: bar.low,
             close: bar.close,
+            volume: bar.volume,
         })
         .collect()
+}
+
+/// One indicator as a chart asks for it: the rule language's own declaration
+/// (the `indicators` entry of a rule file, as JSON), resolved with `params`.
+/// Computed by [`indicator_curve`] with the code a data rule runs, so the
+/// curve is what a rule would have seen; points begin at the first bar the
+/// indicator has a value for.
+///
+/// # Errors
+///
+/// A declaration that does not parse, or one that does not resolve: a period
+/// naming a parameter `params` does not hold, or a period that is not a
+/// whole number of bars.
+pub fn resolve_indicator(
+    declaration: &str,
+    params: &std::collections::BTreeMap<String, f64>,
+) -> Result<arvo_research::rule::ResolvedIndicator, String> {
+    let indicator: arvo_research::rule::Indicator =
+        serde_json::from_str(declaration).map_err(|err| format!("the indicator does not parse: {err}"))?;
+    indicator.resolve("chart", "indicator", params).map_err(|err| err.to_string())
+}
+
+/// The resolved indicator over `bars`, named as a legend names it.
+#[must_use]
+pub fn indicator_curve(bars: &[arvo_data::Bar], resolved: arvo_research::rule::ResolvedIndicator) -> NamedCurveView {
+    let points = arvo_nautilus::indicator_series(resolved, bars)
+        .into_iter()
+        .zip(bars)
+        .filter_map(|(value, bar)| value.map(|value| CurvePoint { time: bar.at.and_utc().timestamp(), value }))
+        .collect();
+    NamedCurveView { name: resolved.label(), points }
 }
 
 /// Every entry and exit in a ledger, as chart markers on the bars that caused
@@ -985,6 +1017,31 @@ mod chart_tests {
             .expect("valid")
             .and_hms_opt(hour, minute, 0)
             .expect("valid")
+    }
+
+    /// The curve a chart draws is the rule's own indicator: declared in the
+    /// rule language, warmed up the same way, and named for a legend.
+    #[test]
+    fn an_indicator_curve_starts_when_the_rule_would_first_see_a_value() {
+        let bars: Vec<arvo_data::Bar> = (1..=5)
+            .map(|day| {
+                let close = f64::from(day) * 10.0;
+                arvo_data::Bar { at: at(day, 0, 0), open: close, high: close, low: close, close, volume: 1.0 }
+            })
+            .collect();
+        let params = std::collections::BTreeMap::from([("n".to_owned(), 3.0)]);
+        let resolved = resolve_indicator(r#"{"kind":"SMA","period":"n"}"#, &params).expect("resolves");
+        let curve = indicator_curve(&bars, resolved);
+
+        assert_eq!(curve.name, "SMA(close, 3)");
+        let times: Vec<i64> = curve.points.iter().map(|point| point.time).collect();
+        assert_eq!(times, vec![at(3, 0, 0).and_utc().timestamp(), at(4, 0, 0).and_utc().timestamp(), at(5, 0, 0).and_utc().timestamp()]);
+        let values: Vec<f64> = curve.points.iter().map(|point| point.value).collect();
+        assert_eq!(values, vec![20.0, 30.0, 40.0]);
+
+        let missing = resolve_indicator(r#"{"kind":"SMA","period":"n"}"#, &std::collections::BTreeMap::new());
+        assert!(missing.is_err_and(|why| why.contains("n")), "a period naming an unsupplied parameter is refused");
+        assert!(resolve_indicator("not json", &params).is_err());
     }
 
     fn trade(opened: chrono::NaiveDateTime, closed: Option<chrono::NaiveDateTime>) -> Trade {

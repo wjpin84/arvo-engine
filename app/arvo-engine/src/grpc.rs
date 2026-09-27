@@ -32,6 +32,7 @@ use proto::platform::{
 use proto::portfolio::{PortfolioLibraryView, PortfolioName};
 use proto::research::{
     Advice, AttachRequest, Attachment, AttachmentRef, Attachments, BarView, BarsRequest, BarsView, BookRequest,
+    IndicatorRequest, NamedCurveView,
     ComparisonView, Finding, PanelRequest, RankRequest, Ranking, RegimePointView, PineScript, PineTranslation, RuleFile, RuleFiles, RuleText, RegimeView, ReviewRequest, ReviewView,
     FindingId, FindingIds, FindingSummary, Findings, HistoryView, PanelView, Point, ProblemsView, RecordView,
     ReplayView, ReportFigure, ReportRequest, RiskModel, Rules, Ruleset, RulesetForm, RulesetPath, Rulesets,
@@ -276,6 +277,17 @@ impl market_server::Market for Market {
         )
         .await
         .map_err(refused)?;
+        // What the library now says about the instrument, so a reader holding
+        // its bars under the old hash drops them (LibraryEvent).
+        use arvo_data::BarProvider as _;
+        let fingerprint = view
+            .interval
+            .parse::<arvo_data::BarInterval>()
+            .ok()
+            .and_then(|interval| self.workbench.bars.fingerprint(&view.instrument, interval).ok().flatten());
+        if let Some(fingerprint) = fingerprint {
+            let _ = self.events.send(arvo_service::events::library_changed(&view.instrument, &fingerprint));
+        }
         Ok(Response::new(view))
     }
 
@@ -667,6 +679,16 @@ const MAX_BARS: u32 = 2000;
 /// the interval it parsed to, and at most `last` bars from the end of the
 /// window (#195).
 fn bars_in(data: &std::path::Path, asked: &BarsRequest) -> Result<(String, arvo_data::BarInterval, Vec<arvo_data::Bar>), Status> {
+    let (instrument, interval, mut bars) = window(data, asked)?;
+    let keep = asked.last.unwrap_or(DEFAULT_BARS).min(MAX_BARS) as usize;
+    let skip = bars.len().saturating_sub(keep);
+    bars.drain(..skip);
+    Ok((instrument, interval, bars))
+}
+
+/// Every bar of the library between `from` and `to`, uncapped: what a
+/// stream pages and an indicator warms up over.
+fn window(data: &std::path::Path, asked: &BarsRequest) -> Result<(String, arvo_data::BarInterval, Vec<arvo_data::Bar>), Status> {
     use arvo_data::BarProvider as _;
     let instrument = required(&asked.instrument, "instrument")?.to_owned();
     let interval: arvo_data::BarInterval = asked
@@ -687,16 +709,34 @@ fn bars_in(data: &std::path::Path, asked: &BarsRequest) -> Result<(String, arvo_
     };
     let from = day(&asked.from, "from", chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap_or_default())?;
     let to = day(&asked.to, "to", chrono::Utc::now().date_naive())?;
-    let mut bars = arvo_data::CsvBars::new(data)
+    let bars = arvo_data::CsvBars::new(data)
         .bars(&instrument, interval, from, to)
         .map_err(|err| Status::not_found(format!("{instrument} at {interval}: {err}")))?;
     if bars.is_empty() {
         return Err(Status::not_found(format!("{instrument} has no {interval} bars between {from} and {to}")));
     }
-    let keep = asked.last.unwrap_or(DEFAULT_BARS).min(MAX_BARS) as usize;
-    let skip = bars.len().saturating_sub(keep);
-    bars.drain(..skip);
     Ok((instrument, interval, bars))
+}
+
+/// Bars as the contract carries them: `at` as text and `time` as the same
+/// instant in seconds, both UTC, and the zone the sessions are stated in.
+fn bars_view<'a>(instrument: &str, interval: arvo_data::BarInterval, bars: impl Iterator<Item = &'a arvo_data::Bar>) -> BarsView {
+    BarsView {
+        instrument: instrument.to_owned(),
+        interval: interval.to_string(),
+        bars: bars
+            .map(|bar| BarView {
+                at: bar.at.to_string(),
+                open: bar.open,
+                high: bar.high,
+                low: bar.low,
+                close: bar.close,
+                volume: bar.volume,
+                time: bar.at.and_utc().timestamp(),
+            })
+            .collect(),
+        zone: arvo_data::session::ZONE.to_owned(),
+    }
 }
 
 fn required<'a>(field: &'a str, name: &str) -> Result<&'a str, Status> {
@@ -959,21 +999,40 @@ impl research_server::Research for Service {
 
     async fn read_bars(&self, request: Request<BarsRequest>) -> Result<Response<BarsView>, Status> {
         let (instrument, interval, bars) = bars_in(self.research.data(), request.get_ref())?;
-        Ok(Response::new(BarsView {
-            instrument,
-            interval: interval.to_string(),
-            bars: bars
-                .into_iter()
-                .map(|bar| BarView {
-                    at: bar.at.to_string(),
-                    open: bar.open,
-                    high: bar.high,
-                    low: bar.low,
-                    close: bar.close,
-                    volume: bar.volume,
-                })
-                .collect(),
-        }))
+        Ok(Response::new(bars_view(&instrument, interval, bars.iter())))
+    }
+
+    type StreamBarsStream = std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<BarsView, Status>> + Send>>;
+
+    async fn stream_bars(&self, request: Request<BarsRequest>) -> Result<Response<Self::StreamBarsStream>, Status> {
+        // The whole window in pages: `last` caps ReadBars for an agent's
+        // context, and a chart paging through history has no such limit.
+        let (instrument, interval, bars) = window(self.research.data(), request.get_ref())?;
+        let pages: Vec<Result<BarsView, Status>> =
+            bars.chunks(MAX_BARS as usize).map(|page| Ok(bars_view(&instrument, interval, page.iter()))).collect();
+        Ok(Response::new(Box::pin(tokio_stream::iter(pages))))
+    }
+
+    async fn read_indicator(&self, request: Request<IndicatorRequest>) -> Result<Response<NamedCurveView>, Status> {
+        use arvo_service::research::views::{indicator_curve, resolve_indicator};
+        let IndicatorRequest { bars: asked, indicator, params } = request.into_inner();
+        let asked = asked.ok_or_else(|| Status::invalid_argument("bars is required"))?;
+        let resolved = resolve_indicator(&indicator, &params.into_iter().collect()).map_err(Status::invalid_argument)?;
+        // Computed over the warm-up before the window too, so the first bar
+        // asked for has a value rather than the first `period` saying
+        // nothing; then only the window is answered. A window given by dates
+        // is answered as asked: the caller pads it.
+        let keep = asked.last.map(|last| last.min(MAX_BARS) as usize);
+        let (_, _, mut bars) = window(self.research.data(), &asked)?;
+        if let Some(keep) = keep {
+            let warm = keep + resolved.period();
+            bars.drain(..bars.len().saturating_sub(warm));
+        }
+        let skip = keep.map_or(0, |keep| bars.len().saturating_sub(keep));
+        let mut curve = indicator_curve(&bars, resolved);
+        let from = bars.get(skip).map(|bar| bar.at.and_utc().timestamp());
+        curve.points.retain(|point| from.is_none_or(|from| point.time >= from));
+        Ok(Response::new(curve))
     }
 
     async fn view_regime(&self, request: Request<BarsRequest>) -> Result<Response<RegimeView>, Status> {
@@ -1738,14 +1797,16 @@ mod tests {
         // library the studies read, and nothing else: an agent that can run
         // a study on those bars can look at them (#195). ViewReview reads
         // the day's session records back as a report and reaches no session
-        // (#217).
+        // (#217). StreamBars is ReadBars without the cap, for a chart paging
+        // through history, and ReadIndicator computes over the same bars;
+        // neither reaches anything else.
         assert_eq!(
             calls,
             [
                 "ListStrategies", "ListInstruments", "ListFindings", "OpenFinding", "RunStudy", "RunWalkForward",
                 "RecordFinding", "AttachFile", "ListRulesets", "ReadRuleset", "WriteRuleset", "ListRules", "ListRuleFiles", "WriteRule", "TranslatePine", "GetRiskModel",
                 "ViewStudy", "ViewWalkForward", "ViewPanel", "RunPanel", "ViewBook", "ViewHistory", "ViewRecord", "ViewReplay",
-                "ViewComparison", "ReadBars", "ViewRegime", "ViewReview", "RankFindings", "ViewProblems", "ListAttachments", "Subscribe",
+                "ViewComparison", "ReadBars", "StreamBars", "ReadIndicator", "ViewRegime", "ViewReview", "RankFindings", "ViewProblems", "ListAttachments", "Subscribe",
             ]
         );
         for forbidden in ["Fetch", "Order", "Trade", "Share", "Import", "Key", "Sign", "Session", "Halt"] {

@@ -150,6 +150,21 @@ pub fn session(id: &str, state: &str, detail: Option<&str>) -> EventView {
     )
 }
 
+/// A fetch wrote an instrument's bars.
+///
+/// Information, not an alarm: the person asked for the fetch. Carries the
+/// fingerprint so a reader holding the bars under an older one drops them
+/// without a round trip.
+#[must_use]
+pub fn library_changed(instrument: &str, fingerprint: &str) -> EventView {
+    EventView::new(
+        EventKindView::library(instrument.to_owned(), fingerprint.to_owned()),
+        "Library changed".to_owned(),
+        format!("{instrument} was fetched"),
+        SeverityView::Info,
+    )
+}
+
 /// A source failure worth announcing, if it is one.
 ///
 /// A session can expire between any two calls, and the call that happens to

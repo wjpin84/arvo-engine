@@ -149,6 +149,10 @@ impl Fields {
         }
     }
 
+    const fn of_library(bar: &arvo_data::Bar) -> Self {
+        Self { open: bar.open, high: bar.high, low: bar.low, close: bar.close, volume: bar.volume }
+    }
+
     const fn get(&self, input: Input) -> f64 {
         match input {
             Input::Open => self.open,
@@ -158,6 +162,15 @@ impl Fields {
             Input::Volume => self.volume,
         }
     }
+}
+
+/// One indicator over library bars, one value per bar, `None` while it is
+/// warming up. The same code a data rule runs, so a chart draws what the
+/// rule saw.
+#[must_use]
+pub fn indicator_series(indicator: ResolvedIndicator, bars: &[arvo_data::Bar]) -> Vec<Option<f64>> {
+    let mut series = Series::new(indicator);
+    bars.iter().map(|bar| series.update(&Fields::of_library(bar))).collect()
 }
 
 /// A live indicator.
