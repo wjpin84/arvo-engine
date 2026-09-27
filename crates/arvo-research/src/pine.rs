@@ -84,12 +84,14 @@ enum Binding {
 /// search for, not a symptom.
 const REFUSED: &[(&str, &str)] = &[
     ("request.security", "request.security: another symbol or timeframe; a rule here runs on one instrument at one interval"),
-    ("ta.ema", "ta.ema: this build's indicators are SMA, ATR, MAX and MIN"),
-    ("ta.rsi", "ta.rsi: this build's indicators are SMA, ATR, MAX and MIN"),
-    ("ta.vwap", "ta.vwap: this build's indicators are SMA, ATR, MAX and MIN"),
-    ("ta.macd", "ta.macd: this build's indicators are SMA, ATR, MAX and MIN"),
-    ("ta.stoch", "ta.stoch: this build's indicators are SMA, ATR, MAX and MIN"),
-    ("ta.bb", "ta.bb: this build's indicators are SMA, ATR, MAX and MIN"),
+    ("ta.vwap", "ta.vwap: this build's indicators are SMA, EMA, ATR, RSI, MACD, MAX and MIN"),
+    // MACD exists as an indicator, but Pine's call hands back three series at
+    // once and a rule here reads one named number per indicator. Declaring it
+    // three times in a rule file says the same thing; a tuple does not
+    // translate, and guessing which of the three was meant would be worse.
+    ("ta.macd", "ta.macd: returns three series from one call; declare MACD in a rule file, once per series you read"),
+    ("ta.stoch", "ta.stoch: this build's indicators are SMA, EMA, ATR, RSI, MACD, MAX and MIN"),
+    ("ta.bb", "ta.bb: this build's indicators are SMA, EMA, ATR, RSI, MACD, MAX and MIN"),
     ("varip", "varip: state that survives a bar; a rule here is a function of the bars it has seen"),
     ("strategy.order", "strategy.order: only strategy.entry, strategy.close and strategy.exit are read"),
     ("strategy.short", "strategy.short: every rule here is long only"),
@@ -326,7 +328,9 @@ impl Reader {
         };
         match call.as_str() {
             "ta.sma" => Ok(Some(Indicator::Sma { input: input(&args, 0)?, period: period(&args, 1)? })),
+            "ta.ema" => Ok(Some(Indicator::Ema { input: input(&args, 0)?, period: period(&args, 1)? })),
             "ta.atr" => Ok(Some(Indicator::Atr { period: period(&args, 0)? })),
+            "ta.rsi" => Ok(Some(Indicator::Rsi { input: input(&args, 0)?, period: period(&args, 1)? })),
             "ta.highest" => Ok(Some(Indicator::Max { input: input(&args, 0)?, period: period(&args, 1)? })),
             "ta.lowest" => Ok(Some(Indicator::Min { input: input(&args, 0)?, period: period(&args, 1)? })),
             _ => Ok(None),
@@ -718,15 +722,57 @@ if ta.crossunder(fastMa, slowMa)
         assert_eq!(source.hash, blake3::hash(TWO_SMA.as_bytes()).to_hex().to_string());
     }
 
+#[test]
+    fn an_rsi_mean_reversion_script_imports_and_macd_says_why_it_cannot() {
+        // The second-commonest shape on TradingView after a moving-average
+        // cross, and one this could not read until EMA and RSI existed as
+        // indicators. Worth a test of its own: adding an indicator to the rule
+        // language does nothing for an import until the translator knows it,
+        // and the refusal list said so for three releases.
+        let script = r#"//@version=5
+strategy("RSI dip", overlay=false)
+length = input.int(14, "RSI length")
+trend = ta.ema(close, 200)
+osc = ta.rsi(close, length)
+if osc < 30 and close > trend
+    strategy.entry("long", strategy.long)
+if osc > 70
+    strategy.close("long")
+"#;
+        let translated = translate(script, DAILY).expect("EMA and RSI translate now");
+        assert_eq!(
+            translated.rule.indicators,
+            BTreeMap::from([
+                ("trend".to_owned(), Indicator::Ema { input: Input::Close, period: Value::Literal(200.0) }),
+                ("osc".to_owned(), Indicator::Rsi { input: Input::Close, period: Value::Param("length".to_owned()) }),
+            ])
+        );
+        // It runs, and warms on the longest of the two — the EMA at 200.
+        let resolved = translated.rule.resolve(&BTreeMap::new()).expect("the imported rule runs");
+        assert_eq!(resolved.min_bars(), 200);
+
+        // MACD is an indicator here but not an import: Pine hands back three
+        // series from one call and a rule reads one named number per
+        // indicator. The refusal has to say that rather than claim MACD is
+        // missing, which is what it used to say.
+        let macd = "//@version=5\nstrategy(\"M\")\n[m, sig, h] = ta.macd(close, 12, 26, 9)\nif m > sig\n    strategy.entry(\"long\", strategy.long)\n";
+        let Err(PineError::Unsupported { constructs }) = translate(macd, DAILY) else {
+            panic!("a tuple-returning call is refused");
+        };
+        let said = constructs.join(" | ");
+        assert!(said.contains("three series"), "the reason is the tuple, not a missing indicator: {said}");
+        assert!(!said.contains("indicators are"), "it no longer claims MACD is absent: {said}");
+    }
+
     #[test]
     fn every_construct_it_cannot_translate_is_named_at_once() {
         let script = r#"//@version=5
 strategy("Everything", overlay=true)
 spx = request.security("SPX", "D", close)
-rsi = ta.rsi(close, 14)
+k = ta.stoch(close, high, low, 14)
 var count = 0
 count := count + 1
-if rsi > 70
+if k > 70
     strategy.entry("short", strategy.short)
 alert("fired")
 "#;
@@ -734,7 +780,7 @@ alert("fired")
             panic!("a script full of what this cannot say is refused");
         };
         let said = constructs.join(" | ");
-        for word in ["request.security", "ta.rsi", "strategy.short", "alert", ":="] {
+        for word in ["request.security", "ta.stoch", "strategy.short", "alert", ":="] {
             assert!(said.contains(word), "{word} is named: {said}");
         }
     }
