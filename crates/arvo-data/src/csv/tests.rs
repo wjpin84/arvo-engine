@@ -235,3 +235,38 @@ fn a_provider_that_knows_nothing_of_dividends_says_so() {
     let fixture = InMemoryBars::new();
     assert_eq!(fixture.dividends("MSFT.RH", from, to).expect("read"), None);
 }
+
+/// A pair's id is spelled with a dash, not a slash, so the library can hold it.
+///
+/// `safe_name` refuses a slash, which is what stops an id walking out of the
+/// data directory — so `BTC/USD` could never be a file here, and weakening that
+/// guard to admit one would trade a path-traversal defence for a spelling. The
+/// slash belongs in the request to the venue, not in the id.
+#[test]
+fn a_coin_pair_is_a_name_the_library_can_write_and_a_slashed_one_is_not() {
+    let (_dir, library) = library();
+    let (from, to) = window();
+    let priced = |day: u32, close: f64| Bar {
+        at: NaiveDate::from_ymd_opt(2024, 3, day).expect("valid").and_time(NaiveTime::MIN),
+        open: close,
+        high: close,
+        low: close,
+        close,
+        volume: 1.0,
+    };
+    let bars = vec![priced(1, 2.4567), priced(2, 2.4581)];
+
+    library
+        .write("XRP-USD.ALPACA", BarInterval::DAILY, &bars)
+        .expect("a dashed pair is a safe name");
+    assert_eq!(
+        library.bars("XRP-USD.ALPACA", BarInterval::DAILY, from, to).expect("written"),
+        bars,
+        "and reads back with its sub-cent prices"
+    );
+
+    assert!(matches!(
+        library.write("XRP/USD.ALPACA", BarInterval::DAILY, &bars),
+        Err(DataError::UnsafeInstrument(_))
+    ), "a slash stays refused");
+}

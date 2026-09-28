@@ -199,7 +199,7 @@ impl ZeroDteBreakout {
                 } else {
                     None
                 };
-                if let (Some(reason), Ok(size)) = (reason, Quantity::new_checked(position, 0)) {
+                if let (Some(reason), Some(size)) = (reason, crate::convert::sized(held.id, position)) {
                     self.send(held.id, OrderSide::Sell, size, vec![reason.to_owned()])?;
                 }
             }
@@ -269,7 +269,7 @@ impl ZeroDteBreakout {
             *self.skipped.entry("refused").or_default() += 1;
             return Ok(());
         };
-        let Ok(size) = Quantity::new_checked(quantity, 0) else {
+        let Some(size) = crate::convert::sized(id, quantity) else {
             return Ok(());
         };
         self.send(

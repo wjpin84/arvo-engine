@@ -417,7 +417,7 @@ impl PutSpread {
             *self.skipped.entry("refused").or_default() += 1;
             return Ok(());
         };
-        let Ok(size) = Quantity::new_checked(long_units, 0) else {
+        let Some(size) = crate::convert::sized(long_id, long_units) else {
             return Ok(());
         };
         self.send(
@@ -445,7 +445,7 @@ impl PutSpread {
         let Some(pending) = self.pending.take() else {
             return Ok(());
         };
-        let Ok(size) = Quantity::new_checked(quantity, 0) else {
+        let Some(size) = crate::convert::sized(pending.open.short, quantity) else {
             return Ok(());
         };
         match self.ask(
@@ -527,7 +527,7 @@ impl PutSpread {
         super::decide_entry(
             opens_short,
             &self.risk,
-            Quantity::new_checked(size, 0).unwrap_or(self.trade_size),
+            crate::convert::sized(*id, size).unwrap_or(self.trade_size),
             &id.to_string(),
             price,
             None,
@@ -550,7 +550,7 @@ impl PutSpread {
         } else {
             OrderSide::Sell
         };
-        match Quantity::new_checked(held.abs(), 0) {
+        match crate::convert::sized(id, held.abs()).ok_or(()) {
             Ok(size) if held != 0.0 => self.send(id, side, size, vec![EXIT_SIGNAL.to_owned()]),
             _ => Ok(()),
         }

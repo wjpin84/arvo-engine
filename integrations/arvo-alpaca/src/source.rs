@@ -23,6 +23,14 @@ pub const IEX_VENUE: &str = "AIEX";
 pub const SIP_SOURCE_ID: &str = "alpaca-sip";
 pub const SIP_VENUE: &str = "ASIP";
 
+/// Crypto, which is a different endpoint rather than a different feed.
+pub const CRYPTO_SOURCE_ID: &str = "alpaca-crypto";
+pub const CRYPTO_VENUE: &str = "ACRYPTO";
+
+/// The crypto endpoint's location. Alpaca partitions its crypto venues
+/// geographically; `us` is the one US keys are entitled to.
+const CRYPTO_LOCATION: &str = "us";
+
 /// Each feed again, total-return adjusted, under venues of their own.
 pub const IEX_TOTAL_RETURN_SOURCE_ID: &str = "alpaca-iex-tr";
 pub const IEX_TOTAL_RETURN_VENUE: &str = "AIEXTR";
@@ -41,7 +49,20 @@ pub struct Alpaca {
     id: &'static str,
     venue: &'static str,
     label: &'static str,
+    market: Market,
     keys: KeySource,
+}
+
+/// Which of Alpaca's markets a source serves.
+///
+/// Not a setting: the two are different endpoints, asked for with different
+/// symbol spellings, over different calendars. A source serving one cannot
+/// serve the other by flipping a flag, which is the same reason a feed is a
+/// constructor here rather than a parameter.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Market {
+    Equities,
+    Crypto,
 }
 
 /// Where a data call's key pair comes from.
@@ -66,6 +87,7 @@ impl Alpaca {
             id: IEX_SOURCE_ID,
             venue: IEX_VENUE,
             label: "Alpaca (IEX, free)",
+            market: Market::Equities,
             keys: KeySource::Keychain,
         }
     }
@@ -79,6 +101,7 @@ impl Alpaca {
             id: SIP_SOURCE_ID,
             venue: SIP_VENUE,
             label: "Alpaca (all exchanges)",
+            market: Market::Equities,
             keys: KeySource::Keychain,
         }
     }
@@ -92,6 +115,7 @@ impl Alpaca {
             id: IEX_TOTAL_RETURN_SOURCE_ID,
             venue: IEX_TOTAL_RETURN_VENUE,
             label: "Alpaca (IEX, free, total return)",
+            market: Market::Equities,
             keys: KeySource::Keychain,
         }
     }
@@ -105,6 +129,26 @@ impl Alpaca {
             id: SIP_TOTAL_RETURN_SOURCE_ID,
             venue: SIP_TOTAL_RETURN_VENUE,
             label: "Alpaca (all exchanges, total return)",
+            market: Market::Equities,
+            keys: KeySource::Keychain,
+        }
+    }
+
+    /// Crypto: coin pairs, around the clock, on the same key pair.
+    ///
+    /// A different endpoint rather than a different feed, so it takes neither a
+    /// feed nor an adjustment — a coin has no splits to adjust for and pays no
+    /// distributions, so split-adjusted and total-return are the same series and
+    /// [`Adjustment::Split`] is the honest label rather than a choice.
+    #[must_use]
+    pub const fn crypto() -> Self {
+        Self {
+            feed: "",
+            adjustment: Adjustment::Split,
+            id: CRYPTO_SOURCE_ID,
+            venue: CRYPTO_VENUE,
+            label: "Alpaca (crypto)",
+            market: Market::Crypto,
             keys: KeySource::Keychain,
         }
     }
@@ -124,6 +168,34 @@ impl Alpaca {
         match &self.keys {
             KeySource::Keychain => keys(),
             KeySource::Given(given) => Ok(given.clone()),
+        }
+    }
+}
+
+/// Alpaca's spelling of a coin pair.
+///
+/// Arvo files a pair as `XRP-USD` because `csv::safe_name` refuses a slash — that
+/// refusal is what stops an instrument id walking out of the data directory, and
+/// it is not worth trading for a spelling. Alpaca asks for `XRP/USD`, so the
+/// slash goes back on at the boundaries that want it: this one for market data,
+/// and the order body in `crate::execution`. Split on the last dash, the same way
+/// the instrument is described.
+///
+/// Returned with a literal slash. A query string encodes it; a JSON body does
+/// not, and encoding it there would send Alpaca a symbol it has never listed.
+pub(crate) fn pair_symbol(symbol: &str) -> String {
+    match symbol.rsplit_once('-') {
+        Some((base, quote)) => format!("{base}/{quote}"),
+        None => symbol.to_owned(),
+    }
+}
+
+impl Market {
+    /// What this market calls the symbol Arvo asked for.
+    fn symbol(self, symbol: &str) -> String {
+        match self {
+            Self::Equities => symbol.to_owned(),
+            Self::Crypto => pair_symbol(symbol),
         }
     }
 }
@@ -152,7 +224,12 @@ impl Source for Alpaca {
     }
 
     fn provides(&self) -> &'static [&'static str] {
-        &["bars", "option quotes", "holdings"]
+        match self.market {
+            // No chains on a coin, and crypto holdings are a separate endpoint
+            // that nothing asks for yet.
+            Market::Crypto => &["bars"],
+            Market::Equities => &["bars", "option quotes", "holdings"],
+        }
     }
 
     fn venue(&self) -> &'static str {
@@ -170,10 +247,12 @@ impl Source for Alpaca {
             // The declaration this source exists to make. IEX prices agree with
             // the tape and IEX volume does not, and no check on the bars can
             // tell you which you have.
-            feed: if self.feed == "iex" {
-                Feed::SingleVenue("IEX")
-            } else {
-                Feed::Consolidated
+            feed: match self.market {
+                // Alpaca aggregates several crypto exchanges into one book, so
+                // this is consolidated in the same sense SIP is.
+                Market::Crypto => Feed::Consolidated,
+                Market::Equities if self.feed == "iex" => Feed::SingleVenue("IEX"),
+                Market::Equities => Feed::Consolidated,
             },
             // Always passed explicitly at the call site: Alpaca's default is
             // `raw`, which would make every split read as a crash.
@@ -194,25 +273,40 @@ impl Source for Alpaca {
     ) -> Result<Fetched, SourceError> {
         let mut bars = Vec::new();
         let mut page: Option<String> = None;
+        // The venue's spelling, which for a pair is not Arvo's.
+        let asked = self.market.symbol(symbol);
 
         // Paginated because one request caps at 10,000 bars and a decade of
         // daily data is more than that at intraday resolutions. Looping until
         // the token is absent rather than a fixed number of times: a partial
         // series that looked complete is the failure this avoids.
         loop {
-            let mut url = format!(
-                "{DATA}/v2/stocks/bars?symbols={symbol}&timeframe={}&start={from}&end={to}\
-                 &adjustment={}&feed={}&limit={PAGE}",
-                spelling(interval)?,
-                adjustment_parameter(self.adjustment),
-                self.feed,
-            );
+            // A different endpoint per market, and the crypto one takes neither
+            // a feed nor an adjustment: there is one book and nothing to adjust.
+            let mut url = match self.market {
+                Market::Equities => format!(
+                    "{DATA}/v2/stocks/bars?symbols={asked}&timeframe={}&start={from}&end={to}\
+                     &adjustment={}&feed={}&limit={PAGE}",
+                    spelling(interval)?,
+                    adjustment_parameter(self.adjustment),
+                    self.feed,
+                ),
+                Market::Crypto => format!(
+                    "{DATA}/v1beta3/crypto/{CRYPTO_LOCATION}/bars?symbols={}\
+                     &timeframe={}&start={from}&end={to}&limit={PAGE}",
+                    // Encoded here, because this one is a query string.
+                    asked.replace('/', "%2F"),
+                    spelling(interval)?,
+                ),
+            };
             if let Some(token) = &page {
                 url.push_str(&format!("&page_token={token}"));
             }
 
             let body = get_with(self.keys()?, &url).await?;
-            bars.extend(parse_bars(&body, symbol)?);
+            // Keyed by the symbol as the response spells it, which is the
+            // slashed form for a pair.
+            bars.extend(parse_bars(&body, &asked)?);
 
             page = body
                 .get("next_page_token")
@@ -230,7 +324,12 @@ impl Source for Alpaca {
         // `bounds=regular` and Yahoo omits them by default. Kept, they would
         // form the opening range from 04:00 prints and break the 390-minute
         // day every annualised figure assumes.
-        if interval.is_intraday() {
+        //
+        // A coin has no outside-the-session to drop, and dropping two thirds of
+        // its day here would be the same lie the quality gate stopped telling
+        // (arvo-desktop #243): the bars are real, and the calendar is the
+        // instrument's.
+        if interval.is_intraday() && self.market == Market::Equities {
             bars.retain(|bar| arvo_data::session::in_regular_session(bar.at));
         }
         Ok(Fetched {
@@ -259,6 +358,12 @@ impl Source for Alpaca {
         from: chrono::NaiveDate,
         to: chrono::NaiveDate,
     ) -> Result<Vec<Dividend>, SourceError> {
+        // A coin pays no distributions, so there is nothing to ask and no
+        // request spent asking it.
+        if self.market == Market::Crypto {
+            return Ok(Vec::new());
+        }
+
         let mut paid = Vec::new();
         let mut page: Option<String> = None;
 
@@ -324,6 +429,49 @@ mod tests {
         assert_eq!(Alpaca::sip().basis().feed, Feed::Consolidated);
     }
 
+    /// The spelling boundary. Arvo files a pair with a dash because
+    /// `csv::safe_name` refuses a slash; Alpaca asks with a slash. Both halves
+    /// have to agree or the fetch writes an empty file and says nothing.
+    #[test]
+    fn a_pair_is_asked_for_with_a_slash_and_a_share_is_left_alone() {
+        assert_eq!(Market::Crypto.symbol("XRP-USD"), "XRP/USD");
+        assert_eq!(Market::Crypto.symbol("BTC-USD"), "BTC/USD");
+        // Split on the last dash, as the instrument is described.
+        assert_eq!(Market::Crypto.symbol("ETH-BTC"), "ETH/BTC");
+        // Nothing to split: asked for as it stands rather than mangled.
+        assert_eq!(Market::Crypto.symbol("BTCUSD"), "BTCUSD");
+        // An equity keeps its name, dash and all — BRK-B is a share class.
+        assert_eq!(Market::Equities.symbol("BRK-B"), "BRK-B");
+        assert_eq!(Market::Equities.symbol("MSFT"), "MSFT");
+
+        // The query string is what encodes it, not the spelling function: a
+        // JSON order body wants the literal slash.
+        assert_eq!(Market::Crypto.symbol("XRP-USD").replace('/', "%2F"), "XRP%2FUSD");
+    }
+
+    /// A coin files under its own venue, like every other dataset here.
+    #[test]
+    fn crypto_is_its_own_source_and_venue_and_serves_bars_only() {
+        let crypto = Alpaca::crypto();
+        assert_eq!(crypto.id(), CRYPTO_SOURCE_ID);
+        assert_eq!(crypto.venue(), CRYPTO_VENUE);
+        for equities in [Alpaca::iex(), Alpaca::sip()] {
+            assert_ne!(crypto.venue(), equities.venue());
+            assert_ne!(crypto.id(), equities.id());
+        }
+        assert_eq!(crypto.provides(), &["bars"], "no chains on a coin");
+        assert_eq!(crypto.basis().feed, Feed::Consolidated);
+
+        // The instrument the source serves is described as a pair, around the
+        // clock, which is what the annualisation and the quality gate read.
+        let described = crypto.instrument("XRP-USD");
+        assert_eq!(described.hours, arvo_data::instrument::Hours::Continuous);
+        assert!(matches!(
+            described.kind,
+            arvo_data::instrument::Kind::Crypto { .. }
+        ));
+    }
+
     #[test]
     fn the_two_feeds_file_under_different_venues() {
         // Two datasets with two content hashes. Sharing a venue would let a
@@ -374,6 +522,39 @@ mod tests {
 
         let given = Alpaca::sip().with_keys(Some(Keys { key_id: "k".into(), secret: "s".into() }));
         assert!(given.connected().await.expect("asked"));
+    }
+
+    /// The endpoint really answers, and answers on a weekend.
+    ///
+    /// Ignored because it reaches the network and needs a key pair, like every
+    /// other live check here. Run it with
+    /// `cargo test -p arvo-alpaca serves_a_coin -- --ignored` after touching the
+    /// crypto request: the spelling, the endpoint and the calendar are three
+    /// things no offline test can confirm together.
+    #[tokio::test]
+    #[ignore = "reaches Alpaca and needs keys"]
+    async fn alpaca_really_serves_a_coin_including_its_weekends() {
+        let source = Alpaca::crypto();
+        let to = chrono::Utc::now().date_naive() - chrono::Duration::days(1);
+        let from = to - chrono::Duration::days(20);
+        let fetched = source
+            .bars("BTC-USD", BarInterval::DAILY, from, to)
+            .await
+            .expect("Alpaca serves BTC/USD daily");
+
+        assert!(fetched.bars.len() > 10, "got {} bars", fetched.bars.len());
+        assert!(
+            fetched.bars.iter().all(|bar| bar.close > 0.0),
+            "every bar has a price"
+        );
+        // The thing an equity source could never return: a Saturday or a Sunday.
+        assert!(
+            fetched.bars.iter().any(|bar| matches!(
+                chrono::Datelike::weekday(&bar.at.date()),
+                chrono::Weekday::Sat | chrono::Weekday::Sun
+            )),
+            "a coin trades at the weekend and the bars should show it"
+        );
     }
 
     #[test]

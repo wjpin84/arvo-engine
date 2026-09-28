@@ -205,7 +205,7 @@ impl DataActor for BuyAndHold {
             // venue refuses it and the refusal is counted, rather than the
             // benchmark quietly holding nothing.
             Some(units) if units >= lot && units < size.as_f64() => {
-                Quantity::new_checked(units, 0).unwrap_or(size)
+                crate::convert::sized(self.instrument_id, units).unwrap_or(size)
             }
             _ => size,
         };

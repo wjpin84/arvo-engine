@@ -22,6 +22,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("usage: intraday <data-dir> <instrument> <interval> [risk] [slippage] [strategy]")?;
     let instrument = args.next().ok_or("missing instrument")?;
     let interval: BarInterval = args.next().ok_or("missing interval")?.parse()?;
+    // The calendar the annualisation below is scaled on: the instrument's, so a
+    // coin is counted over 365 days of 1440 minutes and a share over 252 of 390.
+    let hours = arvo_data::Instrument::of(&instrument).hours;
     // Optional 4th argument: "none" for fixed sizing, so risk-based sizing
     // can be isolated as a cause rather than assumed.
     let risk_arg = args.next().unwrap_or_else(|| "0.01".to_owned());
@@ -49,7 +52,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("{instrument} at {interval}: {strategy}, slippage {slippage_bps} bps");
 
     // What is wrong with the bars, before anything is concluded from them.
-    let quality = arvo_data::quality::inspect(&series, interval);
+    let quality = arvo_data::quality::inspect(&series, interval, hours);
     if quality.is_clean() {
         println!("  data: nothing to report across {} bars", quality.bars);
     } else {
@@ -70,8 +73,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  {} bars, {} .. {}", series.len(), first.at, last.at);
     println!(
         "  {:.1} periods a year (a daily bar is {:.0})",
-        interval.periods_per_year(),
-        BarInterval::DAILY.periods_per_year()
+        interval.periods_per_year(hours),
+        BarInterval::DAILY.periods_per_year(hours)
     );
 
     let experiment = Experiment {
@@ -160,7 +163,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     match Metrics::from_curve(
         &result.equity_curve,
         result.trades,
-        interval.periods_per_year(),
+        interval.periods_per_year(hours),
     ) {
         None => println!("  too few equity points to evaluate"),
         Some(metrics) => {

@@ -367,10 +367,18 @@ impl AlpacaExecutor {
 /// indistinguishable from here, and a fresh id per attempt is how one signal
 /// becomes two positions. [`AlpacaExecutor::adopt`] handles the other half.
 fn order_body(order: &Order) -> Value {
+    let bare = arvo_data::source::symbol_of(&order.instrument);
+    let coin = matches!(
+        arvo_data::Instrument::of(&order.instrument).kind,
+        arvo_data::instrument::Kind::Crypto { .. }
+    );
     json!({
-        "symbol": arvo_data::source::symbol_of(&order.instrument),
-        // A string, and not rounded: `risk::decide` floors to whole shares and
-        // refuses anything below one, so this is the size that was approved.
+        // The venue's spelling. Arvo files a pair with a dash because a slash
+        // cannot be a file name; Alpaca will not trade a symbol it has not
+        // listed, and it lists `BTC/USD`.
+        "symbol": if coin { crate::source::pair_symbol(bare) } else { bare.to_owned() },
+        // A string, and not rounded: this is the size the gate approved, which
+        // for a coin is a fraction of one (arvo-desktop #244).
         "qty": order.quantity.to_string(),
         "side": match order.side {
             Side::Buy => "buy",
@@ -381,7 +389,12 @@ fn order_body(order: &Order) -> Value {
         // sized it is an order nothing is watching: the gate's day-trade count,
         // loss limit and halt are all per-session, and a GTC order would fill
         // tomorrow against none of them.
-        "time_in_force": "day",
+        //
+        // A coin has no day to be good for, and Alpaca refuses `day` outright on
+        // a crypto order. `ioc` is the closest thing that keeps the property the
+        // comment above is about: fill now at market or not at all, so nothing
+        // survives the session that sized it. `gtc` would be the opposite.
+        "time_in_force": if coin { "ioc" } else { "day" },
         "client_order_id": client_order_id(order),
     })
 }
@@ -558,6 +571,33 @@ mod tests {
             AlpacaExecutor::paper().venue(),
             AlpacaExecutor::live().venue()
         );
+    }
+
+    /// A coin is ordered in the venue's spelling, for a time in force it will
+    /// accept, in a fraction of a unit.
+    ///
+    /// Three things Alpaca refuses otherwise: `BTC-USD` is not a symbol it has
+    /// listed, `day` is not a time in force it allows on a crypto order, and a
+    /// whole coin is not a size anyone means to buy.
+    #[test]
+    fn a_coin_is_ordered_with_a_slash_immediately_and_in_a_fraction() {
+        let body = order_body(&Order {
+            instrument: "BTC-USD.ACRYPTO".to_owned(),
+            quantity: 0.0125,
+            ..order()
+        });
+        assert_eq!(body["symbol"], "BTC/USD", "the venue's spelling, not Arvo's");
+        assert_eq!(body["qty"], "0.0125", "a fraction of a coin");
+        assert_eq!(
+            body["time_in_force"], "ioc",
+            "a coin has no day to be good for, and Alpaca refuses `day` on one"
+        );
+        assert_eq!(body["type"], "market");
+
+        // An equity is untouched: still the bare symbol and still a day order.
+        let share = order_body(&order());
+        assert_eq!(share["symbol"], "MSFT");
+        assert_eq!(share["time_in_force"], "day");
     }
 
     #[test]

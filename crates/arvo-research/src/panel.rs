@@ -356,7 +356,9 @@ pub fn run_panel(
                     Metrics::from_curve(
                         &result.equity_curve,
                         result.trades,
-                        study.template.interval.periods_per_year(),
+                        study.template.interval.periods_per_year(
+                            arvo_data::Instrument::of(instrument).hours,
+                        ),
                     )
                     .and_then(|metrics| metrics.sharpe)
                 })
@@ -451,7 +453,10 @@ pub fn run_panel(
 
         let outcome = provider.run(&experiment).and_then(|strategy_result| {
             let benchmark_result = provider.run(&benchmark)?;
-            let periods = study.template.interval.periods_per_year();
+            let periods = study
+                .template
+                .interval
+                .periods_per_year(arvo_data::Instrument::of(instrument).hours);
             let metrics = |result: &crate::SimulationResult| {
                 Metrics::from_curve(&result.equity_curve, result.trades, periods)
             };
@@ -513,10 +518,14 @@ pub fn run_panel(
     // rescales rather than re-simulates: it cannot show capital contention
     // between them. See `crate::book` for the rest of what it assumes.
     let book = crate::book::combine(study.template.starting_cash, &curves).and_then(|curve| {
+        // One calendar or none. A pooled curve over instruments that do not
+        // share one has no annualisation that is right for any member, so the
+        // pooled metrics are absent rather than wrong.
+        let hours = arvo_data::Hours::shared(curves.iter().map(|(id, _)| id.as_str()))?;
         Metrics::from_curve(
             &curve,
             pooled.total_trades,
-            study.template.interval.periods_per_year(),
+            study.template.interval.periods_per_year(hours),
         )
     });
     let (verdict, reasons) = judge(&pooled, &selection, criteria, &failures, &breadth);

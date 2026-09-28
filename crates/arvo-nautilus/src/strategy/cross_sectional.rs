@@ -279,7 +279,7 @@ impl CrossSectionalMomentum {
             let arvo_research::Decision::Accept { quantity } = decision else {
                 continue;
             };
-            let Ok(size) = Quantity::new_checked(quantity, 0) else {
+            let Some(size) = crate::convert::sized(id, quantity) else {
                 continue;
             };
             let costs = position.risk().costs;
@@ -329,7 +329,7 @@ impl CrossSectionalMomentum {
         let intended = self.positions.get_mut(&id).and_then(Position::release);
         let actual = self.portfolio().net_position(&id);
         let size = match f64::try_from(actual).ok().filter(|held| *held > 0.0) {
-            Some(held) => Quantity::new_checked(held, 0).ok(),
+            Some(held) => crate::convert::sized(id, held),
             None => intended,
         };
         let Some(size) = size else {

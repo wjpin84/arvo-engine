@@ -559,6 +559,32 @@ pub fn write(root: &Path, review: &Review) -> Result<PathBuf, String> {
     Ok(md)
 }
 
+/// Whether `day` is over for everything that traded in it, as at `now`.
+///
+/// An equity day ends at the regular close, and the review waits a quarter of an
+/// hour past it for the last fills to settle. A day that held a session on an
+/// instrument trading around the clock does not end there — it ends when the day
+/// does, at midnight UTC — so such a day is only finished once the date has
+/// rolled over.
+///
+/// A day with no sessions at all is not a day anyone needs a review of, which is
+/// what replaced asking the equity calendar whether it was a trading day: a
+/// Saturday with a crypto session is a trading day, and a Tuesday with nothing
+/// running is not.
+#[must_use]
+pub fn is_finished(review: &Review, now: DateTime<Utc>) -> bool {
+    if review.sessions.is_empty() {
+        return false;
+    }
+    let continuous = review.sessions.iter().any(|session| {
+        arvo_data::Instrument::of(&session.instrument).hours == arvo_data::Hours::Continuous
+    });
+    if continuous {
+        return now.naive_utc().date() > review.day;
+    }
+    now.naive_utc() >= arvo_data::session::regular_close(review.day) + chrono::Duration::minutes(15)
+}
+
 /// The review already written for `day`, if there is one.
 #[must_use]
 pub fn read(root: &Path, day: NaiveDate) -> Option<(PathBuf, String)> {
@@ -569,6 +595,54 @@ pub fn read(root: &Path, day: NaiveDate) -> Option<(PathBuf, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// When a day is over, for an equity day and for one that never closed.
+    #[test]
+    fn a_continuous_day_is_finished_at_midnight_and_an_equity_day_at_the_close() {
+        let day = NaiveDate::from_ymd_opt(2026, 9, 26).expect("valid");
+        let reviewed = |instrument: &str| Review {
+            day,
+            written_at: Utc::now(),
+            sessions: vec![SessionReview {
+                id: "s".to_owned(),
+                instrument: instrument.to_owned(),
+                ..SessionReview::default()
+            }],
+        };
+        let at = |hour: u32, minute: u32| {
+            day.and_hms_opt(hour, minute, 0).expect("valid").and_utc()
+        };
+
+        // 16:00 New York is 20:00 UTC in September; the review waits a quarter
+        // of an hour past it.
+        let share = reviewed("MSFT.RH");
+        assert!(!is_finished(&share, at(20, 10)), "ten minutes after the close is too early");
+        assert!(is_finished(&share, at(20, 16)), "a quarter of an hour after it is not");
+
+        // A coin's day is not over when the equity market shuts.
+        let coin = reviewed("BTC-USD.ACRYPTO");
+        assert!(!is_finished(&coin, at(20, 16)), "the coin is still trading");
+        assert!(!is_finished(&coin, at(23, 59)), "and still trading a minute before midnight");
+        let tomorrow = (day + chrono::Duration::days(1)).and_hms_opt(0, 5, 0).expect("valid").and_utc();
+        assert!(is_finished(&coin, tomorrow), "finished once the day itself is");
+
+        // A day with both waits for the later of them.
+        let both = Review {
+            sessions: vec![
+                share.sessions[0].clone(),
+                coin.sessions[0].clone(),
+            ],
+            ..reviewed("MSFT.RH")
+        };
+        assert!(!is_finished(&both, at(20, 16)));
+        assert!(is_finished(&both, tomorrow));
+
+        // A day nothing ran on is not a day to review — which is what replaced
+        // asking the equity calendar whether it was a trading day. A Saturday
+        // with a crypto session is a trading day; a Tuesday with nothing is not.
+        let empty = Review { day, written_at: Utc::now(), sessions: Vec::new() };
+        assert!(!is_finished(&empty, tomorrow));
+    }
 
     fn line(at: &str, event: &str, detail: Value) -> String {
         serde_json::json!({ "at": at, "event": event, "detail": detail }).to_string()

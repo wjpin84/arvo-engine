@@ -457,7 +457,9 @@ fn search(
                 Metrics::from_curve(
                     &result.equity_curve,
                     result.trades,
-                    family.template.interval.periods_per_year(),
+                    family.template.interval.periods_per_year(
+                        arvo_data::Instrument::of(&family.template.instrument).hours,
+                    ),
                 )
                 .and_then(|metrics| metrics.sharpe)
             })

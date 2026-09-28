@@ -632,9 +632,12 @@ pub fn evaluate_against_benchmark(
     let strategy_result = provider.run(experiment)?;
     let benchmark_result = provider.run(&benchmark_experiment)?;
 
-    // From the experiment's own resolution, not a constant: this is the
-    // number every annualised statistic is scaled by.
-    let periods = experiment.interval.periods_per_year();
+    // From the experiment's own resolution *and* the instrument's hours, not a
+    // constant: this is the number every annualised statistic is scaled by, and
+    // a coin's year is 365 days of 1440 minutes where an equity's is 252 of 390.
+    let periods = experiment
+        .interval
+        .periods_per_year(arvo_data::Instrument::of(&experiment.instrument).hours);
     let metrics = |result: &SimulationResult, what: &str| {
         Metrics::from_curve(&result.equity_curve, result.trades, periods).ok_or_else(|| {
             SimulationError::Rejected(format!(

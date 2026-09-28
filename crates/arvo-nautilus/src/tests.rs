@@ -566,8 +566,9 @@ fn every_advertised_strategy_can_actually_be_planned() {
         // At whichever resolution the rule is defined: the session rules
         // intraday, a put spread on daily closes.
         assert!(
-            Plan::from_spec(&spec, intraday).is_ok()
-                || Plan::from_spec(&spec, arvo_data::BarInterval::DAILY).is_ok(),
+            Plan::from_spec(&spec, intraday, arvo_data::Hours::Regular).is_ok()
+                || Plan::from_spec(&spec, arvo_data::BarInterval::DAILY, arvo_data::Hours::Regular)
+                    .is_ok(),
             "{name} is advertised but cannot be planned"
         );
     }
@@ -1526,7 +1527,7 @@ fn a_drawdown_limit_stops_the_run_and_the_ledger_says_so() {
     let drawdown = arvo_research::Metrics::from_curve(
         &result.equity_curve,
         result.trades,
-        arvo_data::BarInterval::DAILY.periods_per_year(),
+        arvo_data::BarInterval::DAILY.periods_per_year(arvo_data::Hours::Regular),
     )
     .expect("a curve to measure")
     .max_drawdown;
@@ -1571,7 +1572,7 @@ fn without_a_limit_the_same_run_keeps_trading() {
     let drawdown = arvo_research::Metrics::from_curve(
         &result.equity_curve,
         result.trades,
-        arvo_data::BarInterval::DAILY.periods_per_year(),
+        arvo_data::BarInterval::DAILY.periods_per_year(arvo_data::Hours::Regular),
     )
     .expect("a curve to measure")
     .max_drawdown;
@@ -2882,4 +2883,206 @@ fn a_member_with_no_data_fails_the_whole_book_by_name() {
         err.to_string().contains("NVDA.NASDAQ"),
         "the failure should name the member that caused it, got {err}"
     );
+}
+
+/// A coin's price reaches Nautilus with its decimals, and a share's does not
+/// gain any.
+///
+/// The two together are what #240 and #241 are for: the precision comes from
+/// the instrument rather than from a constant, and a pair is described as a
+/// pair. Before this, `XRP-USD` at 2.4567 was built at two places and settled
+/// as 2.46 — a fifth of a cent a unit, silently, on every bar.
+#[test]
+fn a_coins_price_keeps_its_decimals_and_a_shares_does_not_gain_any() {
+    use crate::convert::{to_nautilus_bar, Precision};
+    use nautilus_model::data::BarType;
+
+    let priced = |id: &str, close: f64, volume: f64| {
+        let bar = arvo_data::Bar {
+            at: date(2026, 9, 27).and_time(NaiveTime::MIN),
+            open: close,
+            high: close,
+            low: close,
+            close,
+            volume,
+        };
+        let bar_type = BarType::from(format!("{id}-1-DAY-LAST-EXTERNAL").as_str());
+        to_nautilus_bar(bar_type, &bar, arvo_data::BarInterval::DAILY, Precision::named(id))
+            .expect("the bar is representable")
+    };
+
+    let coin = priced("XRP-USD.ALPACA", 2.456_7, 1234.5);
+    assert_eq!(coin.close.to_string(), "2.45670000", "eight places, not 2.46");
+    assert_eq!(coin.volume.to_string(), "1234.50000000", "a fraction of a coin traded");
+
+    let share = priced("MSFT.RH", 512.34, 1_000.0);
+    assert_eq!(share.close.to_string(), "512.34", "a cent, exactly as before");
+    assert_eq!(share.volume.to_string(), "1000", "whole shares, exactly as before");
+}
+
+/// A coin pair reaches the engine as a pair, and one that cannot settle in the
+/// account's currency is refused by name.
+///
+/// #245. Before this there were two arms — `Equity` and `OptionContract` — so a
+/// pair was either refused or built as a share of a company that does not exist,
+/// sized in whole units with an equity fee schedule.
+#[test]
+fn a_coin_pair_is_built_as_a_pair_and_a_foreign_quote_is_refused_by_name() {
+    use crate::convert::pair;
+    use nautilus_model::{identifiers::InstrumentId, instruments::Instrument as _, types::Currency};
+
+    let built = |id: &str| {
+        let described = arvo_data::Instrument::of(id);
+        let arvo_data::instrument::Kind::Crypto { base, quote } = &described.kind else {
+            panic!("{id} is not described as a pair");
+        };
+        pair(
+            InstrumentId::from(format!("{id}.ALPACA").as_str()),
+            &described,
+            base,
+            quote,
+            Currency::USD(),
+            5.0,
+        )
+    };
+
+    let coin = built("XRP-USD").expect("a dollar-quoted pair is supported");
+    assert_eq!(coin.base_currency().expect("a pair has a base").code.as_str(), "XRP");
+    assert_eq!(coin.quote_currency().code.as_str(), "USD");
+    assert_eq!(coin.price_precision(), 8, "sub-cent prices survive");
+    assert_eq!(coin.size_precision(), 8, "and a fraction of a coin is a size");
+
+    // Not a dollar, and not pretending to be one.
+    for foreign in ["ETH-BTC", "SOL-USDT"] {
+        let err = built(foreign).expect_err("a pair that does not settle in USD is unsupported");
+        assert!(
+            matches!(err, arvo_research::SimulationError::Unsupported(_)),
+            "{foreign} should be Unsupported, not Rejected: {err:?}"
+        );
+        let said = err.to_string();
+        assert!(said.contains(foreign), "the refusal names the pair: {said}");
+    }
+}
+
+/// A whole backtest runs on a coin, priced in satoshis and traded in fractions.
+///
+/// The integration #245 is actually for: the pair reaches the venue, the bars
+/// keep their decimals, a rule trades it, and the ledger's quantities and prices
+/// multiply out against a cash account. A sub-cent instrument would previously
+/// have been built as an `Equity` at two decimal places, which rounds a 2.4567
+/// close to 2.46 before any rule sees it.
+#[test]
+fn a_rule_trades_a_coin_in_fractions_at_sub_cent_prices() {
+    // A sawtooth an order of magnitude below a cent's resolution: every one of
+    // these closes rounds to the same two-decimal price.
+    let bars: Vec<arvo_data::Bar> = sawtooth(120)
+        .into_iter()
+        .map(|bar| arvo_data::Bar {
+            open: bar.open / 40_000.0,
+            high: bar.high / 40_000.0,
+            low: bar.low / 40_000.0,
+            close: bar.close / 40_000.0,
+            volume: bar.volume,
+            at: bar.at,
+        })
+        .collect();
+
+    let coin = "XRP-USD.ALPACA";
+    let mut experiment = experiment(params(5.0, 20.0), &bars);
+    experiment.instrument = coin.to_owned();
+    // A hundred thousand dollars of a coin priced near a cent: a fractional
+    // size a whole-unit instrument could not hold.
+    experiment.strategy.params.insert("trade_size".to_owned(), 1_234.567_89);
+
+    let provider = NautilusSimulation::new(InMemoryBars::new().with_instrument(coin, bars.clone()));
+    let result = arvo_research::SimulationProvider::run(&provider, &experiment)
+        .expect("a coin is a tradeable instrument");
+
+    assert!(
+        result.trades > 0,
+        "the rule traded the coin; refused {:?}",
+        result.refused
+    );
+    assert!(
+        result.equity_curve.len() > 1,
+        "and produced a curve to measure"
+    );
+
+    // The fractional size survived into the ledger, not rounded to a whole coin.
+    let sizes: Vec<f64> = result.ledger.iter().map(|trade| trade.quantity).collect();
+    assert!(
+        sizes.iter().any(|size| (size - size.round()).abs() > 1e-9),
+        "a fraction of a coin was traded, not a whole number: {sizes:?}"
+    );
+
+    // And the prices are the sub-cent ones, not rounded to a cent.
+    let prices: Vec<f64> = result.ledger.iter().map(|trade| trade.entry).collect();
+    assert!(
+        prices.iter().all(|price| *price > 0.0 && *price < 0.01),
+        "sub-cent entries survived: {prices:?}"
+    );
+}
+
+/// A session-shaped rule refuses an instrument that has no session.
+///
+/// #247. `OpeningRange` documents the deviation it already lives with on
+/// equities: with no exchange calendar, a position open at day's end closes on
+/// the first bar of the next session. On a continuous series that is not a
+/// deviation, it is the whole behaviour — the range forms from whatever three
+/// bars follow midnight UTC and the day never ends. The rule would still produce
+/// a curve, and the curve would describe something nobody asked to test.
+#[test]
+fn a_session_shaped_rule_refuses_an_instrument_that_never_closes() {
+    let intraday = arvo_data::BarInterval::new(5, arvo_data::IntervalUnit::Minute);
+    let anchored = [
+        (crate::OPENING_RANGE, params_for_opening_range()),
+        (crate::VWAP_REVERSION, params_for_vwap()),
+    ];
+
+    for (name, params) in anchored {
+        let spec = arvo_research::StrategySpec {
+            rule: None,
+            name: name.to_owned(),
+            params: params.clone(),
+        };
+
+        // On an equity it plans, which is what makes the refusal meaningful.
+        Plan::from_spec(&spec, intraday, arvo_data::Hours::Regular)
+            .unwrap_or_else(|err| panic!("{name} should plan on an equity: {err}"));
+
+        // On a coin it is refused, by name, saying why.
+        let Err(err) = Plan::from_spec(&spec, intraday, arvo_data::Hours::Continuous) else {
+            panic!("{name} ran on an instrument with no session to anchor to");
+        };
+        let said = err.to_string();
+        assert!(said.contains(name), "the refusal names the rule: {said}");
+        assert!(
+            said.contains("around the clock"),
+            "and says what is wrong with the instrument: {said}"
+        );
+    }
+
+    // A rule that is not session-shaped is untouched: most rules are fine on a
+    // coin and a blanket refusal would be the wrong lesson.
+    let ordinary = arvo_research::StrategySpec {
+        rule: None,
+        name: SMA_CROSS.to_owned(),
+        params: params(5.0, 20.0),
+    };
+    assert!(Plan::from_spec(&ordinary, intraday, arvo_data::Hours::Continuous).is_ok());
+}
+
+fn params_for_opening_range() -> BTreeMap<String, f64> {
+    BTreeMap::from([
+        ("range_bars".to_owned(), 3.0),
+        ("target_range_multiple".to_owned(), 2.0),
+        ("trade_size".to_owned(), 10.0),
+    ])
+}
+
+fn params_for_vwap() -> BTreeMap<String, f64> {
+    BTreeMap::from([
+        ("entry_deviations".to_owned(), 2.0),
+        ("trade_size".to_owned(), 10.0),
+    ])
 }

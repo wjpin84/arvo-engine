@@ -527,7 +527,7 @@ pub(crate) trait Managed: Strategy + StrategyNative + DataActorNative {
             // re-derive it.
             return Ok(false);
         };
-        let Ok(size) = Quantity::new_checked(quantity, 0) else {
+        let Some(size) = crate::convert::sized(self.instrument(), quantity) else {
             return Ok(false);
         };
 
@@ -555,7 +555,7 @@ pub(crate) trait Managed: Strategy + StrategyNative + DataActorNative {
         else {
             return Ok(false);
         };
-        let Ok(size) = Quantity::new_checked(quantity, 0) else {
+        let Some(size) = crate::convert::sized(self.instrument(), quantity) else {
             return Ok(false);
         };
         self.position_mut().hold(size);
@@ -659,9 +659,9 @@ pub(crate) trait Managed: Strategy + StrategyNative + DataActorNative {
         // A short is closed by buying it back. The venue's sign decides, since
         // this strategy's own record holds a size and not a side.
         let (side, size) = if actual < 0.0 {
-            (OrderSide::Buy, Quantity::new_checked(-actual, 0).ok())
+            (OrderSide::Buy, crate::convert::sized(self.instrument(), -actual))
         } else if actual > 0.0 {
-            (OrderSide::Sell, Quantity::new_checked(actual, 0).ok())
+            (OrderSide::Sell, crate::convert::sized(self.instrument(), actual))
         } else {
             (OrderSide::Sell, intended)
         };

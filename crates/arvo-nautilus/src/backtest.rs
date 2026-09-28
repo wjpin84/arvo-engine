@@ -22,7 +22,7 @@ use nautilus_trading::strategy::{StrategyConfig, StrategyCore};
 
 use crate::chain::Settlement;
 use crate::convert::{
-    aggregation_of, equity, option, to_nautilus_bar, PRICE_PRECISION, SIZE_PRECISION,
+    aggregation_of, equity, option, pair, to_nautilus_bar, Precision,
 };
 use crate::plan::Plan;
 use crate::{fee, fill, ledger, strategy, ENGINE};
@@ -131,7 +131,7 @@ pub(crate) fn build<'a>(
         None => None,
     };
 
-    let trade_size = Quantity::new_checked(plan.trade_size(), SIZE_PRECISION)
+    let trade_size = Quantity::new_checked(plan.trade_size(), Precision::named(&experiment.instrument).size)
         .map_err(|err| rejected("trade size", &err))?;
 
     // Risk is expressed as a fraction of capital in the record and as an
@@ -310,17 +310,33 @@ fn add_book(
 ) -> Result<Vec<BarType>, SimulationError> {
     let mut bar_types = Vec::with_capacity(book.len());
     for (instrument_id, _, bars) in book {
-        let instrument = match arvo_data::option::OptionContract::parse(&instrument_id.to_string())
-        {
-            Some(contract) => option(
+        // Once per instrument, not once per bar: the described instrument is
+        // parsed from its name and a panel walks millions of bars.
+        let precision = Precision::named(&instrument_id.to_string());
+        // Dispatched on what the instrument is described as, rather than on a
+        // second parse of its name: one answer about what a thing is (#241).
+        let described = arvo_data::Instrument::of(&instrument_id.to_string());
+        let instrument = match &described.kind {
+            arvo_data::instrument::Kind::Option(contract) => option(
                 *instrument_id,
-                &contract,
+                contract,
                 currency,
                 experiment.costs.commission_bps,
-            ),
-            None => equity(*instrument_id, currency, experiment.costs.commission_bps),
-        }
-        .map_err(|err| rejected("building the instrument", &err))?;
+            )
+            .map_err(|err| rejected("building the instrument", &err))?,
+            arvo_data::instrument::Kind::Crypto { base, quote } => pair(
+                *instrument_id,
+                &described,
+                base,
+                quote,
+                currency,
+                experiment.costs.commission_bps,
+            )?,
+            arvo_data::instrument::Kind::Stock => {
+                equity(*instrument_id, currency, experiment.costs.commission_bps)
+                    .map_err(|err| rejected("building the instrument", &err))?
+            }
+        };
         engine
             .add_instrument(&instrument)
             .map_err(|err| rejected("adding the instrument", &err))?;
@@ -331,7 +347,7 @@ fn add_book(
 
         let data = bars
             .iter()
-            .map(|bar| to_nautilus_bar(bar_type, bar, experiment.interval).map(Data::Bar))
+            .map(|bar| to_nautilus_bar(bar_type, bar, experiment.interval, precision).map(Data::Bar))
             .collect::<Result<Vec<_>, _>>()?;
 
         // Once per instrument rather than one merged batch: Nautilus sorts what
@@ -360,14 +376,17 @@ fn add_settlement(
 ) -> Result<Option<BarType>, SimulationError> {
     let mut driver: Option<BarType> = None;
     let underlying_id = InstrumentId::from(format!("{}.{venue}", settlement.symbol).as_str());
+    // The underlying is described like anything else: a stock, so a cent and
+    // whole shares, but read from the instrument rather than assumed here.
+    let underlying = Precision::named(&underlying_id.to_string());
     let index = IndexInstrument::builder()
         .instrument_id(underlying_id)
         .raw_symbol(Symbol::from(settlement.symbol.as_str()))
         .currency(currency)
-        .price_precision(PRICE_PRECISION)
-        .size_precision(SIZE_PRECISION)
+        .price_precision(underlying.price)
+        .size_precision(underlying.size)
         .price_increment(
-            Price::new_checked(0.01, PRICE_PRECISION)
+            Price::new_checked(0.01, underlying.price)
                 .map_err(|err| rejected("underlying tick", &err))?,
         )
         .size_increment(Quantity::from(1))
@@ -396,7 +415,7 @@ fn add_settlement(
             // ponytail: rounded to the cent, so a 657.535 close settles at
             // 657.54 — up to half a cent a share, $0.50 a contract, either
             // way. Round against each contract's holder if that matters.
-            let price = Price::new_checked(*close, PRICE_PRECISION)
+            let price = Price::new_checked(*close, underlying.price)
                 .map_err(|err| rejected("underlying close", &err))?;
             Ok(Data::IndexPrice(IndexPriceUpdate::new(
                 underlying_id,
@@ -416,7 +435,7 @@ fn add_settlement(
         let data = settlement
             .drive
             .iter()
-            .map(|bar| to_nautilus_bar(bar_type, bar, experiment.interval).map(Data::Bar))
+            .map(|bar| to_nautilus_bar(bar_type, bar, experiment.interval, underlying).map(Data::Bar))
             .collect::<Result<Vec<_>, _>>()?;
         engine
             .add_data(data, None, true, true)

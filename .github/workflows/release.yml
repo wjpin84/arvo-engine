@@ -61,7 +61,11 @@ jobs:
           mkdir -p stage
           cp "target/${{ matrix.triple }}/release/arvo-engine${{ matrix.suffix }}" stage/
           cp "target/${{ matrix.triple }}/release/arvo-mcp-server${{ matrix.suffix }}" stage/
-          cp LICENSE* stage/ 2>/dev/null || true
+          # NOTICE as well as LICENSE: the LGPL-3.0 obligation on a linked
+          # NautilusTrader attaches to the distributed binary, and the notice
+          # is how it is discharged. An archive without it is the one artifact
+          # where the file actually had to be.
+          cp LICENSE* NOTICE stage/
           name="arvo-engine-${TAG}-${{ matrix.triple }}.zip"
           if [ "${{ runner.os }}" = "Windows" ]; then
             powershell -Command "Compress-Archive -Path stage/* -DestinationPath $name"
