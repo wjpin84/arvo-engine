@@ -90,6 +90,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         None => None,
     };
+    // `--universe NAME` runs the rule over a named universe as a panel, through
+    // `research::study::run_panel_over` — the function the engine's RunPanel
+    // handler calls. It stamps the finding with the universe's name, reason, size
+    // and any missing members, and records it, which is why it needs no
+    // `--record`: a panel over a chosen universe is the kind of answer worth
+    // keeping by default.
+    let universe = match requested.iter().position(|arg| arg == "--universe") {
+        Some(at) => {
+            let value = requested.get(at + 1).ok_or("--universe wants a name")?.clone();
+            requested.drain(at..=at + 1);
+            Some(value)
+        }
+        None => None,
+    };
     let instruments = if requested.is_empty() {
         bars.instruments()?
     } else {
@@ -113,6 +127,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     arvo_service::rulesets::refresh_at(project);
     let plan = arvo_service::research::StrategyPlan::find(strategy)
         .ok_or_else(|| format!("no strategy called {strategy:?}"))?;
+
+    if let Some(name) = &universe {
+        let chosen = arvo_service::universes::find(project, name)?;
+        println!(
+            "universe {} — {} instruments, {}\n  chosen because: {}",
+            chosen.name,
+            chosen.instruments.len(),
+            chosen.interval,
+            chosen.reason
+        );
+        let service = arvo_service::research::ResearchService::new(
+            std::path::PathBuf::from(&root),
+            project.join(arvo_service::research::EVIDENCE_SUBDIR),
+        );
+        match arvo_service::research::study::run_panel_over(&service, &chosen, Some(strategy)) {
+            Err(err) => println!("  FAILED: {err}"),
+            Ok(view) => {
+                println!("  verdict: {} — recorded as {}", view.verdict, view.id);
+                for reason in &view.reasons {
+                    println!("  - {reason}");
+                }
+            }
+        }
+        return Ok(());
+    }
     // The strategy's resolution, as the view uses. This read daily bars for
     // every rule, so an intraday rule was handed a daily file — or reported an
     // instrument that only has intraday bars as unknown.
@@ -123,7 +162,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if interval.is_intraday() {
         println!("(no panel: {strategy} is defined at {interval}, and the panel is daily)");
     } else {
-        run_panel_over(&bars, &simulation, &instruments, &criteria)?;
+        run_panel_over(&bars, &simulation, plan, &instruments, &criteria)?;
     }
 
     // A ranking rule's whole content is the comparison between instruments,
@@ -360,6 +399,7 @@ fn report_walk_forward(found: &arvo_research::WalkForwardEvidence) {
 fn run_panel_over(
     bars: &CsvBars,
     simulation: &NautilusSimulation<CsvBars>,
+    plan: &'static arvo_service::research::StrategyPlan,
     instruments: &[String],
     criteria: &EvaluationCriteria,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -390,7 +430,11 @@ fn run_panel_over(
     println!("\n=== PANEL: {} instruments ===", usable.len());
     println!("  {} .. {}  dataset {}", from, to, &dataset[..16]);
 
-    let study = arvo_service::research::panel_for(usable, window, &dataset);
+    // The rule that was asked for. This used to call `panel_for`, which resolves
+    // the default strategy, so `--strategy` was honoured by the per-instrument
+    // studies and silently ignored by the panel beside them — two different rules
+    // under one heading.
+    let study = arvo_service::research::study::panel_for_plan(usable, window, &dataset, plan);
     match arvo_research::run_panel(simulation, &study, criteria) {
         Err(err) => println!("  FAILED: {err}"),
         Ok(found) => {
