@@ -55,6 +55,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         None => None,
     };
+    // `--cash N` runs the study on an account of that size. Not a rescaling of
+    // the percentages: sizing is in units of the instrument, so a smaller
+    // account buys less of it and the gate caps what it cannot afford — which is
+    // the whole question when someone asks what a rule would have made on $100.
+    let cash: Option<f64> = match requested.iter().position(|arg| arg == "--cash") {
+        Some(at) => {
+            let value = requested.get(at + 1).ok_or("--cash wants an amount")?.clone();
+            requested.drain(at..=at + 1);
+            Some(value.parse()?)
+        }
+        None => None,
+    };
     let instruments = if requested.is_empty() {
         bars.instruments()?
     } else {
@@ -136,8 +148,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
 
-        let family =
+        let mut family =
             arvo_service::research::study_for(&instrument, plan, window, &fingerprint);
+        if let Some(cash) = cash {
+            family.template.starting_cash = cash;
+        }
         match arvo_research::run_family(&simulation, &family, &criteria) {
             Err(err) => println!("  FAILED: {err}"),
             Ok(found) => {
