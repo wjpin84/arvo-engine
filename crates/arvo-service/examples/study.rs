@@ -76,6 +76,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // fills up with answers nobody asked to keep is one nobody reads.
     let record = requested.iter().any(|arg| arg == "--record");
     requested.retain(|arg| arg != "--record");
+    // `--position-fraction N` caps an entry at that share of the account. The
+    // shipped model allows all of it, which at intraday resolutions is how a
+    // rule ends up asking to be all-in on every signal and being refused by the
+    // venue (arvo-desktop #251). A flag rather than an edit to the project's
+    // risk file, so the question can be answered without changing what every
+    // other study in the project is measured against.
+    let fraction: Option<f64> = match requested.iter().position(|arg| arg == "--position-fraction") {
+        Some(at) => {
+            let value = requested.get(at + 1).ok_or("--position-fraction wants a fraction")?.clone();
+            requested.drain(at..=at + 1);
+            Some(value.parse()?)
+        }
+        None => None,
+    };
     let instruments = if requested.is_empty() {
         bars.instruments()?
     } else {
@@ -158,8 +172,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         if record {
-            if cash.is_some() {
-                println!("  --cash is ignored with --record: a stored finding is the study the engine ran");
+            if cash.is_some() || fraction.is_some() {
+                println!(
+                    "  --cash and --position-fraction are ignored with --record: a stored finding                      is the study the engine ran, and one recorded against an account or a cap                      nobody configured could not be reproduced from the project's own settings"
+                );
             }
             let service = arvo_service::research::ResearchService::new(
                 std::path::PathBuf::from(&root),
@@ -176,6 +192,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             arvo_service::research::study_for(&instrument, plan, window, &fingerprint);
         if let Some(cash) = cash {
             family.template.starting_cash = cash;
+        }
+        if let Some(fraction) = fraction {
+            family.template.risk.max_position_fraction = Some(fraction);
         }
         match arvo_research::run_family(&simulation, &family, &criteria) {
             Err(err) => println!("  FAILED: {err}"),
