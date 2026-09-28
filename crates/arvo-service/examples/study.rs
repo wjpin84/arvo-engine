@@ -67,6 +67,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         None => None,
     };
+    // `--record` writes the finding to the evidence store, through
+    // `research::run_study` — the same function the engine's RunStudy handler
+    // calls, not a second writer of the same format. A session starts from a
+    // stored finding, so this is how one gets there without the window.
+    //
+    // Off by default: a terminal run is usually a question, and a store that
+    // fills up with answers nobody asked to keep is one nobody reads.
+    let record = requested.iter().any(|arg| arg == "--record");
+    requested.retain(|arg| arg != "--record");
     let instruments = if requested.is_empty() {
         bars.instruments()?
     } else {
@@ -144,6 +153,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             match arvo_research::run_walk_forward(&simulation, &procedure, &criteria) {
                 Err(reason) => println!("  could not run: {reason}"),
                 Ok(found) => report_walk_forward(&found),
+            }
+            continue;
+        }
+
+        if record {
+            if cash.is_some() {
+                println!("  --cash is ignored with --record: a stored finding is the study the engine ran");
+            }
+            let service = arvo_service::research::ResearchService::new(
+                std::path::PathBuf::from(&root),
+                project.join(arvo_service::research::EVIDENCE_SUBDIR),
+            );
+            match arvo_service::research::study::run_study(&service, &instrument, Some(strategy)) {
+                Err(err) => println!("  FAILED: {err}"),
+                Ok(view) => println!("  verdict: {} — recorded as {}", view.verdict, view.id),
             }
             continue;
         }
