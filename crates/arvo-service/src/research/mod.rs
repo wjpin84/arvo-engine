@@ -93,6 +93,27 @@ const COMMISSION_BPS: f64 = 1.0;
 const SLIPPAGE_BPS: f64 = 1.0;
 const TRADE_SIZE: f64 = 100.0;
 
+/// The same two, for a coin, where they are a different order of magnitude.
+///
+/// A share costs a basis point to trade. Alpaca's crypto schedule charges its
+/// entry tier — under $100,000 of 30-day volume, which is the account this
+/// platform is for — 0.15% to a maker and **0.25% to a taker**, and Arvo sends
+/// market orders, which are always takers. Twenty-five basis points a side, not
+/// one, and the conservative tier lifts it to 37.5.
+///
+/// Using the equity figure on a coin was not a rounding error: it understated
+/// the cost of a round trip by fifty times, and it did so in the direction that
+/// makes a rule look tradeable. Every rule it flatters most is the one that
+/// trades most often, which is the rule a search is most likely to surface.
+///
+/// The slippage is an assumption rather than a published rate: five basis
+/// points, wider than the one a liquid US large cap is quoted at, because a
+/// major pair's book is thinner than a large cap's and the fills are the same
+/// kind of market order. Named here rather than buried, so the day it is wrong
+/// it is findable — as `SESSION_MINUTES` was.
+const CRYPTO_COMMISSION_BPS: f64 = 25.0;
+const CRYPTO_SLIPPAGE_BPS: f64 = 5.0;
+
 /// What the workbench offers, and what each one searches over.
 ///
 /// The grid is part of the claim, not a convenience. Its size is deflated

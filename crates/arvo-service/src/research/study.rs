@@ -286,8 +286,52 @@ pub fn panel_for_plan(
     // across all of them rather than from the subject — which here is the word
     // "panel" and has no venue.
     let adjustment = crate::source::adjustment_across(instruments.iter().map(String::as_str));
-    let template = template_for("panel", plan, window, dataset_version, adjustment);
+    let mut template = template_for("panel", plan, window, dataset_version, adjustment);
+    // And the costs are read across them too, for the same reason: the subject
+    // is the word "panel", which `Instrument::of` describes as a share, so a
+    // panel of coins would otherwise be charged a share's basis point.
+    if !plan.trades_options() {
+        template.costs = spot_costs_across(instruments.iter().map(String::as_str));
+    }
     arvo_research::PanelStudy::new(template, instruments, plan.grid())
+}
+
+/// What one side of a trade in `subject` costs, at market.
+///
+/// A coin's fees are a different order of magnitude from a share's
+/// (`CRYPTO_COMMISSION_BPS`), and which applies is a property of the
+/// instrument rather than of the rule — so it is read from the instrument, the
+/// same place its tick, lot and hours come from.
+fn spot_costs(subject: &str) -> CostModel {
+    if matches!(
+        arvo_data::Instrument::of(subject).kind,
+        arvo_data::instrument::Kind::Crypto { .. }
+    ) {
+        CostModel::proportional(CRYPTO_COMMISSION_BPS, CRYPTO_SLIPPAGE_BPS)
+    } else {
+        CostModel::proportional(COMMISSION_BPS, SLIPPAGE_BPS)
+    }
+}
+
+/// The dearer of the two, if any of `instruments` is a coin.
+///
+/// A panel carries one cost model and every member's run derives from it, so a
+/// panel mixing asset classes has no single honest answer. It takes the dearer
+/// one: charging a share a coin's fees understates that member, and understating
+/// a result is the failure this platform can live with. The reverse — charging a
+/// coin a share's basis point — is the one it cannot.
+fn spot_costs_across<'a>(instruments: impl IntoIterator<Item = &'a str>) -> CostModel {
+    let any_coin = instruments.into_iter().any(|instrument| {
+        matches!(
+            arvo_data::Instrument::of(instrument).kind,
+            arvo_data::instrument::Kind::Crypto { .. }
+        )
+    });
+    if any_coin {
+        CostModel::proportional(CRYPTO_COMMISSION_BPS, CRYPTO_SLIPPAGE_BPS)
+    } else {
+        CostModel::proportional(COMMISSION_BPS, SLIPPAGE_BPS)
+    }
 }
 
 pub fn template_for(
@@ -311,7 +355,7 @@ pub fn template_for(
         )
     } else {
         (
-            CostModel::proportional(COMMISSION_BPS, SLIPPAGE_BPS),
+            spot_costs(subject),
             // The project's file, or the shipped model (`crate::risk`).
             crate::risk::current(),
             format!("trend-following predicts returns in {subject}"),
@@ -1043,5 +1087,41 @@ mod tests {
             "a study that assumes free fills is the optimistic one, and the engine honours \
              slippage now"
         );
+    }
+
+    /// A coin is charged a coin's fees, and a share is not charged a coin's.
+    ///
+    /// Alpaca's entry tier takes 0.25% from a taker and Arvo sends market
+    /// orders. Charging the equity basis point understated a round trip by
+    /// fifty times, in the direction that makes a rule look tradeable.
+    #[test]
+    fn a_coin_costs_what_a_coin_costs_and_a_share_is_unchanged() {
+        let share = spot_costs("MSFT.RH");
+        assert!((share.commission_bps - COMMISSION_BPS).abs() < f64::EPSILON);
+        assert!((share.slippage_bps - SLIPPAGE_BPS).abs() < f64::EPSILON);
+
+        let coin = spot_costs("BTC-USD.ACRYPTO");
+        assert!((coin.commission_bps - CRYPTO_COMMISSION_BPS).abs() < f64::EPSILON);
+        assert!((coin.slippage_bps - CRYPTO_SLIPPAGE_BPS).abs() < f64::EPSILON);
+        assert!(
+            coin.commission_bps > share.commission_bps * 20.0,
+            "a coin is not a share with wider spreads; it is a different order of magnitude"
+        );
+
+        // And the conservative tier lifts it further rather than capping it.
+        let strict = coin.at(arvo_research::risk::CostTier::Conservative);
+        assert!(strict.commission_bps > coin.commission_bps);
+
+        // A panel reads its members, because its own subject is the word
+        // "panel" and `Instrument::of` calls that a share.
+        assert!(
+            (spot_costs_across(["MSFT.RH", "AAPL.YF"]).commission_bps - COMMISSION_BPS).abs()
+                < f64::EPSILON
+        );
+        let coins = spot_costs_across(["BTC-USD.ACRYPTO", "ETH-USD.ACRYPTO"]);
+        assert!((coins.commission_bps - CRYPTO_COMMISSION_BPS).abs() < f64::EPSILON);
+        // Mixed: the dearer one, so nothing is charged less than it costs.
+        let mixed = spot_costs_across(["MSFT.RH", "BTC-USD.ACRYPTO"]);
+        assert!((mixed.commission_bps - CRYPTO_COMMISSION_BPS).abs() < f64::EPSILON);
     }
 }
