@@ -482,7 +482,7 @@ impl PutSpread {
             return 0;
         }
         let (positions, _, _) = super::account_from_cache(&self.cache(), today);
-        let cash = super::spendable(&self.cache(), &long).unwrap_or(self.risk.starting_cash);
+        let cash = super::spendable(&self.cache(), long).unwrap_or(self.risk.starting_cash);
         let held: Vec<(&str, f64)> = positions
             .iter()
             .map(|(name, position)| (name.as_str(), position.quantity))
@@ -521,7 +521,6 @@ impl PutSpread {
         size: f64,
         now: NaiveDateTime,
     ) -> arvo_research::Decision {
-        let venue = id.venue;
         let (positions, realised_today, day_trades_used) =
             super::account_from_cache(&self.cache(), now.date());
         super::decide_entry(
