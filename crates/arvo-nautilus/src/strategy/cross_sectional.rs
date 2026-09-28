@@ -236,7 +236,7 @@ impl CrossSectionalMomentum {
         let mut spendable = self
             .bar_types
             .first()
-            .and_then(|bar_type| super::spendable(&self.cache(), &bar_type.instrument_id().venue));
+            .and_then(|bar_type| super::spendable(&self.cache(), &bar_type.instrument_id()));
         for id in wanted {
             if self.positions.get(&id).is_some_and(Position::is_open) {
                 continue;

@@ -414,17 +414,36 @@ pub(crate) fn account_from_positions(
 ///
 /// ponytail: `None` for a multi-currency account, which has no single cash
 /// figure; price the balances in one currency if a run ever holds two.
+/// The cash this account can spend on `instrument`, as the venue reports it.
+///
+/// # Why it asks which currency rather than counting balances
+///
+/// It used to take the account's only free balance and give up when there was
+/// more than one, on the reasoning that an account with two currencies has no
+/// single answer. That held while every instrument was a share: a share position
+/// is not a currency, so a US equity account has exactly one balance no matter
+/// what it holds.
+///
+/// A coin position *is* a currency balance. The moment a rule holds any ETH the
+/// account reports USD and ETH, the count stops being one, and this returned
+/// `None` — which sends the caller to `starting_cash` and sizes every later
+/// entry against money the account no longer has. The venue then refuses the
+/// order: 618 refusals out of 620 signals on a five-minute crypto run
+/// (arvo-desktop #251), every one of them the gate approving a position the
+/// account could not pay for.
+///
+/// So it asks for the currency the instrument is priced in — the quote currency
+/// of a pair, the currency of a share — which is the balance the purchase will
+/// actually draw on. An equity account answers exactly as it did before.
 pub(crate) fn spendable(
     cache: &nautilus_common::cache::CacheApi<'_>,
-    venue: &nautilus_model::identifiers::Venue,
+    instrument_id: &nautilus_model::identifiers::InstrumentId,
 ) -> Option<f64> {
     use nautilus_model::accounts::Account as _;
-    let free = cache.account_for_venue(venue)?.balances_free();
-    let mut balances = free.values();
-    match (balances.next(), balances.next()) {
-        (Some(only), None) => Some(only.as_f64()),
-        _ => None,
-    }
+    use nautilus_model::instruments::Instrument as _;
+    let currency = cache.instrument(instrument_id)?.quote_currency();
+    let free = cache.account_for_venue(&instrument_id.venue)?.balances_free();
+    free.get(&currency).map(nautilus_model::types::Money::as_f64)
 }
 
 /// Puts one entry to the same risk policy a live session uses.
@@ -601,7 +620,7 @@ pub(crate) trait Managed: Strategy + StrategyNative + DataActorNative {
             self.position().is_halted(),
             equity,
             day_trades_used,
-            spendable(&self.cache(), &self.instrument().venue),
+            spendable(&self.cache(), &self.instrument()),
             Some(self.position().correlations.as_ref()),
         ))
     }

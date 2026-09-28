@@ -38,9 +38,26 @@ use crate::{CostModel, RiskModel};
 /// what that cash can buy. Sizing still comes off the opening balance; only
 /// affordability reads the live figure.
 ///
-/// ponytail: the fill lands at the next bar's price, not the reference, and
-/// slippage rounds up to a whole tick. Flooring to whole shares absorbs both
-/// almost always; a gap past the slack is still refused, and now counted.
+/// # The headroom the whole-share floor used to provide
+///
+/// The fill lands at the next bar's price, not the reference, and slippage
+/// rounds up to a whole tick. Flooring to whole shares absorbed both almost
+/// always — a position of a thousand shares gives up to one share, a tenth of a
+/// percent, and that was the margin. It was never stated as a margin; it was a
+/// side effect of the lot being one.
+///
+/// A coin's lot is a hundred-millionth, so flooring gives back nothing and the
+/// entry is sized to the last cent the account holds. Any upward tick before the
+/// fill then makes it unaffordable, and the venue refuses it. On a five-minute
+/// crypto run that was 618 refusals out of 620 signals (arvo-desktop #251): the
+/// gate approved every one and the venue took two.
+///
+/// So the margin is explicit now: [`HEADROOM_BPS`] of the cash, less whatever a
+/// lot is worth, because flooring to whole lots already leaves up to one lot
+/// unspent. For any instrument whose lot is worth more than that — every share,
+/// every option — the shortfall is zero and the arithmetic is exactly what it
+/// always was. It is a coin, whose lot is worth a millionth of a cent, that gets
+/// a margin it did not have.
 /// The most contracts one proposal may sell, however much cash there is. A
 /// bound on the collateral search, not a trading limit anyone should meet.
 ///
@@ -53,6 +70,16 @@ use crate::{CostModel, RiskModel};
 /// ponytail: if anything other than an option ever needs collateral sizing,
 /// this and `sellable` want counting in units rather than in whole lots.
 const MAX_CONTRACTS: u32 = 10_000;
+
+/// How much of the spendable cash an entry leaves unspent, in basis points.
+///
+/// Ten. Enough to absorb the gap between the reference price this sizes against
+/// and the next bar's price it fills at, which is what the whole-share floor
+/// used to absorb by accident. Deliberately smaller than the slack an equity
+/// position of a thousand shares already had, so that an instrument whose lot
+/// provides more than this keeps deciding for itself and every result computed
+/// before this is unchanged.
+const HEADROOM_BPS: f64 = 10.0;
 
 pub(super) fn size(
     model: &RiskModel,
@@ -151,7 +178,15 @@ pub(super) fn size(
     }
 
     let by_cap = ((starting_cash * ceiling - per_fill) / per_unit).max(0.0);
-    let by_cash = spendable.map(|cash| ((cash - per_fill) / per_unit).max(0.0));
+    // The cash ceiling keeps a little back. See the type note: the whole-share
+    // floor used to do this by accident and a satoshi lot does not.
+    let by_cash = spendable.map(|cash| {
+        // Only the shortfall. Flooring to whole lots below already leaves up to
+        // one lot unspent, so reserving a lot here as well would take two — and
+        // the equity arithmetic has to come out where it always did.
+        let reserved = (cash * HEADROOM_BPS / 10_000.0 - lot * per_unit).max(0.0);
+        ((cash - reserved - per_fill) / per_unit).max(0.0)
+    });
     let by_cap = by_cash.map_or(by_cap, |by_cash| by_cap.min(by_cash));
 
     // Risk sizing wins where it applies; otherwise what was asked for; and the

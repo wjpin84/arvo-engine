@@ -197,7 +197,7 @@ impl DataActor for BuyAndHold {
                 price + spread.half_spread(price)
             })
             * (1.0 + costs.commission_bps / 10_000.0);
-        let affordable = super::spendable(&self.cache(), &self.instrument_id.venue)
+        let affordable = super::spendable(&self.cache(), &self.instrument_id)
             .filter(|_| per_unit > 0.0)
             .map(|cash| (((cash - costs.per_fill) / per_unit / lot).floor() * lot).max(0.0));
         let size = match affordable {
