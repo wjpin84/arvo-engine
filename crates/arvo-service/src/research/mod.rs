@@ -26,6 +26,7 @@ pub mod rank;
 pub mod report;
 pub mod staleness;
 pub mod study;
+pub mod sweep;
 pub mod views;
 
 // Re-exported because the integration tests in `tests/` reach them through
