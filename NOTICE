@@ -11,22 +11,26 @@ This file records third-party licence obligations that attach to distributed
 Arvo artifacts. Arvo's own source remains Apache-2.0 in every case below —
 these are obligations on what we ship, not on what we write.
 
+This is the engine's notice. The window's front end carries its own, for the
+components it vendors; nothing below is vendored here.
+
 NautilusTrader — GNU Lesser General Public License v3.0 (LGPL-3.0-only)
   https://github.com/nautechsystems/nautilus_trader
 
   STATUS: active dependency. `crates/arvo-nautilus` is the only crate
   permitted to depend on it, and depends on `nautilus-backtest`,
-  `nautilus-common`, `nautilus-core`, `nautilus-model` and
-  `nautilus-trading` (all pinned `=0.63.0`), which in turn pull in
-  `nautilus-analysis`, `-data`, `-execution`, `-portfolio`, `-risk` and
-  `-system`. The whole backtest engine is now linked, not just the domain
-  model. Everything below applies to real distributed artifacts.
+  `nautilus-common`, `nautilus-core`, `nautilus-execution`, `nautilus-model`
+  and `nautilus-trading` (all pinned `=0.63.0`), which in turn pull in
+  `nautilus-analysis`, `-data`, `-portfolio`, `-risk` and `-system`. The whole
+  backtest engine is linked, not just the domain model. Everything below
+  applies to real distributed artifacts, including the release archives this
+  repository publishes on a tag.
 
-  Arvo links NautilusTrader's Rust crates in-process (see
-  arvo-desktop/.scratch/arvo-architecture/map.md). A statically linked binary is
-  therefore a "Combined Work" under LGPL-3.0 section 4, and the obligations
-  attach to distributed binaries — notably the Tauri installer — not to Arvo's
-  own Apache-2.0 source.
+  Arvo links NautilusTrader's Rust crates in-process — see
+  `crates/arvo-nautilus`, which is where the boundary lives. A statically
+  linked binary is therefore a "Combined Work" under LGPL-3.0 section 4, and
+  the obligations attach to distributed binaries, not to Arvo's own
+  Apache-2.0 source.
 
   What that requires of anything we distribute:
 
@@ -49,38 +53,14 @@ NautilusTrader — GNU Lesser General Public License v3.0 (LGPL-3.0-only)
   before any commercial distribution.
 
 --------------------------------------------------------------------------------
-
-TradingView Lightweight Charts — Apache License 2.0
-  https://github.com/tradingview/lightweight-charts
-
-  Vendored at public/vendor/lightweight-charts.standalone.production.js
-  (v4.2.3). Its copyright header is preserved in that file, which is what
-  Apache-2.0 section 4 requires of a redistributed copy.
-
-  Unlike the NautilusTrader entry above, this imposes no obligation on Arvo's
-  own licensing: Apache-2.0 is the licence Arvo already uses, and shipping a
-  copy needs only the notice and the retained header.
-
+No longer here
 --------------------------------------------------------------------------------
 
-xterm.js and its fit addon — MIT License
-  https://github.com/xtermjs/xterm.js (@xterm/xterm v6.0.0, @xterm/addon-fit)
-
-  Vendored at public/vendor/xterm as the package's own UMD builds, unmodified,
-  with the licence beside them (LICENSE.xterm). The integrated terminal's
-  front end; the shell it talks to runs in the runtime through portable-pty
-  (MIT, a Rust crate linked like any other). MIT asks only that the notice
-  travel with the copies, and places no obligation on Arvo's own licensing.
-
-Monaco Editor, web-tree-sitter and tree-sitter-python — MIT License
-  https://github.com/microsoft/monaco-editor (v0.56.0)
-  https://github.com/tree-sitter/tree-sitter (web-tree-sitter v0.27.0)
-  https://github.com/tree-sitter/tree-sitter-python (v0.25.0)
-
-  Vendored at public/vendor/monaco, bundled by tools/monaco/build.mjs, with
-  each project's licence beside it (LICENSE.monaco-editor,
-  LICENSE.web-tree-sitter, LICENSE.tree-sitter-python) and the bundle's
-  retained third-party comments (DOMPurify, Apache-2.0/MPL-2.0) in
-  arvo-monaco.js.LEGAL.txt. tree-sitter-python.wasm and python-highlights.scm
-  are that release's assets unmodified. MIT asks only that the notice travel
-  with the copies, and places no obligation on Arvo's own licensing.
+The engine once carried entries for TradingView Lightweight Charts, xterm.js
+and its fit addon, and the Monaco Editor with web-tree-sitter and
+tree-sitter-python. All were vendored assets of a front end this repository no
+longer holds: there is no `public/vendor` here, and nothing in the tree
+references them. They are named here rather than deleted silently, because a
+notice that quietly loses an entry is indistinguishable from one that never
+had it, and a reader comparing an older archive against this one should be
+able to tell which happened.
