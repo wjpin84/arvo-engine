@@ -100,12 +100,18 @@ impl Record {
     pub fn strategy(&self) -> &str {
         match self {
             Self::Study(evidence) => &evidence.selected.strategy.name,
-            // A panel's record does not carry the rule's name: the workbench
-            // runs its default rule across every instrument that has data,
-            // and the evidence keeps the chosen parameters and the outcomes.
-            // Naming it here would be a persisted-format change for a value
-            // that is the same on every panel; empty says "not recorded".
-            Self::Panel(_) => "",
+            // A panel carries its whole study, so the rule is on disk already —
+            // this used to say a panel's rule was "the same on every panel",
+            // which stopped being true when a panel could be run over a chosen
+            // universe with a chosen rule (#227). Nine panels recorded on
+            // 2026-09-28 under five different rules were indistinguishable here.
+            // Empty for a panel old enough to predate the study being kept,
+            // which honestly says "not recorded" rather than guessing the rule
+            // from its parameter names.
+            Self::Panel(evidence) => evidence
+                .study
+                .as_ref()
+                .map_or("", |study| study.template.strategy.name.as_str()),
             Self::WalkForward(evidence) => &evidence.template.strategy.name,
             Self::Reported(evidence) => &evidence.reported.experiment.strategy.name,
         }

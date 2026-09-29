@@ -67,6 +67,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         None => None,
     };
+    // `--record` writes the finding to the evidence store, through
+    // `research::run_study` — the same function the engine's RunStudy handler
+    // calls, not a second writer of the same format. A session starts from a
+    // stored finding, so this is how one gets there without the window.
+    //
+    // Off by default: a terminal run is usually a question, and a store that
+    // fills up with answers nobody asked to keep is one nobody reads.
+    let record = requested.iter().any(|arg| arg == "--record");
+    requested.retain(|arg| arg != "--record");
+    // `--position-fraction N` caps an entry at that share of the account. The
+    // shipped model allows all of it, which at intraday resolutions is how a
+    // rule ends up asking to be all-in on every signal and being refused by the
+    // venue (arvo-desktop #251). A flag rather than an edit to the project's
+    // risk file, so the question can be answered without changing what every
+    // other study in the project is measured against.
+    let fraction: Option<f64> = match requested.iter().position(|arg| arg == "--position-fraction") {
+        Some(at) => {
+            let value = requested.get(at + 1).ok_or("--position-fraction wants a fraction")?.clone();
+            requested.drain(at..=at + 1);
+            Some(value.parse()?)
+        }
+        None => None,
+    };
+    // `--universe NAME` runs the rule over a named universe as a panel, through
+    // `research::study::run_panel_over` — the function the engine's RunPanel
+    // handler calls. It stamps the finding with the universe's name, reason, size
+    // and any missing members, and records it, which is why it needs no
+    // `--record`: a panel over a chosen universe is the kind of answer worth
+    // keeping by default.
+    let universe = match requested.iter().position(|arg| arg == "--universe") {
+        Some(at) => {
+            let value = requested.get(at + 1).ok_or("--universe wants a name")?.clone();
+            requested.drain(at..=at + 1);
+            Some(value)
+        }
+        None => None,
+    };
     let instruments = if requested.is_empty() {
         bars.instruments()?
     } else {
@@ -90,6 +127,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     arvo_service::rulesets::refresh_at(project);
     let plan = arvo_service::research::StrategyPlan::find(strategy)
         .ok_or_else(|| format!("no strategy called {strategy:?}"))?;
+
+    if let Some(name) = &universe {
+        let chosen = arvo_service::universes::find(project, name)?;
+        println!(
+            "universe {} — {} instruments, {}\n  chosen because: {}",
+            chosen.name,
+            chosen.instruments.len(),
+            chosen.interval,
+            chosen.reason
+        );
+        let service = arvo_service::research::ResearchService::new(
+            std::path::PathBuf::from(&root),
+            project.join(arvo_service::research::EVIDENCE_SUBDIR),
+        );
+        match arvo_service::research::study::run_panel_over(&service, &chosen, Some(strategy)) {
+            Err(err) => println!("  FAILED: {err}"),
+            Ok(view) => {
+                println!("  verdict: {} — recorded as {}", view.verdict, view.id);
+                for reason in &view.reasons {
+                    println!("  - {reason}");
+                }
+            }
+        }
+        return Ok(());
+    }
     // The strategy's resolution, as the view uses. This read daily bars for
     // every rule, so an intraday rule was handed a daily file — or reported an
     // instrument that only has intraday bars as unknown.
@@ -100,7 +162,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if interval.is_intraday() {
         println!("(no panel: {strategy} is defined at {interval}, and the panel is daily)");
     } else {
-        run_panel_over(&bars, &simulation, &instruments, &criteria)?;
+        run_panel_over(&bars, &simulation, plan, &instruments, &criteria)?;
     }
 
     // A ranking rule's whole content is the comparison between instruments,
@@ -148,10 +210,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
 
+        if record {
+            if cash.is_some() || fraction.is_some() {
+                println!(
+                    "  --cash and --position-fraction are ignored with --record: a stored finding                      is the study the engine ran, and one recorded against an account or a cap                      nobody configured could not be reproduced from the project's own settings"
+                );
+            }
+            let service = arvo_service::research::ResearchService::new(
+                std::path::PathBuf::from(&root),
+                project.join(arvo_service::research::EVIDENCE_SUBDIR),
+            );
+            match arvo_service::research::study::run_study(&service, &instrument, Some(strategy)) {
+                Err(err) => println!("  FAILED: {err}"),
+                Ok(view) => println!("  verdict: {} — recorded as {}", view.verdict, view.id),
+            }
+            continue;
+        }
+
         let mut family =
             arvo_service::research::study_for(&instrument, plan, window, &fingerprint);
         if let Some(cash) = cash {
             family.template.starting_cash = cash;
+        }
+        if let Some(fraction) = fraction {
+            family.template.risk.max_position_fraction = Some(fraction);
         }
         match arvo_research::run_family(&simulation, &family, &criteria) {
             Err(err) => println!("  FAILED: {err}"),
@@ -317,6 +399,7 @@ fn report_walk_forward(found: &arvo_research::WalkForwardEvidence) {
 fn run_panel_over(
     bars: &CsvBars,
     simulation: &NautilusSimulation<CsvBars>,
+    plan: &'static arvo_service::research::StrategyPlan,
     instruments: &[String],
     criteria: &EvaluationCriteria,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -347,7 +430,11 @@ fn run_panel_over(
     println!("\n=== PANEL: {} instruments ===", usable.len());
     println!("  {} .. {}  dataset {}", from, to, &dataset[..16]);
 
-    let study = arvo_service::research::panel_for(usable, window, &dataset);
+    // The rule that was asked for. This used to call `panel_for`, which resolves
+    // the default strategy, so `--strategy` was honoured by the per-instrument
+    // studies and silently ignored by the panel beside them — two different rules
+    // under one heading.
+    let study = arvo_service::research::study::panel_for_plan(usable, window, &dataset, plan);
     match arvo_research::run_panel(simulation, &study, criteria) {
         Err(err) => println!("  FAILED: {err}"),
         Ok(found) => {

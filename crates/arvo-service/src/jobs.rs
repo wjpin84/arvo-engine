@@ -1,9 +1,10 @@
 //! The jobs that belong to whatever process holds the data.
 //!
-//! Two of them, and they are here rather than in the window because that is
-//! where their work is: one hashes the bar library to find findings that went
-//! stale, the other records an option chain from a venue. Both want to keep
-//! running when the window is closed (ADR-0018), and the second needs a
+//! They are here rather than in the window because that is where their work is:
+//! one hashes the bar library to find findings that went stale, one records an
+//! option chain from a venue, one keeps the universes fetched, one writes the
+//! day's review, and one sweeps a universe nobody has swept. All of them want to
+//! keep running when the window is closed (ADR-0018), and the chain needs a
 //! credential the engine holds (ADR-0028).
 //!
 //! The window keeps its own jobs — the script runs a person scheduled, whose
@@ -99,6 +100,66 @@ pub fn register(jobs: &Jobs, root: &Path, research: Arc<ResearchService>, raise:
                 }
             }
             Ok(if said.is_empty() { "no universes".to_owned() } else { said.join("; ") })
+        }
+    });
+
+    // A universe nobody has swept (ADR-0034). The universes sat unrun for days
+    // with every member's bars already on disk, because nothing scheduled a
+    // search — the platform scheduled fetching and reviewing and left the
+    // question to whoever remembered to ask it.
+    //
+    // # Why it sweeps only what has never been swept
+    //
+    // Every run charges its author's search history (ADR-0014), and the store is
+    // already charging 156 configurations across 22 findings. A nightly sweep of
+    // nine panels would add three thousand a year and raise the deflated bar
+    // until nothing could clear it — a scheduled job that made the gates
+    // unpassable would be worse than no job at all.
+    //
+    // So this fills gaps and never re-measures. A pair of universe and rule that
+    // has a recorded panel is left alone however old it is; a new universe, or a
+    // new rule, or a rule whose resolution newly matches, gets one sweep.
+    // Re-measuring the same pair against newer bars stays a deliberate act,
+    // because deciding it is worth another draw on the search budget is a
+    // judgement and not a schedule.
+    //
+    // One panel per tick, because a hundred-instrument panel is a couple of
+    // minutes of every core and a backlog of nine should not take the machine
+    // for half an hour at once.
+    let sweeping = research.clone();
+    let announce_sweep = announce.clone();
+    let sweep_root = root.to_path_buf();
+    jobs.every("research", "Sweep a universe nobody has swept", std::time::Duration::from_secs(60 * 60), move || {
+        let research = sweeping.clone();
+        let raise = announce_sweep.clone();
+        let root = sweep_root.clone();
+        async move {
+            let Some((universe, rule)) = tokio::task::spawn_blocking({
+                let research = research.clone();
+                let root = root.clone();
+                move || crate::research::sweep::next(&research, &root)
+            })
+            .await
+            .map_err(|err| format!("the sweep did not decide what to run: {err}"))?
+            else {
+                return Ok("nothing unswept".to_owned());
+            };
+
+            let said = format!("{rule} over {}", universe.name);
+            let view = tokio::task::spawn_blocking(move || {
+                crate::research::study::run_panel_over(&research, &universe, Some(&rule))
+            })
+            .await
+            .map_err(|err| format!("{said} did not finish: {err}"))?
+            .map_err(|err| err.to_string())?;
+
+            raise(EventView::new(
+                arvo_api::EventKindView::findings(0),
+                format!("Swept {said}"),
+                format!("{}: {}", view.verdict, view.reasons.join("; ")),
+                arvo_api::SeverityView::Info,
+            ));
+            Ok(format!("{said}: {}", view.verdict))
         }
     });
 

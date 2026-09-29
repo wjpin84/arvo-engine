@@ -262,7 +262,7 @@ impl ZeroDteBreakout {
             false,
             self.risk.starting_cash,
             day_trades_used,
-            super::spendable(&self.cache(), &id.venue),
+            super::spendable(&self.cache(), &id),
             None,
         );
         let arvo_research::Decision::Accept { quantity } = decision else {
