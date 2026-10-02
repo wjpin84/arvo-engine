@@ -160,6 +160,13 @@ pub(crate) async fn drive<E: Executor>(
     let mut session =
         Session::new(gate, executor).against_assumed_slippage_bps(experiment.costs.slippage_bps);
 
+    // Whether the gate is halted — by the kill switch, by what the venue
+    // already held at start, or by its own drawdown limit. The loop stays up
+    // either way: nothing is proposed, since the gate refuses it, but exits
+    // are settled and the kill switch can still flatten what is held. A
+    // halted session whose loop had ended could not be flattened at all (#11).
+    let mut killed = false;
+
     // What the venue already holds is adopted and halts the session: a
     // position this rule did not open is one it cannot reason about.
     //
@@ -181,9 +188,8 @@ pub(crate) async fn drive<E: Executor>(
     );
     if let Some(why) = session.gate().halted() {
         halt(status, record, events, why);
-        return Ok(());
-    }
-    {
+        killed = true;
+    } else {
         let mut status = status
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -202,9 +208,6 @@ pub(crate) async fn drive<E: Executor>(
     let mut last_poll: Option<std::time::Instant> = None;
     // The last close seen, as the reference price for a kill switch's exits.
     let mut last_close: Option<f64> = None;
-    // Whether the kill switch fired: the loop then keeps settling the exits
-    // rather than ending on the gate's halt like a drawdown does.
-    let mut killed = false;
     while !stop.load(Ordering::SeqCst) {
         // Read, then the lock is dropped: the caller polls that lock while
         // the command runs, and a reconcile waits on the venue.
@@ -398,10 +401,10 @@ pub(crate) async fn drive<E: Executor>(
                 .await?;
             }
             if killed {
-                // Already halted by hand; the loop stays up to book the exits.
+                // Already halted; the loop stays up to book the exits.
             } else if let Some(why) = session.gate().halted() {
                 halt(status, record, events, why);
-                return Ok(());
+                killed = true;
             }
         }
 

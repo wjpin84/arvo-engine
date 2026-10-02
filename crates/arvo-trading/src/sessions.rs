@@ -40,6 +40,14 @@ impl std::fmt::Debug for Sessions {
     }
 }
 
+/// Whether a session in `state` takes the kill switch: one whose loop is
+/// still up — live, frozen, or halted with the loop kept running to settle
+/// exits and take exactly this (#11). A stopped or failed session has no loop
+/// to flatten anything.
+pub(crate) fn takes_the_kill_switch(state: &str) -> bool {
+    matches!(state, "starting" | "running" | "frozen" | "halted")
+}
+
 impl Sessions {
     #[must_use]
     pub fn new(data: &Path, events: broadcast::Sender<EventView>, venues: Arc<dyn Venues>) -> Self {
@@ -247,9 +255,14 @@ impl Sessions {
     /// The session stays up, halted, so the exits' fills are still booked
     /// and the record says what the venue would not exit.
     ///
+    /// A session already halted takes it too (#11): arming is a no-op on a
+    /// halted gate, and flattening is what a halted account still needs —
+    /// a position adopted at start, or held through a drawdown halt, is
+    /// otherwise closable only at the venue by hand.
+    ///
     /// # Errors
     ///
-    /// No session by that id, or one that is not running or frozen.
+    /// No session by that id, or one that has stopped or failed.
     pub fn halt(&self, id: &str, reason: &str) -> Result<Status, String> {
         let reason = if reason.trim().is_empty() {
             "a person pressed the kill switch".to_owned()
@@ -274,7 +287,7 @@ impl Sessions {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             match command {
                 Command::Halt(_) => {
-                    if !matches!(status.state.as_str(), "starting" | "running" | "frozen") {
+                    if !takes_the_kill_switch(&status.state) {
                         return Err(format!("{id} is {}; nothing to halt", status.state));
                     }
                 }

@@ -235,6 +235,21 @@ fn a_missing_finding_fails_the_session_rather_than_the_call() {
     assert_eq!(sessions.list().len(), 1);
 }
 
+/// A session the gate halted — on what the venue held at start, or on its
+/// drawdown limit — keeps its loop and takes the kill switch, so what it
+/// holds can be flattened through the record rather than at the venue by
+/// hand (#11). One whose loop has ended cannot.
+#[test]
+fn a_halted_session_still_takes_the_kill_switch() {
+    use crate::sessions::takes_the_kill_switch;
+    for live in ["starting", "running", "frozen", "halted"] {
+        assert!(takes_the_kill_switch(live), "{live}");
+    }
+    for gone in ["stopped", "failed"] {
+        assert!(!takes_the_kill_switch(gone), "{gone}");
+    }
+}
+
 #[test]
 fn only_a_live_session_takes_the_kill_switch() {
     let dir = tempfile::tempdir().expect("tempdir");
