@@ -162,20 +162,23 @@ pub(crate) async fn drive<E: Executor>(
 
     // What the venue already holds is adopted and halts the session: a
     // position this rule did not open is one it cannot reason about.
+    //
+    // Written at every start, flat included, with each holding's entry: the
+    // review rebuilds the book from this record, and a position closed by
+    // hand between two sessions leaves no sell behind it. An empty `adopted`
+    // is the one statement that closes those lots (#9).
     let found = session
         .reconcile(now(), venue)
         .await
         .map_err(|err| err.to_string())?;
-    if found.found_anything() {
-        record.write(
-            "reconciled",
-            Some(serde_json::json!({
-                "adopted": found.adopted.iter().map(|h| (&h.symbol, h.quantity)).collect::<Vec<_>>(),
-                "cancelled": found.cancelled.len(),
-                "stranded": found.stranded.len(),
-            })),
-        );
-    }
+    record.write(
+        "reconciled",
+        Some(serde_json::json!({
+            "adopted": found.adopted.iter().map(|h| (&h.symbol, h.quantity, h.entry)).collect::<Vec<_>>(),
+            "cancelled": found.cancelled.len(),
+            "stranded": found.stranded.len(),
+        })),
+    );
     if let Some(why) = session.gate().halted() {
         halt(status, record, events, why);
         return Ok(());
