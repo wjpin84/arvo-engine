@@ -235,6 +235,37 @@ fn a_missing_finding_fails_the_session_rather_than_the_call() {
     assert_eq!(sessions.list().len(), 1);
 }
 
+/// A session the gate halted — on what the venue held at start, or on its
+/// drawdown limit — keeps its loop and takes the kill switch, so what it
+/// holds can be flattened through the record rather than at the venue by
+/// hand (#11). One whose loop has ended cannot.
+#[test]
+fn a_halted_session_still_takes_the_kill_switch() {
+    use crate::sessions::takes_the_kill_switch;
+    for live in ["starting", "running", "frozen", "halted"] {
+        assert!(takes_the_kill_switch(live), "{live}");
+    }
+    for gone in ["stopped", "failed"] {
+        assert!(!takes_the_kill_switch(gone), "{gone}");
+    }
+}
+
+/// Silence on the feed is a dead feed when the market is open, and the
+/// calendar when it is not (#12): the record held twenty evening freezes
+/// that meant nothing, and a review that counts them is one a reader
+/// learns to skip.
+#[test]
+fn silence_on_the_feed_is_a_dead_feed_only_while_the_market_is_open() {
+    use crate::run::silence_matters;
+    use arvo_data::Hours;
+    let at = |h: u32, m: u32| chrono::NaiveDate::from_ymd_opt(2026, 10, 1).unwrap().and_hms_opt(h, m, 0).unwrap();
+    assert!(silence_matters(Hours::Regular, at(14, 30)), "10:30 New York, in session");
+    assert!(!silence_matters(Hours::Regular, at(22, 14)), "18:14 New York, the evening the record shows");
+    assert!(!silence_matters(Hours::Regular, at(12, 49)), "08:49 New York, before the open");
+    assert!(silence_matters(Hours::Continuous, at(22, 14)), "crypto never closes");
+    assert!(silence_matters(Hours::Continuous, at(3, 0)));
+}
+
 #[test]
 fn only_a_live_session_takes_the_kill_switch() {
     let dir = tempfile::tempdir().expect("tempdir");

@@ -147,6 +147,7 @@ pub(crate) async fn drive<E: Executor>(
     // The source that serves the bars says what the instrument is — its
     // lot, tick, hours — and the gate sizes against that (#186).
     let described = source.instrument(symbol);
+    let hours = described.hours;
     record.write(
         "instrument",
         Some(serde_json::to_value(&described).unwrap_or_default()),
@@ -160,27 +161,36 @@ pub(crate) async fn drive<E: Executor>(
     let mut session =
         Session::new(gate, executor).against_assumed_slippage_bps(experiment.costs.slippage_bps);
 
+    // Whether the gate is halted — by the kill switch, by what the venue
+    // already held at start, or by its own drawdown limit. The loop stays up
+    // either way: nothing is proposed, since the gate refuses it, but exits
+    // are settled and the kill switch can still flatten what is held. A
+    // halted session whose loop had ended could not be flattened at all (#11).
+    let mut killed = false;
+
     // What the venue already holds is adopted and halts the session: a
     // position this rule did not open is one it cannot reason about.
+    //
+    // Written at every start, flat included, with each holding's entry: the
+    // review rebuilds the book from this record, and a position closed by
+    // hand between two sessions leaves no sell behind it. An empty `adopted`
+    // is the one statement that closes those lots (#9).
     let found = session
         .reconcile(now(), venue)
         .await
         .map_err(|err| err.to_string())?;
-    if found.found_anything() {
-        record.write(
-            "reconciled",
-            Some(serde_json::json!({
-                "adopted": found.adopted.iter().map(|h| (&h.symbol, h.quantity)).collect::<Vec<_>>(),
-                "cancelled": found.cancelled.len(),
-                "stranded": found.stranded.len(),
-            })),
-        );
-    }
+    record.write(
+        "reconciled",
+        Some(serde_json::json!({
+            "adopted": found.adopted.iter().map(|h| (&h.symbol, h.quantity, h.entry)).collect::<Vec<_>>(),
+            "cancelled": found.cancelled.len(),
+            "stranded": found.stranded.len(),
+        })),
+    );
     if let Some(why) = session.gate().halted() {
         halt(status, record, events, why);
-        return Ok(());
-    }
-    {
+        killed = true;
+    } else {
         let mut status = status
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -196,12 +206,12 @@ pub(crate) async fn drive<E: Executor>(
         Some(serde_json::json!({ "streaming": feed.is_some(), "source": source.id() })),
     );
     let mut frozen: Option<Freeze> = None;
+    // A feed_down the stream raised on after-hours silence, swallowed along
+    // with the feed_up its reconnect sends a moment later (#12).
+    let mut quiet_after_hours = false;
     let mut last_poll: Option<std::time::Instant> = None;
     // The last close seen, as the reference price for a kill switch's exits.
     let mut last_close: Option<f64> = None;
-    // Whether the kill switch fired: the loop then keeps settling the exits
-    // rather than ending on the gate's halt like a drawdown does.
-    let mut killed = false;
     while !stop.load(Ordering::SeqCst) {
         // Read, then the lock is dropped: the caller polls that lock while
         // the command runs, and a reconcile waits on the venue.
@@ -294,11 +304,21 @@ pub(crate) async fn drive<E: Executor>(
             match tokio::time::timeout(Duration::from_secs(1), live.next()).await {
                 Ok(Some(FeedEvent::Bar(bar))) => fresh.push(bar),
                 Ok(Some(FeedEvent::Up)) => {
-                    record.write("feed_up", None);
+                    if !quiet_after_hours {
+                        record.write("feed_up", None);
+                    }
+                    quiet_after_hours = false;
                     if matches!(frozen, Some(Freeze::Stale)) {
                         frozen = None;
                         thaw(status, record, events, Some("the feed is back"));
                     }
+                }
+                // Silence on a regular-hours instrument's feed outside the
+                // session is the calendar, not a dead feed: the stream gives
+                // up and reconnects, and nothing is written, because a freeze
+                // every evening teaches a reader to skip the one at 10:15 (#12).
+                Ok(Some(FeedEvent::Down(_))) if !silence_matters(hours, now()) => {
+                    quiet_after_hours = true;
                 }
                 Ok(Some(FeedEvent::Down(why))) => {
                     record.write("feed_down", Some(serde_json::json!(why)));
@@ -395,10 +415,10 @@ pub(crate) async fn drive<E: Executor>(
                 .await?;
             }
             if killed {
-                // Already halted by hand; the loop stays up to book the exits.
+                // Already halted; the loop stays up to book the exits.
             } else if let Some(why) = session.gate().halted() {
                 halt(status, record, events, why);
-                return Ok(());
+                killed = true;
             }
         }
 
@@ -495,6 +515,14 @@ pub(crate) async fn drive<E: Executor>(
     }
     record.write("stopped", None);
     Ok(())
+}
+
+/// Whether a feed that has gone silent at `at` has gone dark: always, for an
+/// instrument that trades around the clock; inside the US regular session
+/// only, for one that does not — after the close the feed is silent by
+/// nature, and reporting that silence is reporting the calendar (#12).
+pub(crate) fn silence_matters(hours: arvo_data::Hours, at: chrono::NaiveDateTime) -> bool {
+    hours == arvo_data::Hours::Continuous || arvo_data::session::in_regular_session(at)
 }
 
 /// Sleeps one poll, waking early when asked to stop or handed a command, so

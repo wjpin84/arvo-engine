@@ -399,14 +399,41 @@ pub fn review_record(id: &str, record: &str, day: NaiveDate) -> Option<SessionRe
                     }
                 }
             }
-            "reconciled" if today => {
-                let adopted = line.detail.get("adopted").and_then(Value::as_array).map_or(0, Vec::len);
-                let corrected = line.detail.get("corrected").and_then(Value::as_array).map_or(0, Vec::len);
-                if adopted > 0 {
-                    out.interventions.push(format!("{} adopted {adopted} position(s) the venue already held", clock(line.at)));
+            // The book is rebuilt from the venue at every start: whatever the
+            // record thought was still open was closed outside this session,
+            // or is adopted by the reconcile that follows (#9).
+            "started" => {
+                held = 0.0;
+                entry = 0.0;
+                opened_by = None;
+            }
+            "reconciled" => {
+                if let Some(adopted) = line.detail.get("adopted").and_then(Value::as_array) {
+                    held = 0.0;
+                    entry = 0.0;
+                    // (symbol, quantity, entry); a record from before #9 carries
+                    // (symbol, quantity) and its adopted lot is priced at zero.
+                    for lot in adopted {
+                        let quantity = lot.get(1).and_then(Value::as_f64).unwrap_or(0.0);
+                        let price = lot.get(2).and_then(Value::as_f64).unwrap_or(0.0);
+                        let total = held + quantity;
+                        entry = if total > 0.0 { (entry * held + price * quantity) / total } else { 0.0 };
+                        held = total;
+                    }
+                    if held > 0.0 {
+                        opened_at = line.at.to_rfc3339();
+                        opened_by = None;
+                    }
                 }
-                if corrected > 0 {
-                    out.interventions.push(format!("{} reconciled {corrected} position(s) the rule did not open", clock(line.at)));
+                if today {
+                    let adopted = line.detail.get("adopted").and_then(Value::as_array).map_or(0, Vec::len);
+                    let corrected = line.detail.get("corrected").and_then(Value::as_array).map_or(0, Vec::len);
+                    if adopted > 0 {
+                        out.interventions.push(format!("{} adopted {adopted} position(s) the venue already held", clock(line.at)));
+                    }
+                    if corrected > 0 {
+                        out.interventions.push(format!("{} reconciled {corrected} position(s) the rule did not open", clock(line.at)));
+                    }
                 }
             }
             "resumed" if today && line.detail.is_null() => out.interventions.push(format!("{} resumed by hand", clock(line.at))),
@@ -642,6 +669,49 @@ mod tests {
         // with a crypto session is a trading day; a Tuesday with nothing is not.
         let empty = Review { day, written_at: Utc::now(), sessions: Vec::new() };
         assert!(!is_finished(&empty, tomorrow));
+    }
+
+    /// A buy before a stop, flattened by hand and never sold on the record,
+    /// is not the entry of the trip the next session opens (#9): the book is
+    /// rebuilt at every start, and a reconcile that adopts a lot prices it.
+    #[test]
+    fn a_restart_closes_what_the_record_still_held() {
+        let fill = |at: &str, order: &str, side: &str, quantity: f64, price: f64| {
+            line(at, "filled", serde_json::json!({ "order": order, "instrument": "AAPL.AIEX", "side": side, "quantity": quantity, "decision_price": price, "fill_price": price, "decision_at": at, "filled_at": at }))
+        };
+        let day = NaiveDate::from_ymd_opt(2026, 9, 30).unwrap();
+        let record = [
+            line("2026-09-21T13:55:00Z", "started", Value::Null),
+            line("2026-09-21T13:55:00Z", "instrument", serde_json::json!({ "id": "AAPL.AIEX" })),
+            fill("2026-09-21T13:56:11Z", "o1", "buy", 297.0, 335.89),
+            line("2026-09-21T14:08:00Z", "stopped", Value::Null),
+            line("2026-09-29T14:21:00Z", "started", Value::Null),
+            line("2026-09-29T14:21:00Z", "reconciled", serde_json::json!({ "adopted": [], "cancelled": 0, "stranded": 0 })),
+            fill("2026-09-30T13:50:11Z", "o2", "buy", 299.0, 333.43),
+            fill("2026-09-30T14:05:20Z", "o3", "sell", 299.0, 338.17),
+        ]
+        .join("\n");
+        let reviewed = review_record("f@alpaca-paper", &record, day).expect("the trip closed today");
+        assert_eq!(reviewed.round_trips.len(), 1);
+        let trip = &reviewed.round_trips[0];
+        assert!((trip.entry - 333.43).abs() < 1e-9, "priced against its own buy, not the 09-21 lot: {}", trip.entry);
+        assert!((trip.pnl - 1417.26).abs() < 1e-6, "{}", trip.pnl);
+        assert!(trip.opened.starts_with("2026-09-30T13:50"), "{}", trip.opened);
+        assert!((reviewed.realised - 1417.26).abs() < 1e-6);
+
+        // A reconcile that adopts a lot carries its entry, so a position that
+        // legitimately survived a restart is priced at what the venue says.
+        let adopted = [
+            line("2026-09-29T14:21:00Z", "started", Value::Null),
+            line("2026-09-29T14:21:00Z", "instrument", serde_json::json!({ "id": "AAPL.AIEX" })),
+            line("2026-09-29T14:21:00Z", "reconciled", serde_json::json!({ "adopted": [["AAPL", 100.0, 330.0]], "cancelled": 0, "stranded": 0 })),
+            fill("2026-09-30T14:05:20Z", "o4", "sell", 100.0, 338.0),
+        ]
+        .join("\n");
+        let reviewed = review_record("f@alpaca-paper", &adopted, day).expect("the adopted lot closed today");
+        assert_eq!(reviewed.round_trips.len(), 1);
+        assert!((reviewed.round_trips[0].pnl - 800.0).abs() < 1e-9, "{}", reviewed.round_trips[0].pnl);
+        assert!(reviewed.round_trips[0].rule.is_empty(), "no order of ours opened it");
     }
 
     fn line(at: &str, event: &str, detail: Value) -> String {
