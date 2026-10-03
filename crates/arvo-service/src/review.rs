@@ -90,6 +90,15 @@ pub struct Span {
 }
 
 /// One session's day.
+/// When a signal fired and what it was: the rule's name for an entry, the
+/// exit's reason for an exit. Kept so a chart can put the day's signals on
+/// the time axis, which a count cannot.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Signal {
+    pub at: String,
+    pub what: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct SessionReview {
     /// The record's file stem: the finding and the executor.
@@ -97,6 +106,10 @@ pub struct SessionReview {
     pub instrument: String,
     pub bars: u32,
     pub signals: u32,
+    /// Each of them, in order. `default` because a review written before
+    /// this field still reads.
+    #[serde(default)]
+    pub signals_at: Vec<Signal>,
     /// Entries and exits that went to the venue.
     pub submitted: u32,
     /// Orders that ended at the venue without a fill (#231).
@@ -250,7 +263,15 @@ pub fn review_record(id: &str, record: &str, day: NaiveDate) -> Option<SessionRe
         let today = line.at.date_naive() == day;
         match line.event.as_str() {
             "bar" if today => out.bars += 1,
-            "signal" if today => out.signals += 1,
+            "signal" if today => {
+                out.signals += 1;
+                // An entry names its rule; an exit names its reason.
+                let what = match line.detail.get("exit") {
+                    Some(Value::String(why)) => format!("exit: {why}"),
+                    _ => text(&line.detail, "rule"),
+                };
+                out.signals_at.push(Signal { at: line.at.to_rfc3339(), what });
+            }
             "submitted" if today => out.submitted += 1,
             "refused" if today => {
                 let detail = text(&line.detail, "why");
@@ -792,6 +813,11 @@ mod tests {
         assert_eq!(reviewed.instrument, "AAPL.AIEX");
         // The entry and both exits carried orders to the venue (#231).
         assert_eq!((reviewed.bars, reviewed.signals, reviewed.submitted), (1, 4, 3));
+        // Each signal keeps its time and what it was, so a chart can place it.
+        assert_eq!(reviewed.signals_at.len(), 4);
+        assert_eq!(reviewed.signals_at[0].what, "exit: stop");
+        assert!(reviewed.signals_at[0].at.starts_with("2026-09-21T13:36:00"), "{}", reviewed.signals_at[0].at);
+        assert_eq!(reviewed.signals_at[1].what, "close above the opening range");
         assert_eq!(reviewed.unfilled, 1);
         assert_eq!(reviewed.refused.get("Stale"), Some(&1));
         assert_eq!(reviewed.exits.get("stop"), Some(&1));
