@@ -121,6 +121,17 @@ pub struct Span {
 pub struct Signal {
     pub at: String,
     pub what: String,
+    /// The prices the rule decided against, on an entry. `default`: a
+    /// review written before this field still reads.
+    #[serde(default)]
+    pub levels: Vec<Level>,
+}
+
+/// A price a rule decided against, by its name in the rule.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Level {
+    pub name: String,
+    pub price: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -343,7 +354,18 @@ pub fn review_record(id: &str, record: &str, day: NaiveDate) -> Option<SessionRe
                     Some(Value::String(why)) => format!("exit: {why}"),
                     _ => text(&line.detail, "rule"),
                 };
-                out.signals_at.push(Signal { at: line.at.to_rfc3339(), what });
+                let levels = line
+                    .detail
+                    .get("levels")
+                    .and_then(Value::as_array)
+                    .map(|levels| {
+                        levels
+                            .iter()
+                            .filter_map(|level| Some(Level { name: level.get("name")?.as_str()?.to_owned(), price: level.get("price")?.as_f64()? }))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                out.signals_at.push(Signal { at: line.at.to_rfc3339(), what, levels });
             }
             "submitted" if today => out.submitted += 1,
             "refused" if today => {
@@ -834,7 +856,7 @@ mod tests {
             line("2026-09-21T13:36:03Z", "filled", serde_json::json!({ "order": "o2", "instrument": "AAPL.AIEX", "side": "sell", "quantity": 10.0, "decision_price": 98.0, "fill_price": 97.9, "decision_at": "2026-09-21T13:36:00", "filled_at": "2026-09-21T13:36:03" })),
             line("2026-09-21T14:00:00Z", "signal", serde_json::json!({ "id": "s2", "rule": "close above the opening range", "regime": "trending up" })),
             line("2026-09-21T14:00:00Z", "refused", serde_json::json!({ "signal": "s2", "why": "Stale { age_ms: 900, limit_ms: 500 }" })),
-            line("2026-09-21T14:05:00Z", "signal", serde_json::json!({ "id": "s3", "rule": "close above the opening range", "regime": "trending up" })),
+            line("2026-09-21T14:05:00Z", "signal", serde_json::json!({ "id": "s3", "rule": "close above the opening range", "regime": "trending up", "price": 101.5, "levels": [{ "name": "range high", "price": 101.2 }, { "name": "target", "price": 102.4 }] })),
             line("2026-09-21T14:05:00Z", "submitted", serde_json::json!({ "signal": "s3", "order": "o3" })),
             line("2026-09-21T14:05:01Z", "filled", serde_json::json!({ "order": "o3", "instrument": "AAPL.AIEX", "side": "buy", "quantity": 5.0, "decision_price": 100.0, "fill_price": 100.0, "decision_at": "2026-09-21T14:05:00", "filled_at": "2026-09-21T14:05:01" })),
             line("2026-09-21T14:30:00Z", "frozen", serde_json::json!({ "stale": "nothing heard for 900s" })),
@@ -895,6 +917,9 @@ mod tests {
         assert_eq!(reviewed.signals_at[0].what, "exit: stop");
         assert!(reviewed.signals_at[0].at.starts_with("2026-09-21T13:36:00"), "{}", reviewed.signals_at[0].at);
         assert_eq!(reviewed.signals_at[1].what, "close above the opening range");
+        // The prices the rule decided against ride on its signal.
+        let s3 = &reviewed.signals_at[2];
+        assert_eq!(s3.levels.iter().map(|level| (level.name.as_str(), level.price)).collect::<Vec<_>>(), [("range high", 101.2), ("target", 102.4)]);
         // Every order of the day, from sending to its end: the entry o3 was
         // sent as a buy, the exits o2 and o4 as sells.
         let order = |id: &str| reviewed.orders.iter().find(|order| order.id == id).unwrap_or_else(|| panic!("order {id}: {:?}", reviewed.orders));

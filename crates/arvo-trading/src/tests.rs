@@ -534,6 +534,7 @@ async fn an_exit_is_stamped_when_it_is_sent_so_the_venue_does_not_call_it_stale(
         rule: Some("test".to_owned()),
         signal: None,
         regime: None,
+        levels: Vec::new(),
     };
 
     act(&mut session, &mut watch, "s#0", &signal, "test", now, None, &record, &status)
@@ -606,6 +607,7 @@ async fn a_held_entry_never_reaches_the_venue() {
         rule: Some("test".to_owned()),
         signal: None,
         regime: None,
+        levels: Vec::new(),
     };
 
     act(
@@ -670,6 +672,7 @@ async fn a_coins_fraction_reaches_the_venue_through_the_session() {
         rule: Some("test".to_owned()),
         signal: None,
         regime: None,
+        levels: Vec::new(),
     };
 
     act(

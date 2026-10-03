@@ -77,8 +77,10 @@ pub(crate) async fn act<E: Executor>(
             "side": format!("{:?}", signal.side),
             "quantity": signal.quantity,
             "price": signal.reference_price,
-            // Kept so the review can draw the stop the gate watched (#43).
+            // Kept so the review can draw the stop the gate watched (#43),
+            // and the prices the rule decided against.
             "stop_distance": signal.stop_distance,
+            "levels": signal.levels.iter().map(|(name, price)| serde_json::json!({ "name": name, "price": price })).collect::<Vec<_>>(),
             "at": signal.signalled_at,
             "exit": signal.exit,
             "rule": signal.rule,
