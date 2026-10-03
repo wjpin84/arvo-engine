@@ -80,27 +80,43 @@ pub(crate) const ENTRY_RULE: &str = "arvo:rule=";
 pub(crate) const ENTRY_SIGNAL: &str = "arvo:signal=";
 pub(crate) const ENTRY_REGIME: &str = "arvo:regime=";
 pub(crate) const ENTRY_ASKED: &str = "arvo:asked=";
+/// A price the rule decided against, `name=value`: the opening range's
+/// high, a target. One tag per level, so a review can draw what the rule
+/// saw rather than recompute it.
+pub(crate) const ENTRY_LEVEL: &str = "arvo:level=";
 
 /// The condition that fired and the value it was judged on.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Trigger {
     pub rule: std::borrow::Cow<'static, str>,
     pub signal: f64,
+    /// The prices the rule decided against, by name.
+    pub levels: Vec<(&'static str, f64)>,
 }
 
 impl Trigger {
     pub(crate) const fn new(rule: &'static str, signal: f64) -> Self {
-        Self { rule: std::borrow::Cow::Borrowed(rule), signal }
+        Self { rule: std::borrow::Cow::Borrowed(rule), signal, levels: Vec::new() }
     }
 
     /// A rule written as data (#225) names its own trigger.
     pub(crate) fn named(rule: String, signal: f64) -> Self {
-        Self { rule: std::borrow::Cow::Owned(rule), signal }
+        Self { rule: std::borrow::Cow::Owned(rule), signal, levels: Vec::new() }
+    }
+
+    /// A price the rule decided against, kept so the review can draw it.
+    #[must_use]
+    pub(crate) fn level(mut self, name: &'static str, price: f64) -> Self {
+        if price.is_finite() {
+            self.levels.push((name, price));
+        }
+        self
     }
 
     /// The tags an entry order carries for it, plus the regime and the ask.
     pub(crate) fn tags(self, regime: Option<arvo_research::regime::Regime>, asked: f64) -> Vec<String> {
         let mut tags = vec![format!("{ENTRY_RULE}{}", self.rule), format!("{ENTRY_SIGNAL}{}", self.signal), format!("{ENTRY_ASKED}{asked}")];
+        tags.extend(self.levels.iter().map(|(name, price)| format!("{ENTRY_LEVEL}{name}={price}")));
         if let Some(regime) = regime {
             tags.push(format!("{ENTRY_REGIME}{}", regime.label()));
         }
@@ -1145,5 +1161,12 @@ mod tests {
         assert!(open.stopped_out(98.0), "traded through it mid-bar");
         assert!(!open.target_met(104.0));
         assert!(open.target_met(105.0), "touching the target is meeting it");
+    }
+
+    #[test]
+    fn a_triggers_levels_ride_on_the_entry_order_as_tags() {
+        let tags = Trigger::new("close above the opening range", 0.4).level("range high", 101.25).level("nowhere", f64::NAN).tags(None, 10.0);
+        assert!(tags.contains(&format!("{ENTRY_LEVEL}range high=101.25")), "{tags:?}");
+        assert!(!tags.iter().any(|tag| tag.contains("nowhere")), "a level that is not a price is not kept: {tags:?}");
     }
 }

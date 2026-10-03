@@ -39,7 +39,7 @@ use crate::backtest;
 use crate::chain::Settlement;
 use crate::convert::to_nautilus_bar;
 use crate::plan::Plan;
-use crate::strategy::{ENTRY_REGIME, ENTRY_RULE, ENTRY_SIGNAL, ENTRY_STOP};
+use crate::strategy::{ENTRY_LEVEL, ENTRY_REGIME, ENTRY_RULE, ENTRY_SIGNAL, ENTRY_STOP};
 
 /// Which way a signal goes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,6 +72,8 @@ pub struct Signal {
     pub signal: Option<f64>,
     /// The regime the rule saw the instrument in, when it had seen enough.
     pub regime: Option<String>,
+    /// The prices the rule decided against, by name, on an entry.
+    pub levels: Vec<(String, f64)>,
 }
 
 /// A backtest engine kept alive and fed one bar at a time.
@@ -181,6 +183,12 @@ impl Shadow {
             let rule = tagged(ENTRY_RULE);
             let value = tagged(ENTRY_SIGNAL).and_then(|value| value.parse().ok());
             let regime = tagged(ENTRY_REGIME);
+            let levels = tags
+                .iter()
+                .filter_map(|tag| tag.as_str().strip_prefix(ENTRY_LEVEL))
+                .filter_map(|level| level.split_once('='))
+                .filter_map(|(name, price)| Some((name.to_owned(), price.parse().ok()?)))
+                .collect();
             signals.push(Signal {
                 instrument,
                 side: match order.order_side() {
@@ -195,6 +203,7 @@ impl Shadow {
                 rule,
                 signal: value,
                 regime,
+                levels,
             });
         }
         Ok(signals)

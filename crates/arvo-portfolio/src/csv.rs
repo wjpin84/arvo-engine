@@ -126,6 +126,7 @@ mod roles {
         "average cost basis",
         "avg cost basis",
         "average cost",
+        "cost basis per share",
         "cost per share",
     ];
     pub const ACCOUNT: &[&str] = &[
@@ -309,6 +310,11 @@ fn find_excluding(header: &[String], aliases: &[&str], exclude: &[usize]) -> Opt
     None
 }
 
+/// A heading that names an amount per share rather than for the position.
+fn per_unit(normalised: &str) -> bool {
+    normalised.contains("per share") || normalised.contains("per unit") || normalised.contains("average") || normalised.split_whitespace().any(|word| word == "avg")
+}
+
 fn find(header: &[String], aliases: &[&str]) -> Option<usize> {
     find_excluding(header, aliases, &[])
 }
@@ -346,7 +352,14 @@ fn map_header(header: &[String]) -> Option<Mapping> {
     // it is the more specific heading, and letting the looser pattern claim
     // it is the silent-wrongness case described on `find_excluding`.
     let cost_per_share = find(header, roles::COST_PER_SHARE);
-    let claimed: Vec<usize> = cost_per_share.into_iter().collect();
+    // And no column that says it is per share or an average can be the
+    // total, whatever its other words: "Cost Basis Per Share" contains
+    // "cost basis", and reading it as the total understates cost by the
+    // share count while every number downstream looks reasonable.
+    let claimed: Vec<usize> = cost_per_share
+        .into_iter()
+        .chain(header.iter().enumerate().filter(|(_, column)| per_unit(&normalise(column))).map(|(index, _)| index))
+        .collect();
 
     Some(Mapping {
         instrument,
@@ -633,6 +646,26 @@ mod tests {
             "10 shares at 150 average is 1500 total, not 150"
         );
         assert!(imported[0].report.cost_basis_derived);
+    }
+
+    #[test]
+    fn a_cost_basis_per_share_column_is_per_share_not_the_total() {
+        // Fidelity's heading. It contains "cost basis", which the total's
+        // loose match would take: 2 shares at 250 is 500, not 250.
+        let imported = load(
+            "Symbol,Quantity,Last Price,Current Value,Cost Basis Per Share
+             VTI,2,280.00,560.00,250.00
+",
+        );
+        assert_eq!(imported[0].portfolio.holdings[0].cost_basis, Some(500.0));
+        assert!(imported[0].report.cost_basis_derived);
+        // Nor does an unknown per-unit heading become the total.
+        let imported = load(
+            "Symbol,Quantity,Last Price,Cost Basis Per Unit
+             VTI,2,280.00,250.00
+",
+        );
+        assert_eq!(imported[0].portfolio.holdings[0].cost_basis, None, "an unknown per-unit column is not taken as the total");
     }
 
     #[test]

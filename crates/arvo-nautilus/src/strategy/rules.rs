@@ -403,7 +403,11 @@ impl DataActor for OpeningRange {
             return Ok(());
         }
         let target = close + width * self.target_range_multiple;
-        if self.enter_long(close, atr, Some(target), Trigger::new("close above the opening range", (close - range_high) / width))? {
+        let trigger = Trigger::new("close above the opening range", (close - range_high) / width)
+            .level("range high", range_high)
+            .level("range low", range_low)
+            .level("target", target);
+        if self.enter_long(close, atr, Some(target), trigger)? {
             self.traded_today = true;
         }
         Ok(())

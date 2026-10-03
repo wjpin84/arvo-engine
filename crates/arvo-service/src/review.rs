@@ -54,6 +54,30 @@ pub struct RoundTrip {
     pub regime: String,
     /// Why it was closed: `signal`, `stop`, `target`, `halt`, or empty.
     pub exit_reason: String,
+    /// The stop the gate was watching for this trip: the entry less the
+    /// signal's stop distance. `None` when the signal carried no stop or
+    /// the record predates the distance being kept.
+    #[serde(default)]
+    pub stop: Option<f64>,
+}
+
+/// An order from the moment it was sent to the moment it ended: what a
+/// chart draws as a line at the order's price from placement to fill, or
+/// to the end of the day when it never filled.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Order {
+    pub id: String,
+    pub placed_at: String,
+    /// `buy` or `sell`.
+    pub side: String,
+    /// The price the rule decided at: the signal's reference price, which
+    /// is what the order was sent against.
+    pub price: f64,
+    /// When the venue answered, `None` while it never did.
+    pub resolved_at: Option<String>,
+    /// `filled`, else `unfilled`: ended at the venue without a fill, or
+    /// still open when the record ends.
+    pub outcome: String,
 }
 
 /// Losses with the same condition, regime and exit, added up: how a rule
@@ -90,6 +114,26 @@ pub struct Span {
 }
 
 /// One session's day.
+/// When a signal fired and what it was: the rule's name for an entry, the
+/// exit's reason for an exit. Kept so a chart can put the day's signals on
+/// the time axis, which a count cannot.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Signal {
+    pub at: String,
+    pub what: String,
+    /// The prices the rule decided against, on an entry. `default`: a
+    /// review written before this field still reads.
+    #[serde(default)]
+    pub levels: Vec<Level>,
+}
+
+/// A price a rule decided against, by its name in the rule.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Level {
+    pub name: String,
+    pub price: f64,
+}
+
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct SessionReview {
     /// The record's file stem: the finding and the executor.
@@ -97,6 +141,14 @@ pub struct SessionReview {
     pub instrument: String,
     pub bars: u32,
     pub signals: u32,
+    /// Each of them, in order. `default` because a review written before
+    /// this field still reads.
+    #[serde(default)]
+    pub signals_at: Vec<Signal>,
+    /// Every order placed or resolved on the day, from sending to its end.
+    /// `default` because a review written before this field still reads.
+    #[serde(default)]
+    pub orders: Vec<Order>,
     /// Entries and exits that went to the venue.
     pub submitted: u32,
     /// Orders that ended at the venue without a fill (#231).
@@ -160,6 +212,18 @@ struct Line {
     detail: Value,
 }
 
+/// What a signal said when it fired, kept by id for the orders and the
+/// round trips that came of it.
+#[derive(Default, Clone)]
+struct Journaled {
+    rule: String,
+    regime: String,
+    /// The reference price the rule decided at.
+    price: Option<f64>,
+    /// How far below the entry the stop sat, when the signal carried one.
+    stop_distance: Option<f64>,
+}
+
 fn parse(text: &str) -> Vec<Line> {
     text.lines()
         .filter_map(|line| {
@@ -214,9 +278,23 @@ pub fn review_record(id: &str, record: &str, day: NaiveDate) -> Option<SessionRe
 
     // What the whole record says about each signal and order, whatever day
     // it was: a round trip closed today may have opened last week.
-    let mut journal: BTreeMap<String, (String, String)> = BTreeMap::new(); // signal id → (rule, regime)
+    let mut journal: BTreeMap<String, Journaled> = BTreeMap::new(); // signal id → what the signal said
     let mut submitted: BTreeMap<String, String> = BTreeMap::new(); // order → signal id
     let mut exit_orders: BTreeMap<String, String> = BTreeMap::new(); // order → why
+    let mut orders: BTreeMap<String, Order> = BTreeMap::new(); // order → its life
+    // An order is sent against the signal's reference price, which is the
+    // price the line is drawn at.
+    let placed = |orders: &mut BTreeMap<String, Order>, journal: &BTreeMap<String, Journaled>, line: &Line, side: &str| {
+        let order = text(&line.detail, "order");
+        if order.is_empty() {
+            return;
+        }
+        let price = journal.get(&text(&line.detail, "signal")).and_then(|signal| signal.price).unwrap_or_default();
+        orders.insert(
+            order.clone(),
+            Order { id: order, placed_at: line.at.to_rfc3339(), side: side.to_owned(), price, resolved_at: None, outcome: "unfilled".to_owned() },
+        );
+    };
     for line in &lines {
         match line.event.as_str() {
             "instrument" => out.instrument = text(&line.detail, "id"),
@@ -225,20 +303,39 @@ pub fn review_record(id: &str, record: &str, day: NaiveDate) -> Option<SessionRe
                 out.assumed_slippage_bps = number(&line.detail, "slippage_bps");
             }
             "signal" => {
-                journal.insert(text(&line.detail, "id"), (text(&line.detail, "rule"), text(&line.detail, "regime")));
+                journal.insert(
+                    text(&line.detail, "id"),
+                    Journaled {
+                        rule: text(&line.detail, "rule"),
+                        regime: text(&line.detail, "regime"),
+                        price: number(&line.detail, "price"),
+                        stop_distance: number(&line.detail, "stop_distance"),
+                    },
+                );
             }
             "submitted" => {
                 submitted.insert(text(&line.detail, "order"), text(&line.detail, "signal"));
+                placed(&mut orders, &journal, line, "buy");
             }
             "exit" => {
                 let order = text(&line.detail, "order");
                 if !order.is_empty() {
                     exit_orders.insert(order, text(&line.detail, "why"));
+                    placed(&mut orders, &journal, line, "sell");
+                }
+            }
+            "filled" => {
+                if let Some(order) = orders.get_mut(&text(&line.detail, "order")) {
+                    order.resolved_at = Some(line.at.to_rfc3339());
+                    order.outcome = "filled".to_owned();
                 }
             }
             _ => {}
         }
     }
+    // The day's orders: placed today, or resolved today after an earlier day.
+    let on_day = |at: &str| at.starts_with(&day.to_string());
+    out.orders = orders.into_values().filter(|order| on_day(&order.placed_at) || order.resolved_at.as_deref().is_some_and(on_day)).collect();
 
     // The book, fill by fill, so a sell today realises against the buys
     // that built the position, whenever they were.
@@ -250,7 +347,26 @@ pub fn review_record(id: &str, record: &str, day: NaiveDate) -> Option<SessionRe
         let today = line.at.date_naive() == day;
         match line.event.as_str() {
             "bar" if today => out.bars += 1,
-            "signal" if today => out.signals += 1,
+            "signal" if today => {
+                out.signals += 1;
+                // An entry names its rule; an exit names its reason.
+                let what = match line.detail.get("exit") {
+                    Some(Value::String(why)) => format!("exit: {why}"),
+                    _ => text(&line.detail, "rule"),
+                };
+                let levels = line
+                    .detail
+                    .get("levels")
+                    .and_then(Value::as_array)
+                    .map(|levels| {
+                        levels
+                            .iter()
+                            .filter_map(|level| Some(Level { name: level.get("name")?.as_str()?.to_owned(), price: level.get("price")?.as_f64()? }))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                out.signals_at.push(Signal { at: line.at.to_rfc3339(), what, levels });
+            }
             "submitted" if today => out.submitted += 1,
             "refused" if today => {
                 let detail = text(&line.detail, "why");
@@ -297,12 +413,15 @@ pub fn review_record(id: &str, record: &str, day: NaiveDate) -> Option<SessionRe
                     let pnl = (price - entry) * sold;
                     held -= sold;
                     if today {
-                        let (rule, regime) = opened_by
+                        let Journaled { rule, regime, stop_distance, .. } = opened_by
                             .as_ref()
                             .and_then(|order| submitted.get(order))
                             .and_then(|signal| journal.get(signal))
                             .cloned()
                             .unwrap_or_default();
+                        // The gate watched the entry less the distance; a
+                        // trip built from several buys takes the average entry.
+                        let stop = stop_distance.map(|distance| entry - distance);
                         let exit_reason = exit_orders.get(&order).cloned().unwrap_or_default();
                         if pnl < 0.0 {
                             let key = format!(
@@ -327,6 +446,7 @@ pub fn review_record(id: &str, record: &str, day: NaiveDate) -> Option<SessionRe
                             rule,
                             regime,
                             exit_reason,
+                            stop,
                         });
                     }
                     if held <= 1e-9 {
@@ -736,7 +856,7 @@ mod tests {
             line("2026-09-21T13:36:03Z", "filled", serde_json::json!({ "order": "o2", "instrument": "AAPL.AIEX", "side": "sell", "quantity": 10.0, "decision_price": 98.0, "fill_price": 97.9, "decision_at": "2026-09-21T13:36:00", "filled_at": "2026-09-21T13:36:03" })),
             line("2026-09-21T14:00:00Z", "signal", serde_json::json!({ "id": "s2", "rule": "close above the opening range", "regime": "trending up" })),
             line("2026-09-21T14:00:00Z", "refused", serde_json::json!({ "signal": "s2", "why": "Stale { age_ms: 900, limit_ms: 500 }" })),
-            line("2026-09-21T14:05:00Z", "signal", serde_json::json!({ "id": "s3", "rule": "close above the opening range", "regime": "trending up" })),
+            line("2026-09-21T14:05:00Z", "signal", serde_json::json!({ "id": "s3", "rule": "close above the opening range", "regime": "trending up", "price": 101.5, "levels": [{ "name": "range high", "price": 101.2 }, { "name": "target", "price": 102.4 }] })),
             line("2026-09-21T14:05:00Z", "submitted", serde_json::json!({ "signal": "s3", "order": "o3" })),
             line("2026-09-21T14:05:01Z", "filled", serde_json::json!({ "order": "o3", "instrument": "AAPL.AIEX", "side": "buy", "quantity": 5.0, "decision_price": 100.0, "fill_price": 100.0, "decision_at": "2026-09-21T14:05:00", "filled_at": "2026-09-21T14:05:01" })),
             line("2026-09-21T14:30:00Z", "frozen", serde_json::json!({ "stale": "nothing heard for 900s" })),
@@ -792,6 +912,20 @@ mod tests {
         assert_eq!(reviewed.instrument, "AAPL.AIEX");
         // The entry and both exits carried orders to the venue (#231).
         assert_eq!((reviewed.bars, reviewed.signals, reviewed.submitted), (1, 4, 3));
+        // Each signal keeps its time and what it was, so a chart can place it.
+        assert_eq!(reviewed.signals_at.len(), 4);
+        assert_eq!(reviewed.signals_at[0].what, "exit: stop");
+        assert!(reviewed.signals_at[0].at.starts_with("2026-09-21T13:36:00"), "{}", reviewed.signals_at[0].at);
+        assert_eq!(reviewed.signals_at[1].what, "close above the opening range");
+        // The prices the rule decided against ride on its signal.
+        let s3 = &reviewed.signals_at[2];
+        assert_eq!(s3.levels.iter().map(|level| (level.name.as_str(), level.price)).collect::<Vec<_>>(), [("range high", 101.2), ("target", 102.4)]);
+        // Every order of the day, from sending to its end: the entry o3 was
+        // sent as a buy, the exits o2 and o4 as sells.
+        let order = |id: &str| reviewed.orders.iter().find(|order| order.id == id).unwrap_or_else(|| panic!("order {id}: {:?}", reviewed.orders));
+        assert_eq!(order("o3").side, "buy");
+        assert!(order("o3").placed_at.starts_with("2026-09-21T14:05:00"), "{}", order("o3").placed_at);
+        assert_eq!((order("o2").side.as_str(), order("o4").side.as_str()), ("sell", "sell"));
         assert_eq!(reviewed.unfilled, 1);
         assert_eq!(reviewed.refused.get("Stale"), Some(&1));
         assert_eq!(reviewed.exits.get("stop"), Some(&1));
