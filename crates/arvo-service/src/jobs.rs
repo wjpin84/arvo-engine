@@ -45,6 +45,10 @@ pub fn prepare(root: &Path) {
     if let Err(err) = crate::risk::ensure(root) {
         eprintln!("arvo-engine: could not write the project risk model in {}: {err}", root.display());
     }
+    // The stores as DuckDB views (ADR-0039), from what is on disk now.
+    if let Err(err) = crate::views::write(root) {
+        eprintln!("arvo-engine: could not write {}/{}: {err}", root.display(), crate::views::FILE);
+    }
 }
 
 /// Registers the staleness check and the option-chain recorder on `jobs`.
@@ -277,7 +281,17 @@ pub fn register(jobs: &Jobs, root: &Path, research: Arc<ResearchService>, raise:
             let root = compacting.clone();
             async move {
                 let today = chrono::Utc::now().date_naive();
-                tokio::task::spawn_blocking(move || crate::option_quotes::compact_finished(&root, today).describe())
+                tokio::task::spawn_blocking(move || {
+                    let done = crate::option_quotes::compact_finished(&root, today);
+                    // A day changed form, so the views say so. A failure here
+                    // costs a stale views file, not the compaction.
+                    if done.days > 0 && crate::project::remembered().is_some() {
+                        if let Err(err) = crate::views::write(&root) {
+                            tracing::warn!(error = %err, "could not rewrite the project's DuckDB views");
+                        }
+                    }
+                    done.describe()
+                })
                     .await
                     .map_err(|err| format!("the compaction did not finish: {err}"))
             }
