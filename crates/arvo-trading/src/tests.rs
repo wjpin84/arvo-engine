@@ -477,7 +477,7 @@ impl crate::Venues for TestVenues {
 }
 
 /// A `Status` as a session starts, since it has no `Default`.
-fn fresh_status() -> Status {
+pub(crate) fn fresh_status() -> Status {
     Status {
         id: "f-1@fake".to_owned(),
         finding: "f-1".to_owned(),
@@ -708,4 +708,62 @@ async fn a_coins_fraction_reaches_the_venue_through_the_session() {
         0,
         "and nothing refused it"
     );
+}
+
+/// The engine's way out (#13): every loop that is up is asked to stop and
+/// given a moment to, so its record ends with `stopped` and not mid-day. One
+/// that will not go is named, and does not hold the engine.
+#[test]
+fn stopping_every_session_waits_for_the_ones_that_listen_and_names_the_one_that_does_not() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let sessions = Sessions::new(dir.path(), broadcast::channel(16).0, std::sync::Arc::new(TestVenues));
+
+    // A loop that ends when asked, the way a session's does between polls.
+    let listens = Arc::new(AtomicBool::new(false));
+    let heard = listens.clone();
+    sessions.adopt(
+        "a-listens@alpaca-paper",
+        listens,
+        std::thread::spawn(move || {
+            while !heard.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }),
+    );
+    // One stuck in a call that never returns. It is let go when the test ends.
+    let release = Arc::new(AtomicBool::new(false));
+    let released = release.clone();
+    sessions.adopt(
+        "b-stuck@alpaca-paper",
+        Arc::new(AtomicBool::new(false)),
+        std::thread::spawn(move || {
+            while !released.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }),
+    );
+    // One whose loop ended by itself: a finding that does not exist.
+    let failed = sessions.start("nope", "alpaca-paper").expect("starts");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while sessions.list().iter().any(|status| status.id == failed.id && status.state == "starting") {
+        assert!(Instant::now() < deadline, "the session never failed");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::thread::sleep(Duration::from_millis(50));
+
+    let started = Instant::now();
+    let done = sessions.stop_all(Duration::from_millis(400));
+    assert_eq!(done.stopped, vec!["a-listens@alpaca-paper".to_owned()]);
+    assert_eq!(done.unfinished, vec!["b-stuck@alpaca-paper".to_owned()], "named, not waited on for ever");
+    assert!(started.elapsed() < Duration::from_secs(2), "one wait for all of them, and a bounded one");
+
+    // Asked again there is nothing left that listens.
+    release.store(true, Ordering::SeqCst);
+    let again = sessions.stop_all(Duration::from_secs(2));
+    assert_eq!(again.stopped, vec!["b-stuck@alpaca-paper".to_owned()], "it ended once it could");
+    assert!(sessions.stop_all(Duration::from_millis(10)).stopped.is_empty());
 }

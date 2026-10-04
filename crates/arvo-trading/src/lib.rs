@@ -92,6 +92,6 @@ mod tests;
 
 pub use promotion::{Promotion, EXECUTORS, PAPER_MINIMUM_DAYS, SUBDIR};
 pub use record::record_path;
-pub use sessions::Sessions;
+pub use sessions::{Sessions, Stopped};
 pub use status::Status;
 pub use venues::Venues;
