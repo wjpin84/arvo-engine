@@ -20,12 +20,21 @@
 //! without the code that rendered it. Storing a flattened view would save a
 //! picture of a finding and lose the finding.
 //!
+//! # Where the curves are
+//!
+//! Not in the record's file. A finding's equity curves are its artifact: the
+//! series a run produced, which the same run over the same bars produces
+//! again. They were 88 percent of one project's store, so they are kept apart
+//! under `artifacts/`, as Parquet, named by a hash of what they say
+//! (ADR-0037, ADR-0039). [`EvidenceStore::save`] takes them out and
+//! [`EvidenceStore::open`] puts them back, so a [`StoredRecord`] in memory is
+//! the whole finding, as it always was. See [`artifact`].
+//!
 //! # What is deliberately not here
 //!
 //! No `StorageProvider` trait. There is one backend, local files, and the
-//! abstraction is earned by a second one or by artifacts big enough to need
-//! content addressing — neither of which exists. `std::fs` is the whole
-//! implementation.
+//! abstraction is earned by a second one, which does not exist. `std::fs` and
+//! one Parquet file per artifact are the whole implementation.
 
 use std::path::{Path, PathBuf};
 
@@ -249,7 +258,12 @@ impl Author {
 /// `missing field \`at\` at line 16903`, which is what four real findings said
 /// after `EquityPoint.date` was renamed and nothing recorded that a rename had
 /// happened.
-pub const SCHEMA: u32 = 1;
+///
+/// `2`: a finding's curves are in an artifact beside the store and not in its
+/// file (ADR-0037). A build that reads `1` would open such a finding and draw
+/// an empty chart without a word, so it has to be told the file is newer than
+/// it is. A `1` finding carries its curves and reads here as it always did.
+pub const SCHEMA: u32 = 2;
 
 /// What produced a finding, beyond the experiment it describes (#189).
 ///
@@ -559,6 +573,42 @@ pub struct Loaded {
     pub problems: Vec<String>,
 }
 
+/// What [`EvidenceStore::rewrite`] did.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Rewritten {
+    /// Findings now in this build's form.
+    pub rewritten: usize,
+    /// Findings that already were.
+    pub already: usize,
+    /// The rewritten findings' files, before and after.
+    pub bytes_before: u64,
+    pub bytes_after: u64,
+    /// Every artifact in the store, which is where the curves went.
+    pub artifact_bytes: u64,
+    /// A finding that could not be rewritten, and why. It is as it was.
+    pub problems: Vec<String>,
+}
+
+impl Rewritten {
+    #[must_use]
+    pub fn describe(&self) -> String {
+        let megabytes = |bytes: u64| bytes as f64 / (1024.0 * 1024.0);
+        let mut said = format!(
+            "{} finding(s) rewritten, {:.1} MB to {:.1} MB of records; {} already in this form; artifacts hold {:.1} MB",
+            self.rewritten,
+            megabytes(self.bytes_before),
+            megabytes(self.bytes_after),
+            self.already,
+            megabytes(self.artifact_bytes)
+        );
+        for problem in &self.problems {
+            said.push_str("\n  ");
+            said.push_str(problem);
+        }
+        said
+    }
+}
+
 /// Findings on disk, one JSON file each.
 ///
 /// A file per record rather than one growing document: writes never rewrite
@@ -577,6 +627,10 @@ impl EvidenceStore {
 
     /// Writes one record, returning where it landed.
     ///
+    /// The record goes down as compact JSON without its curves, and the curves
+    /// as an artifact beside it (see [`artifact`]). Indented, one project's
+    /// store was twice the size it needed to be.
+    ///
     /// # Errors
     ///
     /// Returns [`MemoryError`] if the directory cannot be created, the record
@@ -588,12 +642,96 @@ impl EvidenceStore {
         })?;
 
         let path = self.root.join(format!("{}.json", slug(&record.id)));
-        let encoded = serde_json::to_vec_pretty(record).map_err(MemoryError::Encode)?;
-        std::fs::write(&path, encoded).map_err(|source| MemoryError::Write {
+        std::fs::write(&path, self.encode(record)?).map_err(|source| MemoryError::Write {
             path: path.clone(),
             source,
         })?;
         Ok(path)
+    }
+
+    /// The bytes a record is stored as, with its curves moved to an artifact.
+    ///
+    /// An artifact that cannot be written, or does not read back as written,
+    /// is not a reason to lose the finding: the record is then written whole,
+    /// curves and all, which is how every finding was written before.
+    fn encode(&self, record: &StoredRecord) -> Result<Vec<u8>, MemoryError> {
+        let mut value = serde_json::to_value(record).map_err(MemoryError::Encode)?;
+        // `split` changes nothing unless it succeeds, so there is nothing to
+        // undo here when it does not.
+        let _ = artifact::split(&self.root, &mut value);
+        serde_json::to_vec(&value).map_err(MemoryError::Encode)
+    }
+
+    /// Rewrites every finding in the form this build writes: compact, with
+    /// its curves in an artifact.
+    ///
+    /// For a store written before either existed. It works on the file's own
+    /// JSON and not on the types this build knows, so a field this build has
+    /// never heard of is carried across untouched. Each finding's new bytes
+    /// are read back, their curves put back, and compared with what the file
+    /// held; the file is replaced only when the two are the same. Nothing
+    /// about a finding changes but the format number that says which build can
+    /// read it.
+    ///
+    /// A finding this build cannot read is left alone and named: rewriting
+    /// what cannot be checked is how a store loses things.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MemoryError::Read`] only if the directory cannot be listed.
+    /// A finding that cannot be rewritten is named and left as it was.
+    pub fn rewrite(&self) -> Result<Rewritten, MemoryError> {
+        let mut done = Rewritten::default();
+        for path in self.finding_paths()? {
+            let before = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+            let where_ = path.display().to_string();
+            let outcome = (|| -> Result<bool, String> {
+                let held = std::fs::read(&path).map_err(|err| format!("{where_}: {err}"))?;
+                decode(&self.root, &path, &held)?;
+
+                // The finding as a whole, curves in place, at this format.
+                let mut whole: serde_json::Value =
+                    serde_json::from_slice(&held).map_err(|err| format!("{where_}: {err}"))?;
+                artifact::join(&self.root, &mut whole).map_err(|reason| format!("{where_}: {reason}"))?;
+                if let Some(fields) = whole.as_object_mut() {
+                    fields.insert("schema".to_owned(), SCHEMA.into());
+                }
+
+                let mut stored = whole.clone();
+                let _ = artifact::split(&self.root, &mut stored);
+                let bytes = serde_json::to_vec(&stored).map_err(|err| format!("{where_}: {err}"))?;
+                if bytes == held {
+                    return Ok(false);
+                }
+
+                let mut back: serde_json::Value =
+                    serde_json::from_slice(&bytes).map_err(|err| format!("{where_}: {err}"))?;
+                artifact::join(&self.root, &mut back).map_err(|reason| format!("{where_}: {reason}"))?;
+                if let Some(place) = first_difference(&whole, &back, &mut String::new()) {
+                    return Err(format!(
+                        "{where_}: would not read back as the finding it is ({place}); left as it is"
+                    ));
+                }
+                let partial = path.with_extension("json.partial");
+                std::fs::write(&partial, &bytes)
+                    .and_then(|()| std::fs::rename(&partial, &path))
+                    .map_err(|err| format!("{where_}: {err}"))?;
+                Ok(true)
+            })();
+            match outcome {
+                Ok(true) => {
+                    done.rewritten += 1;
+                    done.bytes_before += before;
+                    done.bytes_after += std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+                }
+                Ok(false) => done.already += 1,
+                Err(problem) => done.problems.push(problem),
+            }
+        }
+        done.artifact_bytes = std::fs::read_dir(self.root.join(artifact::ARTIFACTS_SUBDIR))
+            .map(|entries| entries.flatten().filter_map(|entry| entry.metadata().ok()).map(|meta| meta.len()).sum())
+            .unwrap_or(0);
+        Ok(done)
     }
 
     /// Reads every record, newest first.
@@ -791,26 +929,70 @@ impl EvidenceStore {
     }
 }
 
+/// Where two JSON documents first differ, and how, or `None` when they are
+/// the same. For saying why a rewrite was refused, in terms a person can look
+/// up in the file.
+fn first_difference(was: &serde_json::Value, now: &serde_json::Value, pointer: &mut String) -> Option<String> {
+    use serde_json::Value;
+    match (was, now) {
+        (Value::Object(a), Value::Object(b)) => {
+            for key in a.keys().chain(b.keys().filter(|key| !a.contains_key(*key))) {
+                let length = pointer.len();
+                pointer.push('/');
+                pointer.push_str(key);
+                let found = match (a.get(key), b.get(key)) {
+                    (Some(x), Some(y)) => first_difference(x, y, pointer),
+                    (Some(_), None) => Some(format!("{pointer} would be lost")),
+                    _ => Some(format!("{pointer} would appear")),
+                };
+                if found.is_some() {
+                    return found;
+                }
+                pointer.truncate(length);
+            }
+            None
+        }
+        (Value::Array(a), Value::Array(b)) if a.len() == b.len() => a.iter().zip(b).enumerate().find_map(|(index, (x, y))| {
+            let length = pointer.len();
+            pointer.push_str(&format!("/{index}"));
+            let found = first_difference(x, y, pointer);
+            pointer.truncate(length);
+            found
+        }),
+        (Value::Array(a), Value::Array(b)) => Some(format!("{pointer} holds {} items and would hold {}", a.len(), b.len())),
+        _ if was == now => None,
+        _ => Some(format!("{pointer} is {was} and would be {now}")),
+    }
+}
+
 fn read_record(path: &Path) -> Result<StoredRecord, String> {
-    let text = std::fs::read_to_string(path).map_err(|err| format!("{}: {err}", path.display()))?;
+    let bytes = std::fs::read(path).map_err(|err| format!("{}: {err}", path.display()))?;
+    // The artifacts are beside the findings, under the store the file is in.
+    let root = path.parent().unwrap_or_else(|| Path::new("."));
+    decode(root, path, &bytes)
+}
+
+/// A stored finding from its bytes, with its curves put back from the
+/// artifact under `root`. `path` is only for saying where a problem is.
+fn decode(root: &Path, path: &Path, bytes: &[u8]) -> Result<StoredRecord, String> {
+    // The path stays in every message. A reason without one is a reason
+    // nobody can act on when the store holds hundreds of files.
+    let where_ = path.display();
+    let mut value: serde_json::Value = serde_json::from_slice(bytes).map_err(|err| format!("{where_}: {err}"))?;
 
     // Read the version before the record. A finding written by a newer build
     // fails on whichever field changed first, and "missing field `at`" is a
     // description of a symptom rather than of the problem.
-    let schema = serde_json::from_str::<serde_json::Value>(&text)
-        .ok()
-        .and_then(|value| value.get("schema").and_then(serde_json::Value::as_u64))
-        .unwrap_or(0);
-    // The path stays in every message. A reason without one is a reason
-    // nobody can act on when the store holds hundreds of files.
-    let where_ = path.display();
+    let schema = value.get("schema").and_then(serde_json::Value::as_u64).unwrap_or(0);
     if schema > u64::from(SCHEMA) {
         return Err(format!(
             "{where_}: written by a newer version of Arvo (format {schema}, this build reads {SCHEMA})"
         ));
     }
 
-    serde_json::from_str(&text).map_err(|err| {
+    artifact::join(root, &mut value).map_err(|reason| format!("{where_}: {reason}"))?;
+
+    serde_json::from_value(value).map_err(|err| {
         if schema < u64::from(SCHEMA) {
             format!(
                 "{where_}: written by an older version of Arvo (format {schema}) and cannot be read: {err}"
@@ -820,6 +1002,8 @@ fn read_record(path: &Path) -> Result<StoredRecord, String> {
         }
     })
 }
+
+pub mod artifact;
 
 #[cfg(test)]
 pub(crate) mod tests;

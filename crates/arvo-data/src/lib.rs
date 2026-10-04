@@ -26,6 +26,7 @@ pub mod interval;
 pub mod option;
 pub mod quality;
 pub mod quotes;
+pub mod series;
 pub mod session;
 pub mod signal;
 

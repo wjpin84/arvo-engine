@@ -41,7 +41,8 @@ const USAGE: &str = "usage:
   arvo-engine [<data-dir>] pine <file> [--interval 1day] [--keep]   read a Pine v5 strategy as a rule; --keep writes it under rules/
   arvo-engine [<data-dir>] option-quotes spreads <symbol>   what the recorded chains say an option costs to cross, by premium
   arvo-engine [<data-dir>] option-quotes compact   rewrite every finished day of recorded quotes as Parquet
-  arvo-engine [<data-dir>] views [--print]       the project's stores as DuckDB views, written to .arvo/views.sql; --print shows them and writes nothing";
+  arvo-engine [<data-dir>] views [--print]       the project's stores as DuckDB views, written to .arvo/views.sql; --print shows them and writes nothing
+  arvo-engine [<data-dir>] evidence rewrite      rewrite every finding compact, with its curves in an artifact; stop the engine first";
 
 async fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -72,6 +73,12 @@ async fn run() -> Result<(), String> {
         if verb == "views" && std::path::Path::new(dir).is_dir() {
             return views_command(&PathBuf::from(dir), rest);
         }
+        if verb == "evidence" && std::path::Path::new(dir).is_dir() {
+            return evidence_command(&PathBuf::from(dir), rest);
+        }
+    }
+    if args.first().map(String::as_str) == Some("evidence") {
+        return evidence_command(&research::default_root()?, &args[1..]);
     }
     if args.first().map(String::as_str) == Some("views") {
         return views_command(&research::default_root()?, &args[1..]);
@@ -346,6 +353,47 @@ fn option_quotes_command(root: &std::path::Path, args: &[String]) -> Result<(), 
                 Ok(())
             } else {
                 Err(format!("{} day(s) could not be compacted and are still CSV", done.failed.len()))
+            }
+        }
+        _ => Err(USAGE.to_owned()),
+    }
+}
+
+/// `evidence rewrite`: every finding under `root` in the form this build
+/// writes, compact and with its curves in an artifact (ADR-0037, ADR-0039).
+///
+/// For a store written before either existed. It refuses while an engine is
+/// serving the directory: that engine may be an older build, which could not
+/// read a finding once it is rewritten, and a session reads its finding when
+/// it starts.
+fn evidence_command(root: &std::path::Path, args: &[String]) -> Result<(), String> {
+    match args {
+        [verb] if verb == "rewrite" => {
+            // The engine serving this folder wrote its engine.json in it, or
+            // in the app data directory when this is the project it remembers.
+            let same = |a: &std::path::Path, b: &std::path::Path| {
+                std::fs::canonicalize(a).ok().zip(std::fs::canonicalize(b).ok()).is_some_and(|(a, b)| a == b)
+            };
+            let remembered = arvo_service::project::remembered().is_some_and(|project| same(&project, root));
+            let serving = discovery::running(root).or_else(|| {
+                remembered
+                    .then(|| arvo_service::project::app_data_root().ok())
+                    .flatten()
+                    .and_then(|dir| discovery::running(&dir))
+            });
+            if let Some(found) = serving {
+                return Err(format!(
+                    "an engine is running (pid {}); stop it first, since a build older than this one cannot read a rewritten finding",
+                    found.pid
+                ));
+            }
+            let store = arvo_research::EvidenceStore::new(root.join(arvo_service::research::EVIDENCE_SUBDIR));
+            let done = store.rewrite().map_err(|err| err.to_string())?;
+            println!("{}", done.describe());
+            if done.problems.is_empty() {
+                Ok(())
+            } else {
+                Err(format!("{} finding(s) were left as they were", done.problems.len()))
             }
         }
         _ => Err(USAGE.to_owned()),

@@ -406,6 +406,89 @@ fn a_subject_can_never_escape_the_store_directory() {
     }
 }
 
+/// A study whose out-of-sample evaluation drew something.
+fn drawn(instrument: &str) -> StoredRecord {
+    let mut record = study(instrument, "hash-a");
+    if let Record::Study(evidence) = &mut record {
+        let day = |n: u32| {
+            chrono::NaiveDate::from_ymd_opt(2026, 3, n)
+                .expect("valid")
+                .and_hms_opt(0, 0, 0)
+                .expect("valid")
+        };
+        let curve = |step: f64| -> Vec<crate::EquityPoint> {
+            (1..=5).map(|n| crate::EquityPoint { at: day(n), equity: 100_000.0 + step * f64::from(n) }).collect()
+        };
+        evidence.out_of_sample_evidence.evaluation.strategy_curve = curve(12.34);
+        evidence.out_of_sample_evidence.evaluation.benchmark_curve = curve(-3.5);
+    }
+    StoredRecord::new(record, at(1))
+}
+
+fn artifacts(store: &EvidenceStore) -> usize {
+    std::fs::read_dir(store.root.join(artifact::ARTIFACTS_SUBDIR)).map_or(0, Iterator::count)
+}
+
+/// ADR-0037: the record is the file, the curves are an artifact beside it, and
+/// a finding read back is the finding that was saved.
+#[test]
+fn a_findings_curves_are_kept_beside_its_record_and_come_back_with_it() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = EvidenceStore::new(dir.path());
+    let original = drawn("AAPL.NASDAQ");
+    let path = store.save(&original).expect("should write");
+
+    let text = std::fs::read_to_string(&path).expect("read");
+    assert!(!text.contains("\"equity\""), "no point is left in the record: {text}");
+    assert!(text.contains("\"artifact\""), "and the record says where they went");
+    assert!(!text.contains('\n'), "written compact");
+    assert_eq!(artifacts(&store), 1);
+
+    assert_eq!(store.open(&original.id).expect("opens"), original);
+    assert_eq!(store.load().expect("loads").records, vec![original.clone()]);
+
+    // Attaching a file saves the record again. The curves go back to the same
+    // artifact, and the finding still has them.
+    store.attach(&original.id, "note.txt", "text/plain", b"read this").expect("attaches");
+    let attached = store.open(&original.id).expect("opens");
+    assert_eq!(attached.record, original.record);
+    assert_eq!(artifacts(&store), 1, "the same curves are the same artifact");
+
+    // A second finding that drew the same curves shares the file.
+    let mut twin = drawn("AAPL.NASDAQ");
+    twin.id = format!("{}-again", original.id);
+    store.save(&twin).expect("should write");
+    assert_eq!(artifacts(&store), 1);
+}
+
+/// A store written before the split is rewritten in place, and nothing about
+/// a finding changes but the format number.
+#[test]
+fn an_older_store_is_rewritten_without_changing_a_finding() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = EvidenceStore::new(dir.path());
+    let mut old = drawn("MSFT.NASDAQ");
+    old.schema = 1;
+    let path = dir.path().join(format!("{}.json", slug(&old.id)));
+    // As the build before this wrote it: indented, curves inside.
+    std::fs::write(&path, serde_json::to_vec_pretty(&old).expect("json")).expect("writes");
+    let before = std::fs::metadata(&path).expect("meta").len();
+    assert_eq!(store.open(&old.id).expect("an older finding still opens"), old);
+
+    let done = store.rewrite().expect("rewrites");
+    assert_eq!((done.rewritten, done.already), (1, 0), "{}", done.describe());
+    assert!(done.problems.is_empty(), "{:?}", done.problems);
+    assert!(done.bytes_after < before, "{} is not smaller than {before}", done.bytes_after);
+    assert!(done.artifact_bytes > 0);
+
+    let now = store.open(&old.id).expect("opens");
+    assert_eq!(now.schema, SCHEMA);
+    assert_eq!(StoredRecord { schema: 1, ..now }, old, "the finding is the finding it was");
+
+    let again = store.rewrite().expect("rewrites");
+    assert_eq!((again.rewritten, again.already), (0, 1), "a second pass has nothing to do");
+}
+
 /// A number written is the number read, to the bit, however many times the
 /// finding is saved.
 ///

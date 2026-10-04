@@ -169,11 +169,28 @@ pub fn sql(root: &Path) -> String {
              json_extract_string(provenance, '$.code_commit') AS code_commit,\n       \
              json_extract_string(provenance, '$.ruleset.name') AS ruleset,\n       \
              CAST(json_extract(record, '$.reasons') AS VARCHAR[]) AS reasons,\n       \
+             json_extract_string(artifact, '$.hash') AS artifact,\n       \
              record\n  \
              FROM read_json('evidence/[0-9]*.json', maximum_object_size = 268435456,\n       \
-             columns = {'id': 'VARCHAR', 'recorded_at': 'VARCHAR', 'author': 'JSON', 'provenance': 'JSON', 'record': 'JSON'});"
+             columns = {'id': 'VARCHAR', 'recorded_at': 'VARCHAR', 'author': 'JSON', 'provenance': 'JSON', 'artifact': 'JSON', 'record': 'JSON'});"
                 .to_owned(),
         );
+    }
+
+    // Curves: a finding's series are kept apart from its record, one Parquet
+    // file per artifact, named by a hash of what it holds (ADR-0037). A
+    // finding written before that carries its curves in `record` and has no
+    // row here until the store is rewritten.
+    let artifacts = root.join(crate::research::EVIDENCE_SUBDIR).join(arvo_research::memory::artifact::ARTIFACTS_SUBDIR);
+    if holds(&artifacts, "parquet") {
+        views.push(format!(
+            "-- Every equity curve, by the artifact it is kept in: join to findings on `artifact`.\n\
+             -- `series` is where in the record the curve belongs.\n\
+             CREATE OR REPLACE VIEW curves AS\n\
+             SELECT {} AS artifact, series, \"at\" AS time, value AS equity\n  \
+             FROM read_parquet('evidence/artifacts/*.parquet', filename = true);",
+            stem("parquet")
+        ));
     }
 
     if holds(&root.join("sessions"), "jsonl") {
@@ -254,6 +271,14 @@ mod tests {
         assert!(!text.contains("'dividends' AS \"interval\""), "dividends are a store of their own, not a resolution");
         assert!(!text.contains("VIEW option_quotes"), "nothing recorded yet");
         assert!(!text.contains("VIEW audit"), "no agent has asked anything yet");
+        assert!(!text.contains("VIEW curves"), "a store written before artifacts has no curves beside it");
+
+        // A finding's curves are kept beside its record, and joined on the
+        // hash the record names.
+        put(dir.path(), "evidence/artifacts/0f3a.parquet");
+        let text = sql(dir.path());
+        assert!(text.contains("CREATE OR REPLACE VIEW curves AS"));
+        assert!(text.contains("json_extract_string(artifact, '$.hash') AS artifact"));
     }
 
     #[test]
