@@ -68,7 +68,7 @@ pub use family::{Costed,
     run_family, ExperimentFamily, FamilyEvidence, ParameterGrid, ScoredTrial, Selection,
 };
 pub use memory::{
-    Author, EvidenceStore, Loaded, MemoryError, Record, StoredRecord, Summary, Unreadable, SCHEMA,
+    Author, EvidenceStore, Loaded, MemoryError, Record, Rewritten, StoredRecord, Summary, Unreadable, SCHEMA,
 };
 pub use psr::{period_returns, probabilistic_sharpe};
 pub use regime::{Breakdown, Regime, RegimeOutcome};

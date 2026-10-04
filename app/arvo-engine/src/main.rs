@@ -38,7 +38,11 @@ const USAGE: &str = "usage:
   arvo-engine [<data-dir>] review [YYYY-MM-DD]   the review after the close: written under reviews/, and printed
   arvo-engine [<data-dir>] rank [--rule R] [--instrument I]   the leaderboard: every comparable finding, in the one order
   arvo-engine [<data-dir>] universes [refresh]   the project's universes and their coverage; `refresh` fetches what is missing or behind
-  arvo-engine [<data-dir>] pine <file> [--interval 1day] [--keep]   read a Pine v5 strategy as a rule; --keep writes it under rules/";
+  arvo-engine [<data-dir>] pine <file> [--interval 1day] [--keep]   read a Pine v5 strategy as a rule; --keep writes it under rules/
+  arvo-engine [<data-dir>] option-quotes spreads <symbol>   what the recorded chains say an option costs to cross, by premium
+  arvo-engine [<data-dir>] option-quotes compact   rewrite every finished day of recorded quotes as Parquet
+  arvo-engine [<data-dir>] views [--print]       the project's stores as DuckDB views, written to .arvo/views.sql; --print shows them and writes nothing
+  arvo-engine [<data-dir>] evidence rewrite      rewrite every finding compact, with its curves in an artifact; stop the engine first";
 
 async fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -63,6 +67,24 @@ async fn run() -> Result<(), String> {
         if verb == "pine" && std::path::Path::new(dir).is_dir() {
             return pine_command(PathBuf::from(dir), rest);
         }
+        if verb == "option-quotes" && std::path::Path::new(dir).is_dir() {
+            return option_quotes_command(&PathBuf::from(dir), rest);
+        }
+        if verb == "views" && std::path::Path::new(dir).is_dir() {
+            return views_command(&PathBuf::from(dir), rest);
+        }
+        if verb == "evidence" && std::path::Path::new(dir).is_dir() {
+            return evidence_command(&PathBuf::from(dir), rest);
+        }
+    }
+    if args.first().map(String::as_str) == Some("evidence") {
+        return evidence_command(&research::default_root()?, &args[1..]);
+    }
+    if args.first().map(String::as_str) == Some("views") {
+        return views_command(&research::default_root()?, &args[1..]);
+    }
+    if args.first().map(String::as_str) == Some("option-quotes") {
+        return option_quotes_command(&research::default_root()?, &args[1..]);
     }
     if args.first().map(String::as_str) == Some("pine") {
         return pine_command(research::default_root()?, &args[1..]);
@@ -306,6 +328,99 @@ fn rank_command(root: PathBuf, args: &[String]) -> Result<(), String> {
         eprintln!("arvo-engine: {note}");
     }
     Ok(())
+}
+
+/// `option-quotes spreads <symbol>` and `option-quotes compact`: the recorded
+/// chains under `root`, read and tidied (ADR-0039). Needs no engine.
+///
+/// `spreads` prints what the recording says an option costs to cross, beside
+/// what the cost model charges. It changes nothing: moving the model's
+/// constant re-costs every option study, which is a decision and not a
+/// side effect of reading a table.
+fn option_quotes_command(root: &std::path::Path, args: &[String]) -> Result<(), String> {
+    match args {
+        [verb, symbol] if verb == "spreads" => {
+            for chain in arvo_service::option_quotes::spreads(root, symbol)? {
+                println!("{}", chain.table());
+            }
+            Ok(())
+        }
+        [verb] if verb == "compact" => {
+            let today = chrono::Utc::now().date_naive();
+            let done = arvo_service::option_quotes::compact_finished(root, today);
+            println!("{}", done.describe());
+            if done.failed.is_empty() {
+                Ok(())
+            } else {
+                Err(format!("{} day(s) could not be compacted and are still CSV", done.failed.len()))
+            }
+        }
+        _ => Err(USAGE.to_owned()),
+    }
+}
+
+/// `evidence rewrite`: every finding under `root` in the form this build
+/// writes, compact and with its curves in an artifact (ADR-0037, ADR-0039).
+///
+/// For a store written before either existed. It refuses while an engine is
+/// serving the directory: that engine may be an older build, which could not
+/// read a finding once it is rewritten, and a session reads its finding when
+/// it starts.
+fn evidence_command(root: &std::path::Path, args: &[String]) -> Result<(), String> {
+    match args {
+        [verb] if verb == "rewrite" => {
+            // The engine serving this folder wrote its engine.json in it, or
+            // in the app data directory when this is the project it remembers.
+            let same = |a: &std::path::Path, b: &std::path::Path| {
+                std::fs::canonicalize(a).ok().zip(std::fs::canonicalize(b).ok()).is_some_and(|(a, b)| a == b)
+            };
+            let remembered = arvo_service::project::remembered().is_some_and(|project| same(&project, root));
+            let serving = discovery::running(root).or_else(|| {
+                remembered
+                    .then(|| arvo_service::project::app_data_root().ok())
+                    .flatten()
+                    .and_then(|dir| discovery::running(&dir))
+            });
+            if let Some(found) = serving {
+                return Err(format!(
+                    "an engine is running (pid {}); stop it first, since a build older than this one cannot read a rewritten finding",
+                    found.pid
+                ));
+            }
+            let store = arvo_research::EvidenceStore::new(root.join(arvo_service::research::EVIDENCE_SUBDIR));
+            let done = store.rewrite().map_err(|err| err.to_string())?;
+            println!("{}", done.describe());
+            if done.problems.is_empty() {
+                Ok(())
+            } else {
+                Err(format!("{} finding(s) were left as they were", done.problems.len()))
+            }
+        }
+        _ => Err(USAGE.to_owned()),
+    }
+}
+
+/// `views [--print]`: the stores under `root` as DuckDB views (ADR-0039).
+/// Needs no engine, and the engine links no DuckDB: this writes the file a
+/// person opens with it.
+fn views_command(root: &std::path::Path, args: &[String]) -> Result<(), String> {
+    match args {
+        [flag] if flag == "--print" => {
+            print!("{}", arvo_service::views::sql(root));
+            Ok(())
+        }
+        [] => {
+            let path = arvo_service::views::write(root).map_err(|err| format!("writing the views: {err}"))?;
+            println!(
+                "{}\n\nfrom {}:\n  duckdb -init {}",
+                path.display(),
+                root.display(),
+                arvo_service::views::FILE
+            );
+            Ok(())
+        }
+        _ => Err(USAGE.to_owned()),
+    }
 }
 
 /// `review [YYYY-MM-DD]`: the day's review from the session records under

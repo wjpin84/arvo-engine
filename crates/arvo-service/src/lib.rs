@@ -26,6 +26,7 @@ pub mod scripts;
 pub mod source;
 pub mod stream;
 pub mod universes;
+pub mod views;
 
 pub use arvo_client::CommandError;
 

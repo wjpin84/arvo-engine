@@ -16,8 +16,11 @@
 //! same way a stock feed is part of its venue: a spread measured on it is a
 //! spread *on this feed*, and a model calibrated from it has to say so.
 
+use std::collections::BTreeMap;
+use std::hash::{Hash as _, Hasher as _};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
 
 use arvo_data::option::{OptionContract, Right};
 use arvo_data::source::SourceError;
@@ -59,6 +62,9 @@ pub struct ChainQuote {
 pub struct Recorded {
     pub path: PathBuf,
     pub contracts: usize,
+    /// The chain was the last one over again, so nothing was written: the
+    /// market is closed, whatever the clock said.
+    pub unchanged: bool,
 }
 
 /// Snapshots the chain around the underlying's price and appends it to
@@ -68,8 +74,10 @@ pub struct Recorded {
 /// quote can be placed against the price it was quoted beside. They come from
 /// the IEX feed: for SPY its top of book is the market's, within a cent.
 ///
-/// ponytail: ~3,400 SPY contracts per snapshot, ~9 MB a day at one every fifteen
-/// minutes. Compress closed days if the folder grows past what anyone wants.
+/// About 3,400 SPY contracts per snapshot and 9 MB a day at one every fifteen
+/// minutes. The day's file is a CSV because it is appended to; once the day is
+/// over the engine compacts it to Parquet (`arvo_data::quotes::compact`,
+/// ADR-0039), which is a seventeenth of the size.
 ///
 /// # Errors
 ///
@@ -128,10 +136,44 @@ pub async fn record_chain(
         }
     }
     quotes.sort_by(|a, b| a.symbol.cmp(&b.symbol));
+    append(underlying, dir, now, &quotes, under_bid, under_ask)
+}
 
+/// The chain each underlying was last written with, as a hash of everything a
+/// row holds except the moment it was recorded.
+static LAST: Mutex<BTreeMap<String, u64>> = Mutex::new(BTreeMap::new());
+
+/// Appends one snapshot, unless it is the snapshot before it over again.
+///
+/// A closed market answers every request with the same chain: the same quotes
+/// at the same times beside the same underlying price. Written every fifteen
+/// minutes that is the close recorded twenty-six times, which is what two
+/// weekends of this folder were (arvo-engine#28). The session check keeps the
+/// recorder off a weekend; this keeps it quiet on a holiday and after an early
+/// close, which no clock here knows about.
+///
+/// ponytail: the memory is this process's, so the first snapshot after a
+/// restart is always written. Compaction drops a repeat that got through.
+fn append(
+    underlying: &str,
+    dir: &Path,
+    now: DateTime<Utc>,
+    quotes: &[ChainQuote],
+    under_bid: f64,
+    under_ask: f64,
+) -> Result<Recorded, SourceError> {
     let folder = dir.join(format!("{underlying}.{FEED}"));
-    std::fs::create_dir_all(&folder).map_err(io)?;
     let path = folder.join(format!("{}.csv", now.date_naive()));
+    let identity = identity(quotes, under_bid, under_ask);
+    let seen = |last: &BTreeMap<String, u64>| last.get(underlying) == Some(&identity);
+    if seen(&LAST.lock().unwrap_or_else(PoisonError::into_inner)) {
+        return Ok(Recorded {
+            path,
+            contracts: 0,
+            unchanged: true,
+        });
+    }
+    std::fs::create_dir_all(&folder).map_err(io)?;
     let fresh = !path.exists();
     let mut file = std::fs::OpenOptions::new()
         .create(true)
@@ -143,21 +185,42 @@ pub async fn record_chain(
         text.push_str(HEADER);
         text.push('\n');
     }
-    for quote in &quotes {
+    for quote in quotes {
         text.push_str(&row(now, quote, under_bid, under_ask));
         text.push('\n');
     }
     // One write, so a crash mid-snapshot leaves at most one torn line rather
     // than a snapshot that silently holds half the chain.
     file.write_all(text.as_bytes()).map_err(io)?;
+    LAST.lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(underlying.to_owned(), identity);
 
     Ok(Recorded {
         path,
         contracts: quotes.len(),
+        unchanged: false,
     })
 }
 
-const HEADER: &str = "recorded_at,symbol,expiration,right,strike,quote_at,bid,ask,bid_size,ask_size,underlying_bid,underlying_ask";
+/// What a snapshot says, apart from when it was taken.
+fn identity(quotes: &[ChainQuote], under_bid: f64, under_ask: f64) -> u64 {
+    // In-process only, so the hasher need not be stable across builds.
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    under_bid.to_bits().hash(&mut hasher);
+    under_ask.to_bits().hash(&mut hasher);
+    for quote in quotes {
+        quote.symbol.hash(&mut hasher);
+        quote.quote_at.timestamp_millis().hash(&mut hasher);
+        for value in [quote.bid, quote.ask, quote.bid_size, quote.ask_size] {
+            value.to_bits().hash(&mut hasher);
+        }
+    }
+    hasher.finish()
+}
+
+// The columns, stated once where the file is also read and compacted.
+use arvo_data::quotes::HEADER;
 
 fn row(recorded_at: DateTime<Utc>, q: &ChainQuote, under_bid: f64, under_ask: f64) -> String {
     format!(
@@ -287,5 +350,51 @@ mod tests {
         let line = row(quote.quote_at, &quote, 762.17, 762.32);
         assert_eq!(line.split(',').count(), HEADER.split(',').count());
         assert!(line.contains(",2.27,2.28,147,47,762.17,762.32"));
+    }
+
+    #[test]
+    fn a_chain_that_has_not_changed_is_not_written_again() {
+        let quote = |bid: f64| ChainQuote {
+            symbol: "TEST260914C00760000".to_owned(),
+            contract: OptionContract::parse("TEST260914C00760000").expect("valid"),
+            quote_at: DateTime::parse_from_rfc3339("2026-10-02T19:59:59Z")
+                .expect("valid")
+                .with_timezone(&Utc),
+            bid,
+            ask: 2.28,
+            bid_size: 147.0,
+            ask_size: 47.0,
+        };
+        let at = |minute: u32| {
+            DateTime::parse_from_rfc3339(&format!("2026-10-05T14:{minute:02}:00Z"))
+                .expect("valid")
+                .with_timezone(&Utc)
+        };
+        let dir = std::env::temp_dir().join(format!("arvo-option-quotes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let lines = |path: &Path| std::fs::read_to_string(path).expect("read").lines().count();
+
+        // A name no other test records, since the memory is the process's.
+        let first = append("TEST", &dir, at(0), &[quote(2.27)], 762.17, 762.32).expect("written");
+        assert!(!first.unchanged);
+        assert_eq!(lines(&first.path), 2, "the header and one quote");
+
+        // Fifteen minutes on a closed market: the same chain. Nothing is
+        // written, and the caller is told why.
+        let again = append("TEST", &dir, at(15), &[quote(2.27)], 762.17, 762.32).expect("skipped");
+        assert!(again.unchanged);
+        assert_eq!(again.contracts, 0);
+        assert_eq!(lines(&first.path), 2, "the same snapshot twice is one snapshot");
+
+        // One quote moves and it is a new snapshot.
+        let moved = append("TEST", &dir, at(30), &[quote(2.26)], 762.17, 762.32).expect("written");
+        assert!(!moved.unchanged);
+        assert_eq!(lines(&first.path), 3);
+
+        // The underlying moving is news too, with the chain as it was.
+        let beside = append("TEST", &dir, at(45), &[quote(2.26)], 762.20, 762.35).expect("written");
+        assert!(!beside.unchanged);
+        assert_eq!(lines(&first.path), 4);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
