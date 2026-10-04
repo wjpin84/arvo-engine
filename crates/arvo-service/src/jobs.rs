@@ -216,16 +216,20 @@ pub fn register(jobs: &Jobs, root: &Path, research: Arc<ResearchService>, raise:
             async move {
                 let now = chrono::Utc::now();
                 if !arvo_data::session::in_regular_session(now.naive_utc()) {
-                    return Ok("outside the regular session".to_owned());
+                    return Ok("outside the regular session: a weekend, or before the open or after the close".to_owned());
                 }
                 // Every underlying the project asked for (#230). One that
                 // fails is named and the rest are still recorded: a chain
                 // missed today cannot be fetched tomorrow (#83).
                 let (symbols, complaint) = crate::option_quotes::wanted(&root);
                 let mut said: Vec<String> = complaint.into_iter().collect();
-                let (mut recorded, mut asleep) = (0usize, 0usize);
+                let (mut recorded, mut asleep, mut unchanged) = (0usize, 0usize, 0usize);
                 for symbol in &symbols {
                     match crate::source::alpaca::options::record_chain(symbol, &dir, now).await {
+                        // The chain is the last one over again: a holiday or
+                        // an early close, which the session check cannot see
+                        // (arvo-engine#28). Nothing was written.
+                        Ok(chain) if chain.unchanged => unchanged += 1,
                         Ok(chain) => {
                             recorded += 1;
                             said.push(format!("{symbol} {}", chain.contracts));
@@ -236,6 +240,12 @@ pub fn register(jobs: &Jobs, root: &Path, research: Arc<ResearchService>, raise:
                 }
                 if asleep == symbols.len() {
                     return Ok("no Alpaca session".to_owned());
+                }
+                if unchanged > 0 && recorded == 0 && said.is_empty() {
+                    return Ok("nothing recorded: no chain has changed since the last snapshot, so the market is closed".to_owned());
+                }
+                if unchanged > 0 {
+                    said.push(format!("{unchanged} unchanged and not written"));
                 }
                 // The day's cost on disk, which is one of the three numbers
                 // that decide whether the library needs a different store.

@@ -18,9 +18,20 @@
 //! tz database for one question, and clocks change at 02:00 on a Sunday, so
 //! the date alone decides every instant a session can contain.
 //!
+//! # A clock asks this too, not only a bar
+//!
+//! A bar on a Saturday does not exist, so for bars the time of day was the
+//! whole question. But the option-quote recorder and a live session ask it of
+//! *now*, and now is a Saturday twice a week: the recorder kept Friday's close
+//! every fifteen minutes all weekend, and a session called a silent feed dark
+//! (arvo-engine#28). So a weekend is outside the session, whatever the time.
+//!
 //! ponytail: no exchange calendar, so an early close (13:00 the day after
-//! Thanksgiving) still counts 13:00–16:00 as regular. Holidays need nothing:
-//! no bars exist to misclassify.
+//! Thanksgiving) still counts 13:00–16:00 as regular, and a weekday holiday
+//! counts as open. No bars exist to misclassify on a holiday; a clock that
+//! asks on one is told the market is open, and the recorder's own check for an
+//! unchanged chain is what keeps it quiet. Add the calendar when a third
+//! caller needs the day rather than the hour.
 
 use chrono::{Datelike, Duration, NaiveDate, NaiveDateTime, NaiveTime, Weekday};
 
@@ -28,16 +39,20 @@ use chrono::{Datelike, Duration, NaiveDate, NaiveDateTime, NaiveTime, Weekday};
 /// bars in exchange time. Bars themselves are UTC.
 pub const ZONE: &str = "America/New_York";
 
-/// Whether a bar opening at `open` (UTC) falls inside the US regular session.
+/// Whether a bar opening at `open` (UTC) falls inside the US regular session:
+/// 09:30 to 16:00 New York time, Monday to Friday.
 #[must_use]
 pub fn in_regular_session(open: NaiveDateTime) -> bool {
     let offset = if daylight_saving(open.date()) { 4 } else { 5 };
-    let local = (open - Duration::hours(offset)).time();
+    let local = open - Duration::hours(offset);
+    if matches!(local.weekday(), Weekday::Sat | Weekday::Sun) {
+        return false;
+    }
     let (start, end) = (
         NaiveTime::from_hms_opt(9, 30, 0).expect("valid"),
         NaiveTime::from_hms_opt(16, 0, 0).expect("valid"),
     );
-    local >= start && local < end
+    local.time() >= start && local.time() < end
 }
 
 /// The regular close on `date`, 16:00 New York, as a UTC instant.
@@ -95,6 +110,16 @@ mod tests {
     fn pre_market_and_after_hours_are_outside() {
         assert!(!in_regular_session(utc(2024, 7, 1, 8, 0)), "04:00 EDT");
         assert!(!in_regular_session(utc(2024, 7, 1, 23, 55)), "19:55 EDT");
+    }
+
+    #[test]
+    fn a_weekend_is_outside_the_session_at_any_hour() {
+        // 2026-10-02 is a Friday. The recorder ran at this hour on the two
+        // days after it and wrote Friday's close 26 times each (arvo-engine#28).
+        assert!(in_regular_session(utc(2026, 10, 2, 14, 38)), "Friday 10:38 EDT");
+        assert!(!in_regular_session(utc(2026, 10, 3, 14, 38)), "Saturday 10:38 EDT");
+        assert!(!in_regular_session(utc(2026, 10, 4, 14, 38)), "Sunday 10:38 EDT");
+        assert!(in_regular_session(utc(2026, 10, 5, 14, 38)), "Monday 10:38 EDT");
     }
 
     #[test]

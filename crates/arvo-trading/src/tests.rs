@@ -264,6 +264,12 @@ fn silence_on_the_feed_is_a_dead_feed_only_while_the_market_is_open() {
     assert!(!silence_matters(Hours::Regular, at(12, 49)), "08:49 New York, before the open");
     assert!(silence_matters(Hours::Continuous, at(22, 14)), "crypto never closes");
     assert!(silence_matters(Hours::Continuous, at(3, 0)));
+    // A weekend is the calendar too. On Sunday 2026-10-04 at 10:38 New York
+    // the record shows a freeze and a thaw for a market that was never open
+    // (arvo-engine#28).
+    let sunday = chrono::NaiveDate::from_ymd_opt(2026, 10, 4).unwrap().and_hms_opt(14, 38, 0).unwrap();
+    assert!(!silence_matters(Hours::Regular, sunday), "Sunday 10:38 New York");
+    assert!(silence_matters(Hours::Continuous, sunday), "a coin trades on a Sunday");
 }
 
 #[test]
