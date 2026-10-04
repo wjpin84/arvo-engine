@@ -301,7 +301,7 @@ pub fn expected_best_of(sharpes: &[f64], trials: usize) -> Option<f64> {
 /// where the asymptotic form is out by half.
 fn expected_maximum(n: f64) -> f64 {
     /// Euler-Mascheroni.
-    const GAMMA: f64 = 0.577_215_664_901_532_9;
+    const GAMMA: f64 = std::f64::consts::EULER_GAMMA;
 
     (1.0 - GAMMA) * inverse_normal_cdf(1.0 - 1.0 / n)
         + GAMMA * inverse_normal_cdf(1.0 - 1.0 / (n * std::f64::consts::E))
