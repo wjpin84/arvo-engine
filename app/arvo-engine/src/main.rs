@@ -30,6 +30,7 @@ async fn main() {
 
 const USAGE: &str = "usage:
   arvo-engine [<data-dir>]                       serve; the app data directory when none is given
+  arvo-engine [<data-dir>] shutdown              stop that engine: its sessions end with `stopped`, its plugins stop, and it exits; positions are not touched
   arvo-engine [<data-dir>] session list          the verbs reach the engine serving <data-dir>,
   arvo-engine [<data-dir>] session start <finding> <executor>   or the app data one when none is given
   arvo-engine [<data-dir>] session stop|reconcile|resume <id>
@@ -49,11 +50,17 @@ async fn run() -> Result<(), String> {
     if args.first().map(String::as_str) == Some("session") {
         return session_command(None, &args[1..]).await;
     }
+    if args.first().map(String::as_str) == Some("shutdown") {
+        return shutdown_command(None, &args[1..]).await;
+    }
     // `arvo-engine <data-dir> session …`: the verbs against the engine that
     // serves that directory, which wrote its engine.json there (#223).
     if let [dir, verb, rest @ ..] = args.as_slice() {
         if verb == "session" && std::path::Path::new(dir).is_dir() {
             return session_command(Some(PathBuf::from(dir)), rest).await;
+        }
+        if verb == "shutdown" && std::path::Path::new(dir).is_dir() {
+            return shutdown_command(Some(PathBuf::from(dir)), rest).await;
         }
         if verb == "review" && std::path::Path::new(dir).is_dir() {
             return review_command(PathBuf::from(dir), rest);
@@ -184,6 +191,7 @@ async fn run() -> Result<(), String> {
     };
     tokio::spawn(streaming);
 
+    let hosted = sessions.clone();
     let engine =
         grpc::Engine { research: research::Research::new(&data), sessions, events, jobs, plugins, stream, ticks, stop };
     let served = grpc::serve(listener, engine, &tokens, async {
@@ -193,11 +201,120 @@ async fn run() -> Result<(), String> {
         }
     })
     .await;
+    // The way out, in the order things depend on each other. Sessions first:
+    // each loop finishes its poll and writes `stopped`, so a record that ends
+    // here reads as an engine that was stopped and not one that died (#13).
+    // Positions are left as they are. On a blocking thread, since it waits on
+    // other threads.
+    let ended = tokio::task::spawn_blocking(move || hosted.stop_all(SESSIONS_GRACE)).await.unwrap_or_default();
+    for id in &ended.stopped {
+        eprintln!("arvo-engine: stopped {id}; its positions are as they were");
+    }
+    for id in &ended.unfinished {
+        eprintln!(
+            "arvo-engine: {id} did not stop within {} seconds; its record will not end with `stopped`",
+            SESSIONS_GRACE.as_secs()
+        );
+    }
     // Nothing this started lingers (ADR-0023 point 5), now that this is what
     // started it.
     stopping.stop_all().await;
+    // Last, because it is what `shutdown` waits for: once the file is gone the
+    // engine has nothing left to do but return.
     discovery::remove_if_ours(&root, pid);
     served.map_err(|err| format!("serving: {err}"))
+}
+
+/// How long the sessions get to finish their poll when the engine stops. A
+/// loop wakes every second to look, so this is room for a call in flight to a
+/// venue and no more.
+const SESSIONS_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// `shutdown`: asks the engine serving `dir` to stop, and waits until it has.
+///
+/// The engine stops its sessions so each record ends with `stopped`, stops the
+/// plugins it started, removes its `engine.json` and exits. Killing the
+/// process does none of that: no destructor runs, the plugins are orphaned,
+/// and a session's record just ends. Positions are not touched; `session halt`
+/// is the kill switch.
+///
+/// No engine running is not an error: the thing asked for is already true,
+/// and `arvo-engine shutdown` followed by a build should not fail on a
+/// machine where the engine was not up.
+async fn shutdown_command(dir: Option<PathBuf>, args: &[String]) -> Result<(), String> {
+    use arvo_engine::grpc::proto::common::Empty;
+    use arvo_engine::grpc::proto::services::sessions_client::SessionsClient;
+
+    if !args.is_empty() {
+        return Err(USAGE.to_owned());
+    }
+    let data = match &dir {
+        Some(dir) => dir.clone(),
+        None => research::default_root()?,
+    };
+    let root = match dir {
+        Some(dir) => dir,
+        None => arvo_service::project::app_data_root().map_err(|err| format!("no app data directory: {err}"))?,
+    };
+    let Some(found) = discovery::running(&root) else {
+        println!("no engine is running for {}", root.display());
+        return Ok(());
+    };
+    let token = discovery::read_control(&root).ok_or("no control.json beside engine.json")?;
+    let mut client = SessionsClient::connect(format!("http://{}", found.address))
+        .await
+        .map_err(|err| format!("connecting to the engine: {err}"))?;
+    let bearer = |message| arvo_client::request(&token, message).map_err(|err| err.to_string());
+
+    // Which sessions are up, so the answer can say what became of each.
+    let live: Vec<String> = client
+        .list_sessions(bearer(Empty {})?)
+        .await
+        .map_err(|err| err.message().to_owned())?
+        .into_inner()
+        .sessions
+        .into_iter()
+        .filter(|status| matches!(status.state.as_str(), "starting" | "running" | "frozen" | "halted"))
+        .map(|status| status.id)
+        .collect();
+    client.shutdown(bearer(Empty {})?).await.map_err(|err| err.message().to_owned())?;
+
+    // Gone when its engine.json no longer names it: removing that file is the
+    // last thing the engine does.
+    let patience = SESSIONS_GRACE + grpc::STREAMS_GRACE + std::time::Duration::from_secs(20);
+    let deadline = std::time::Instant::now() + patience;
+    while discovery::read(&root).is_some_and(|still| still.pid == found.pid) {
+        if std::time::Instant::now() > deadline {
+            return Err(format!(
+                "asked the engine (pid {}) to stop and it has not after {} seconds; it can be ended with the operating system, which orphans its plugins",
+                found.pid,
+                patience.as_secs()
+            ));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    // The file goes a moment before the process does, and on Windows the
+    // binary stays locked until the process has.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    println!("the engine (pid {}) has stopped", found.pid);
+    for id in &live {
+        let path = arvo_trading::record_path(&data, id);
+        let ended_with_stopped = std::fs::read_to_string(&path).ok().is_some_and(|record| {
+            record
+                .lines()
+                .rev()
+                .find(|line| !line.trim().is_empty())
+                .and_then(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .is_some_and(|line| line.get("event").and_then(serde_json::Value::as_str) == Some("stopped"))
+        });
+        if ended_with_stopped {
+            println!("  {id}: stopped, positions as they were");
+        } else {
+            println!("  {id}: its record does not end with `stopped`; see {}", path.display());
+        }
+    }
+    Ok(())
 }
 
 /// `pine <file> [--interval I] [--keep]`: reads a Pine v5 strategy as a rule

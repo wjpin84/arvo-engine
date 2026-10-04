@@ -167,7 +167,14 @@ pub async fn serve(
         ScriptsServer::new(Scripts { scripts }).max_decoding_message_size(MAX_MESSAGE_BYTES),
         control(),
     );
-    tonic::transport::Server::builder()
+    // The server stops gracefully: it takes no new call and waits for the
+    // ones in flight. A call that streams is in flight for as long as someone
+    // is listening, and a window listens to events for as long as it is open,
+    // so "wait for them" on its own means an engine that is asked to stop and
+    // does not. They get a moment to notice, and then the engine goes.
+    let asked = std::sync::Arc::new(tokio::sync::Notify::new());
+    let heard = asked.clone();
+    let server = tonic::transport::Server::builder()
         .add_service(research_tier)
         .add_service(sessions_tier)
         .add_service(market_tier)
@@ -176,9 +183,23 @@ pub async fn serve(
         .add_service(platform_tier)
         .add_service(files_tier)
         .add_service(scripts_tier)
-        .serve_with_incoming_shutdown(tokio_stream::wrappers::TcpListenerStream::new(listener), shutdown)
-        .await
+        .serve_with_incoming_shutdown(tokio_stream::wrappers::TcpListenerStream::new(listener), async move {
+            shutdown.await;
+            heard.notify_one();
+        });
+    tokio::select! {
+        served = server => served,
+        () = async {
+            asked.notified().await;
+            tokio::time::sleep(STREAMS_GRACE).await;
+        } => Ok(()),
+    }
 }
+
+/// How long a call still streaming may hold the server once it has been asked
+/// to stop. Long enough for a reply already on its way; short enough that
+/// `shutdown` followed by a build does not sit and wait for a window.
+pub const STREAMS_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// An interceptor admitting only `Bearer <token>`.
 fn bearer(token: &str, file: &'static str) -> impl Fn(Request<()>) -> Result<Request<()>, Status> + Clone {
@@ -1366,6 +1387,13 @@ mod tests {
 
     /// A served engine over an empty app data directory, and a way to stop it.
     async fn engine() -> (tempfile::TempDir, String, tokio::sync::oneshot::Sender<()>) {
+        let (dir, address, stop, _serving) = engine_and_its_task().await;
+        (dir, address, stop)
+    }
+
+    /// The same, with the task the server runs on, for a test about it ending.
+    async fn engine_and_its_task(
+    ) -> (tempfile::TempDir, String, tokio::sync::oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
         let dir = tempfile::tempdir().expect("tempdir");
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let address = format!("http://{}", listener.local_addr().expect("address"));
@@ -1377,7 +1405,7 @@ mod tests {
         // The path, not the handle: `dir` is returned to the test so the
         // directory outlives the server.
         let root = dir.path().to_path_buf();
-        tokio::spawn(async move {
+        let serving = tokio::spawn(async move {
             let jobs = arvo_schedule::Jobs::new(std::sync::Arc::new(|future| {
                 let handle = tokio::spawn(future);
                 Box::new(move || handle.abort())
@@ -1398,7 +1426,39 @@ mod tests {
             .await
             .expect("serves");
         });
-        (dir, address, stop)
+        (dir, address, stop, serving)
+    }
+
+    /// A window listens to the engine's events for as long as it is open. A
+    /// server that waited for every call in flight would, asked to stop, wait
+    /// for the window to close first.
+    #[tokio::test]
+    async fn a_listener_still_listening_does_not_hold_the_engine_open() {
+        let (_dir, address, stop, serving) = engine_and_its_task().await;
+        let mut client = ResearchClient::connect(address).await.expect("connects");
+        // Held open for the whole test: this is the window that has not closed.
+        let _events = client.subscribe(with_token(Empty {}, TOKEN)).await.expect("subscribed").into_inner();
+
+        let asked = std::time::Instant::now();
+        stop.send(()).expect("the server is waiting for this");
+        tokio::time::timeout(STREAMS_GRACE + std::time::Duration::from_secs(3), serving)
+            .await
+            .expect("the server ends although someone is still subscribed")
+            .expect("and ends cleanly");
+        assert!(asked.elapsed() >= STREAMS_GRACE, "the listener was given its moment first");
+        // The listener's connection goes when the process does, which is the
+        // next thing the engine does and not something a test in one process
+        // can show.
+    }
+
+    /// With nobody listening there is nothing to wait for.
+    #[tokio::test]
+    async fn an_engine_nobody_is_listening_to_stops_at_once() {
+        let (_dir, _address, stop, serving) = engine_and_its_task().await;
+        let asked = std::time::Instant::now();
+        stop.send(()).expect("the server is waiting for this");
+        tokio::time::timeout(std::time::Duration::from_secs(3), serving).await.expect("ends").expect("cleanly");
+        assert!(asked.elapsed() < STREAMS_GRACE, "{:?} is the grace, spent on nobody", asked.elapsed());
     }
 
     /// Stopping the engine is a control action, and it exists because a

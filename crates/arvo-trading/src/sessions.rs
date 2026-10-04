@@ -20,6 +20,16 @@ use crate::run::run;
 use crate::venues::Venues;
 use crate::status::{announce, Command, Mailbox, Running, Status};
 
+/// What [`Sessions::stop_all`] did.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Stopped {
+    /// Sessions whose loop was up and has ended: each record's last line is
+    /// `stopped`.
+    pub stopped: Vec<String>,
+    /// Sessions that had not ended when the wait ran out.
+    pub unfinished: Vec<String>,
+}
+
 /// Every session this engine is hosting.
 pub struct Sessions {
     data: PathBuf,
@@ -228,6 +238,66 @@ impl Sessions {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         Ok(status)
+    }
+
+    /// Asks every session whose loop is still up to stop, and waits up to
+    /// `within` for them to do it. For the engine's way out.
+    ///
+    /// An engine that simply ended took its sessions' threads with it, and a
+    /// record that stops mid-day with no `stopped` line reads the same as a
+    /// crash (#13). Asked this way each loop finishes its poll and writes the
+    /// line. Positions are left as they are, as with [`Self::stop`]: stopping
+    /// is not flattening.
+    ///
+    /// All are asked before any is waited for, so the wait is one poll and not
+    /// one poll each. A session that does not end in time is named and left:
+    /// the engine is going down either way, and that record will end without
+    /// its line, which is the truth about it.
+    pub fn stop_all(&self, within: Duration) -> Stopped {
+        let mut running = self
+            .running
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Only a loop that is still up has anything to stop. One that failed
+        // or was stopped already has said so in its own record.
+        let live: Vec<String> = running
+            .iter()
+            .filter(|(_, found)| found.thread.as_ref().is_some_and(|thread| !thread.is_finished()))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &live {
+            if let Some(found) = running.get(id) {
+                found.stop.store(true, Ordering::SeqCst);
+            }
+        }
+        let deadline = std::time::Instant::now() + within;
+        let mut done = Stopped::default();
+        for id in live {
+            let Some(found) = running.get_mut(&id) else { continue };
+            let Some(thread) = found.thread.take() else { continue };
+            while !thread.is_finished() && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            if thread.is_finished() {
+                let _ = thread.join();
+                done.stopped.push(id);
+            } else {
+                found.thread = Some(thread);
+                done.unfinished.push(id);
+            }
+        }
+        done
+    }
+
+    /// A session whose thread is `thread`, for a test that needs a loop it
+    /// controls rather than one that opens a finding.
+    #[cfg(test)]
+    pub(crate) fn adopt(&self, id: &str, stop: Arc<AtomicBool>, thread: std::thread::JoinHandle<()>) {
+        let status = Arc::new(Mutex::new(crate::tests::fresh_status()));
+        self.running
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(id.to_owned(), Running { status, stop, mailbox: Mailbox::default(), thread: Some(thread) });
     }
 
     /// Makes a frozen session's gate agree with the venue. The session stays
