@@ -23,6 +23,11 @@ serde.workspace = true
 # the shape serde already writes, and already compiled in this graph.
 serde_json = "1"
 thiserror.workspace = true
+# Series are stored as Parquet (ADR-0039), beginning with recorded option
+# quotes. No default features: the low-level reader and writer are enough, so
+# arrow stays out of the graph. zstd is the one codec a file here is written
+# with.
+parquet = { version = "60", default-features = false, features = ["zstd"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }

@@ -74,8 +74,10 @@ pub struct Recorded {
 /// quote can be placed against the price it was quoted beside. They come from
 /// the IEX feed: for SPY its top of book is the market's, within a cent.
 ///
-/// ponytail: ~3,400 SPY contracts per snapshot, ~9 MB a day at one every fifteen
-/// minutes. Compress closed days if the folder grows past what anyone wants.
+/// About 3,400 SPY contracts per snapshot and 9 MB a day at one every fifteen
+/// minutes. The day's file is a CSV because it is appended to; once the day is
+/// over the engine compacts it to Parquet (`arvo_data::quotes::compact`,
+/// ADR-0039), which is a seventeenth of the size.
 ///
 /// # Errors
 ///
@@ -217,7 +219,8 @@ fn identity(quotes: &[ChainQuote], under_bid: f64, under_ask: f64) -> u64 {
     hasher.finish()
 }
 
-const HEADER: &str = "recorded_at,symbol,expiration,right,strike,quote_at,bid,ask,bid_size,ask_size,underlying_bid,underlying_ask";
+// The columns, stated once where the file is also read and compacted.
+use arvo_data::quotes::HEADER;
 
 fn row(recorded_at: DateTime<Utc>, q: &ChainQuote, under_bid: f64, under_ask: f64) -> String {
     format!(

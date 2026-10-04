@@ -262,4 +262,25 @@ pub fn register(jobs: &Jobs, root: &Path, research: Arc<ResearchService>, raise:
             }
         },
     );
+
+    // A finished day of quotes becomes Parquet (ADR-0039): the same rows in a
+    // seventeenth of the bytes, and readable. Hourly, because nothing is
+    // waiting on it: a day is finished from the moment the date turns, and
+    // the first pass after that does the work. On a blocking thread: it reads
+    // and rewrites whole files.
+    let compacting = root.to_path_buf();
+    jobs.every(
+        "option-quotes-compact",
+        "Compact finished days of option quotes",
+        std::time::Duration::from_secs(60 * 60),
+        move || {
+            let root = compacting.clone();
+            async move {
+                let today = chrono::Utc::now().date_naive();
+                tokio::task::spawn_blocking(move || crate::option_quotes::compact_finished(&root, today).describe())
+                    .await
+                    .map_err(|err| format!("the compaction did not finish: {err}"))
+            }
+        },
+    );
 }

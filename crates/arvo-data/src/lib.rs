@@ -25,6 +25,7 @@ pub mod instrument;
 pub mod interval;
 pub mod option;
 pub mod quality;
+pub mod quotes;
 pub mod session;
 pub mod signal;
 
@@ -102,6 +103,8 @@ pub enum DataError {
         #[source]
         source: std::io::Error,
     },
+    #[error("{path}: {reason}")]
+    Parquet { path: PathBuf, reason: String },
     #[error("{path} line {line}: {reason}")]
     Malformed {
         path: PathBuf,

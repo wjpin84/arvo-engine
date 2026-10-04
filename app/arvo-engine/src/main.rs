@@ -38,7 +38,9 @@ const USAGE: &str = "usage:
   arvo-engine [<data-dir>] review [YYYY-MM-DD]   the review after the close: written under reviews/, and printed
   arvo-engine [<data-dir>] rank [--rule R] [--instrument I]   the leaderboard: every comparable finding, in the one order
   arvo-engine [<data-dir>] universes [refresh]   the project's universes and their coverage; `refresh` fetches what is missing or behind
-  arvo-engine [<data-dir>] pine <file> [--interval 1day] [--keep]   read a Pine v5 strategy as a rule; --keep writes it under rules/";
+  arvo-engine [<data-dir>] pine <file> [--interval 1day] [--keep]   read a Pine v5 strategy as a rule; --keep writes it under rules/
+  arvo-engine [<data-dir>] option-quotes spreads <symbol>   what the recorded chains say an option costs to cross, by premium
+  arvo-engine [<data-dir>] option-quotes compact   rewrite every finished day of recorded quotes as Parquet";
 
 async fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -63,6 +65,12 @@ async fn run() -> Result<(), String> {
         if verb == "pine" && std::path::Path::new(dir).is_dir() {
             return pine_command(PathBuf::from(dir), rest);
         }
+        if verb == "option-quotes" && std::path::Path::new(dir).is_dir() {
+            return option_quotes_command(&PathBuf::from(dir), rest);
+        }
+    }
+    if args.first().map(String::as_str) == Some("option-quotes") {
+        return option_quotes_command(&research::default_root()?, &args[1..]);
     }
     if args.first().map(String::as_str) == Some("pine") {
         return pine_command(research::default_root()?, &args[1..]);
@@ -306,6 +314,35 @@ fn rank_command(root: PathBuf, args: &[String]) -> Result<(), String> {
         eprintln!("arvo-engine: {note}");
     }
     Ok(())
+}
+
+/// `option-quotes spreads <symbol>` and `option-quotes compact`: the recorded
+/// chains under `root`, read and tidied (ADR-0039). Needs no engine.
+///
+/// `spreads` prints what the recording says an option costs to cross, beside
+/// what the cost model charges. It changes nothing: moving the model's
+/// constant re-costs every option study, which is a decision and not a
+/// side effect of reading a table.
+fn option_quotes_command(root: &std::path::Path, args: &[String]) -> Result<(), String> {
+    match args {
+        [verb, symbol] if verb == "spreads" => {
+            for chain in arvo_service::option_quotes::spreads(root, symbol)? {
+                println!("{}", chain.table());
+            }
+            Ok(())
+        }
+        [verb] if verb == "compact" => {
+            let today = chrono::Utc::now().date_naive();
+            let done = arvo_service::option_quotes::compact_finished(root, today);
+            println!("{}", done.describe());
+            if done.failed.is_empty() {
+                Ok(())
+            } else {
+                Err(format!("{} day(s) could not be compacted and are still CSV", done.failed.len()))
+            }
+        }
+        _ => Err(USAGE.to_owned()),
+    }
 }
 
 /// `review [YYYY-MM-DD]`: the day's review from the session records under
