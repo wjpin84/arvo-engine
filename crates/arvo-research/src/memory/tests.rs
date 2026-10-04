@@ -405,3 +405,38 @@ fn a_subject_can_never_escape_the_store_directory() {
         );
     }
 }
+
+/// A number written is the number read, to the bit, however many times the
+/// finding is saved.
+///
+/// A real panel holds a signal of exactly 2^-44, written as
+/// `5.684341886080802e-14`. serde_json's default float parsing is fast and not
+/// always correctly rounded: it read that text as the next float up, and the
+/// text of *that* as the one after. So the finding had never once been read
+/// as it was written, and each save (attaching a file is one) moved the
+/// number another step. `float_roundtrip` is the feature that reads what was
+/// written.
+#[test]
+fn a_number_reads_back_as_the_number_that_was_written() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = EvidenceStore::new(dir.path());
+    let exact = f64::from_bits(0x3d30_0000_0000_0000);
+    let mut original = StoredRecord::new(study("AAPL.NASDAQ", "hash-a"), at(1));
+    if let Record::Study(evidence) = &mut original.record {
+        evidence.selection.best_sharpe = exact;
+    }
+    let best = |stored: &StoredRecord| match &stored.record {
+        Record::Study(evidence) => evidence.selection.best_sharpe.to_bits(),
+        _ => unreachable!("a study was saved"),
+    };
+
+    store.save(&original).expect("should write");
+    let once = store.open(&original.id).expect("opens");
+    assert_eq!(best(&once), exact.to_bits(), "one bit off is a different number");
+
+    // Saved again from what was read, twice over, it is still that number.
+    store.save(&once).expect("should write");
+    let twice = store.open(&original.id).expect("opens");
+    store.save(&twice).expect("should write");
+    assert_eq!(best(&store.open(&original.id).expect("opens")), exact.to_bits());
+}

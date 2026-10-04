@@ -18,7 +18,12 @@ arvo-risk.workspace = true
 blake3 = "1.8.7"
 chrono.workspace = true
 serde.workspace = true
-serde_json = "1"
+# `float_roundtrip`: a finding is numbers on disk, and serde_json's default
+# float parsing is fast and not always correctly rounded. A real finding
+# held 2^-44 and was read as the float above it, every time, and re-saved a
+# step further on. With this a number reads back as the number written.
+# Cargo unifies features, so every crate in the engine reads this way.
+serde_json = { version = "1", features = ["float_roundtrip"] }
 thiserror.workspace = true
 # The family sweep runs its configurations across the cores (#212).
 rayon = "1.12.0"
