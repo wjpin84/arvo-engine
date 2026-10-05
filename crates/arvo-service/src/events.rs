@@ -151,12 +151,12 @@ fn plural(count: usize, one: &str, many: &str) -> String {
 
 /// A trading session changed state.
 ///
-/// Halted and failed are worth interrupting someone for: money that was
-/// being managed is not, any more, and nobody clicked anything. The rest
+/// Halted, failed and dropped are worth interrupting someone for: money that
+/// was being managed is not, any more, and nobody clicked anything. The rest
 /// is information.
 #[must_use]
 pub fn session(id: &str, state: &str, detail: Option<&str>) -> EventView {
-    let alarming = matches!(state, "halted" | "failed");
+    let alarming = matches!(state, "halted" | "failed" | "dropped");
     EventView::new(
         EventKindView::session(id.to_owned(), state.to_owned()),
         format!("Session {state}"),

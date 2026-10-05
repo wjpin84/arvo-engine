@@ -15,7 +15,8 @@ use arvo_research::live::Expectation;
 use arvo_research::{EvidenceStore, Experiment, Record};
 use tokio::sync::broadcast;
 
-use crate::promotion::{executor_is_known, is_paper, promotion, Promotion, EXECUTORS};
+use crate::promotion::{executor_is_known, is_paper, promotion, Promotion, EXECUTORS, SUBDIR};
+use crate::record::Recorder;
 use crate::run::run;
 use crate::venues::Venues;
 use crate::status::{announce, Command, Mailbox, Running, Status};
@@ -56,6 +57,33 @@ impl std::fmt::Debug for Sessions {
 /// to flatten anything.
 pub(crate) fn takes_the_kill_switch(state: &str) -> bool {
     matches!(state, "starting" | "running" | "frozen" | "halted")
+}
+
+/// A session's status before its thread has said anything.
+fn starting(id: &str, finding: &str, executor: &str) -> Status {
+    Status {
+        id: id.to_owned(),
+        finding: finding.to_owned(),
+        executor: executor.to_owned(),
+        instrument: String::new(),
+        strategy: String::new(),
+        started_at: chrono::Utc::now().to_rfc3339(),
+        state: "starting".to_owned(),
+        signals: 0,
+        submitted: 0,
+        refused: 0,
+        fills: 0,
+        halted: None,
+        last_error: None,
+        error_from: None,
+        last_bar: None,
+        frozen: None,
+        reconciled: false,
+        verdict: "inconclusive".to_owned(),
+        verdict_reason: None,
+        warnings: Vec::new(),
+        divergence: None,
+    }
 }
 
 impl Sessions {
@@ -128,29 +156,7 @@ impl Sessions {
                 return Err(format!("{id} is already running"));
             }
         }
-        let status = Arc::new(Mutex::new(Status {
-            id: id.clone(),
-            finding: finding.to_owned(),
-            executor: executor.to_owned(),
-            instrument: String::new(),
-            strategy: String::new(),
-            started_at: chrono::Utc::now().to_rfc3339(),
-            state: "starting".to_owned(),
-            signals: 0,
-            submitted: 0,
-            refused: 0,
-            fills: 0,
-            halted: None,
-            last_error: None,
-            error_from: None,
-            last_bar: None,
-            frozen: None,
-            reconciled: false,
-            verdict: "inconclusive".to_owned(),
-            verdict_reason: None,
-            warnings: Vec::new(),
-            divergence: None,
-        }));
+        let status = Arc::new(Mutex::new(starting(&id, finding, executor)));
         let stop = Arc::new(AtomicBool::new(false));
         let mailbox: Mailbox = Arc::default();
         let snapshot = status
@@ -166,6 +172,7 @@ impl Sessions {
             let mailbox = mailbox.clone();
             let events = self.events.clone();
             let venues = Arc::clone(&self.venues);
+            let session = id.clone();
             // Its own thread: the shadow's message bus is thread-local
             // (ADR-0001), and a session is a loop that sleeps.
             std::thread::Builder::new()
@@ -186,12 +193,17 @@ impl Sessions {
                                 status.state = "stopped".to_owned();
                             }
                         }
+                        // A loop that ended this way wrote no `stopped`,
+                        // and a record that just stops reads as an engine
+                        // that died (#13). Its last line says which.
                         Ok(Err(reason)) => {
+                            crate::record::failed(&data, &session, &reason);
                             status.state = "failed".to_owned();
                             status.last_error = Some(reason);
                             status.error_from = Some("failed");
                         }
                         Err(_) => {
+                            crate::record::failed(&data, &session, "the session thread panicked");
                             status.state = "failed".to_owned();
                             status.last_error = Some("the session thread panicked".to_owned());
                             status.error_from = Some("panicked");
@@ -287,6 +299,84 @@ impl Sessions {
             }
         }
         done
+    }
+
+    /// Says so about every session an engine left without a last word (#13).
+    ///
+    /// An engine that is killed, or dies, takes its sessions' threads with
+    /// it. Each record stops wherever it was, and the next engine knew nothing
+    /// of them: it answered "no sessions" while a venue still held what they
+    /// had opened. A record that ends on anything but `stopped`, `failed` or
+    /// `dropped` is such a session. It gets a `dropped` line and an event, and
+    /// a place in [`Self::list`] until it is started again or this engine
+    /// ends.
+    ///
+    /// The line is stamped with the record's last moment, not this one: that
+    /// is when the session ended, and the promotion gate counts a paper
+    /// session's days by its record. Nothing is restarted. Starting a session
+    /// is a decision, and a start adopts what the venue holds.
+    ///
+    /// For an engine's start, and only when no other engine is serving the
+    /// same data: a session that is running has no last word yet either.
+    pub fn note_dropped(&self) -> Vec<Status> {
+        let Ok(dir) = std::fs::read_dir(self.data.join(SUBDIR)) else {
+            return Vec::new();
+        };
+        let mut paths: Vec<PathBuf> = dir
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|extension| extension == "jsonl"))
+            .collect();
+        paths.sort();
+        let mut dropped = Vec::new();
+        for path in paths {
+            let Ok(text) = std::fs::read_to_string(&path) else { continue };
+            let lines: Vec<serde_json::Value> =
+                text.lines().filter_map(|line| serde_json::from_str(line).ok()).collect();
+            let Some(last) = lines.last() else { continue };
+            let event = last["event"].as_str().unwrap_or_default().to_owned();
+            if matches!(event.as_str(), "stopped" | "failed" | "dropped") {
+                continue;
+            }
+            let now = chrono::Utc::now().to_rfc3339();
+            let last_at = last["at"].as_str().unwrap_or(&now).to_owned();
+            let started = lines.iter().rev().find(|line| line["event"] == "started");
+            let said = |key: &str| started.and_then(|line| line["detail"][key].as_str()).unwrap_or_default().to_owned();
+            // A record from before a start named its session has only its
+            // file's name to go by, which has lost the id's punctuation.
+            let id = Some(said("session")).filter(|id| !id.is_empty()).unwrap_or_else(|| {
+                path.file_stem().map(|stem| stem.to_string_lossy().into_owned()).unwrap_or_default()
+            });
+            let mut status = starting(&id, &said("finding"), &said("executor"));
+            status.started_at = started.and_then(|line| line["at"].as_str()).unwrap_or_default().to_owned();
+            status.state = "dropped".to_owned();
+            status.last_error = Some(format!(
+                "the engine hosting it ended without stopping it; its record's last line is `{event}` at {last_at}. \
+                 Whatever it held is still at the venue: start it again and it adopts what the venue holds"
+            ));
+            status.error_from = Some("dropped");
+            // An engine killed mid-write leaves half a line; the next one
+            // starts on its own.
+            if !text.ends_with('\n') {
+                use std::io::Write as _;
+                if let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(&path) {
+                    let _ = writeln!(file);
+                }
+            }
+            Recorder { path }.write_at(last_at, "dropped", Some(serde_json::json!({ "after": event, "noticed_at": now })));
+            announce(&self.events, &status);
+            self.running.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(
+                id,
+                Running {
+                    status: Arc::new(Mutex::new(status.clone())),
+                    stop: Arc::default(),
+                    mailbox: Mailbox::default(),
+                    thread: None,
+                },
+            );
+            dropped.push(status);
+        }
+        dropped
     }
 
     /// A session whose thread is `thread`, for a test that needs a loop it

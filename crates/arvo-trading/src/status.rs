@@ -28,7 +28,8 @@ pub struct Status {
     pub instrument: String,
     pub strategy: String,
     pub started_at: String,
-    /// `starting`, `running`, `frozen`, `halted`, `stopped` or `failed`.
+    /// `starting`, `running`, `frozen`, `halted`, `stopped`, `failed` or
+    /// `dropped`: the engine hosting it ended without stopping it (#13).
     /// Frozen is a book the venue disagrees with (#187) or a feed that has
     /// gone dark (#185); `frozen` says which.
     pub state: String,

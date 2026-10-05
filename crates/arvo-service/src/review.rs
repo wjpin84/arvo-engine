@@ -180,6 +180,10 @@ pub struct SessionReview {
     pub spans: Vec<Span>,
     /// Halts, in the record's words: the gate's, or a person's.
     pub halts: Vec<String>,
+    /// How the session ended, when nobody stopped it (#13): it failed, or the
+    /// engine hosting it died and the next one found the record unfinished.
+    #[serde(default)]
+    pub endings: Vec<String>,
     /// The verdict each time it changed, with its reason.
     pub verdicts: Vec<String>,
     /// The limits entered, each time the band moved.
@@ -558,6 +562,17 @@ pub fn review_record(id: &str, record: &str, day: NaiveDate) -> Option<SessionRe
             }
             "resumed" if today && line.detail.is_null() => out.interventions.push(format!("{} resumed by hand", clock(line.at))),
             "stopped" if today => out.interventions.push(format!("{} stopped", clock(line.at))),
+            "failed" if today => out.endings.push(format!(
+                "failed at {}: {}",
+                clock(line.at),
+                line.detail.as_str().unwrap_or("no reason recorded")
+            )),
+            // Stamped with the record's last moment, so it falls on the day
+            // the session ended and not the day somebody noticed.
+            "dropped" if today => out.endings.push(format!(
+                "was dropped after {}: the engine ended without stopping it, and what it held was left at the venue",
+                clock(line.at)
+            )),
             _ => {}
         }
     }
@@ -672,6 +687,7 @@ pub fn markdown(review: &Review) -> String {
         for halt in &session.halts {
             notes.push(format!("halted, {halt}"));
         }
+        notes.extend(session.endings.iter().cloned());
         for verdict in &session.verdicts {
             notes.push(format!("verdict became {verdict}"));
         }
@@ -836,6 +852,31 @@ mod tests {
 
     fn line(at: &str, event: &str, detail: Value) -> String {
         serde_json::json!({ "at": at, "event": event, "detail": detail }).to_string()
+    }
+
+    /// A session nobody stopped says how it ended (#13), under the day it
+    /// ended on, and not as something a person did.
+    #[test]
+    fn a_day_that_ended_in_a_failure_or_a_dead_engine_says_so() {
+        let day = NaiveDate::from_ymd_opt(2026, 9, 22).unwrap();
+        let record = [
+            line("2026-09-22T13:40:00Z", "started", Value::Null),
+            line("2026-09-22T14:02:00Z", "failed", serde_json::json!("the venue said no")),
+            line("2026-09-22T14:30:00Z", "started", Value::Null),
+            line("2026-09-22T15:05:00Z", "bar", Value::Null),
+            // Noticed two days later, stamped with the record's last moment.
+            line("2026-09-22T15:05:00Z", "dropped", serde_json::json!({ "after": "bar", "noticed_at": "2026-09-24T09:00:00Z" })),
+        ]
+        .join("\n");
+        let reviewed = review_record("f@alpaca-paper", &record, day).expect("the day has lines");
+        assert_eq!(reviewed.endings.len(), 2, "{:?}", reviewed.endings);
+        assert!(reviewed.endings[0].starts_with("failed at ") && reviewed.endings[0].ends_with(": the venue said no"), "{}", reviewed.endings[0]);
+        assert!(reviewed.endings[1].starts_with("was dropped after "), "{}", reviewed.endings[1]);
+        assert!(reviewed.interventions.is_empty(), "nobody did this: {:?}", reviewed.interventions);
+        assert!(review_record("f@alpaca-paper", &record, NaiveDate::from_ymd_opt(2026, 9, 24).unwrap()).is_none(), "not the day it was noticed");
+
+        let said = markdown(&Review { day, written_at: Utc::now(), sessions: vec![reviewed] });
+        assert!(said.contains("the engine ended without stopping it"), "{said}");
     }
 
     /// Two round trips closed on the day: one opened the day before and
