@@ -55,9 +55,12 @@ do not re-run what is already known. State a hypothesis in one sentence. Write i
 as a ruleset with write_ruleset (one of Arvo's rules, the parameters you fix, the \
 axes you search - keep the search small, a dozen configurations is plenty). Run it \
 with run_study on one instrument, then open_finding and read the verdict, the \
-reasons and the advice before any number. NotSupported and Inconclusive are the \
-ordinary outcomes and are evidence: say what the run ruled out. Change one thing \
-at a time and say why.
+reasons, data_findings and the advice before any number. data_findings says what \
+is wrong with the bars the finding rests on - a gap, a suspected unadjusted split, \
+a stalled feed - and a fault there undermines every number after it, so say so \
+when you report the finding. NotSupported and Inconclusive are the ordinary \
+outcomes and are evidence: say what the run ruled out. Change one thing at a time \
+and say why.
 
 Every run is saved as your finding and deflated against everything you have run, \
 so running until something passes does not make it pass; a Supported verdict that \
@@ -458,6 +461,9 @@ fn finding_json(found: Finding) -> Value {
         "ruleset_hash": summary.ruleset_hash,
         "read_this_first": found.read_this_first,
         "reasons": found.reasons,
+        // What is wrong with the bars under it (#16), ahead of the advice and
+        // the numbers: a verdict is only as good as its series.
+        "data_findings": found.data_findings,
         "advice": found.advice,
         "attachments": found.attachments,
     });
@@ -551,7 +557,7 @@ fn tools() -> Value {
         },
         {
             "name": "open_finding",
-            "description": "One finding: verdict, reasons, advice, the search it came from, and its out-of-sample numbers. Read the verdict and advice before any number.",
+            "description": "One finding: verdict, reasons, data_findings (what is wrong with the bars it rests on), advice, the search it came from, and its out-of-sample numbers. Read the verdict, data_findings and advice before any number.",
             "inputSchema": {
                 "type": "object",
                 "properties": { "id": { "type": "string", "description": "A finding id from list_findings" } },
@@ -1020,6 +1026,99 @@ mod tests {
         assert_eq!(missing["result"]["isError"], json!(true));
         let last = audit(&engine).pop().expect("a line");
         assert_eq!((last["tool"].as_str(), last["ok"] == json!(true)), (Some("run_panel"), false));
+    }
+
+    /// Seven hundred daily bars that wander, with the days in `missing` left
+    /// out: a hole in the series, late enough to fall in what a study judges.
+    fn wandering(phase: f64, missing: std::ops::Range<u32>) -> Vec<arvo_data::Bar> {
+        let start = chrono::NaiveDate::from_ymd_opt(2023, 1, 2).expect("date").and_hms_opt(0, 0, 0).expect("time");
+        (0..700)
+            .filter(|day| !missing.contains(day))
+            .map(|i| {
+                let t = f64::from(i);
+                let close = 100.0 + t * 0.05 + 12.0 * (t / 37.0 + phase).sin() + 3.0 * (t / 5.0 + phase).cos();
+                arvo_data::Bar {
+                    at: start + chrono::Duration::days(i64::from(i)),
+                    open: close - 0.2,
+                    high: close + 0.6,
+                    low: close - 0.6,
+                    close,
+                    volume: 10_000.0,
+                }
+            })
+            .collect()
+    }
+
+    /// An agent reads the verdict and the numbers, and until now nothing about
+    /// the series under them (#16). The window showed a hole beside the chart;
+    /// the reader most likely to take a number at face value never saw it.
+    #[test]
+    fn a_finding_tells_an_agent_what_is_wrong_with_its_bars() {
+        let engine = engine();
+        let library = arvo_data::CsvBars::new(engine.dir.path().join("data"));
+        library.write("WHOLE.YF", arvo_data::BarInterval::DAILY, &wandering(0.0, 0..0)).expect("written");
+        // Three weeks with nothing in them, in the last part of the history.
+        library.write("HOLED.YF", arvo_data::BarInterval::DAILY, &wandering(1.7, 640..661)).expect("written");
+        let mut server = server(&engine, Some("careful-agent"));
+        let study = |server: &mut Server, id: u32, instrument: &str| {
+            let reply = call(
+                server,
+                json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call",
+                        "params": { "name": "run_study", "arguments": { "instrument": instrument, "strategy": "sma_cross" } } }),
+            );
+            assert_ne!(reply["result"]["isError"], json!(true), "{reply}");
+            reply["result"]["structuredContent"].clone()
+        };
+
+        // A clean series says so by saying nothing, and says it as a list.
+        let whole = study(&mut server, 40, "WHOLE.YF");
+        assert_eq!(whole["data_findings"], json!([]), "{whole}");
+
+        // The holed one names the hole, on the run's own reply.
+        let holed = study(&mut server, 41, "HOLED.YF");
+        let found = holed["data_findings"].as_array().expect("a list");
+        assert_eq!(found.len(), 1, "{holed}");
+        assert_eq!((found[0]["severity"].as_str(), found[0]["kind"].as_str()), (Some("suspect"), Some("gap")));
+        assert!(found[0]["detail"].as_str().expect("detail").contains("nothing in between"), "{}", found[0]);
+
+        // And again whenever the finding is opened, read from the library as
+        // it is then.
+        let opened = call(
+            &mut server,
+            json!({ "jsonrpc": "2.0", "id": 42, "method": "tools/call",
+                    "params": { "name": "open_finding", "arguments": { "id": holed["id"] } } }),
+        );
+        assert_eq!(opened["result"]["structuredContent"]["data_findings"], holed["data_findings"]);
+        assert!(
+            opened["result"]["structuredContent"].get("search").is_some(),
+            "and the numbers are still there, after it"
+        );
+
+        // A panel has many series. Each member worth a look gets one line
+        // naming it, not every row of every member.
+        std::fs::create_dir_all(engine.dir.path().join("universes")).expect("universes/");
+        std::fs::write(
+            engine.dir.path().join("universes/pair.json"),
+            r#"{ "name": "pair", "reason": "two made-up series, for a test", "interval": {"step":1,"unit":"day"},
+                 "instruments": ["WHOLE.YF", "HOLED.YF"] }"#,
+        )
+        .expect("write");
+        let panel = call(
+            &mut server,
+            json!({ "jsonrpc": "2.0", "id": 43, "method": "tools/call",
+                    "params": { "name": "run_panel", "arguments": { "universe": "pair" } } }),
+        );
+        assert_ne!(panel["result"]["isError"], json!(true), "{panel}");
+        let id = panel["result"]["structuredContent"]["id"].clone();
+        let opened = call(
+            &mut server,
+            json!({ "jsonrpc": "2.0", "id": 44, "method": "tools/call",
+                    "params": { "name": "open_finding", "arguments": { "id": id } } }),
+        );
+        let found = opened["result"]["structuredContent"]["data_findings"].as_array().expect("a list").clone();
+        assert_eq!(found.len(), 1, "{opened}");
+        assert_eq!(found[0]["kind"], json!("summary"));
+        assert_eq!(found[0]["detail"], json!("HOLED.YF: 1 worth a look (1 gap)"));
     }
 
     #[test]
