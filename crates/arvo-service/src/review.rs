@@ -748,11 +748,58 @@ pub fn is_finished(review: &Review, now: DateTime<Utc>) -> bool {
     now.naive_utc() >= arvo_data::session::regular_close(review.day) + chrono::Duration::minutes(15)
 }
 
-/// The review already written for `day`, if there is one.
+/// The review already written for `day`, if there is one that was written
+/// when the day was over.
+///
+/// One written earlier is not that day's review. Opening a day used to write
+/// it whenever no file existed, so a look at a day yet to come left an empty
+/// review, and since a review is never rewritten the day itself could not
+/// replace it. Such a file is passed over here and written again by whoever
+/// writes next. A review with no JSON beside it is taken as it stands.
 #[must_use]
 pub fn read(root: &Path, day: NaiveDate) -> Option<(PathBuf, String)> {
     let md = root.join(DIR).join(format!("{day}.md"));
-    std::fs::read_to_string(&md).ok().map(|text| (md, text))
+    let text = std::fs::read_to_string(&md).ok()?;
+    let early = std::fs::read_to_string(md.with_extension("json"))
+        .ok()
+        .and_then(|json| serde_json::from_str::<Review>(&json).ok())
+        .is_some_and(|stored| !is_finished(&stored, stored.written_at));
+    (!early).then_some((md, text))
+}
+
+/// A day's review as a reader gets it.
+#[derive(Debug)]
+pub struct Opened {
+    /// The records as they stand now, which is what a chart draws.
+    pub review: Review,
+    /// What a person reads: the review as it was written, or `review` put
+    /// into words when nothing is written yet.
+    pub markdown: String,
+    /// Where it is written, or will be once the day is over.
+    pub path: PathBuf,
+    /// Whether this call wrote it.
+    pub written_now: bool,
+}
+
+/// The review of `day` for someone asking at `now`: the one written when the
+/// day was over, or the records as they stand.
+///
+/// It is written only once the day is finished, by whoever asks first: the
+/// job after the close, a window or the command line. A look at noon is a
+/// reading of the morning and leaves nothing behind, so the day can still be
+/// written when it ends.
+///
+/// # Errors
+///
+/// The day is finished and its review could not be written.
+pub fn open(root: &Path, day: NaiveDate, now: DateTime<Utc>) -> Result<Opened, String> {
+    let review = review(root, day);
+    if let Some((path, markdown)) = read(root, day) {
+        return Ok(Opened { review, markdown, path, written_now: false });
+    }
+    let written_now = is_finished(&review, now);
+    let path = if written_now { write(root, &review)? } else { root.join(DIR).join(format!("{day}.md")) };
+    Ok(Opened { markdown: markdown(&review), review, path, written_now })
 }
 
 #[cfg(test)]
@@ -1017,5 +1064,47 @@ mod tests {
         assert_eq!(again, text);
         let quiet = review(dir.path(), NaiveDate::from_ymd_opt(2026, 9, 25).unwrap());
         assert!(markdown(&quiet).contains("No session had anything to say"));
+    }
+
+    /// Opening a day does not write it until the day is over, and a review
+    /// that was written early does not stand in for the day.
+    #[test]
+    fn a_day_is_written_when_it_is_over_and_not_when_it_is_first_looked_at() {
+        let dir = tempfile::tempdir().unwrap();
+        let day = NaiveDate::from_ymd_opt(2026, 9, 21).unwrap();
+        let file = dir.path().join(DIR).join("2026-09-21.md");
+        let at = |day: NaiveDate, hour: u32| day.and_hms_opt(hour, 0, 0).unwrap().and_utc();
+
+        // Looked at two days before, when no session had run: nothing to
+        // say, and nothing written. This is the look that used to leave an
+        // empty review behind for good.
+        let before = open(dir.path(), day, at(day - chrono::Duration::days(2), 13)).unwrap();
+        assert!(before.markdown.contains("No session had anything to say"));
+        assert!(!before.written_now && !file.exists());
+
+        // A review written that way by an older build is on disk.
+        write(dir.path(), &Review { day, written_at: at(day - chrono::Duration::days(2), 13), sessions: Vec::new() }).unwrap();
+        assert!(file.exists());
+
+        // The day comes and a session runs. Looked at before the close: the
+        // records as they stand, the early file passed over, nothing written.
+        std::fs::create_dir_all(dir.path().join(SESSIONS)).unwrap();
+        std::fs::write(dir.path().join(SESSIONS).join("f@alpaca-paper.jsonl"), record()).unwrap();
+        assert!(read(dir.path(), day).is_none(), "written before the day was over");
+        let midday = open(dir.path(), day, at(day, 16)).unwrap();
+        assert_eq!(midday.review.sessions.len(), 1);
+        assert!(midday.markdown.contains("Losses, grouped"), "{}", midday.markdown);
+        assert!(!midday.written_now);
+        assert!(std::fs::read_to_string(&file).unwrap().contains("No session had anything to say"), "left as it was");
+
+        // After the close it is written, over the early one, and from then
+        // on it is read back as it was written.
+        let after = open(dir.path(), day, at(day, 21)).unwrap();
+        assert!(after.written_now);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), after.markdown);
+        assert!(after.markdown.contains("Losses, grouped"));
+        let again = open(dir.path(), day, at(day + chrono::Duration::days(3), 9)).unwrap();
+        assert!(!again.written_now);
+        assert_eq!(again.markdown, after.markdown);
     }
 }

@@ -1217,7 +1217,9 @@ mod tests {
         );
         assert!(reply["result"]["content"][0]["text"].as_str().expect("text").contains("at least two"));
 
-        // A day with no session record reviews an empty day, and is written.
+        // A day with no session record reviews an empty day, and leaves
+        // nothing behind: a review is written once a day that ran a session
+        // is over, and an empty file would stand in for the day for good.
         let reply = call(
             &mut server,
             json!({ "jsonrpc": "2.0", "id": 11, "method": "tools/call",
@@ -1226,9 +1228,9 @@ mod tests {
         assert_ne!(reply["result"]["isError"], json!(true), "{reply}");
         let reviewed = &reply["result"]["structuredContent"];
         assert_eq!(reviewed["day"], json!("2026-09-21"));
-        assert_eq!(reviewed["written_now"], json!(true));
+        assert_eq!(reviewed["written_now"], json!(false));
         assert!(reviewed["markdown"].as_str().expect("text").starts_with("# Review · 2026-09-21"));
-        assert!(engine.dir.path().join("reviews").join("2026-09-21.md").exists());
+        assert!(!engine.dir.path().join("reviews").join("2026-09-21.md").exists());
     }
 
     /// No engine answers and none can be started: the error names what to do.
