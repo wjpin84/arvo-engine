@@ -24,6 +24,28 @@ pub fn ruleset_changed(summary: &arvo_research::Summary) -> bool {
 }
 
 pub fn live_version(service: &ResearchService, summary: &arvo_research::Summary) -> Option<String> {
+    // A finding that pinned a span is checked over that span, by the function
+    // that made its version (ADR-0036). Anything older is checked below, the
+    // way it was made.
+    if let Some((from, to)) = super::version::span_of(&summary.dataset_version) {
+        let interval = summary.interval?;
+        return match &summary.instrument {
+            Some(instrument) if summary.dataset_version.starts_with(super::version::CHAIN) => {
+                super::version::of_chain(&service.bars, instrument, interval, from, to)
+            }
+            Some(instrument) if summary.alongside.is_empty() => {
+                super::version::of_series(&service.bars, instrument, interval, from, to)
+            }
+            // A book: the head and what it was held alongside.
+            Some(instrument) => {
+                let members: Vec<String> =
+                    std::iter::once(instrument.clone()).chain(summary.alongside.iter().cloned()).collect();
+                super::version::of_members(&service.bars, &members, interval, from, to)
+            }
+            // A panel: its own members, not whatever the library holds today.
+            None => super::version::of_members(&service.bars, &summary.alongside, interval, from, to),
+        };
+    }
     match (&summary.instrument, summary.interval) {
         // A study of an option rule: the bars and the chain, as it was made.
         (Some(instrument), Some(interval))
@@ -244,8 +266,11 @@ pub fn replay_view(outcome: &arvo_research::Replay) -> ReplayView {
 }
 
 /// First eight characters of a content hash, or the whole thing if shorter.
+/// A version that names the span it covers is shortened to its hash: the
+/// span is the same on both sides of a comparison, and the hash is what
+/// differs.
 pub fn short_hash(hash: &str) -> String {
-    hash.chars().take(8).collect()
+    hash.rsplit(':').next().unwrap_or(hash).chars().take(8).collect()
 }
 
 /// What a comparison is worth, and what is wrong with it.

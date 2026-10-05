@@ -26,6 +26,7 @@ pub mod rank;
 pub mod report;
 pub mod staleness;
 pub mod study;
+pub mod version;
 pub mod sweep;
 pub mod views;
 

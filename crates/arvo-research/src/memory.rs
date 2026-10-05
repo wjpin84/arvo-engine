@@ -345,13 +345,14 @@ pub struct Summary {
     pub hypothesis: HypothesisId,
     pub dataset_version: String,
     /// The instrument and resolution the finding was produced at, so
-    /// staleness can be checked without loading it. `None` for a panel, whose
-    /// dataset identity is every member's hash combined and has to be
-    /// recomputed the same way it was produced.
+    /// staleness can be checked without loading it. A panel has no one
+    /// instrument: its members are in [`Self::alongside`], and its dataset
+    /// identity is recomputed over them the way it was produced.
     pub instrument: Option<String>,
     pub interval: Option<arvo_data::BarInterval>,
-    /// Instruments a book held alongside [`Self::instrument`]; empty for
-    /// anything else.
+    /// Instruments a book held alongside [`Self::instrument`], or every
+    /// member of a panel, which has no head instrument; empty for anything
+    /// else.
     ///
     /// A book's dataset version is every member's hash combined, so checking
     /// it against the head instrument alone called every book stale forever —
@@ -487,7 +488,16 @@ impl StoredRecord {
                 Some(evidence.reported.experiment.interval),
                 Vec::new(),
             ),
-            Record::Panel(_) => (None, None, Vec::new()),
+            // A panel's version is its members over the span it read, so
+            // the check needs to know who they were and at what resolution.
+            // The list is the one the panel was handed, not the members that
+            // produced a result: a member that failed was still read. A panel
+            // recorded before its study was kept says nothing here, and is
+            // checked the way it was made.
+            Record::Panel(evidence) => match &evidence.study {
+                Some(study) => (None, Some(study.template.interval), study.instruments.clone()),
+                None => (None, None, Vec::new()),
+            },
         };
         Summary {
             id: self.id.clone(),
