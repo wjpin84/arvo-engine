@@ -21,6 +21,7 @@
 
 pub mod source;
 pub mod agreement;
+pub mod fetches;
 pub mod instrument;
 pub mod interval;
 pub mod option;
@@ -268,10 +269,12 @@ pub trait BarProvider: Send + Sync {
     /// does not invalidate a result, because none of that changes what the
     /// experiment saw. Changing a single price does.
     ///
-    /// Covers the instrument's whole history at that resolution, rather than
-    /// any one window. A dataset is the data; which slice of it an experiment
-    /// used is recorded separately, and conflating the two would make every
-    /// window look like a different dataset.
+    /// Covers the instrument's whole history at that resolution. That is the
+    /// right question for "has this file changed": a chart's cache and the
+    /// event raised after a fetch both ask it. It is the wrong one for "has
+    /// what this run read changed", because a series that gains a bar every
+    /// trading day would then stale every finding on it each morning
+    /// (ADR-0036). A run pins [`Self::fingerprint_within`].
     ///
     /// Per-resolution, because they *are* different datasets: the same
     /// instrument at five minutes and at one day is two different series, and
@@ -288,7 +291,29 @@ pub trait BarProvider: Send + Sync {
         instrument: &str,
         interval: BarInterval,
     ) -> Result<Option<String>, DataError> {
-        let bars = self.bars(instrument, interval, NaiveDate::MIN, NaiveDate::MAX)?;
+        self.fingerprint_within(instrument, interval, NaiveDate::MIN, NaiveDate::MAX)
+    }
+
+    /// A content hash of the bars `instrument` holds from `from` to `to`, both
+    /// inclusive: what a run over that span read, and nothing it did not.
+    ///
+    /// A bar added after `to`, or history fetched deeper than `from`, leaves
+    /// this as it was. A bar inside the span that is revised, removed or
+    /// added does not.
+    ///
+    /// `None` when the span holds no bars.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataError`] on the same conditions as [`Self::daily_bars`].
+    fn fingerprint_within(
+        &self,
+        instrument: &str,
+        interval: BarInterval,
+        from: NaiveDate,
+        to: NaiveDate,
+    ) -> Result<Option<String>, DataError> {
+        let bars = self.bars(instrument, interval, from, to)?;
         if bars.is_empty() {
             return Ok(None);
         }
