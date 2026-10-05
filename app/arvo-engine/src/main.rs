@@ -129,6 +129,10 @@ async fn run() -> Result<(), String> {
         return Ok(());
     }
 
+    // Asked before this engine writes its own engine.json, which the same
+    // question would then find.
+    let elsewhere = serving(&data);
+
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .map_err(|err| format!("binding a loopback port: {err}"))?;
@@ -147,6 +151,23 @@ async fn run() -> Result<(), String> {
     // data tier and handed out by Subscribe (#150).
     let events = tokio::sync::broadcast::channel(256).0;
     let sessions = std::sync::Arc::new(arvo_trading::Sessions::new(&data, events.clone(), std::sync::Arc::new(venues::Brokers)));
+    // The sessions the last engine left without a last word (#13): killed, or
+    // dead, it took their threads with it, and this one used to answer "no
+    // sessions" while a venue still held what they had opened. Not while
+    // another engine serves this data, whose live sessions have no last word
+    // yet either.
+    match elsewhere {
+        Some(other) => eprintln!(
+            "arvo-engine: another engine (pid {}) is serving {}; not looking for sessions it may be running",
+            other.pid,
+            data.display()
+        ),
+        None => {
+            for dropped in sessions.note_dropped() {
+                eprintln!("arvo-engine: {} was dropped: {}", dropped.id, dropped.last_error.unwrap_or_default());
+            }
+        }
+    }
     arvo_service::jobs::prepare(&data);
 
     // The engine's own jobs, on its own runtime: this is `#[tokio::main]`, so
@@ -476,6 +497,22 @@ fn option_quotes_command(root: &std::path::Path, args: &[String]) -> Result<(), 
     }
 }
 
+/// The engine serving the data under `root`, if one is. It wrote its
+/// engine.json there, or in the app data directory when `root` is the project
+/// it remembers.
+fn serving(root: &std::path::Path) -> Option<discovery::Discovery> {
+    let same = |a: &std::path::Path, b: &std::path::Path| {
+        std::fs::canonicalize(a).ok().zip(std::fs::canonicalize(b).ok()).is_some_and(|(a, b)| a == b)
+    };
+    let remembered = arvo_service::project::remembered().is_some_and(|project| same(&project, root));
+    discovery::running(root).or_else(|| {
+        remembered
+            .then(|| arvo_service::project::app_data_root().ok())
+            .flatten()
+            .and_then(|dir| discovery::running(&dir))
+    })
+}
+
 /// `evidence rewrite`: every finding under `root` in the form this build
 /// writes, compact and with its curves in an artifact (ADR-0037, ADR-0039).
 ///
@@ -486,19 +523,7 @@ fn option_quotes_command(root: &std::path::Path, args: &[String]) -> Result<(), 
 fn evidence_command(root: &std::path::Path, args: &[String]) -> Result<(), String> {
     match args {
         [verb] if verb == "rewrite" => {
-            // The engine serving this folder wrote its engine.json in it, or
-            // in the app data directory when this is the project it remembers.
-            let same = |a: &std::path::Path, b: &std::path::Path| {
-                std::fs::canonicalize(a).ok().zip(std::fs::canonicalize(b).ok()).is_some_and(|(a, b)| a == b)
-            };
-            let remembered = arvo_service::project::remembered().is_some_and(|project| same(&project, root));
-            let serving = discovery::running(root).or_else(|| {
-                remembered
-                    .then(|| arvo_service::project::app_data_root().ok())
-                    .flatten()
-                    .and_then(|dir| discovery::running(&dir))
-            });
-            if let Some(found) = serving {
+            if let Some(found) = serving(root) {
                 return Err(format!(
                     "an engine is running (pid {}); stop it first, since a build older than this one cannot read a rewritten finding",
                     found.pid

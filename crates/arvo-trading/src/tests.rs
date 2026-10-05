@@ -767,3 +767,130 @@ fn stopping_every_session_waits_for_the_ones_that_listen_and_names_the_one_that_
     assert_eq!(again.stopped, vec!["b-stuck@alpaca-paper".to_owned()], "it ended once it could");
     assert!(sessions.stop_all(Duration::from_millis(10)).stopped.is_empty());
 }
+
+/// An engine that is killed writes nothing on the way out. The next one says
+/// so (#13): in the record, to whoever is listening, and in its list, where
+/// it used to answer "no sessions".
+#[test]
+fn a_record_with_no_last_word_is_said_to_be_dropped_and_said_once() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let records = dir.path().join(crate::promotion::SUBDIR);
+    std::fs::create_dir_all(&records).expect("sessions/");
+    let line = |at: &str, event: &str, detail: serde_json::Value| {
+        serde_json::json!({ "at": at, "event": event, "detail": detail }).to_string()
+    };
+    let killed = record_path(dir.path(), "f-1@alpaca-paper");
+    // Killed mid-write: the last line is half a line.
+    std::fs::write(
+        &killed,
+        [
+            line("2026-09-21T13:40:00+00:00", "started", serde_json::json!({ "session": "f-0@alpaca-paper", "finding": "f-0", "executor": "alpaca-paper" })),
+            line("2026-09-21T20:00:00+00:00", "stopped", serde_json::Value::Null),
+            line("2026-09-22T13:40:00+00:00", "started", serde_json::json!({ "session": "f-1@alpaca-paper", "finding": "f-1", "executor": "alpaca-paper" })),
+            line("2026-09-22T15:05:00+00:00", "bar", serde_json::json!({ "close": 1.0 })),
+            r#"{"at":"2026-09-22T15:10:00+00:00","eve"#.to_owned(),
+        ]
+        .join("\n"),
+    )
+    .expect("written");
+    // From before a start named its session: the file's name is all there is.
+    let old = records.join("f-2_OLD_alpaca-paper.jsonl");
+    std::fs::write(&old, line("2026-09-20T13:40:00+00:00", "started", serde_json::json!({ "experiment": "x" })) + "\n").expect("written");
+    // Stopped, and failed: each has had its last word.
+    paper_record(dir.path(), "f-3", 3, None);
+    std::fs::write(
+        record_path(dir.path(), "f-4@alpaca-paper"),
+        line("2026-09-20T13:40:00+00:00", "started", serde_json::Value::Null) + "\n" + &line("2026-09-20T13:41:00+00:00", "failed", serde_json::json!("the venue said no")) + "\n",
+    )
+    .expect("written");
+
+    let events = broadcast::channel(16).0;
+    let mut heard = events.subscribe();
+    let sessions = Sessions::new(dir.path(), events, std::sync::Arc::new(TestVenues));
+    assert!(sessions.list().is_empty(), "nothing is said until someone looks");
+    let dropped = sessions.note_dropped();
+    assert_eq!(dropped.iter().map(|status| status.id.as_str()).collect::<Vec<_>>(), ["f-1@alpaca-paper", "f-2_OLD_alpaca-paper"]);
+
+    let listed = sessions.list();
+    assert_eq!(listed.len(), 2, "the engine no longer answers that there are no sessions");
+    let first = &listed[0];
+    assert_eq!((first.finding.as_str(), first.executor.as_str(), first.state.as_str()), ("f-1", "alpaca-paper", "dropped"));
+    assert_eq!(first.started_at, "2026-09-22T13:40:00+00:00", "this life's start, not the first");
+    let why = first.last_error.as_deref().expect("it says why");
+    assert!(why.contains("`bar` at 2026-09-22T15:05:00+00:00"), "{why}");
+    assert!(why.contains("still at the venue"), "{why}");
+    assert_eq!(first.error_from, Some("dropped"));
+
+    // The record says so, on a line of its own, stamped when the session
+    // ended and not when somebody noticed.
+    let text = std::fs::read_to_string(&killed).expect("reads");
+    let last: serde_json::Value = serde_json::from_str(text.lines().last().expect("a line")).expect("a whole line");
+    assert_eq!(last["event"], "dropped");
+    assert_eq!(last["at"], "2026-09-22T15:05:00+00:00");
+    assert_eq!(last["detail"]["after"], "bar");
+    assert!(last["detail"]["noticed_at"].is_string());
+
+    // Whoever is listening is told, and told it matters.
+    let event = heard.try_recv().expect("an event");
+    assert_eq!(event.title, "Session dropped");
+    assert_eq!(event.severity, arvo_api::SeverityView::Warning as i32);
+    assert!(event.detail.starts_with("f-1@alpaca-paper: "), "{}", event.detail);
+
+    // There is no loop to halt, and nothing here started one.
+    let refused = sessions.halt("f-1@alpaca-paper", "").expect_err("nothing to halt");
+    assert!(refused.contains("is dropped"), "{refused}");
+
+    // The next engine does not say it again.
+    let next = Sessions::new(dir.path(), broadcast::channel(16).0, std::sync::Arc::new(TestVenues));
+    assert!(next.note_dropped().is_empty());
+    assert!(next.list().is_empty());
+}
+
+/// A session that fails ends its record by saying so (#13), and neither that
+/// line nor a `dropped` one counts as a day of paper trading.
+#[test]
+fn a_failed_session_says_so_in_its_record_and_the_gate_does_not_count_it() {
+    use std::time::{Duration, Instant};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let sessions = Sessions::new(dir.path(), broadcast::channel(16).0, std::sync::Arc::new(TestVenues));
+    // A paper session that ran a day, weeks ago, and was stopped.
+    let path = record_path(dir.path(), "f-1@alpaca-paper");
+    std::fs::create_dir_all(path.parent().expect("a folder")).expect("sessions/");
+    let then = chrono::Utc::now() - chrono::Duration::days(30);
+    std::fs::write(
+        &path,
+        format!(
+            "{}\n{}\n",
+            serde_json::json!({ "at": then.to_rfc3339(), "event": "started" }),
+            serde_json::json!({ "at": (then + chrono::Duration::days(1)).to_rfc3339(), "event": "stopped" }),
+        ),
+    )
+    .expect("written");
+    assert_eq!(sessions.promotion("f-1", "alpaca-live").expect("answers").paper_days, Some(1));
+
+    // Started again today on a finding that cannot be opened: it fails.
+    let failed = sessions.start("f-1", "alpaca-paper").expect("starts");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while sessions.list().iter().any(|status| status.id == failed.id && status.state == "starting") {
+        assert!(Instant::now() < deadline, "the session never failed");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let text = std::fs::read_to_string(&path).expect("reads");
+    let last: serde_json::Value = serde_json::from_str(text.lines().last().expect("a line")).expect("json");
+    assert_eq!(last["event"], "failed");
+    assert!(last["detail"].is_string(), "{last}");
+    assert_eq!(
+        sessions.promotion("f-1", "alpaca-live").expect("answers").paper_days,
+        Some(1),
+        "a failed start a month later is not a month of paper trading"
+    );
+
+    // A start with no record to end leaves none behind.
+    let other = sessions.start("f-9", "alpaca-paper").expect("starts");
+    while sessions.list().iter().any(|status| status.id == other.id && status.state == "starting") {
+        assert!(Instant::now() < deadline, "the session never failed");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!record_path(dir.path(), "f-9@alpaca-paper").exists());
+}

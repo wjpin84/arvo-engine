@@ -204,6 +204,24 @@ pub fn sql(root: &Path) -> String {
         ));
     }
 
+    // The fetch log (ADR-0036): what each fetch into the library did.
+    if data.join(arvo_data::fetches::FILE).is_file() {
+        views.push(
+            "-- Every fetch into the library: when, from where, and how what came back compares with\n\
+             -- what was held. `change` is first, no_overlap, aligned, rescaled or diverged.\n\
+             CREATE OR REPLACE VIEW fetches AS\n\
+             SELECT CAST(\"at\" AS TIMESTAMPTZ) AS time, source, instrument, \"interval\", asked_from, asked_to, bars,\n       \
+             \"first\", \"last\", interpolated, json_extract_string(change, '$.class') AS change, change AS change_detail,\n       \
+             faults, suspects, before, after\n  \
+             FROM read_json('data/fetches.jsonl', format = 'newline_delimited',\n       \
+             columns = {'at': 'VARCHAR', 'source': 'VARCHAR', 'instrument': 'VARCHAR', 'interval': 'VARCHAR',\n                  \
+             'asked_from': 'DATE', 'asked_to': 'DATE', 'bars': 'BIGINT', 'first': 'VARCHAR', 'last': 'VARCHAR',\n                  \
+             'interpolated': 'BIGINT', 'before': 'VARCHAR', 'after': 'VARCHAR', 'change': 'JSON',\n                  \
+             'faults': 'BIGINT', 'suspects': 'BIGINT'});"
+                .to_owned(),
+        );
+    }
+
     if root.join("agent-audit.jsonl").is_file() {
         views.push(
             "-- What an agent or a script asked the engine to do.\n\

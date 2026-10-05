@@ -19,15 +19,29 @@ pub fn remember<V: Recorded>(
     (mut view, record): (V, Record),
 ) -> Result<V, CommandError> {
     let stored = StoredRecord::new(record, chrono::Utc::now()).with_provenance(super::provenance_for(plan));
-    match service.memory.save(&stored) {
+    view.identify(keep(service, &stored));
+    Ok(view)
+}
+
+/// Saves `stored` and answers with its id, for the view that shows it.
+///
+/// The view carries the id it was stored under, so a tab showing a fresh run
+/// can ask for a report of it (#159) without going back to History to find
+/// out what it was called.
+fn keep(service: &ResearchService, stored: &StoredRecord) -> String {
+    match service.memory.save(stored) {
         Ok(path) => tracing::info!(id = %stored.id, path = %path.display(), "recorded a finding"),
         Err(err) => tracing::error!(error = %err, id = %stored.id, "could not record a finding"),
     }
-    // The view goes to the window carrying the id it was stored under, so a
-    // tab showing a fresh run can ask for a report of it (#159) without
-    // going back to History to find out what it was called.
-    view.identify(stored.id);
-    Ok(view)
+    stored.id.clone()
+}
+
+/// Who asked for a run, when it was not a person at the window: an agent or a
+/// script, and where in its code the call was made.
+#[derive(Debug, Clone, Copy)]
+pub struct Asker<'a> {
+    pub author: &'a str,
+    pub origin: Option<&'a str>,
 }
 
 /// A view that came from a stored finding and can say which one.
@@ -85,12 +99,12 @@ pub fn study_data(
         .coverage(instrument, interval)
         .map_err(|err| format!("reading {instrument}: {err}"))?
         .ok_or_else(missing)?;
-    let fingerprint = bars
-        .fingerprint(instrument, interval)
-        .map_err(|err| format!("hashing {instrument}: {err}"))?
-        .ok_or_else(missing)?;
+    // The run pins the bars it can read, not the whole series: one new bar
+    // a day would otherwise stale every finding each morning (ADR-0036).
+    let held_from = from;
     if !plan.trades_options() {
-        return Ok((DateRange::new(from, to).map_err(|err| err.to_string())?, fingerprint));
+        let version = super::version::of_series(bars, instrument, interval, from, to).ok_or_else(missing)?;
+        return Ok((DateRange::new(from, to).map_err(|err| err.to_string())?, version));
     }
 
     let symbol = instrument.split('.').next().unwrap_or_default();
@@ -112,17 +126,18 @@ pub fn study_data(
     let lead = if plan.intraday { 0 } else { 60 };
     from = from.max(*first - chrono::Duration::days(lead));
     to = to.min(*last);
-    let chain = bars
-        .option_chain_fingerprint(symbol, interval)
-        .map_err(|err| format!("hashing {symbol}'s chain: {err}"))?
+    let window =
+        DateRange::new(from, to).map_err(|err| format!("{instrument} and its chain do not overlap: {err}"))?;
+    // The underlying from where its bars begin, not from where the window
+    // was narrowed to: a rule warms up on what comes before its window.
+    let version = super::version::of_chain(bars, instrument, interval, held_from, to)
         .ok_or_else(|| format!("{symbol}'s chain holds no bars"))?;
-    Ok((
-        DateRange::new(from, to).map_err(|err| format!("{instrument} and its chain do not overlap: {err}"))?,
-        chain_dataset_version(&fingerprint, &chain),
-    ))
+    Ok((window, version))
 }
 
-/// The version of a study on bars and a chain together.
+/// The version of a study on bars and a chain together, as it was before a
+/// run pinned a span: kept so a finding recorded then is still checked the
+/// way it was made.
 pub fn chain_dataset_version(fingerprint: &str, chain: &str) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(fingerprint.as_bytes());
@@ -172,7 +187,10 @@ pub fn sector_cap(
     })
 }
 
-/// A book's dataset identity: every member's name and hash, in order.
+/// A book's dataset identity as it was before a run pinned a span: every
+/// member's name and whole-series hash, in order. Kept so a finding recorded
+/// then is still checked the way it was made; a new book is versioned by
+/// [`super::version::of_members`].
 ///
 /// One function because two places must agree on it exactly — the run that
 /// records it and the staleness check that recomputes it. When they were two
@@ -201,16 +219,12 @@ pub fn panel_dataset_version_over(
 ) -> Option<(String, Vec<String>, chrono::NaiveDate, chrono::NaiveDate)> {
     let mut from = chrono::NaiveDate::MIN;
     let mut to = chrono::NaiveDate::MAX;
-    let mut hasher = blake3::Hasher::new();
     let mut instruments = Vec::new();
 
     for id in members.iter().cloned() {
         let Ok(Some((first, last))) = bars.coverage(&id, interval) else {
             continue;
         };
-        if let Ok(Some(fingerprint)) = bars.fingerprint(&id, interval) {
-            hasher.update(fingerprint.as_bytes());
-        }
         from = from.max(first);
         to = to.min(last);
         instruments.push(id);
@@ -219,12 +233,12 @@ pub fn panel_dataset_version_over(
     if instruments.is_empty() {
         return None;
     }
-    Some((
-        hasher.finalize().to_hex().to_string(),
-        instruments,
-        from,
-        to,
-    ))
+    // The members over the period they share, which is what the panel reads
+    // (ADR-0036). With no period in common there is nothing to pin, and the
+    // caller refuses the window before anything is recorded.
+    let version =
+        if from <= to { super::version::of_members(bars, &instruments, interval, from, to)? } else { String::new() };
+    Some((version, instruments, from, to))
 }
 
 /// What can be run, so the UI offers the engine's actual list rather than a
@@ -589,6 +603,29 @@ pub fn run_panel_over(
     universe: &crate::universes::Universe,
     strategy: Option<&str>,
 ) -> Result<PanelView, CommandError> {
+    run_panel_over_as(service, universe, strategy, None)
+}
+
+/// [`run_panel_over`], saying who asked.
+///
+/// With an asker the panel is that author's finding, held to everything the
+/// author has run, exactly as a study is (`StoredRecord::by_agent`). A panel
+/// is the widest search Arvo runs, and it was the one an agent could repeat
+/// for nothing: it was saved as a person's, so no count rose and no bar moved
+/// (arvo-engine#15). The view is built after the author's bar is applied, so
+/// it shows the verdict that was stored and not the one the panel had on its
+/// own.
+///
+/// # Errors
+///
+/// As [`run_panel_over`], and when the author's earlier findings cannot be
+/// read: a bar drawn from half a history would be a lenient one.
+pub fn run_panel_over_as(
+    service: &ResearchService,
+    universe: &crate::universes::Universe,
+    strategy: Option<&str>,
+    asker: Option<Asker<'_>>,
+) -> Result<PanelView, CommandError> {
     service.load_risk()?;
     let plan = match strategy {
         Some(name) => StrategyPlan::find(name)
@@ -626,8 +663,20 @@ pub fn run_panel_over(
         size: universe.instruments.len(),
         missing,
     });
-    let view = panel_view(&found, service.simulation.engine());
-    remember(service, Some(plan.name()), (view, Record::Panel(Box::new(found))))
+    let record = Record::Panel(Box::new(found));
+    let now = chrono::Utc::now();
+    let stored = match asker {
+        Some(Asker { author, origin }) => {
+            let history = service.memory.load().map_err(|err| CommandError::Failed(err.to_string()))?.records;
+            StoredRecord::by_agent(record, author, &history, now).with_origin(origin.map(ToOwned::to_owned))
+        }
+        None => StoredRecord::new(record, now),
+    }
+    .with_provenance(super::provenance_for(Some(plan.name())));
+    let Record::Panel(found) = &stored.record else { unreachable!("a panel was just put there") };
+    let mut view = panel_view(found, service.simulation.engine());
+    view.identify(keep(service, &stored));
+    Ok(view)
 }
 
 pub async fn book_sector_cap(
@@ -683,7 +732,6 @@ pub fn run_book(
     // when the head changed and fresh when any other member did.
     let mut from = chrono::NaiveDate::MIN;
     let mut to = chrono::NaiveDate::MAX;
-    let mut fingerprints = Vec::with_capacity(instruments.len());
     for instrument in &instruments {
         let missing = || {
             CommandError::Failed(format!(
@@ -696,12 +744,6 @@ pub fn run_book(
             .coverage(instrument, interval)
             .map_err(|err| CommandError::Failed(format!("reading {instrument}: {err}")))?
             .ok_or_else(missing)?;
-        let fingerprint = service
-            .bars
-            .fingerprint(instrument, interval)
-            .map_err(|err| CommandError::Failed(format!("hashing {instrument}: {err}")))?
-            .ok_or_else(missing)?;
-        fingerprints.push(fingerprint);
         from = from.max(coverage.0);
         to = to.min(coverage.1);
     }
@@ -711,7 +753,13 @@ pub fn run_book(
             instruments.len(),
         ))
     })?;
-    let dataset_version = book_dataset_version(&instruments, &fingerprints);
+    let dataset_version =
+        super::version::of_members(&service.bars, &instruments, interval, from, to).ok_or_else(|| {
+            CommandError::Failed(format!(
+                "one of these {} instruments holds no {interval} bars in the period they share, {from} to {to}",
+                instruments.len(),
+            ))
+        })?;
 
     let head = instruments[0].clone();
     let mut family = study_for(&head, plan, window, &dataset_version);
@@ -783,11 +831,8 @@ pub fn run_shared(service: &ResearchService, text: &str, instrument: &str) -> Re
         .coverage(instrument, interval)
         .map_err(|err| CommandError::Failed(format!("reading {instrument}: {err}")))?
         .ok_or_else(missing)?;
-    let fingerprint = service
-        .bars
-        .fingerprint(instrument, interval)
-        .map_err(|err| CommandError::Failed(format!("hashing {instrument}: {err}")))?
-        .ok_or_else(missing)?;
+    let fingerprint =
+        super::version::of_series(&service.bars, instrument, interval, coverage.0, coverage.1).ok_or_else(missing)?;
     let window = DateRange::new(coverage.0, coverage.1).map_err(|err| CommandError::Failed(err.to_string()))?;
     let family = shared.family(
         instrument,

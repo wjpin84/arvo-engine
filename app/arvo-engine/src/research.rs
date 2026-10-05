@@ -152,7 +152,7 @@ impl Research {
     /// When there is no such finding or it cannot be read.
     pub fn open_finding(&self, id: &str) -> Result<Value, String> {
         let stored = self.store().open(id).map_err(|err| err.to_string())?;
-        Ok(summarize(&stored))
+        Ok(self.described(&stored))
     }
 
     /// Runs a study, or a walk-forward when `rolling`, saved as `author`'s.
@@ -208,7 +208,7 @@ impl Research {
             .with_origin(origin.map(ToOwned::to_owned))
             .with_provenance(provenance);
         store.save(&stored).map_err(|err| err.to_string())?;
-        Ok(summarize(&stored))
+        Ok(self.described(&stored))
     }
 
     /// Records evidence an engine Arvo did not run computed, judged here by
@@ -235,7 +235,20 @@ impl Research {
             .with_origin(origin.map(ToOwned::to_owned))
             .with_provenance(provenance);
         store.save(&stored).map_err(|err| err.to_string())?;
-        Ok(summarize(&stored))
+        Ok(self.described(&stored))
+    }
+
+    /// A finding as a reader gets it: [`summarize`], and what is wrong with
+    /// the bars under it as they are in the library now (#16). Read from the
+    /// library each time and not stored with the finding, for the reason the
+    /// views give: the bars are the input, and what is wrong with them can
+    /// change after the finding was recorded.
+    fn described(&self, stored: &StoredRecord) -> Value {
+        let mut out = summarize(stored);
+        let found =
+            arvo_service::research::views::finding_data_findings(&CsvBars::new(&self.data), &stored.record);
+        out["data_findings"] = json!(found);
+        out
     }
 
     /// Keeps a file with a finding (#157): bytes stored once by hash, the

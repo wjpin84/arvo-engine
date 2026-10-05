@@ -83,7 +83,11 @@ pub fn stream_stalled(reason: &str) -> EventView {
 /// A warning, so it raises a notification: the whole point is that the person
 /// was not in History when it happened. Names the subjects, a few of them —
 /// a count alone says something changed and not what to reopen.
-pub fn findings_stale(changed: &[String], gone: &[String]) -> EventView {
+///
+/// It says why, as far as the fetch log can (ADR-0036): a series re-adjusted
+/// after a corporate action and one whose history was revised want different
+/// responses, and "changed" used to be all either could say.
+pub fn findings_stale(readjusted: &[String], revised: &[String], changed: &[String], gone: &[String]) -> EventView {
     const NAMED: usize = 3;
     let named = |subjects: &[String]| {
         // First-seen order, each once: several findings on one instrument
@@ -100,8 +104,22 @@ pub fn findings_stale(changed: &[String], gone: &[String]) -> EventView {
             more => format!("{shown} and {more} more"),
         }
     };
-    let count = changed.len() + gone.len();
+    let count = readjusted.len() + revised.len() + changed.len() + gone.len();
     let mut detail = Vec::new();
+    if !revised.is_empty() {
+        detail.push(format!(
+            "{} on a series whose history the source has revised ({}): the prices it rested on are not the prices held now",
+            plural(revised.len(), "finding is", "findings are"),
+            named(revised),
+        ));
+    }
+    if !readjusted.is_empty() {
+        detail.push(format!(
+            "{} on a series re-adjusted after a corporate action ({}): every price moved by one factor, so a re-run should agree",
+            plural(readjusted.len(), "finding is", "findings are"),
+            named(readjusted),
+        ));
+    }
     if !changed.is_empty() {
         detail.push(format!(
             "{} produced from data that has since changed ({})",
@@ -133,12 +151,12 @@ fn plural(count: usize, one: &str, many: &str) -> String {
 
 /// A trading session changed state.
 ///
-/// Halted and failed are worth interrupting someone for: money that was
-/// being managed is not, any more, and nobody clicked anything. The rest
+/// Halted, failed and dropped are worth interrupting someone for: money that
+/// was being managed is not, any more, and nobody clicked anything. The rest
 /// is information.
 #[must_use]
 pub fn session(id: &str, state: &str, detail: Option<&str>) -> EventView {
-    let alarming = matches!(state, "halted" | "failed");
+    let alarming = matches!(state, "halted" | "failed" | "dropped");
     EventView::new(
         EventKindView::session(id.to_owned(), state.to_owned()),
         format!("Session {state}"),
@@ -215,6 +233,8 @@ mod tests {
     #[test]
     fn a_stale_finding_interrupts_and_names_what_to_reopen() {
         let event = findings_stale(
+            &[],
+            &[],
             &["AAPL.YF".to_owned(), "MSFT.YF".to_owned()],
             &["OLD.SIM".to_owned()],
         );
@@ -230,8 +250,17 @@ mod tests {
     fn a_long_list_is_cut_to_a_few_names() {
         let mut many: Vec<String> = (0..7).map(|i| format!("S{i}.YF")).collect();
         many.push("S0.YF".to_owned());
-        let event = findings_stale(&many, &[]);
+        let event = findings_stale(&[], &[], &many, &[]);
         assert!(event.detail.contains("and 4 more"), "{}", event.detail);
+    }
+
+    #[test]
+    fn a_stale_finding_says_whether_its_series_was_readjusted_or_revised() {
+        let event = findings_stale(&["AAPL.YF".to_owned()], &["MSFT.YF".to_owned()], &[], &[]);
+        assert_eq!(event.title, "2 findings went stale");
+        assert!(event.detail.contains("1 finding is on a series whose history the source has revised (MSFT.YF)"), "{}", event.detail);
+        assert!(event.detail.contains("1 finding is on a series re-adjusted after a corporate action (AAPL.YF)"), "{}", event.detail);
+        assert!(event.detail.find("revised") < event.detail.find("re-adjusted"), "the one that changed the evidence comes first");
     }
 
     /// The distinction the status bar acts on: an expired session needs a

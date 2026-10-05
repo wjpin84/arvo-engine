@@ -87,7 +87,19 @@ pub(crate) fn run(
     let mut shadow = NautilusSimulation::new(library)
         .shadow(&experiment)
         .map_err(|err| err.to_string())?;
-    record.write("started", Some(serde_json::json!({ "experiment": experiment.id.to_string(), "warm_until": last_in_library })));
+    // Which session this is, in its own record: the file's name has lost the
+    // punctuation, and an engine that finds this record with no last line has
+    // to say whose it was (#13).
+    record.write(
+        "started",
+        Some(serde_json::json!({
+            "session": format!("{finding}@{executor}"),
+            "finding": finding,
+            "executor": executor,
+            "experiment": experiment.id.to_string(),
+            "warm_until": last_in_library,
+        })),
+    );
     record.write(
         "expectation",
         Some(expected.as_ref().map_or_else(

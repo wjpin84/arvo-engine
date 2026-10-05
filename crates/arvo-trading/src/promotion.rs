@@ -104,6 +104,9 @@ pub(crate) fn promotion(data: &Path, finding: &str) -> Promotion {
             .map(|at| at.with_timezone(&chrono::Utc));
         match event["event"].as_str() {
             Some("started") if started.is_none() => started = at,
+            // How a session ended without being stopped (#13), not something
+            // it did: neither is a day it ran.
+            Some("failed" | "dropped") => continue,
             Some("verdict") => {
                 verdict = event["detail"]["verdict"].as_str().map(|name| {
                     (

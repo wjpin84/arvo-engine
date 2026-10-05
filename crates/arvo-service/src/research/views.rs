@@ -82,6 +82,66 @@ pub fn data_findings(
         .collect()
 }
 
+/// What is wrong with the bars under a stored finding, for a reader who opens
+/// the finding and not a window (arvo-engine#16).
+///
+/// The window shows these beside the chart. An agent or a script reads the
+/// verdict, the reasons and the advice, and had no word about the series
+/// underneath: it is the reader most likely to take a number at face value
+/// and the one that could not see a suspected unadjusted split.
+///
+/// A study and a walk-forward get the list their own views show, over the
+/// same window, so the two readers are told the same thing. A panel has many
+/// series: every fault is listed with its member named, and the merely
+/// unusual is counted per member, because a hundred members' worth of them is
+/// a list nobody reads. A reported finding has none: its bars are in
+/// somebody else's library.
+#[must_use]
+pub fn finding_data_findings(bars: &dyn arvo_data::BarProvider, record: &Record) -> Vec<DataFindingView> {
+    match record {
+        Record::Study(found) => {
+            data_findings(bars, &found.selected.instrument, found.selected.interval, &found.out_of_sample)
+        }
+        Record::WalkForward(found) => found
+            .folds
+            .first()
+            .zip(found.folds.last())
+            .and_then(|(first, last)| DateRange::new(first.out_of_sample.from, last.out_of_sample.to).ok())
+            .map(|window| data_findings(bars, &found.template.instrument, found.template.interval, &window))
+            .unwrap_or_default(),
+        Record::Panel(found) => {
+            let interval = found.study.as_ref().map(|study| study.template.interval).or_else(|| {
+                found.per_instrument.iter().find_map(|member| member.kept.as_ref().map(|kept| kept.experiment.interval))
+            });
+            let Some(interval) = interval else { return Vec::new() };
+            let mut said = Vec::new();
+            for member in &found.per_instrument {
+                let all = data_findings(bars, &member.instrument, interval, &found.out_of_sample);
+                let (faults, suspects): (Vec<_>, Vec<_>) = all.into_iter().partition(|one| one.severity == "fault");
+                said.extend(faults.into_iter().map(|fault| DataFindingView {
+                    detail: format!("{}: {}", member.instrument, fault.detail),
+                    ..fault
+                }));
+                if !suspects.is_empty() {
+                    let mut kinds: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+                    for suspect in &suspects {
+                        *kinds.entry(suspect.kind.as_str()).or_default() += 1;
+                    }
+                    let by_kind: Vec<String> = kinds.iter().map(|(kind, count)| format!("{count} {kind}")).collect();
+                    said.push(DataFindingView {
+                        severity: "suspect".to_owned(),
+                        kind: "summary".to_owned(),
+                        at: None,
+                        detail: format!("{}: {} worth a look ({})", member.instrument, suspects.len(), by_kind.join(", ")),
+                    });
+                }
+            }
+            said
+        }
+        Record::Reported(_) => Vec::new(),
+    }
+}
+
 /// The instrument's own bars over a window.
 ///
 /// Read from the library at render time rather than stored in the finding.

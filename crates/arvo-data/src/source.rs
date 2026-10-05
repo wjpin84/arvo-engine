@@ -610,8 +610,35 @@ pub async fn ingest(
         .ok()
         .filter(|held| !held.is_empty())
         .map(|held| crate::agreement::compare(&held, &bars).0);
+    let before = crate::BarProvider::fingerprint(&library, &instrument, interval).ok().flatten();
 
     let path = library.write(&instrument, interval, &bars)?;
+
+    // What this fetch did, written down by the one function every fetch goes
+    // through, so no caller can drop it (ADR-0036). The comparison above was
+    // computed for years and kept by nobody: the scheduled refresh threw the
+    // report away, and a finding that went stale could not be told why. A log
+    // that cannot be written costs that explanation and not the fetch.
+    let record = crate::fetches::Fetch {
+        at: chrono::Utc::now(),
+        source: source.id().to_owned(),
+        instrument: instrument.clone(),
+        interval: interval.to_string(),
+        asked_from: from,
+        asked_to: to,
+        bars: bars.len(),
+        first: bars.first().map(|bar| bar.at),
+        last: bars.last().map(|bar| bar.at),
+        interpolated,
+        before,
+        after: crate::BarProvider::fingerprint(&library, &instrument, interval).ok().flatten(),
+        change: revision.as_ref().into(),
+        faults: quality.faults(),
+        suspects: quality.findings.len() - quality.faults(),
+    };
+    if let Err(err) = crate::fetches::append(root, &record) {
+        tracing::warn!(instrument = %instrument, error = %err, "the fetch was written but could not be logged");
+    }
 
     // After the bars are safely down. A source that serves prices but not
     // distributions is the normal case, not a failed fetch — and a dividend

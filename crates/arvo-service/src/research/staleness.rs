@@ -41,10 +41,51 @@ pub const EVERY: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 /// What one check found that had not been reported before.
 #[derive(Debug, Default, PartialEq)]
 pub struct Newly {
-    /// Findings whose data is still there and hashes differently.
+    /// Findings whose data is still there and hashes differently, with no
+    /// fetch on record that says how: a file replaced by hand, a ruleset
+    /// edited, or a change from before fetches were logged.
     pub changed: Vec<String>,
     /// Findings whose data is gone altogether.
     pub gone: Vec<String>,
+    /// Findings on a series a fetch re-adjusted after a corporate action:
+    /// every price moved by one factor, and nothing that happened was
+    /// contradicted. A re-run should agree.
+    pub readjusted: Vec<String>,
+    /// Findings on a series whose history a fetch revised: the source changed
+    /// its mind about prices the finding rested on.
+    pub revised: Vec<String>,
+}
+
+/// Why a finding's data no longer hashes to what it pinned, as far as the
+/// fetch log can say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Why {
+    Readjusted,
+    Revised,
+    /// No fetch on record explains it.
+    Unexplained,
+}
+
+/// What the fetch log says happened to a finding's series since it was
+/// recorded (ADR-0036). A revision outranks a re-adjustment: if a source both
+/// rescaled a series and changed a price in it, the evidence changed.
+#[must_use]
+pub fn why(summary: &Summary, fetches: &[arvo_data::fetches::Fetch]) -> Why {
+    use arvo_data::fetches::Change;
+    let Some(interval) = summary.interval.map(|interval| interval.to_string()) else { return Why::Unexplained };
+    let read = |instrument: &str| summary.instrument.as_deref() == Some(instrument) || summary.alongside.iter().any(|member| member == instrument);
+    let mut found = Why::Unexplained;
+    for fetch in fetches {
+        if fetch.at <= summary.recorded_at || fetch.interval != interval || !read(&fetch.instrument) {
+            continue;
+        }
+        match fetch.change {
+            Change::Diverged { .. } => return Why::Revised,
+            Change::Rescaled { .. } => found = Why::Readjusted,
+            Change::First | Change::NoOverlap | Change::Aligned { .. } => {}
+        }
+    }
+    found
 }
 
 /// Every stale finding now, and which of them were not stale last time.
@@ -55,6 +96,17 @@ pub fn compare(
     summaries: &[Summary],
     live: impl Fn(&Summary) -> Option<String>,
     ruleset: impl Fn(&Summary) -> Option<String>,
+    reported: &BTreeSet<String>,
+) -> (BTreeSet<String>, Newly) {
+    compare_saying(summaries, live, ruleset, |_| Why::Unexplained, reported)
+}
+
+/// [`compare`], also asked why each newly stale finding's data changed.
+pub fn compare_saying(
+    summaries: &[Summary],
+    live: impl Fn(&Summary) -> Option<String>,
+    ruleset: impl Fn(&Summary) -> Option<String>,
+    why: impl Fn(&Summary) -> Why,
     reported: &BTreeSet<String>,
 ) -> (BTreeSet<String>, Newly) {
     let mut stale = BTreeSet::new();
@@ -80,8 +132,15 @@ pub fn compare(
             let subject = summary.subject.clone();
             if gone {
                 newly.gone.push(subject);
-            } else {
+            } else if ruleset_changed {
+                // The rule moved, whatever the data did: that is the reason.
                 newly.changed.push(subject);
+            } else {
+                match why(summary) {
+                    Why::Readjusted => newly.readjusted.push(subject),
+                    Why::Revised => newly.revised.push(subject),
+                    Why::Unexplained => newly.changed.push(subject),
+                }
             }
         }
     }
@@ -110,10 +169,12 @@ pub fn check(service: &ResearchService, record: &Path) -> Option<EventView> {
         .unwrap_or_default();
 
     crate::rulesets::refresh_at(service.data_dir.parent().unwrap_or(&service.data_dir));
-    let (stale, newly) = compare(
+    let fetches = arvo_data::fetches::read(&service.data_dir);
+    let (stale, newly) = compare_saying(
         &summaries,
         |summary| super::history::live_version(service, summary),
         |summary| super::StrategyPlan::ruleset_version(&summary.strategy),
+        |summary| why(summary, &fetches),
         &reported,
     );
 
@@ -126,8 +187,8 @@ pub fn check(service: &ResearchService, record: &Path) -> Option<EventView> {
         }
     }
 
-    (!newly.changed.is_empty() || !newly.gone.is_empty())
-        .then(|| crate::events::findings_stale(&newly.changed, &newly.gone))
+    (newly != Newly::default())
+        .then(|| crate::events::findings_stale(&newly.readjusted, &newly.revised, &newly.changed, &newly.gone))
 }
 
 #[cfg(test)]
@@ -215,6 +276,59 @@ mod tests {
         assert!(fresh.is_empty(), "it is fresh, so it leaves the record");
         let (_, newly) = compare(&store, |_| Some("v3".to_owned()), |_| None, &fresh);
         assert_eq!(newly.changed, vec!["a.SIM"]);
+    }
+
+    /// A stale finding says why (ADR-0036): the fetch log knows whether a
+    /// series was rescaled after a split or had its history revised, and those
+    /// want different responses.
+    #[test]
+    fn a_stale_finding_is_told_why_by_the_fetch_that_changed_its_series() {
+        use arvo_data::fetches::{Change, Fetch};
+        let fetch = |instrument: &str, at: i64, change: Change| Fetch {
+            at: chrono::DateTime::from_timestamp(at, 0).expect("valid"),
+            source: "yahoo".to_owned(),
+            instrument: instrument.to_owned(),
+            interval: "1day".to_owned(),
+            asked_from: chrono::NaiveDate::MIN,
+            asked_to: chrono::NaiveDate::MAX,
+            bars: 3,
+            first: None,
+            last: None,
+            interpolated: 0,
+            before: None,
+            after: None,
+            change,
+            faults: 0,
+            suspects: 0,
+        };
+        let recorded = 1_700_000_000;
+        let log = [
+            // Before the finding was recorded: not what staled it.
+            fetch("a.SIM", recorded - 10, Change::Diverged { disagreeing: 1, compared: 3, worst: 0.1, at: chrono::NaiveDateTime::MIN }),
+            fetch("a.SIM", recorded + 10, Change::Rescaled { factor: 0.25, compared: 3 }),
+            fetch("b.SIM", recorded + 10, Change::Rescaled { factor: 0.5, compared: 3 }),
+            fetch("b.SIM", recorded + 20, Change::Diverged { disagreeing: 2, compared: 3, worst: 0.2, at: chrono::NaiveDateTime::MIN }),
+            fetch("c.SIM", recorded + 10, Change::Aligned { compared: 3 }),
+        ];
+        let store = [summary("a", "v1"), summary("b", "v1"), summary("c", "v1"), summary("d", "v1")];
+        assert_eq!(why(&store[0], &log), Why::Readjusted);
+        assert_eq!(why(&store[1], &log), Why::Revised, "a revision outranks the re-adjustment before it");
+        assert_eq!(why(&store[2], &log), Why::Unexplained, "a fetch that changed nothing explains nothing");
+        assert_eq!(why(&store[3], &log), Why::Unexplained, "nor does no fetch at all");
+
+        let live = |s: &Summary| (s.id != "d").then(|| "v2".to_owned());
+        let (stale, newly) = compare_saying(&store, live, |_| None, |s| why(s, &log), &BTreeSet::new());
+        assert_eq!(stale.len(), 4);
+        assert_eq!(newly.readjusted, vec!["a.SIM"]);
+        assert_eq!(newly.revised, vec!["b.SIM"]);
+        assert_eq!(newly.changed, vec!["c.SIM"]);
+        assert_eq!(newly.gone, vec!["d.SIM"]);
+
+        // A panel is told by any of its members.
+        let mut panel = summary("p", "v1");
+        panel.instrument = None;
+        panel.alongside = vec!["x.SIM".to_owned(), "b.SIM".to_owned()];
+        assert_eq!(why(&panel, &log), Why::Revised);
     }
 
     #[test]

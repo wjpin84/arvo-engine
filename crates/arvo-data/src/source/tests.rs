@@ -192,6 +192,42 @@ async fn a_refetch_compares_against_what_was_held_not_against_itself() {
     );
 }
 
+/// Every fetch leaves a line, whoever asked for it (ADR-0036). The report
+/// goes back to a caller who may drop it; the log is what is left.
+#[tokio::test]
+async fn every_fetch_leaves_a_record_of_what_it_changed() {
+    use crate::fetches::Change;
+    let root = tempfile::tempdir().unwrap();
+    let (from, to) = window();
+    for closes in [
+        [10.0, 20.0, 30.0], // nothing held: a first fetch
+        [10.0, 20.0, 30.0], // the same again
+        [5.0, 10.0, 15.0],  // every price halved: a split re-adjustment
+        [5.0, 10.0, 22.0],  // one price changed: the vendor revised it
+    ] {
+        ingest(root.path(), &canned("acme", "AC", &closes), "MSFT", BarInterval::DAILY, from, to).await.unwrap();
+    }
+
+    let log = crate::fetches::read(root.path());
+    assert_eq!(log.len(), 4);
+    assert!(log.iter().all(|fetch| fetch.source == "acme" && fetch.instrument == "MSFT.AC" && fetch.interval == "1day"));
+    assert!(log.iter().all(|fetch| (fetch.asked_from, fetch.asked_to, fetch.bars) == (from, to, 3)));
+
+    assert_eq!(log[0].change, Change::First);
+    assert_eq!(log[0].before, None, "nothing was held");
+    assert!(matches!(log[1].change, Change::Aligned { compared: 3 }), "{:?}", log[1].change);
+    assert_eq!(log[1].before, log[1].after, "the same bars are the same series");
+    assert!(matches!(log[2].change, Change::Rescaled { compared: 3, .. }), "{:?}", log[2].change);
+    assert!(matches!(log[3].change, Change::Diverged { disagreeing: 1, .. }), "{:?}", log[3].change);
+
+    // Each fetch's `before` is the one before it's `after`: the log is a
+    // chain of what the series was.
+    for pair in log.windows(2) {
+        assert_eq!(pair[1].before, pair[0].after);
+    }
+    assert_ne!(log[2].after, log[1].after, "a rescaled series is a different series");
+}
+
 #[tokio::test]
 async fn an_empty_series_is_an_error_rather_than_an_empty_file() {
     let root = tempfile::tempdir().unwrap();
