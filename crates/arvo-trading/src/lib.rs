@@ -91,6 +91,7 @@ mod watch;
 mod tests;
 
 pub use promotion::{Promotion, EXECUTORS, PAPER_MINIMUM_DAYS, SUBDIR};
+pub use sessions::{Hosted, HOSTED};
 pub use record::record_path;
 pub use sessions::{Sessions, Stopped};
 pub use status::Status;

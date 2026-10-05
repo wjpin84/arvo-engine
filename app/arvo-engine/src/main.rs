@@ -166,7 +166,36 @@ async fn run() -> Result<(), String> {
             for dropped in sessions.note_dropped() {
                 eprintln!("arvo-engine: {} was dropped: {}", dropped.id, dropped.last_error.unwrap_or_default());
             }
+            // And back up: whatever the last engine had running, through the
+            // same start a person makes, so the gate and the reconcile both
+            // run. One that is refused is said so, out loud, since money
+            // that was being managed is not.
+            for (hosted, outcome) in sessions.restore() {
+                match outcome {
+                    Ok(_) => eprintln!("arvo-engine: {} is back up", hosted.id),
+                    Err(why) => {
+                        eprintln!("arvo-engine: {} was not brought back: {why}", hosted.id);
+                        let _ = events.send(arvo_api::EventView::new(
+                            arvo_api::EventKindView::session(hosted.id.clone(), "stopped".to_owned()),
+                            "Session not brought back".to_owned(),
+                            format!("{}: {why}", hosted.id),
+                            arvo_api::SeverityView::Warning,
+                        ));
+                    }
+                }
+            }
         }
+    }
+    // A session changes its own state as it runs; every few seconds the
+    // list of what is wanted up is brought in line with that.
+    {
+        let hosted = sessions.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                hosted.remember();
+            }
+        });
     }
     arvo_service::jobs::prepare(&data);
 

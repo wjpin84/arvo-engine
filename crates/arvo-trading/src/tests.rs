@@ -936,3 +936,73 @@ fn a_failed_session_says_so_in_its_record_and_the_gate_does_not_count_it() {
     }
     assert!(!record_path(dir.path(), "f-9@alpaca-paper").exists());
 }
+
+/// An engine brings back the sessions the last one had up (#13): what is
+/// running is written as it changes, left as it is when the engine goes
+/// down, and started again by the next engine through the ordinary start.
+#[test]
+fn the_sessions_that_were_up_are_remembered_and_brought_back() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join(crate::promotion::SUBDIR).join(HOSTED);
+    let hosted = || -> Vec<Hosted> {
+        std::fs::read_to_string(&file).ok().and_then(|text| serde_json::from_str(&text).ok()).unwrap_or_default()
+    };
+    let ids = |listed: &[Hosted]| listed.iter().map(|hosted| hosted.id.clone()).collect::<Vec<_>>();
+
+    let sessions = Sessions::new(dir.path(), broadcast::channel(16).0, std::sync::Arc::new(TestVenues));
+    let listening = |flag: Arc<AtomicBool>| {
+        std::thread::spawn(move || {
+            while !flag.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        })
+    };
+    let (a, b) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+    sessions.adopt("f-a@alpaca-paper", a.clone(), listening(a));
+    sessions.adopt("f-b@alpaca-paper", b.clone(), listening(b));
+    sessions.remember();
+    let both = hosted();
+    assert_eq!(ids(&both), ["f-a@alpaca-paper", "f-b@alpaca-paper"]);
+    assert_eq!((both[0].finding.as_str(), both[0].executor.as_str()), ("f-a", "alpaca-paper"));
+
+    // A person stops one: not wanted back. (A real loop marks itself
+    // stopped on its way out; the fake one here is marked by hand.)
+    sessions.set_state("f-a@alpaca-paper", "stopped");
+    sessions.stop("f-a@alpaca-paper").expect("stops");
+    assert_eq!(ids(&hosted()), ["f-b@alpaca-paper"]);
+
+    // The engine goes down: what was up stays wanted.
+    let done = sessions.stop_all(Duration::from_secs(2));
+    assert_eq!(done.stopped, vec!["f-b@alpaca-paper".to_owned()]);
+    assert_eq!(ids(&hosted()), ["f-b@alpaca-paper"], "left as it was");
+
+    // The next engine brings it back through the ordinary start: paper
+    // starts (and fails later, on the missing finding, which is the loop's
+    // business); real money meets the promotion gate.
+    std::fs::write(
+        &file,
+        serde_json::to_string(&[
+            Hosted { id: "f-b@alpaca-paper".to_owned(), finding: "f-b".to_owned(), executor: "alpaca-paper".to_owned() },
+            Hosted { id: "f-c@alpaca-live".to_owned(), finding: "f-c".to_owned(), executor: "alpaca-live".to_owned() },
+        ])
+        .expect("json"),
+    )
+    .expect("written");
+    let next = Sessions::new(dir.path(), broadcast::channel(16).0, std::sync::Arc::new(TestVenues));
+    let back = next.restore();
+    assert_eq!(back.len(), 2);
+    assert_eq!(back[0].0.id, "f-b@alpaca-paper");
+    assert!(back[0].1.is_ok(), "{:?}", back[0].1);
+    assert_eq!(back[1].0.id, "f-c@alpaca-live");
+    let refused = back[1].1.as_ref().expect_err("the gate");
+    assert!(refused.starts_with("promotion gate:"), "{refused}");
+    assert!(next.list().iter().any(|status| status.id == "f-b@alpaca-paper"));
+
+    // Nothing to bring back is nothing.
+    std::fs::remove_file(&file).expect("removed");
+    assert!(Sessions::new(dir.path(), broadcast::channel(16).0, std::sync::Arc::new(TestVenues)).restore().is_empty());
+}
