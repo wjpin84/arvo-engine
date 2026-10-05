@@ -19,15 +19,29 @@ pub fn remember<V: Recorded>(
     (mut view, record): (V, Record),
 ) -> Result<V, CommandError> {
     let stored = StoredRecord::new(record, chrono::Utc::now()).with_provenance(super::provenance_for(plan));
-    match service.memory.save(&stored) {
+    view.identify(keep(service, &stored));
+    Ok(view)
+}
+
+/// Saves `stored` and answers with its id, for the view that shows it.
+///
+/// The view carries the id it was stored under, so a tab showing a fresh run
+/// can ask for a report of it (#159) without going back to History to find
+/// out what it was called.
+fn keep(service: &ResearchService, stored: &StoredRecord) -> String {
+    match service.memory.save(stored) {
         Ok(path) => tracing::info!(id = %stored.id, path = %path.display(), "recorded a finding"),
         Err(err) => tracing::error!(error = %err, id = %stored.id, "could not record a finding"),
     }
-    // The view goes to the window carrying the id it was stored under, so a
-    // tab showing a fresh run can ask for a report of it (#159) without
-    // going back to History to find out what it was called.
-    view.identify(stored.id);
-    Ok(view)
+    stored.id.clone()
+}
+
+/// Who asked for a run, when it was not a person at the window: an agent or a
+/// script, and where in its code the call was made.
+#[derive(Debug, Clone, Copy)]
+pub struct Asker<'a> {
+    pub author: &'a str,
+    pub origin: Option<&'a str>,
 }
 
 /// A view that came from a stored finding and can say which one.
@@ -589,6 +603,29 @@ pub fn run_panel_over(
     universe: &crate::universes::Universe,
     strategy: Option<&str>,
 ) -> Result<PanelView, CommandError> {
+    run_panel_over_as(service, universe, strategy, None)
+}
+
+/// [`run_panel_over`], saying who asked.
+///
+/// With an asker the panel is that author's finding, held to everything the
+/// author has run, exactly as a study is (`StoredRecord::by_agent`). A panel
+/// is the widest search Arvo runs, and it was the one an agent could repeat
+/// for nothing: it was saved as a person's, so no count rose and no bar moved
+/// (arvo-engine#15). The view is built after the author's bar is applied, so
+/// it shows the verdict that was stored and not the one the panel had on its
+/// own.
+///
+/// # Errors
+///
+/// As [`run_panel_over`], and when the author's earlier findings cannot be
+/// read: a bar drawn from half a history would be a lenient one.
+pub fn run_panel_over_as(
+    service: &ResearchService,
+    universe: &crate::universes::Universe,
+    strategy: Option<&str>,
+    asker: Option<Asker<'_>>,
+) -> Result<PanelView, CommandError> {
     service.load_risk()?;
     let plan = match strategy {
         Some(name) => StrategyPlan::find(name)
@@ -626,8 +663,20 @@ pub fn run_panel_over(
         size: universe.instruments.len(),
         missing,
     });
-    let view = panel_view(&found, service.simulation.engine());
-    remember(service, Some(plan.name()), (view, Record::Panel(Box::new(found))))
+    let record = Record::Panel(Box::new(found));
+    let now = chrono::Utc::now();
+    let stored = match asker {
+        Some(Asker { author, origin }) => {
+            let history = service.memory.load().map_err(|err| CommandError::Failed(err.to_string()))?.records;
+            StoredRecord::by_agent(record, author, &history, now).with_origin(origin.map(ToOwned::to_owned))
+        }
+        None => StoredRecord::new(record, now),
+    }
+    .with_provenance(super::provenance_for(Some(plan.name())));
+    let Record::Panel(found) = &stored.record else { unreachable!("a panel was just put there") };
+    let mut view = panel_view(found, service.simulation.engine());
+    view.identify(keep(service, &stored));
+    Ok(view)
 }
 
 pub async fn book_sector_cap(

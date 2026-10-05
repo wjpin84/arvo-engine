@@ -45,7 +45,7 @@ use arvo_api::EventView;
 /// `detail_json`.
 const TYPED: &[&str] = &[
     "id", "kind", "subject", "verdict", "recorded_at", "read_this_first", "reasons", "advice", "attachments",
-    "strategy", "code_commit", "ruleset_hash",
+    "strategy", "code_commit", "ruleset_hash", "data_findings",
 ];
 
 /// The largest message either side accepts: a figure or a trades table
@@ -782,6 +782,11 @@ fn finding(summary: &Value) -> Finding {
         })
         .unwrap_or_default();
     Finding {
+        data_findings: summary
+            .get("data_findings")
+            .and_then(Value::as_array)
+            .map(|found| found.iter().filter_map(|one| serde_json::from_value(one.clone()).ok()).collect())
+            .unwrap_or_default(),
         summary: Some(FindingSummary {
             id: text(summary.get("id")),
             kind: text(summary.get("kind")),
@@ -838,6 +843,21 @@ fn attachments(listed: Option<&Value>) -> Vec<Attachment> {
 }
 
 impl Service {
+    /// Leaves a line in the audit trail for a call that said who was making
+    /// it. A call that names nobody is a person at a window, and the trail is
+    /// of what agents and scripts did.
+    fn audited<E: std::fmt::Display>(
+        &self,
+        author: Option<String>,
+        call: &str,
+        arguments: &serde_json::Value,
+        outcome: Result<serde_json::Value, E>,
+    ) {
+        if let Some(author) = author {
+            self.research.audit("grpc", &author, call, arguments, &outcome.map_err(|err| err.to_string()));
+        }
+    }
+
     async fn run(&self, request: RunRequest, rolling: bool) -> Result<Response<Finding>, Status> {
         let instrument = required(&request.instrument, "instrument")?.to_owned();
         let strategy = required(&request.strategy, "strategy")?.to_owned();
@@ -893,9 +913,12 @@ impl research_server::Research for Service {
     }
 
     async fn write_ruleset(&self, request: Request<RulesetForm>) -> Result<Response<Ruleset>, Status> {
-        arvo_service::rulesets::write_form(self.research.root(), request.into_inner())
-            .map(Response::new)
-            .map_err(Status::invalid_argument)
+        let author = arvo_client::author_of(&request).map(ToOwned::to_owned);
+        let form = request.into_inner();
+        let arguments = serde_json::json!({ "name": form.name, "rule": form.rule });
+        let written = arvo_service::rulesets::write_form(self.research.root(), form);
+        self.audited(author, "write_ruleset", &arguments, written.as_ref().map(|kept| serde_json::json!({ "name": kept.name })));
+        written.map(Response::new).map_err(Status::invalid_argument)
     }
 
     async fn list_rules(&self, _: Request<Empty>) -> Result<Response<Rules>, Status> {
@@ -907,14 +930,19 @@ impl research_server::Research for Service {
     }
 
     async fn translate_pine(&self, request: Request<PineScript>) -> Result<Response<PineTranslation>, Status> {
+        let author = arvo_client::author_of(&request).map(ToOwned::to_owned);
         let PineScript { text, interval } = request.into_inner();
         let text = required(&text, "text")?.to_owned();
         let interval: arvo_data::BarInterval = match interval.as_deref().filter(|text| !text.trim().is_empty()) {
             Some(named) => named.parse().map_err(|err| Status::invalid_argument(format!("{named:?}: {err}")))?,
             None => arvo_data::BarInterval::DAILY,
         };
-        let translated = arvo_research::pine::translate(&text, interval).map_err(|err| Status::invalid_argument(err.to_string()))?;
-        let translated = arvo_research::pine::attributed(translated, &text);
+        // The script itself is not kept in the trail: its size and what it
+        // became say enough, and the rule it became is audited when written.
+        let arguments = serde_json::json!({ "interval": interval.to_string(), "lines": text.lines().count() });
+        let translated = arvo_research::pine::translate(&text, interval).map_err(|err| err.to_string());
+        self.audited(author, "translate_pine", &arguments, translated.as_ref().map(|read| serde_json::json!({ "name": read.rule.name })));
+        let translated = arvo_research::pine::attributed(translated.map_err(Status::invalid_argument)?, &text);
         Ok(Response::new(PineTranslation {
             rule: serde_json::to_string_pretty(&translated.rule).map_err(|err| Status::internal(err.to_string()))?,
             ignored: translated.ignored,
@@ -925,12 +953,14 @@ impl research_server::Research for Service {
     }
 
     async fn write_rule(&self, request: Request<RuleText>) -> Result<Response<RuleFile>, Status> {
+        let author = arvo_client::author_of(&request).map(ToOwned::to_owned);
         let json = required(&request.get_ref().json, "json")?;
-        let rule: arvo_research::rule::RuleDefinition =
-            serde_json::from_str(json).map_err(|err| Status::invalid_argument(format!("not a rule definition: {err}")))?;
-        arvo_service::rules::write(self.research.root(), &rule)
-            .map(Response::new)
-            .map_err(Status::invalid_argument)
+        let written = serde_json::from_str::<arvo_research::rule::RuleDefinition>(json)
+            .map_err(|err| format!("not a rule definition: {err}"))
+            .and_then(|rule| arvo_service::rules::write(self.research.root(), &rule).map(|kept| (rule.name, kept)));
+        let arguments = serde_json::json!({ "name": written.as_ref().ok().map(|(name, _)| name) });
+        self.audited(author, "write_rule", &arguments, written.as_ref().map(|(name, _)| serde_json::json!({ "name": name })));
+        written.map(|(_, kept)| Response::new(kept)).map_err(Status::invalid_argument)
     }
 
     async fn get_risk_model(&self, _: Request<Empty>) -> Result<Response<RiskModel>, Status> {
@@ -956,17 +986,38 @@ impl research_server::Research for Service {
     }
 
     async fn run_panel(&self, request: Request<PanelRequest>) -> Result<Response<PanelView>, Status> {
-        let PanelRequest { universe, strategy } = request.into_inner();
+        let PanelRequest { universe, strategy, author, origin } = request.into_inner();
+        // An author makes this that author's finding, held to everything
+        // they have run, and leaves a line in the trail (#15). None is a
+        // person at the window, whose panels were never counted and are not
+        // now.
+        let author = Some(author.trim().to_owned()).filter(|author| !author.is_empty());
+        let origin = Some(origin.trim().to_owned()).filter(|origin| !origin.is_empty());
         let root = self.research.root().to_path_buf();
-        let found = arvo_service::universes::find(&root, &universe).map_err(Status::invalid_argument)?;
+        let arguments = serde_json::json!({ "universe": universe, "strategy": strategy });
+        let found = arvo_service::universes::find(&root, &universe);
+        if let Err(why) = &found {
+            self.audited(author.clone(), "run_panel", &arguments, Err::<serde_json::Value, _>(why));
+        }
+        let found = found.map_err(Status::invalid_argument)?;
         let workbench = self.workbench.clone();
+        let asking = author.clone();
         let view = tokio::task::spawn_blocking(move || {
-            arvo_service::research::study::run_panel_over(&workbench, &found, strategy.as_deref())
+            let asker = asking
+                .as_deref()
+                .map(|author| arvo_service::research::study::Asker { author, origin: origin.as_deref() });
+            arvo_service::research::study::run_panel_over_as(&workbench, &found, strategy.as_deref(), asker)
         })
         .await
         .map_err(|err| Status::internal(err.to_string()))?
-        .map_err(refused)?;
-        Ok(Response::new(view))
+        .map_err(refused);
+        self.audited(
+            author,
+            "run_panel",
+            &arguments,
+            view.as_ref().map(|view| serde_json::json!({ "id": view.id })).map_err(tonic::Status::message),
+        );
+        view.map(Response::new)
     }
 
     async fn view_panel(&self, _: Request<Empty>) -> Result<Response<PanelView>, Status> {

@@ -173,9 +173,17 @@ impl Server {
         self.agent.clone().unwrap_or_else(|| "unnamed-agent".to_owned())
     }
 
-    /// `message`, carrying the research token.
-    fn request<T>(&self, message: T) -> Result<tonic::Request<T>, String> {
-        arvo_client::request(&self.token, message).map_err(|err| err.to_string())
+    /// `message`, carrying the research token and the agent's name.
+    ///
+    /// The name is what the engine's audit trail reads for a call that does
+    /// not record a finding: writing a rule, translating a script (#15). A
+    /// run says it again in the request, because there it decides whose
+    /// finding it is. A name that cannot be sent as a header is left off
+    /// rather than failing every call the agent makes.
+    fn request<T: Clone>(&self, message: T) -> Result<tonic::Request<T>, String> {
+        arvo_client::request_as(&self.token, &self.agent(), message.clone())
+            .or_else(|_| arvo_client::request(&self.token, message))
+            .map_err(|err| err.to_string())
     }
 
     fn call(&mut self, name: &str, arguments: &Value) -> Result<Value, String> {
@@ -313,9 +321,13 @@ impl Server {
                 encode(&compared)
             }
             "run_panel" => {
+                // The agent's, like a study: a panel is the widest search
+                // there is, and it counts against whoever ran it (#15).
                 let asked = PanelRequest {
                     universe: text("universe")?,
                     strategy: arguments.get("strategy").and_then(Value::as_str).map(ToOwned::to_owned),
+                    author: self.agent(),
+                    ..Default::default()
                 };
                 let request = self.request(asked)?;
                 let view = self.runtime.block_on(self.research.run_panel(request)).map_err(refused)?;
@@ -879,6 +891,135 @@ mod tests {
         assert_eq!(refused["result"]["isError"], json!(true));
         assert!(refused["result"]["content"][0]["text"].as_str().expect("text").contains("rsi"), "{refused}");
         assert!(!engine.dir.path().join("rules/agent_broken.json").exists());
+
+        // Writing a rule is the start of a search, so each write is in the
+        // trail under the agent's name, the refused one included (#15).
+        let trail = audit(&engine);
+        let said: Vec<(&str, &str, bool)> = trail
+            .iter()
+            .map(|line| {
+                (line["agent"].as_str().expect("agent"), line["tool"].as_str().expect("tool"), line["ok"] == json!(true))
+            })
+            .collect();
+        assert_eq!(
+            said,
+            vec![
+                ("unnamed-agent", "write_rule", true),
+                ("unnamed-agent", "write_ruleset", true),
+                ("unnamed-agent", "write_rule", false),
+            ],
+            "{trail:?}"
+        );
+        assert_eq!(trail[0]["arguments"]["name"], json!("agent_twin"));
+        assert!(trail[2]["error"].as_str().expect("why").contains("rsi"));
+    }
+
+    /// Every line of the engine's audit trail, in order.
+    fn audit(engine: &TestEngine) -> Vec<Value> {
+        std::fs::read_to_string(engine.dir.path().join("agent-audit.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("a line of json"))
+            .collect()
+    }
+
+    /// A panel an agent runs is the agent's (#15): saved under its name, held
+    /// to everything it has run, and in the trail. It used to be saved as a
+    /// person's, so an agent could run panels until one passed and nothing
+    /// counted them.
+    #[test]
+    fn a_panel_an_agent_runs_is_charged_to_the_agent() {
+        let engine = engine();
+        // Three series that wander differently, long enough for the default
+        // rule's slowest average and a split.
+        let start = chrono::NaiveDate::from_ymd_opt(2023, 1, 2).expect("date").and_hms_opt(0, 0, 0).expect("time");
+        let library = arvo_data::CsvBars::new(engine.dir.path().join("data"));
+        for (name, phase) in [("AAA.YF", 0.0_f64), ("BBB.YF", 1.7), ("CCC.YF", 3.1)] {
+            let bars: Vec<arvo_data::Bar> = (0..700)
+                .map(|i| {
+                    let t = f64::from(i);
+                    let close = 100.0 + t * 0.05 + 12.0 * (t / 37.0 + phase).sin() + 3.0 * (t / 5.0 + phase).cos();
+                    arvo_data::Bar {
+                        at: start + chrono::Duration::days(i64::from(i)),
+                        open: close - 0.2,
+                        high: close + 0.6,
+                        low: close - 0.6,
+                        close,
+                        volume: 10_000.0,
+                    }
+                })
+                .collect();
+            library.write(name, arvo_data::BarInterval::DAILY, &bars).expect("written");
+        }
+        std::fs::create_dir_all(engine.dir.path().join("universes")).expect("universes/");
+        std::fs::write(
+            engine.dir.path().join("universes/three.json"),
+            r#"{ "name": "three", "reason": "three made-up series, for a test", "interval": {"step":1,"unit":"day"},
+                 "instruments": ["AAA.YF", "BBB.YF", "CCC.YF"] }"#,
+        )
+        .expect("write");
+
+        let mut server = server(&engine, Some("panel-agent"));
+        let panels = |engine: &TestEngine| -> Vec<Value> {
+            let mut found: Vec<Value> = std::fs::read_dir(engine.dir.path().join("evidence"))
+                .expect("evidence/")
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+                .filter(|path| path.file_name().is_some_and(|name| name != "index.json"))
+                .map(|path| serde_json::from_str(&std::fs::read_to_string(path).expect("read")).expect("json"))
+                .collect();
+            found.sort_by_key(|stored: &Value| stored["recorded_at"].as_str().map(ToOwned::to_owned));
+            found
+        };
+        let run = |server: &mut Server, id: u32| {
+            call(
+                server,
+                json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call",
+                        "params": { "name": "run_panel", "arguments": { "universe": "three" } } }),
+            )
+        };
+
+        let first = run(&mut server, 30);
+        assert_ne!(first["result"]["isError"], json!(true), "{first}");
+        let stored = panels(&engine);
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0]["record"]["kind"], json!("panel"));
+        assert_eq!(stored[0]["author"]["by"], json!("agent"), "not a person's: {}", stored[0]["author"]);
+        assert_eq!(stored[0]["author"]["id"], json!("panel-agent"));
+        assert_eq!(stored[0]["author"]["search"]["prior_findings"], json!(0));
+        let once = stored[0]["author"]["search"]["trials"].as_u64().expect("trials");
+        assert!(once > 0);
+
+        // Run again, and the second is held to both: the count that was
+        // never kept is kept now.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let second = run(&mut server, 31);
+        assert_ne!(second["result"]["isError"], json!(true), "{second}");
+        let stored = panels(&engine);
+        assert_eq!(stored.len(), 2);
+        assert_eq!(stored[1]["author"]["search"]["prior_findings"], json!(1));
+        assert_eq!(stored[1]["author"]["search"]["trials"].as_u64(), Some(once * 2), "its own search and the one before");
+
+        // And both are in the trail, each naming the finding it made.
+        let trail = audit(&engine);
+        assert_eq!(trail.len(), 2, "{trail:?}");
+        for (line, kept) in trail.iter().zip(&stored) {
+            assert_eq!(line["agent"], json!("panel-agent"));
+            assert_eq!(line["tool"], json!("run_panel"));
+            assert_eq!(line["arguments"]["universe"], json!("three"));
+            assert_eq!(line["finding"], kept["id"]);
+        }
+
+        // A universe that does not exist is a refusal the trail also keeps.
+        let missing = call(
+            &mut server,
+            json!({ "jsonrpc": "2.0", "id": 32, "method": "tools/call",
+                    "params": { "name": "run_panel", "arguments": { "universe": "nowhere" } } }),
+        );
+        assert_eq!(missing["result"]["isError"], json!(true));
+        let last = audit(&engine).pop().expect("a line");
+        assert_eq!((last["tool"].as_str(), last["ok"] == json!(true)), (Some("run_panel"), false));
     }
 
     #[test]
