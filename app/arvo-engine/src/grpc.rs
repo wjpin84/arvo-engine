@@ -1151,20 +1151,17 @@ impl research_server::Research for Service {
         // The structured review is what a chart reads (#229); the markdown is
         // what a person reads. Both come off the same review, so they cannot
         // disagree about the day.
-        let reviewed = arvo_service::review::review(&root, day);
-        let (path, markdown, written_now) = match arvo_service::review::read(&root, day) {
-            Some((path, text)) => (path, text, false),
-            None => {
-                let path = arvo_service::review::write(&root, &reviewed).map_err(Status::internal)?;
-                (path, arvo_service::review::markdown(&reviewed), true)
-            }
-        };
+        //
+        // Written only once the day is over. Opening a day used to write it,
+        // and a review is never rewritten: a look at a day yet to come left
+        // an empty review that the day itself could not replace.
+        let opened = arvo_service::review::open(&root, day, chrono::Utc::now()).map_err(Status::internal)?;
         Ok(Response::new(ReviewView {
             day: day.to_string(),
-            markdown,
-            path: path.display().to_string(),
-            written_now,
-            json: serde_json::to_string(&reviewed).map_err(|err| Status::internal(err.to_string()))?,
+            markdown: opened.markdown,
+            path: opened.path.display().to_string(),
+            written_now: opened.written_now,
+            json: serde_json::to_string(&opened.review).map_err(|err| Status::internal(err.to_string()))?,
         }))
     }
 

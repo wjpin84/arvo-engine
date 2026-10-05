@@ -567,23 +567,19 @@ fn views_command(root: &std::path::Path, args: &[String]) -> Result<(), String> 
 
 /// `review [YYYY-MM-DD]`: the day's review from the session records under
 /// `root`, written under `reviews/` and printed. Needs no engine (#217).
-/// A day already reviewed is printed as it was written, not rewritten.
+/// A day already reviewed is printed as it was written, not rewritten, and
+/// a day that is not over is printed and not written.
 fn review_command(root: PathBuf, args: &[String]) -> Result<(), String> {
     let day = match args {
         [] => chrono::Utc::now().date_naive(),
         [day] => day.parse().map_err(|err| format!("{day:?} is not a date (YYYY-MM-DD): {err}"))?,
         _ => return Err(USAGE.to_owned()),
     };
-    let text = match arvo_service::review::read(&root, day) {
-        Some((_, text)) => text,
-        None => {
-            let reviewed = arvo_service::review::review(&root, day);
-            let path = arvo_service::review::write(&root, &reviewed)?;
-            eprintln!("arvo-engine: written to {}", path.display());
-            arvo_service::review::markdown(&reviewed)
-        }
-    };
-    print!("{text}");
+    let opened = arvo_service::review::open(&root, day, chrono::Utc::now())?;
+    if opened.written_now {
+        eprintln!("arvo-engine: written to {}", opened.path.display());
+    }
+    print!("{}", opened.markdown);
     Ok(())
 }
 

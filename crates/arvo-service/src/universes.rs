@@ -126,21 +126,40 @@ pub struct Refreshed {
     pub current: Vec<String>,
     /// Members whose fetch failed, with the reason.
     pub failed: Vec<(String, String)>,
+    /// Members already fetched for the bar that is due, which the source did
+    /// not have: a market holiday has no bar. Not asked again until a later
+    /// bar is due.
+    pub absent: Vec<String>,
 }
+
+/// What has been fetched and did not bring the bar that was due, by member,
+/// interval and the day wanted. The job runs hourly, and without this a
+/// holiday would refetch every member's whole history each hour until the
+/// next session.
+// ponytail: in memory, so a restart tries once more; a market calendar would
+// replace it.
+static TRIED: std::sync::Mutex<std::collections::BTreeSet<(String, String, chrono::NaiveDate)>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
 
 impl Refreshed {
     #[must_use]
     pub fn describe(&self) -> String {
-        format!("{} fetched, {} current, {} failed", self.fetched.len(), self.current.len(), self.failed.len())
+        let absent = if self.absent.is_empty() {
+            String::new()
+        } else {
+            format!(", {} the source has nothing newer for", self.absent.len())
+        };
+        format!("{} fetched, {} current, {} failed{absent}", self.fetched.len(), self.current.len(), self.failed.len())
     }
 }
 
 /// Whether the library's series for `id` at `interval` ends before the last
-/// bar that could exist by `now`: a daily series is current through the last
-/// weekday before today; an intraday one through yesterday's session.
-fn stale(service: &ResearchService, id: &str, interval: BarInterval, now: chrono::NaiveDate) -> bool {
+/// bar that could exist by `now` (UTC): a daily series is current through the
+/// last weekday before today; an intraday one through today's session once it
+/// has closed.
+fn stale(service: &ResearchService, id: &str, interval: BarInterval, now: chrono::NaiveDateTime) -> bool {
     let Ok(Some((_, last))) = service.bars.coverage(id, interval) else { return true };
-    last < stale_wants(now)
+    last < stale_wants(interval, now)
 }
 
 /// Fetches every member whose series is missing or behind, through the
@@ -153,12 +172,18 @@ fn stale(service: &ResearchService, id: &str, interval: BarInterval, now: chrono
 /// be acted on.
 pub async fn refresh(service: &ResearchService, universe: &Universe, report: crate::research::data::Report<'_>) -> Result<Refreshed, String> {
     let sources = crate::source::all();
-    let today = chrono::Utc::now().date_naive();
+    let now = chrono::Utc::now().naive_utc();
+    let today = now.date();
     let mut done = Refreshed::default();
     for id in &universe.instruments {
         let (symbol, venue) = id.split_once('.').ok_or_else(|| format!("{id:?} names no venue"))?;
-        if !stale(service, id, universe.interval, today) {
+        if !stale(service, id, universe.interval, now) {
             done.current.push(id.clone());
+            continue;
+        }
+        let tried = (id.clone(), universe.interval.to_string(), stale_wants(universe.interval, now));
+        if TRIED.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains(&tried) {
+            done.absent.push(id.clone());
             continue;
         }
         let Some(source) = sources.iter().find(|source| source.venue() == venue) else {
@@ -175,7 +200,12 @@ pub async fn refresh(service: &ResearchService, universe: &Universe, report: cra
             .map_or(reach, |since| u32::try_from((today - since).num_days().max(1)).unwrap_or(reach).min(reach));
         let from = today - chrono::Duration::days(i64::from(days));
         match arvo_data::source::ingest(&service.data_dir, source.as_ref(), symbol, universe.interval, from, today).await {
-            Ok(_) => done.fetched.push(id.clone()),
+            Ok(_) => {
+                if stale(service, id, universe.interval, now) {
+                    TRIED.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(tried);
+                }
+                done.fetched.push(id.clone());
+            }
             Err(err) => {
                 // A dead session is announced once, by the same path a
                 // person's fetch would announce it.
@@ -187,8 +217,21 @@ pub async fn refresh(service: &ResearchService, universe: &Universe, report: cra
     Ok(done)
 }
 
-/// The last weekday before `now`: the most recent daily bar that can exist.
-fn stale_wants(now: chrono::NaiveDate) -> chrono::NaiveDate {
+/// The day of the most recent bar that can exist by `now` (UTC).
+///
+/// For a daily series, the last weekday before today. An intraday series is
+/// due as soon as today's regular session has closed: the day's review draws
+/// these bars, and waiting for the date to roll over in UTC left the review
+/// of a session without its bars until late in the evening.
+fn stale_wants(interval: BarInterval, now: chrono::NaiveDateTime) -> chrono::NaiveDate {
+    let today = now.date();
+    let intraday = matches!(interval.unit, arvo_data::IntervalUnit::Minute | arvo_data::IntervalUnit::Hour);
+    let weekend = matches!(chrono::Datelike::weekday(&today), chrono::Weekday::Sat | chrono::Weekday::Sun);
+    // Five minutes past the close, for the last bar to be published.
+    if intraday && !weekend && now >= arvo_data::session::regular_close(today) + chrono::Duration::minutes(5) {
+        return today;
+    }
+    let now = today;
     let mut wanted = now.pred_opt().unwrap_or(now);
     while matches!(chrono::Datelike::weekday(&wanted), chrono::Weekday::Sat | chrono::Weekday::Sun) {
         wanted = wanted.pred_opt().unwrap_or(wanted);
@@ -242,12 +285,32 @@ mod tests {
     fn a_series_is_current_through_the_last_weekday_before_today() {
         let dir = project();
         let service = ResearchService::new(dir.path().join(crate::research::DATA_SUBDIR), dir.path().join(crate::research::EVIDENCE_SUBDIR));
-        let monday = chrono::NaiveDate::from_ymd_opt(2026, 9, 28).expect("date");
-        assert!(stale(&service, "SPY.YF", BarInterval::DAILY, monday), "nothing in the library is stale");
-        let saturday = chrono::NaiveDate::from_ymd_opt(2026, 9, 26).expect("date");
+        let date = |day: u32| chrono::NaiveDate::from_ymd_opt(2026, 9, day).expect("date");
+        let at = |day: u32, hour: u32, minute: u32| date(day).and_hms_opt(hour, minute, 0).expect("time");
+        let (thursday, friday, saturday, monday) = (24, 25, 26, 28);
+        assert!(stale(&service, "SPY.YF", BarInterval::DAILY, at(monday, 12, 0)), "nothing in the library is stale");
         // The rule wants Friday's bar on Saturday and Monday, and Thursday's on Friday.
-        assert_eq!(super::stale_wants(saturday), chrono::NaiveDate::from_ymd_opt(2026, 9, 25).expect("date"));
-        assert_eq!(super::stale_wants(monday), chrono::NaiveDate::from_ymd_opt(2026, 9, 25).expect("date"));
-        assert_eq!(super::stale_wants(chrono::NaiveDate::from_ymd_opt(2026, 9, 25).expect("date")), chrono::NaiveDate::from_ymd_opt(2026, 9, 24).expect("date"));
+        let daily = |day, hour| super::stale_wants(BarInterval::DAILY, at(day, hour, 0));
+        assert_eq!(daily(saturday, 12), date(friday));
+        assert_eq!(daily(monday, 12), date(friday));
+        assert_eq!(daily(friday, 12), date(thursday));
+        assert_eq!(daily(friday, 23), date(thursday), "a daily series still waits for the date to roll");
+    }
+
+    /// The review after the close draws the day's five-minute bars, so they
+    /// are due when the session closes and not when the date rolls in UTC.
+    #[test]
+    fn an_intraday_series_is_due_once_todays_session_has_closed() {
+        let five = BarInterval { step: 5, unit: arvo_data::IntervalUnit::Minute };
+        let date = |day: u32| chrono::NaiveDate::from_ymd_opt(2026, 10, day).expect("date");
+        let wants = |day: u32, hour: u32, minute: u32| {
+            super::stale_wants(five, date(day).and_hms_opt(hour, minute, 0).expect("time"))
+        };
+        // Monday 2026-10-05. The close is 16:00 New York, 20:00 UTC.
+        assert_eq!(wants(5, 15, 0), date(2), "mid-session: Friday is the last finished day");
+        assert_eq!(wants(5, 20, 4), date(2), "a moment for the last bar to be published");
+        assert_eq!(wants(5, 20, 5), date(5), "due from five past the close");
+        assert_eq!(wants(6, 3, 0), date(5), "and still the day wanted after midnight UTC");
+        assert_eq!(wants(10, 21, 0), date(9), "a Saturday has no session to close");
     }
 }

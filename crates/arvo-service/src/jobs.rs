@@ -81,13 +81,15 @@ pub fn register(jobs: &Jobs, root: &Path, research: Arc<ResearchService>, raise:
         }
     });
 
-    // Universes kept fetched (#227): every six hours, each member whose
-    // series is missing or behind the last completed bar, through the source
-    // that serves its venue.
+    // Universes kept fetched (#227): every hour, each member whose series is
+    // missing or behind the last completed bar, through the source that
+    // serves its venue. Hourly so the day's intraday bars are in the library
+    // within the hour after the close, which is when its review is read; a
+    // run that finds everything current fetches nothing.
     let fetching = research.clone();
     let announce_fetch = announce.clone();
     let universes_root = root.to_path_buf();
-    jobs.every("universes", "Keep the universes fetched", std::time::Duration::from_secs(6 * 60 * 60), move || {
+    jobs.every("universes", "Keep the universes fetched", std::time::Duration::from_secs(60 * 60), move || {
         let research = fetching.clone();
         let raise = announce_fetch.clone();
         let root = universes_root.clone();
