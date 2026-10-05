@@ -114,21 +114,22 @@ fn an_unknown_executor_is_refused_before_a_thread_starts() {
     assert!(sessions.start("f-1", "robinhood").is_err(), "which account?");
 }
 
-/// A paper record spanning `days`, ending on the given verdict.
+/// A paper record that took a bar on each of `days` days, ending on the
+/// given verdict.
 fn paper_record(data: &Path, finding: &str, days: i64, verdict: Option<&str>) {
     let path = record_path(data, &format!("{finding}@alpaca-paper"));
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     let start = chrono::Utc::now() - chrono::Duration::days(days);
-    let mut lines = vec![
-        format!(
-            r#"{{"at":"{}","event":"started","detail":null}}"#,
-            start.to_rfc3339()
-        ),
-        format!(
+    let mut lines = vec![format!(
+        r#"{{"at":"{}","event":"started","detail":null}}"#,
+        start.to_rfc3339()
+    )];
+    for day in 1..=days {
+        lines.push(format!(
             r#"{{"at":"{}","event":"bar","detail":null}}"#,
-            (start + chrono::Duration::days(1)).to_rfc3339()
-        ),
-    ];
+            (start + chrono::Duration::days(day)).to_rfc3339()
+        ));
+    }
     if let Some(verdict) = verdict {
         lines.push(format!(
                 r#"{{"at":"{}","event":"verdict","detail":{{"verdict":"{verdict}","reason":"drawdown"}}}}"#,
@@ -171,7 +172,7 @@ fn a_paper_session_too_short_or_diverging_does_not_promote() {
         .expect_err("too short");
     assert!(
         short.contains(&format!(
-            "ran {} day(s); {PAPER_MINIMUM_DAYS} are needed",
+            "took bars on {} day(s); {PAPER_MINIMUM_DAYS} are needed",
             PAPER_MINIMUM_DAYS - 1
         )),
         "{short}"
@@ -846,6 +847,46 @@ fn a_record_with_no_last_word_is_said_to_be_dropped_and_said_once() {
     assert!(next.list().is_empty());
 }
 
+/// The gate counts the days a paper session took bars on (#36), not the
+/// calendar days from its first start to its last line: a session that ran
+/// one day and was started again a fortnight later did not run a fortnight.
+#[test]
+fn the_gate_counts_days_with_bars_and_not_the_calendar() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let sessions = Sessions::new(dir.path(), broadcast::channel(16).0, std::sync::Arc::new(TestVenues));
+    let path = record_path(dir.path(), "f-1@alpaca-paper");
+    std::fs::create_dir_all(path.parent().expect("a folder")).expect("sessions/");
+    let line = |at: chrono::DateTime<chrono::Utc>, event: &str| {
+        serde_json::json!({ "at": at.to_rfc3339(), "event": event }).to_string()
+    };
+    // Mid-morning New York, so a few hours more stay on the same UTC date.
+    let then = (chrono::Utc::now() - chrono::Duration::days(30)).date_naive().and_hms_opt(14, 0, 0).expect("time").and_utc();
+    let day = |n: i64| then + chrono::Duration::days(n);
+    let hours = |n: i64| chrono::Duration::hours(n);
+    // One day with bars, stopped; started again two weeks later for one
+    // more day with bars, and again with the feed dark; then left dropped.
+    let record = [
+        line(day(0), "started"),
+        line(day(0) + hours(1), "bar"),
+        line(day(0) + hours(2), "bar"),
+        line(day(0) + hours(7), "stopped"),
+        line(day(14), "started"),
+        line(day(14) + hours(1), "bar"),
+        line(day(14) + hours(7), "stopped"),
+        line(day(15), "started"),
+        line(day(15) + hours(1), "feed_down"),
+        line(day(15) + hours(7), "stopped"),
+        line(day(16), "started"),
+        line(day(16) + hours(1), "bar"),
+        line(day(16) + hours(1), "dropped"),
+    ]
+    .join("\n");
+    std::fs::write(&path, record + "\n").expect("written");
+    let asked = sessions.promotion("f-1", "alpaca-live").expect("answers");
+    assert_eq!(asked.paper_days, Some(3), "three days with bars, in a record spanning sixteen");
+    assert!(asked.reasons.iter().any(|reason| reason.contains("took bars on 3 day(s)")), "{:?}", asked.reasons);
+}
+
 /// A session that fails ends its record by saying so (#13), and neither that
 /// line nor a `dropped` one counts as a day of paper trading.
 #[test]
@@ -861,8 +902,9 @@ fn a_failed_session_says_so_in_its_record_and_the_gate_does_not_count_it() {
     std::fs::write(
         &path,
         format!(
-            "{}\n{}\n",
+            "{}\n{}\n{}\n",
             serde_json::json!({ "at": then.to_rfc3339(), "event": "started" }),
+            serde_json::json!({ "at": (then + chrono::Duration::hours(1)).to_rfc3339(), "event": "bar" }),
             serde_json::json!({ "at": (then + chrono::Duration::days(1)).to_rfc3339(), "event": "stopped" }),
         ),
     )
