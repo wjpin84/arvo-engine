@@ -22,7 +22,10 @@ pub const EXECUTORS: &[&str] = &["alpaca-paper", "alpaca-live", "robinhood-<last
 
 /// How long a finding must have run on paper before real money (#194).
 ///
-/// Calendar days between the paper session's start and its last event.
+/// Days on which the paper session took a bar, by its record. Not the
+/// calendar days between its start and its last line (#36): a session that
+/// ran one day and was started again two weeks later had not run for two
+/// weeks, and that count would have let it through to real money.
 /// Five is one trading week: long enough for a daily rule to have seen a
 /// few bars and for the feed, the fills and the reconciliation to have
 /// been exercised, and short enough that it is done rather than skipped.
@@ -43,7 +46,7 @@ pub struct Promotion {
     pub reasons: Vec<String>,
     /// The finding's own verdict, when it can be opened.
     pub verdict: Option<String>,
-    /// Days on paper, by the paper record; `None` without one.
+    /// Days on which the paper session took a bar; `None` without a record.
     pub paper_days: Option<i64>,
     /// The paper session's last verdict against the finding, when it has one.
     pub paper_verdict: Option<String>,
@@ -91,22 +94,22 @@ pub(crate) fn promotion(data: &Path, finding: &str) -> Promotion {
         reasons.push(format!("no paper session on this finding; run it on alpaca-paper for {PAPER_MINIMUM_DAYS} days first"));
         return answer(reasons, found, None, None);
     };
-    let mut started: Option<chrono::DateTime<chrono::Utc>> = None;
-    let mut last: Option<chrono::DateTime<chrono::Utc>> = None;
+    let mut started = false;
+    // The days it took a bar on: a day the session was up but the feed was
+    // dark, or the market shut, is not a day the rule was exercised.
+    let mut days_with_bars = std::collections::BTreeSet::new();
     let mut verdict: Option<(String, Option<String>)> = None;
     for line in text.lines() {
         let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
-        let at = event["at"]
-            .as_str()
-            .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
-            .map(|at| at.with_timezone(&chrono::Utc));
         match event["event"].as_str() {
-            Some("started") if started.is_none() => started = at,
-            // How a session ended without being stopped (#13), not something
-            // it did: neither is a day it ran.
-            Some("failed" | "dropped") => continue,
+            Some("started") => started = true,
+            Some("bar") => {
+                if let Some(at) = event["at"].as_str().and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok()) {
+                    days_with_bars.insert(at.with_timezone(&chrono::Utc).date_naive());
+                }
+            }
             Some("verdict") => {
                 verdict = event["detail"]["verdict"].as_str().map(|name| {
                     (
@@ -117,22 +120,18 @@ pub(crate) fn promotion(data: &Path, finding: &str) -> Promotion {
             }
             _ => {}
         }
-        last = at.or(last);
     }
-    let paper_days = match (started, last) {
-        (Some(started), Some(last)) => {
-            let days = (last - started).num_days();
-            if days < PAPER_MINIMUM_DAYS {
-                reasons.push(format!(
-                    "the paper session ran {days} day(s); {PAPER_MINIMUM_DAYS} are needed"
-                ));
-            }
-            Some(days)
+    let paper_days = if started {
+        let days = i64::try_from(days_with_bars.len()).unwrap_or(i64::MAX);
+        if days < PAPER_MINIMUM_DAYS {
+            reasons.push(format!(
+                "the paper session took bars on {days} day(s); {PAPER_MINIMUM_DAYS} are needed"
+            ));
         }
-        _ => {
-            reasons.push("the paper session's record has no start".to_owned());
-            None
-        }
+        Some(days)
+    } else {
+        reasons.push("the paper session's record has no start".to_owned());
+        None
     };
     if let Some(("diverging", why)) = verdict.as_ref().map(|(name, why)| (name.as_str(), why)) {
         reasons.push(format!(
