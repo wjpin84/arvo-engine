@@ -25,6 +25,16 @@ tonic-prost.workspace = true
 tracing = "0.1"
 # The per-spawn token a supervised plugin requires on every call.
 rand = "0.8"
+# Finding a plugin an earlier engine left behind, by the binary it runs (#39).
+sysinfo = { version = "0.39", default-features = false, features = ["system"] }
+
+# A plugin dies with the engine, however the engine dies (#39): a Job Object
+# on Windows, the parent-death signal on Linux.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_JobObjects"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
 
 [build-dependencies]
 protoc-bin-vendored.workspace = true

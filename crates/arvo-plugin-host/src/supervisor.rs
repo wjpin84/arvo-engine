@@ -176,6 +176,14 @@ async fn run(id: String, launch: Launch, registry: Arc<PluginRegistry>, stop: Ar
             .kill_on_drop(true);
         #[cfg(windows)]
         command.creation_flags(0x0800_0000);
+        #[cfg(target_os = "linux")]
+        crate::lifetime::tie(&mut command);
+
+        // Whatever runs this binary now was left by an engine that is gone
+        // (#39): it holds a port and would be counted as up.
+        for pid in crate::lifetime::reap_orphans(std::path::Path::new(&launch.program)) {
+            tracing::warn!(plugin = %id, pid, "stopped a plugin no engine was behind");
+        }
 
         let mut child = match command.spawn() {
             Ok(child) => child,
@@ -189,6 +197,12 @@ async fn run(id: String, launch: Launch, registry: Arc<PluginRegistry>, stop: Ar
                 return;
             }
         };
+        // Tied to this process, so it ends when the engine does, however
+        // the engine ends (#39). Untied it runs as before, and says so.
+        #[cfg(windows)]
+        if let Err(why) = crate::lifetime::tie(&child) {
+            tracing::warn!(plugin = %id, %why, "not tied to the engine's life");
+        }
         if let Some(stderr) = child.stderr.take() {
             tokio::spawn(log(id.clone(), "stderr", stderr));
         }

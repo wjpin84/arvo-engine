@@ -265,11 +265,13 @@ dependencies = [
  "arvo-data",
  "async-trait",
  "chrono",
+ "libc",
  "prost",
  "protoc-bin-vendored",
  "rand 0.8.8",
  "serde_json",
  "sha2 0.10.9",
+ "sysinfo",
  "tempfile",
  "tokio",
  "tokio-stream",
@@ -277,6 +279,7 @@ dependencies = [
  "tonic-prost",
  "tonic-prost-build",
  "tracing",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
