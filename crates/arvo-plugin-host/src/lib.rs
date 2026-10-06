@@ -5,6 +5,7 @@
 //! removed — see the note on [`registry::PluginRegistry`] for why a sandbox
 //! that grants no imports cannot host the thing plugins are now for.
 
+pub mod lifetime;
 pub mod registry;
 pub mod signal;
 pub mod source;

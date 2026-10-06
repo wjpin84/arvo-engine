@@ -31,10 +31,62 @@ pub struct Stopped {
     pub unfinished: Vec<String>,
 }
 
+/// `<data>/sessions/hosted.json`: the sessions to bring back when an engine
+/// starts (#13). Written from what is running whenever that changes, and left
+/// as it is when the engine goes down, so the next engine knows what the last
+/// one had up.
+pub const HOSTED: &str = "hosted.json";
+
+/// One session the engine is to keep up.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Hosted {
+    pub id: String,
+    pub finding: String,
+    pub executor: String,
+}
+
+/// Writes which sessions are wanted up, from what is running now.
+///
+/// Only a session that is starting or running. A frozen or halted one is
+/// waiting for a person, and a restart that quietly resumed it would undo
+/// what the person decided; a failed or stopped one has ended. Nothing is
+/// written once the engine has begun to stop: its sessions ending then does
+/// not mean they are not wanted.
+fn remember(data: &Path, running: &Mutex<BTreeMap<String, Running>>, stopping: &AtomicBool) {
+    if stopping.load(Ordering::SeqCst) {
+        return;
+    }
+    let wanted: Vec<Hosted> = running
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .values()
+        .filter_map(|found| {
+            let status = found.status.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            matches!(status.state.as_str(), "starting" | "running").then(|| Hosted {
+                id: status.id.clone(),
+                finding: status.finding.clone(),
+                executor: status.executor.clone(),
+            })
+        })
+        .collect();
+    let Ok(text) = serde_json::to_string_pretty(&wanted) else { return };
+    let path = data.join(SUBDIR).join(HOSTED);
+    if std::fs::read_to_string(&path).ok().as_deref() == Some(text.as_str()) {
+        return;
+    }
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(path, text);
+}
+
 /// Every session this engine is hosting.
 pub struct Sessions {
     data: PathBuf,
-    running: Mutex<BTreeMap<String, Running>>,
+    running: Arc<Mutex<BTreeMap<String, Running>>>,
+    /// Set once [`Self::stop_all`] has begun, so the sessions ending on the
+    /// way out are not written off as unwanted.
+    stopping: Arc<AtomicBool>,
     /// Where state changes go, for whoever is listening (#150). Sent, never
     /// awaited: a session does not wait for the window.
     events: broadcast::Sender<EventView>,
@@ -91,10 +143,36 @@ impl Sessions {
     pub fn new(data: &Path, events: broadcast::Sender<EventView>, venues: Arc<dyn Venues>) -> Self {
         Self {
             data: data.to_path_buf(),
-            running: Mutex::new(BTreeMap::new()),
+            running: Arc::default(),
+            stopping: Arc::default(),
             events,
             venues,
         }
+    }
+
+    /// Writes which sessions are wanted up; see [`HOSTED`]. Called wherever
+    /// that changes, and every few seconds by the engine for the changes a
+    /// session makes to itself.
+    pub fn remember(&self) {
+        remember(&self.data, &self.running, &self.stopping);
+    }
+
+    /// Brings back the sessions the last engine had up (#13), as [`HOSTED`]
+    /// lists them, and says what became of each: started, or refused and why.
+    /// A start is the same start a person makes, promotion gate included, and
+    /// it adopts what the venue holds.
+    ///
+    /// For an engine's start, after [`Self::note_dropped`], and only when no
+    /// other engine is serving the same data.
+    pub fn restore(&self) -> Vec<(Hosted, Result<Status, String>)> {
+        let Ok(text) = std::fs::read_to_string(self.data.join(SUBDIR).join(HOSTED)) else {
+            return Vec::new();
+        };
+        let wanted: Vec<Hosted> = serde_json::from_str(&text).unwrap_or_default();
+        wanted.into_iter().map(|hosted| {
+            let outcome = self.start(&hosted.finding, &hosted.executor);
+            (hosted, outcome)
+        }).collect()
     }
 
     /// Starts a session for `finding` against `executor`.
@@ -173,6 +251,8 @@ impl Sessions {
             let events = self.events.clone();
             let venues = Arc::clone(&self.venues);
             let session = id.clone();
+            let hosted = Arc::clone(&self.running);
+            let stopping = Arc::clone(&self.stopping);
             // Its own thread: the shadow's message bus is thread-local
             // (ADR-0001), and a session is a loop that sleeps.
             std::thread::Builder::new()
@@ -210,6 +290,11 @@ impl Sessions {
                         }
                     }
                     announce(&events, &status);
+                    drop(status);
+                    // Ended on its own: not wanted back. Skipped while the
+                    // engine stops, which also keeps this from waiting on a
+                    // lock that `stop_all` holds while it waits on this.
+                    remember(&data, &hosted, &stopping);
                 })
                 .map_err(|err| format!("starting the session thread: {err}"))?
         };
@@ -222,6 +307,8 @@ impl Sessions {
                 thread: Some(thread),
             },
         );
+        drop(running);
+        self.remember();
         Ok(snapshot)
     }
 
@@ -233,19 +320,24 @@ impl Sessions {
     ///
     /// No session by that id.
     pub fn stop(&self, id: &str) -> Result<Status, String> {
-        let mut running = self
-            .running
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let found = running
-            .get_mut(id)
-            .ok_or_else(|| format!("no session {id}"))?;
-        found.stop.store(true, Ordering::SeqCst);
-        if let Some(thread) = found.thread.take() {
+        // The thread is joined with the registry unlocked: on its way out it
+        // writes what is still wanted, which needs the registry.
+        let (thread, status) = {
+            let mut running = self
+                .running
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let found = running
+                .get_mut(id)
+                .ok_or_else(|| format!("no session {id}"))?;
+            found.stop.store(true, Ordering::SeqCst);
+            (found.thread.take(), Arc::clone(&found.status))
+        };
+        if let Some(thread) = thread {
             let _ = thread.join();
         }
-        let status = found
-            .status
+        self.remember();
+        let status = status
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
@@ -266,6 +358,10 @@ impl Sessions {
     /// the engine is going down either way, and that record will end without
     /// its line, which is the truth about it.
     pub fn stop_all(&self, within: Duration) -> Stopped {
+        // What is up now is what the next engine brings back (#13): written
+        // once more, then left alone while the loops end.
+        self.remember();
+        self.stopping.store(true, Ordering::SeqCst);
         let mut running = self
             .running
             .lock()
@@ -383,11 +479,25 @@ impl Sessions {
     /// controls rather than one that opens a finding.
     #[cfg(test)]
     pub(crate) fn adopt(&self, id: &str, stop: Arc<AtomicBool>, thread: std::thread::JoinHandle<()>) {
-        let status = Arc::new(Mutex::new(crate::tests::fresh_status()));
+        let mut status = crate::tests::fresh_status();
+        status.id = id.to_owned();
+        if let Some((finding, executor)) = id.split_once('@') {
+            status.finding = finding.to_owned();
+            status.executor = executor.to_owned();
+        }
+        let status = Arc::new(Mutex::new(status));
         self.running
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(id.to_owned(), Running { status, stop, mailbox: Mailbox::default(), thread: Some(thread) });
+    }
+
+    /// Sets an adopted session's state, as its loop would.
+    #[cfg(test)]
+    pub(crate) fn set_state(&self, id: &str, state: &str) {
+        if let Some(found) = self.running.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(id) {
+            found.status.lock().unwrap_or_else(std::sync::PoisonError::into_inner).state = state.to_owned();
+        }
     }
 
     /// Makes a frozen session's gate agree with the venue. The session stays
@@ -479,6 +589,9 @@ impl Sessions {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
+        // A halt is a person's decision, and a halted session is not
+        // brought back by a restart.
+        self.remember();
         Ok(now)
     }
 
