@@ -140,32 +140,47 @@ pub fn register(jobs: &Jobs, root: &Path, research: Arc<ResearchService>, raise:
         let raise = announce_sweep.clone();
         let root = sweep_root.clone();
         async move {
-            let Some((universe, rule)) = tokio::task::spawn_blocking({
+            let queue = tokio::task::spawn_blocking({
                 let research = research.clone();
                 let root = root.clone();
-                move || crate::research::sweep::next(&research, &root)
+                move || crate::research::sweep::unswept(&research, &root)
             })
             .await
-            .map_err(|err| format!("the sweep did not decide what to run: {err}"))?
-            else {
+            .map_err(|err| format!("the sweep did not decide what to run: {err}"))?;
+            if queue.is_empty() {
                 return Ok("nothing unswept".to_owned());
-            };
+            }
 
-            let said = format!("{rule} over {}", universe.name);
-            let view = tokio::task::spawn_blocking(move || {
-                crate::research::study::run_panel_over(&research, &universe, Some(&rule))
-            })
-            .await
-            .map_err(|err| format!("{said} did not finish: {err}"))?
-            .map_err(|err| err.to_string())?;
-
-            raise(EventView::new(
-                arvo_api::EventKindView::findings(0),
-                format!("Swept {said}"),
-                format!("{}: {}", view.verdict, view.reasons.join("; ")),
-                arvo_api::SeverityView::Info,
-            ));
-            Ok(format!("{said}: {}", view.verdict))
+            // The first pair that runs is the tick's one panel. A pair the
+            // engine refuses is passed over rather than waited on: a refusal
+            // records nothing, so the pair stays unswept, and stopping at it
+            // stopped every pair behind it for as long as it was refused.
+            // ponytail: a refusal is assumed cheap, a check before any
+            // backtest. If one ever costs minutes, cap the refusals per tick.
+            let mut refused = Vec::new();
+            for (universe, rule) in queue {
+                let said = format!("{rule} over {}", universe.name);
+                let ran = tokio::task::spawn_blocking({
+                    let research = research.clone();
+                    move || crate::research::study::run_panel_over(&research, &universe, Some(&rule))
+                })
+                .await
+                .map_err(|err| format!("{said} did not finish: {err}"))?;
+                match ran {
+                    Ok(view) => {
+                        raise(EventView::new(
+                            arvo_api::EventKindView::findings(0),
+                            format!("Swept {said}"),
+                            format!("{}: {}", view.verdict, view.reasons.join("; ")),
+                            arvo_api::SeverityView::Info,
+                        ));
+                        let passed = if refused.is_empty() { String::new() } else { format!("; passed over {}", refused.join("; ")) };
+                        return Ok(format!("{said}: {}{passed}", view.verdict));
+                    }
+                    Err(err) => refused.push(format!("{said} ({err})")),
+                }
+            }
+            Err(format!("nothing unswept could be run: {}", refused.join("; ")))
         }
     });
 
