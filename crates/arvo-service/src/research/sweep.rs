@@ -18,7 +18,16 @@
 //!
 //! An option rule is never returned. Those trade a chain, their window is where
 //! both the bars and the chain exist, and a panel over a universe is not how they
-//! are run.
+//! are run. Nor is a rule with nothing to search: a panel refuses an empty grid,
+//! and what gets swept is the rulesets that give the rule one.
+//!
+//! # A queue, not a head
+//!
+//! This used to return the first unswept pair and nothing else. A pair the
+//! engine refuses is never recorded, so it stayed first: for eight days the
+//! job asked for the same refused panel every hour and nothing behind it ran,
+//! with every universe's bars on disk. So this returns the whole queue in
+//! order, and the job passes over a refusal to the next pair.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -26,26 +35,27 @@ use std::path::Path;
 use super::{ResearchService, StrategyPlan};
 use crate::universes::Universe;
 
-/// The first universe and rule with no recorded panel between them, if there is
-/// one.
+/// Every universe and rule with no recorded panel between them, in the order
+/// they are to be tried.
 ///
 /// Reads the whole store, which is a few dozen small files, and asks each panel
 /// which universe and rule it was. A panel recorded before the rule was
 /// surfaced answers with an empty name and is treated as covering nothing —
 /// honest, since it cannot say what it ran.
 #[must_use]
-pub fn next(service: &ResearchService, root: &Path) -> Option<(Universe, String)> {
+pub fn unswept(service: &ResearchService, root: &Path) -> Vec<(Universe, String)> {
     let swept = already_swept(service);
 
+    let mut queue = Vec::new();
     for (_, universe) in crate::universes::read_all(root) {
         let Ok(universe) = universe else { continue };
         for plan in candidates(universe.interval) {
             if !swept.contains(&(universe.name.clone(), plan.name().to_owned())) {
-                return Some((universe, plan.name().to_owned()));
+                queue.push((universe.clone(), plan.name().to_owned()));
             }
         }
     }
-    None
+    queue
 }
 
 /// Every universe and rule that already has a panel.
@@ -80,17 +90,54 @@ fn already_swept(service: &ResearchService) -> BTreeSet<(String, String)> {
 }
 
 /// The rules worth sweeping a universe at `interval` with: every shipped and
-/// project rule defined at that resolution, minus the ones that trade options.
+/// project rule defined at that resolution that a panel can run.
 fn candidates(interval: arvo_data::BarInterval) -> Vec<&'static StrategyPlan> {
-    super::offered()
-        .into_iter()
-        .filter(|plan| !plan.trades_options() && plan.interval() == interval)
-        .collect()
+    super::offered().into_iter().filter(|plan| sweepable(plan, interval)).collect()
+}
+
+/// Whether a panel over a universe at `interval` can run `plan`: defined at
+/// that resolution, not an option rule, and with something to search. A
+/// project rule written with no values to vary has an empty grid, which a
+/// panel refuses; its rulesets are the candidates, not the rule.
+fn sweepable(plan: &StrategyPlan, interval: arvo_data::BarInterval) -> bool {
+    !plan.trades_options() && plan.interval() == interval && !plan.axes.is_empty()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The defect of 2026-09-29: a project rule with no search was offered,
+    /// refused as an empty grid, never recorded, and so offered for ever.
+    #[test]
+    fn a_rule_with_nothing_to_search_is_not_offered_to_a_panel() {
+        let fixed = StrategyPlan { name: "fixed", rule: None, label: "", premise: "", fixed: &[("period", 20.0)], axes: &[], intraday: false, options: false };
+        let searched = StrategyPlan { axes: &[("period", &[10.0, 20.0])], ..fixed };
+        assert!(!sweepable(&fixed, arvo_data::BarInterval::DAILY));
+        assert!(sweepable(&searched, arvo_data::BarInterval::DAILY));
+        for plan in candidates(arvo_data::BarInterval::DAILY) {
+            assert!(!plan.axes.is_empty(), "{} has an empty grid", plan.name());
+        }
+    }
+
+    /// The queue is every unswept pair, so the job has somewhere to go after
+    /// a refusal.
+    #[test]
+    fn the_queue_holds_every_unswept_pair_of_every_universe() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join(crate::universes::SUBDIR)).expect("mkdir");
+        for name in ["one", "two"] {
+            let text = format!(r#"{{ "name": "{name}", "reason": "a test", "interval": {{"step":1,"unit":"day"}}, "instruments": ["SPY.YF", "QQQ.YF"] }}"#);
+            std::fs::write(dir.path().join(crate::universes::SUBDIR).join(format!("{name}.json")), text).expect("write");
+        }
+        let service = ResearchService::new(dir.path().join("data"), dir.path().join("evidence"));
+        let queue = unswept(&service, dir.path());
+        let daily = candidates(arvo_data::BarInterval::DAILY).len();
+        assert!(daily > 1, "the build ships more than one daily rule");
+        assert_eq!(queue.len(), 2 * daily, "every rule for both universes, not the first pair alone");
+        assert_eq!(queue[0].0.name, "one");
+        assert_eq!(queue[daily].0.name, "two");
+    }
 
     /// The rules offered for a daily universe are daily and are not options.
     #[test]
