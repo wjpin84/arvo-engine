@@ -29,6 +29,9 @@ pub const OPTION_QUOTES_SUBDIR: &str = "option-quotes";
 /// Only for a project, never the app data directory, and only warnings if it
 /// cannot: a folder Arvo cannot write to is a problem to report, not a reason
 /// to refuse to start.
+/// Who the research sweep's panels are recorded as: the job, by its id.
+pub const SWEEP_AUTHOR: &str = "job:research";
+
 pub fn prepare(root: &Path) {
     // The library first, and for the app data directory too: an empty folder
     // that exists is a clearer instruction than a path in an error message.
@@ -132,6 +135,10 @@ pub fn register(jobs: &Jobs, root: &Path, research: Arc<ResearchService>, raise:
     // One panel per tick, because a hundred-instrument panel is a couple of
     // minutes of every core and a backlog of nine should not take the machine
     // for half an hour at once.
+    // The sweep is a search, and an unwatched one, so its panels are recorded
+    // as an agent's and each is held to the bar for every panel the sweep has
+    // run, as ADR-0034 assumed from the start. They were recorded as a
+    // person's until 2026-10-14, which held each to its own grid alone.
     let sweeping = research.clone();
     let announce_sweep = announce.clone();
     let sweep_root = root.to_path_buf();
@@ -162,7 +169,10 @@ pub fn register(jobs: &Jobs, root: &Path, research: Arc<ResearchService>, raise:
                 let said = format!("{rule} over {}", universe.name);
                 let ran = tokio::task::spawn_blocking({
                     let research = research.clone();
-                    move || crate::research::study::run_panel_over(&research, &universe, Some(&rule))
+                    move || {
+                        let asker = crate::research::study::Asker { author: SWEEP_AUTHOR, origin: None };
+                        crate::research::study::run_panel_over_as(&research, &universe, Some(&rule), Some(asker))
+                    }
                 })
                 .await
                 .map_err(|err| format!("{said} did not finish: {err}"))?;

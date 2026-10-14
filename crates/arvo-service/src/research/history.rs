@@ -739,6 +739,7 @@ mod staleness_tests {
             strategy: "sma_cross".to_owned(),
             code_commit: String::new(),
             ruleset_hash: None,
+            confirms: None,
         }
     }
 

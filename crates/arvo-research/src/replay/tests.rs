@@ -114,6 +114,8 @@ fn study(recorded: &[f64], trades: u32) -> Record {
         under_conservative_costs: None,
     
         conservative: None,
+    
+        confirms: None,
     }))
 }
 

@@ -18,6 +18,23 @@
 //! [`expected_best_under_null`](crate::family::expected_best_under_null)
 //! keeps inside a grid.
 //!
+//! # A configuration run again is one try (ADR-0040)
+//!
+//! The pool counts configurations, not runs. The same rule with the same
+//! settings on the same instruments at the same resolution, run twice, is
+//! one draw: re-running it a week later reads nearly the same bars and
+//! scores nearly the same, and two rulesets that are copies of each other
+//! search the same grid. So a configuration seen before in the agent's
+//! history is not counted again. A walk-forward's folds stay apart, by
+//! their position: each fold re-selects on its own window, and those are
+//! different tries.
+//!
+//! # A confirmation is judged alone (ADR-0040)
+//!
+//! A confirmation re-runs one finding's chosen configuration on bars that
+//! finding never saw. It searched nothing, so there is no selection for the
+//! agent's history to explain, and it is not held to the pooled bar.
+//!
 //! # What this does not do
 //!
 //! Count a person's searches. The issue is agents, whose loop is unbounded and
@@ -62,17 +79,31 @@ pub fn deflate_for_agent(
         .map(|stored| &stored.record)
         .collect();
 
+    if matches!(&*record, Record::Study(found) if found.confirms.is_some()) {
+        return AgentSearch { prior_findings: prior.len(), trials: 1, expected_best_under_null: None, survived: true };
+    }
+
     let (trials, bar) = {
-        let selections: Vec<_> = prior
-            .iter()
-            .flat_map(|found| found.selections())
-            .chain(record.selections())
-            .collect();
-        let trials = selections.iter().map(|selection| selection.trials).sum();
-        let sharpes: Vec<f64> = selections
-            .iter()
-            .flat_map(|selection| selection.scored.iter().map(|trial| trial.sharpe))
-            .collect();
+        let mut counted = std::collections::BTreeSet::new();
+        let mut trials = 0;
+        let mut sharpes = Vec::new();
+        for found in prior.iter().copied().chain(std::iter::once(&*record)) {
+            let (rule, fixed, on) = configuration(found);
+            for (position, selection) in found.selections().into_iter().enumerate() {
+                // A finding recorded before its surface was kept counts what
+                // ran, as it always did: there is nothing to compare.
+                trials += selection.trials.saturating_sub(selection.scored.len());
+                for trial in &selection.scored {
+                    let mut params = fixed.clone();
+                    params.extend(trial.params.iter().map(|(name, value)| (name.clone(), *value)));
+                    let settings: Vec<String> = params.iter().map(|(name, value)| format!("{name}={value}")).collect();
+                    if counted.insert(format!("{rule}|{on}|{position}|{}", settings.join(","))) {
+                        trials += 1;
+                        sharpes.push(trial.sharpe);
+                    }
+                }
+            }
+        }
         (trials, expected_best_of(&sharpes, trials))
     };
 
@@ -130,6 +161,24 @@ pub fn deflate_for_agent(
     }
 }
 
+/// What makes two tries the same try: the rule, its fixed settings, and the
+/// instruments and resolution it ran on. The window is left out on purpose:
+/// the same configuration re-run on a later window reads nearly the same bars.
+fn configuration(record: &Record) -> (String, std::collections::BTreeMap<String, f64>, String) {
+    let of = |experiment: &crate::Experiment, on: Vec<String>| {
+        (experiment.strategy.name.clone(), experiment.strategy.params.clone(), format!("{}@{}", on.join(","), experiment.interval))
+    };
+    match record {
+        Record::Study(found) => of(&found.selected, found.selected.instruments()),
+        Record::Panel(found) => found
+            .study
+            .as_ref()
+            .map_or_else(|| (String::new(), Default::default(), String::new()), |study| of(&study.template, study.instruments.clone())),
+        Record::WalkForward(found) => of(&found.template, found.template.instruments()),
+        Record::Reported(found) => of(&found.reported.experiment, found.reported.experiment.instruments()),
+    }
+}
+
 fn clears(best: f64, bar: Option<f64>) -> bool {
     bar.is_none_or(|bar| best > bar)
 }
@@ -158,10 +207,15 @@ mod tests {
         found.selection.best_sharpe = scores.iter().copied().fold(f64::MIN, f64::max);
         found.selection.expected_best_under_null = bar;
         found.selection.survived_deflation = clears(found.selection.best_sharpe, bar);
+        // Each fixture study searches its own settings, so no two are the
+        // same configuration run again: a real grid's trials differ.
+        static RUNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let run = RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as f64;
         found.selection.scored = scores
             .iter()
-            .map(|sharpe| ScoredTrial {
-                params: Default::default(),
+            .enumerate()
+            .map(|(trial, sharpe)| ScoredTrial {
+                params: [("run".to_owned(), run), ("trial".to_owned(), trial as f64)].into_iter().collect(),
                 sharpe: *sharpe,
             })
             .collect();
@@ -275,5 +329,47 @@ mod tests {
         value.as_object_mut().expect("object").remove("author");
         let old: StoredRecord = serde_json::from_value(value).expect("still reads");
         assert_eq!(old.author, Author::Person);
+    }
+
+    /// The same nine settings run again, twenty times: one search of nine.
+    #[test]
+    fn a_configuration_run_again_is_one_try() {
+        let again = |at_second| {
+            let mut record = scored_study(&NOISE);
+            let Record::Study(found) = &mut record else { unreachable!() };
+            for (trial, scored) in found.selection.scored.iter_mut().enumerate() {
+                scored.params = [("trial".to_owned(), trial as f64)].into_iter().collect();
+            }
+            StoredRecord::by_agent(record, "agent-a", &[], at(at_second))
+        };
+        let history: Vec<StoredRecord> = (0..20).map(again).collect();
+        let next = again(99);
+        let Author::Agent { search, .. } = &StoredRecord::by_agent(next.record, "agent-a", &history, at(100)).author else {
+            unreachable!()
+        };
+        assert_eq!(search.trials, 9, "twenty runs of the same nine settings are nine tries, not 189");
+
+        // Twenty different studies of nine are 189, as before.
+        let different = history_of("agent-b", &NOISE);
+        let Author::Agent { search, .. } = &StoredRecord::by_agent(scored_study(&NOISE), "agent-b", &different, at(100)).author else {
+            unreachable!()
+        };
+        assert_eq!(search.trials, 189);
+    }
+
+    /// A confirmation searched nothing; the agent's history has nothing to
+    /// explain in it, however long that history is.
+    #[test]
+    fn a_confirmation_is_judged_alone() {
+        let mut confirmation = scored_study(&LUCKY);
+        let Record::Study(found) = &mut confirmation else { unreachable!() };
+        found.confirms = Some(crate::family::Confirms { finding: "earlier".into(), look: 1 });
+        found.selection.best_sharpe = 0.1;
+        let before = confirmation.verdict();
+        let stored = StoredRecord::by_agent(confirmation, "agent-a", &history("agent-a"), at(100));
+        let Author::Agent { search, .. } = &stored.author else { unreachable!() };
+        assert!(search.survived);
+        assert_eq!(search.expected_best_under_null, None);
+        assert_eq!(stored.record.verdict(), before, "not downgraded by the pool");
     }
 }

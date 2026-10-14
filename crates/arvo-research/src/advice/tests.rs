@@ -557,6 +557,8 @@ fn with_folds(mut walk: WalkForwardEvidence) -> WalkForwardEvidence {
             under_conservative_costs: None,
         
             conservative: None,
+        
+            confirms: None,
         })
         .collect();
     walk

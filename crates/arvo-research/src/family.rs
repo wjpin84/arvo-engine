@@ -201,6 +201,23 @@ pub struct FamilyEvidence {
     /// the tier was not asked, and for findings older than this field.
     #[serde(default)]
     pub conservative: Option<Costed>,
+    /// When this is a confirmation (ADR-0040): the finding whose chosen
+    /// configuration it re-ran, unchanged, on bars that finding never saw.
+    /// `None` for a study that searched. `default`: a persisted format.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirms: Option<Confirms>,
+}
+
+/// The finding a confirmation re-tests, and which look at it this is
+/// (ADR-0040).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Confirms {
+    /// The confirmed finding's id.
+    pub finding: String,
+    /// 1 for the first confirmation of that finding, 2 for the next, and so
+    /// on. Recorded because looking again and again until one look passes
+    /// is a search of its own, and the count is what lets a reader see it.
+    pub look: usize,
 }
 
 /// The out-of-sample result under the conservative cost tier (#192, #226).
@@ -508,6 +525,24 @@ fn search(
     };
 
     let selected = variant(&family.template, &best_params, out_of_sample, "oos");
+    judged(provider, &family.hypothesis, (in_sample, out_of_sample), selection, selected, failures, criteria)
+}
+
+/// What a chosen configuration did on the window it was not chosen on, and
+/// the verdict: the same out-of-sample test, the same conservative re-run
+/// and the same refusals whether the configuration came from a search here
+/// or, for a confirmation, from the finding it confirms. Kept as one so the
+/// two can never be judged differently.
+fn judged(
+    provider: &dyn SimulationProvider,
+    hypothesis: &HypothesisId,
+    (in_sample, out_of_sample): (DateRange, DateRange),
+    selection: Selection,
+    selected: Experiment,
+    failures: Vec<String>,
+    criteria: &EvaluationCriteria,
+) -> Result<FamilyEvidence, SimulationError> {
+    let Selection { best_sharpe, expected_best_under_null: expected, survived_deflation, prior_trials, .. } = selection.clone();
     let out_of_sample_evidence = evaluate_against_benchmark(provider, &selected, criteria)?;
 
     // The same winner, the same window, fills that cost more (#192). Asked
@@ -570,7 +605,7 @@ fn search(
     }
 
     Ok(FamilyEvidence {
-        hypothesis: family.hypothesis.clone(),
+        hypothesis: hypothesis.clone(),
         in_sample,
         out_of_sample,
         selection,
@@ -581,8 +616,62 @@ fn search(
         reasons,
         under_conservative_costs,
         conservative,
+        confirms: None,
     })
 }
+
+/// Re-runs `original`'s chosen configuration, unchanged, over `after`: bars
+/// dated after everything `original` was chosen and judged on (ADR-0040).
+///
+/// One configuration and no search, so there is nothing to deflate and the
+/// result is not pooled with its author's other tries; it is judged by the
+/// same out-of-sample test and the same conservative re-run a study's
+/// winner gets. `version` is the dataset version of the bars it reads.
+///
+/// # Errors
+///
+/// `after` begins on or before the last date `original` saw, or the run
+/// fails.
+pub fn confirm(
+    provider: &dyn SimulationProvider,
+    original: &FamilyEvidence,
+    after: DateRange,
+    version: &str,
+    confirms: Confirms,
+    criteria: &EvaluationCriteria,
+) -> Result<FamilyEvidence, SimulationError> {
+    let seen = original.out_of_sample.to.max(original.in_sample.to);
+    if after.from <= seen {
+        return Err(SimulationError::Rejected(format!(
+            "a confirmation reads only bars after {seen}, the last date the finding saw; {} is not after it",
+            after.from
+        )));
+    }
+    let mut selected = original.selected.clone();
+    selected.window = after;
+    selected.dataset.version = version.to_owned();
+    selected.id = ExperimentId(format!("{}-confirm{}", original.selected.id, confirms.look));
+    let selection = Selection {
+        trials: 1,
+        best_sharpe: original.selection.best_sharpe,
+        expected_best_under_null: None,
+        survived_deflation: true,
+        prior_trials: 0,
+        scored: Vec::new(),
+    };
+    let everything_seen = DateRange { from: original.in_sample.from.min(original.out_of_sample.from), to: seen };
+    let mut found = judged(provider, &original.hypothesis, (everything_seen, after), selection, selected, Vec::new(), criteria)?;
+    found.reasons.insert(
+        0,
+        format!(
+            "confirms {}: its chosen configuration, unchanged, on {} to {}, bars it never saw (look {})",
+            confirms.finding, after.from, after.to, confirms.look
+        ),
+    );
+    found.confirms = Some(confirms);
+    Ok(found)
+}
+
 
 /// Builds one trial: the template, with these parameters, over this window.
 fn variant(

@@ -140,6 +140,7 @@ impl Research {
                 "strategy": s.strategy,
                 "code_commit": s.code_commit,
                 "ruleset_hash": s.ruleset_hash,
+                "confirms": s.confirms,
             })).collect::<Vec<_>>(),
             "unreadable": unreadable.len(),
         }))
@@ -205,6 +206,71 @@ impl Research {
         let history = store.load().map_err(|err| err.to_string())?.records;
         let provenance = arvo_service::research::provenance_for(Some(plan.name()));
         let stored = StoredRecord::by_agent(record, author, &history, chrono::Utc::now())
+            .with_origin(origin.map(ToOwned::to_owned))
+            .with_provenance(provenance);
+        store.save(&stored).map_err(|err| err.to_string())?;
+        Ok(self.described(&stored))
+    }
+
+    /// Re-runs study `id`'s chosen configuration, unchanged, on the bars the
+    /// library holds after everything that study saw (ADR-0040), saved as
+    /// `author`'s. One configuration and no search: the record is a study that
+    /// names the finding it confirms, and it is judged alone, not against the
+    /// author's other tries.
+    ///
+    /// # Errors
+    ///
+    /// No such finding; one that is not a study, or is itself a confirmation;
+    /// no bar yet after the study's window; a failed run or a failed save.
+    pub fn confirm(&self, id: &str, author: &str, origin: Option<&str>) -> Result<Value, String> {
+        let root = self.data.parent().unwrap_or(&self.data);
+        arvo_service::risk::load(root)?;
+        arvo_service::rulesets::refresh_at(root);
+        let store = self.store();
+        let original = store.open(id).map_err(|err| err.to_string())?;
+        let Record::Study(found) = &original.record else {
+            return Err(format!(
+                "{id} is a {}; a confirmation re-runs one study's chosen configuration",
+                original.record.kind()
+            ));
+        };
+        if let Some(of) = &found.confirms {
+            return Err(format!("{id} is itself a confirmation of {}; confirm that finding instead", of.finding));
+        }
+        let instrument = found.selected.instrument.clone();
+        // The rule the study ran, or the ruleset it was offered under: either
+        // names the resolution the library is read at.
+        let plan = StrategyPlan::find(&found.selected.strategy.name)
+            .or_else(|| original.provenance.ruleset.as_ref().and_then(|ruleset| StrategyPlan::find(&ruleset.name)))
+            .ok_or_else(|| format!("{id} ran {:?}, which this engine no longer offers", found.selected.strategy.name))?;
+        let bars = CsvBars::new(&self.data);
+        let (window, fingerprint) = study_data(&bars, &instrument, plan)?;
+        let seen = found.out_of_sample.to.max(found.in_sample.to);
+        let from = seen + chrono::Duration::days(1);
+        if from > window.to {
+            return Err(format!(
+                "nothing to confirm on yet: {id} saw {instrument} to {seen}, and the library's bars end {}; a confirmation reads only bars after the study's",
+                window.to
+            ));
+        }
+        let after = arvo_research::DateRange::new(from, window.to).map_err(|err| err.to_string())?;
+        let history = store.load().map_err(|err| err.to_string())?.records;
+        let look = 1 + history
+            .iter()
+            .filter(|stored| matches!(&stored.record, Record::Study(other) if other.confirms.as_ref().is_some_and(|of| of.finding == id)))
+            .count();
+        let simulation = NautilusSimulation::new(CsvBars::new(&self.data));
+        let confirmed = arvo_research::confirm(
+            &simulation,
+            found,
+            after,
+            &fingerprint,
+            arvo_research::Confirms { finding: id.to_owned(), look },
+            &EvaluationCriteria::default(),
+        )
+        .map_err(|err| err.to_string())?;
+        let provenance = original.provenance.clone();
+        let stored = StoredRecord::by_agent(Record::Study(Box::new(confirmed)), author, &history, chrono::Utc::now())
             .with_origin(origin.map(ToOwned::to_owned))
             .with_provenance(provenance);
         store.save(&stored).map_err(|err| err.to_string())?;
@@ -312,6 +378,10 @@ pub fn summarize(stored: &StoredRecord) -> Value {
         "strategy": stored.provenance.ruleset.as_ref().map_or(record.strategy(), |ruleset| ruleset.name.as_str()),
         "code_commit": stored.provenance.code_commit,
         "ruleset_hash": stored.provenance.ruleset.as_ref().map(|ruleset| ruleset.hash.as_str()),
+        "confirms": match record {
+            Record::Study(found) => found.confirms.as_ref().map(|of| of.finding.as_str()),
+            _ => None,
+        },
     });
     match record {
         Record::Study(found) => {
