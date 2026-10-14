@@ -385,6 +385,11 @@ pub struct Summary {
     pub strategy: String,
     pub code_commit: String,
     pub ruleset_hash: Option<String>,
+    /// The finding this one confirms (ADR-0040), when it is a confirmation.
+    /// `default`: an index written before it reads as no confirmation, which
+    /// every finding then was.
+    #[serde(default)]
+    pub confirms: Option<String>,
 }
 
 /// A finding that could not be read, and why.
@@ -522,6 +527,10 @@ impl StoredRecord {
                 .map_or_else(|| self.record.strategy().to_owned(), |ruleset| ruleset.name.clone()),
             code_commit: self.provenance.code_commit.clone(),
             ruleset_hash: self.provenance.ruleset.as_ref().map(|ruleset| ruleset.hash.clone()),
+            confirms: match &self.record {
+                Record::Study(evidence) => evidence.confirms.as_ref().map(|of| of.finding.clone()),
+                _ => None,
+            },
         }
     }
 }

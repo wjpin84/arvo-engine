@@ -36,7 +36,7 @@ use proto::research::{
     ComparisonView, Finding, PanelRequest, RankRequest, Ranking, RegimePointView, PineScript, PineTranslation, RuleFile, RuleFiles, RuleText, RegimeView, ReviewRequest, ReviewView,
     FindingId, FindingIds, FindingSummary, Findings, HistoryView, PanelView, Point, ProblemsView, RecordView,
     ReplayView, ReportFigure, ReportRequest, RiskModel, Rules, Ruleset, RulesetForm, RulesetPath, Rulesets,
-    RunRequest, SharedExperiment, Strategies, StudyRequest, StudyView, TradeExport, WalkForwardView,
+    ConfirmRequest, RunRequest, SharedExperiment, Strategies, StudyRequest, StudyView, TradeExport, WalkForwardView,
 };
 use proto::session::{Divergence, HaltRequest, PromotionView, SessionId, SessionList, SessionStatus, StartRequest};
 use arvo_api::EventView;
@@ -45,7 +45,7 @@ use arvo_api::EventView;
 /// `detail_json`.
 const TYPED: &[&str] = &[
     "id", "kind", "subject", "verdict", "recorded_at", "read_this_first", "reasons", "advice", "attachments",
-    "strategy", "code_commit", "ruleset_hash", "data_findings",
+    "strategy", "code_commit", "ruleset_hash", "data_findings", "confirms",
 ];
 
 /// The largest message either side accepts: a figure or a trades table
@@ -797,6 +797,7 @@ fn finding(summary: &Value) -> Finding {
             strategy: text(summary.get("strategy")),
             code_commit: text(summary.get("code_commit")),
             ruleset_hash: text(summary.get("ruleset_hash")),
+            confirms: text(summary.get("confirms")),
         }),
         read_this_first: text(summary.get("read_this_first")),
         reasons: summary
@@ -1222,6 +1223,7 @@ impl research_server::Research for Service {
                             strategy: text(row.get("strategy")),
                             code_commit: text(row.get("code_commit")),
                             ruleset_hash: text(row.get("ruleset_hash")),
+                            confirms: text(row.get("confirms")),
                         })
                         .collect()
                 })
@@ -1251,6 +1253,22 @@ impl research_server::Research for Service {
         request: Request<RunRequest>,
     ) -> Result<Response<Finding>, Status> {
         self.run(request.into_inner(), true).await
+    }
+
+    async fn confirm_finding(&self, request: Request<ConfirmRequest>) -> Result<Response<Finding>, Status> {
+        let request = request.into_inner();
+        let id = required(&request.finding_id, "finding_id")?.to_owned();
+        let author = required(&request.author, "author")?.to_owned();
+        let origin = Some(request.origin.trim().to_owned()).filter(|origin| !origin.is_empty());
+        let research = self.research.clone();
+        let outcome = tokio::task::spawn_blocking(move || {
+            let outcome = research.confirm(&id, &author, origin.as_deref());
+            research.audit("grpc", &author, "confirm_finding", &serde_json::json!({ "finding_id": id }), &outcome);
+            outcome
+        })
+        .await
+        .map_err(|err| Status::internal(format!("the confirmation did not finish: {err}")))?;
+        outcome.map(|summary| Response::new(finding(&summary))).map_err(Status::failed_precondition)
     }
 
     async fn attach_file(&self, request: Request<AttachRequest>) -> Result<Response<Attachments>, Status> {
@@ -1907,12 +1925,14 @@ mod tests {
         // the day's session records back as a report and reaches no session
         // (#217). StreamBars is ReadBars without the cap, for a chart paging
         // through history, and ReadIndicator computes over the same bars;
-        // neither reaches anything else.
+        // neither reaches anything else. ConfirmFinding re-runs a study the
+        // research memory already holds, on the bars the library holds after
+        // it, and reaches nothing else (ADR-0040).
         assert_eq!(
             calls,
             [
                 "ListStrategies", "ListInstruments", "ListFindings", "OpenFinding", "RunStudy", "RunWalkForward",
-                "RecordFinding", "AttachFile", "ListRulesets", "ReadRuleset", "WriteRuleset", "ListRules", "ListRuleFiles", "WriteRule", "TranslatePine", "GetRiskModel",
+                "ConfirmFinding", "RecordFinding", "AttachFile", "ListRulesets", "ReadRuleset", "WriteRuleset", "ListRules", "ListRuleFiles", "WriteRule", "TranslatePine", "GetRiskModel",
                 "ViewStudy", "ViewWalkForward", "ViewPanel", "RunPanel", "ViewBook", "ViewHistory", "ViewRecord", "ViewReplay",
                 "ViewComparison", "ReadBars", "StreamBars", "ReadIndicator", "ViewRegime", "ViewReview", "RankFindings", "ViewProblems", "ListAttachments", "Subscribe",
             ]

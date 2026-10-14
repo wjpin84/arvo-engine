@@ -328,6 +328,8 @@ mod tests {
             under_conservative_costs: None,
         
             conservative: None,
+        
+            confirms: None,
         }
     }
 

@@ -291,6 +291,8 @@ pub(crate) fn study(instrument: &str, dataset_version: &str) -> Record {
         under_conservative_costs: None,
     
         conservative: None,
+    
+        confirms: None,
     }))
 }
 

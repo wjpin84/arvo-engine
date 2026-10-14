@@ -36,7 +36,7 @@ use std::time::{Duration, Instant};
 
 use arvo_client::discovery::{self, Discovery};
 use arvo_client::proto::common::Empty;
-use arvo_client::proto::research::{BarsRequest, Finding, FindingId, FindingIds, PanelRequest, Param, PineScript, RankRequest, RuleText, ReviewRequest, RulesetForm, RunRequest};
+use arvo_client::proto::research::{BarsRequest, ConfirmRequest, Finding, FindingId, FindingIds, PanelRequest, Param, PineScript, RankRequest, RuleText, ReviewRequest, RulesetForm, RunRequest};
 use arvo_client::proto::services::research_client::ResearchClient;
 use serde_json::{json, Value};
 use tonic::transport::Channel;
@@ -352,6 +352,12 @@ impl Server {
                 .map_err(refused)?;
                 Ok(finding_json(found.into_inner()))
             }
+            "confirm_finding" => {
+                let asked = ConfirmRequest { finding_id: text("id")?, author: self.agent(), ..Default::default() };
+                let request = self.request(asked)?;
+                let found = self.runtime.block_on(self.research.confirm_finding(request)).map_err(refused)?;
+                Ok(finding_json(found.into_inner()))
+            }
             other => Err(format!("no tool {other:?}; tools/list says what there is")),
         }
     }
@@ -459,6 +465,7 @@ fn finding_json(found: Finding) -> Value {
         "strategy": summary.strategy,
         "code_commit": summary.code_commit,
         "ruleset_hash": summary.ruleset_hash,
+        "confirms": summary.confirms,
         "read_this_first": found.read_this_first,
         "reasons": found.reasons,
         // What is wrong with the bars under it (#16), ahead of the advice and
@@ -644,6 +651,15 @@ fn tools() -> Value {
             "description": "Re-select a strategy on a rolling schedule across an instrument's whole history, and judge the stitched out-of-sample record. Slower than run_study by roughly the number of folds. Saved as your finding and deflated the same way.",
             "inputSchema": instrument_and_strategy,
         },
+        {
+            "name": "confirm_finding",
+            "description": "Re-run one study's chosen configuration, unchanged, on the bars the library holds after everything that study saw. One configuration and no search, so it is judged alone, not against your other runs, and saved as a study that names the finding it confirms. Refused for anything but a study and while there is no bar after the study's window: a confirmation waits for the market to make new data. Each confirmation of the same finding is numbered, because looking again until one look passes is a search of its own.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "id": { "type": "string", "description": "A study's id from list_findings" } },
+                "required": ["id"]
+            },
+        },
     ])
 }
 
@@ -790,7 +806,8 @@ mod tests {
                 "compare_experiments",
                 "run_study",
                 "run_panel",
-                "run_walk_forward"
+                "run_walk_forward",
+                "confirm_finding"
             ]
         );
         for forbidden in ["fetch", "order", "trade", "share", "import", "key", "sign"] {
@@ -997,15 +1014,17 @@ mod tests {
         let once = stored[0]["author"]["search"]["trials"].as_u64().expect("trials");
         assert!(once > 0);
 
-        // Run again, and the second is held to both: the count that was
-        // never kept is kept now.
+        // Run again, and the second is held to the agent's search: the count
+        // that was never kept is kept now. The same nine settings on the same
+        // three names, run again, are the same nine tries (ADR-0040), so the
+        // count does not double; the run itself is still on the record.
         std::thread::sleep(std::time::Duration::from_millis(5));
         let second = run(&mut server, 31);
         assert_ne!(second["result"]["isError"], json!(true), "{second}");
         let stored = panels(&engine);
         assert_eq!(stored.len(), 2);
         assert_eq!(stored[1]["author"]["search"]["prior_findings"], json!(1));
-        assert_eq!(stored[1]["author"]["search"]["trials"].as_u64(), Some(once * 2), "its own search and the one before");
+        assert_eq!(stored[1]["author"]["search"]["trials"].as_u64(), Some(once), "a configuration run again is one try");
 
         // And both are in the trail, each naming the finding it made.
         let trail = audit(&engine);
@@ -1047,6 +1066,54 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    /// A confirmation reads only bars a study never saw, runs its chosen
+    /// configuration alone, and says which look it is (ADR-0040).
+    #[test]
+    fn a_study_is_confirmed_only_on_bars_it_never_saw() {
+        let engine = engine();
+        let library = arvo_data::CsvBars::new(engine.dir.path().join("data"));
+        library.write("LATER.YF", arvo_data::BarInterval::DAILY, &wandering(0.3, 0..0)).expect("written");
+        let mut server = server(&engine, Some("careful-agent"));
+        let tool = |server: &mut Server, id: u32, name: &str, arguments: Value| {
+            call(server, json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call", "params": { "name": name, "arguments": arguments } }))
+        };
+        let study = tool(&mut server, 70, "run_study", json!({ "instrument": "LATER.YF", "strategy": "sma_cross" }));
+        let study = study["result"]["structuredContent"].clone();
+        let id = study["id"].as_str().expect("an id").to_owned();
+
+        // Nothing after the study's window yet: refused, and says why.
+        let early = tool(&mut server, 71, "confirm_finding", json!({ "id": id }));
+        assert_eq!(early["result"]["isError"], json!(true), "{early}");
+        assert!(early.to_string().contains("nothing to confirm on yet"), "{early}");
+
+        // The market makes another three hundred days.
+        let start = chrono::NaiveDate::from_ymd_opt(2023, 1, 2).expect("date").and_hms_opt(0, 0, 0).expect("time");
+        let longer: Vec<arvo_data::Bar> = (0..1000)
+            .map(|i| {
+                let t = f64::from(i);
+                let close = 100.0 + t * 0.05 + 12.0 * (t / 37.0 + 0.3).sin() + 3.0 * (t / 5.0 + 0.3).cos();
+                arvo_data::Bar { at: start + chrono::Duration::days(i64::from(i)), open: close - 0.2, high: close + 0.6, low: close - 0.6, close, volume: 10_000.0 }
+            })
+            .collect();
+        library.write("LATER.YF", arvo_data::BarInterval::DAILY, &longer).expect("written");
+
+        let first = tool(&mut server, 72, "confirm_finding", json!({ "id": id }));
+        assert_ne!(first["result"]["isError"], json!(true), "{first}");
+        let first = first["result"]["structuredContent"].clone();
+        assert_eq!(first["confirms"], json!(id), "{first}");
+        assert_eq!(first["search"]["trials"], json!(1), "one configuration, no search");
+        assert_eq!(first["search"]["chosen"], study["search"]["chosen"], "unchanged");
+        assert!(first["out_of_sample"]["from"].as_str().expect("from") > study["out_of_sample"]["to"].as_str().expect("to"));
+        assert!(first["reasons"][0].as_str().expect("a reason").contains("(look 1)"), "{first}");
+
+        let second = tool(&mut server, 73, "confirm_finding", json!({ "id": id }));
+        assert!(second["result"]["structuredContent"]["reasons"][0].as_str().expect("a reason").contains("(look 2)"), "{second}");
+
+        // A confirmation is not itself confirmed.
+        let again = tool(&mut server, 74, "confirm_finding", json!({ "id": first["id"] }));
+        assert_eq!(again["result"]["isError"], json!(true), "{again}");
     }
 
     /// An agent reads the verdict and the numbers, and until now nothing about

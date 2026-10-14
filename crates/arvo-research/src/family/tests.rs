@@ -317,3 +317,36 @@ fn a_parallel_sweep_scores_trials_in_grid_order_and_breaks_a_tie_as_the_loop_did
     assert_eq!(winner.get("slow"), Some(&30.0), "the tie breaks as the sequential loop broke it");
     assert_eq!(second.selected.strategy.params, *winner);
 }
+
+/// A confirmation re-runs the chosen configuration, unchanged, only on bars
+/// after everything the finding saw (ADR-0040).
+#[test]
+fn a_confirmation_runs_the_chosen_configuration_on_bars_the_finding_never_saw() {
+    let crate::memory::Record::Study(seed) = crate::memory::tests::study("AAPL.NASDAQ", "hash-a") else { unreachable!() };
+    let mut template = seed.selected.clone();
+    template.costs = crate::CostModel::proportional(0.0, 1.0);
+    let grid = ParameterGrid::new().axis("fast", vec![5.0, 10.0]).axis("slow", vec![20.0, 30.0]);
+    let family = ExperimentFamily { hypothesis: template.hypothesis.clone(), template, grid, in_sample_fraction: 0.7, prior_trials: 0 };
+    let criteria = EvaluationCriteria { min_trades: 10, ..EvaluationCriteria::default() };
+    let provider = Costly { edge_bps: 10.0 };
+    let original = run_family(&provider, &family, &criteria).expect("runs");
+
+    let seen = original.out_of_sample.to;
+    let overlapping = DateRange::new(seen, seen + chrono::Duration::days(90)).unwrap();
+    let refused = confirm(&provider, &original, overlapping, "v2", Confirms { finding: "f".into(), look: 1 }, &criteria);
+    assert!(refused.is_err(), "a confirmation may not read a bar the finding saw");
+
+    let after = DateRange::new(seen + chrono::Duration::days(1), seen + chrono::Duration::days(200)).unwrap();
+    let confirmed = confirm(&provider, &original, after, "v2", Confirms { finding: "f".into(), look: 1 }, &criteria).expect("runs");
+    assert_eq!(confirmed.selection.trials, 1, "one configuration, no search");
+    assert_eq!(confirmed.selected.strategy.params, original.selected.strategy.params, "unchanged");
+    assert_eq!(confirmed.selected.window, after);
+    assert_eq!(confirmed.selected.dataset.version, "v2");
+    assert_eq!(confirmed.out_of_sample, after);
+    assert!(confirmed.in_sample.to == seen, "what it saw is everything the finding saw");
+    assert_eq!(confirmed.confirms, Some(Confirms { finding: "f".into(), look: 1 }));
+    assert!(confirmed.reasons[0].starts_with("confirms f:"), "{:?}", confirmed.reasons);
+    assert_eq!(confirmed.verdict, Verdict::Supported, "judged as a study's winner is, conservative tier included");
+    assert_eq!(confirmed.under_conservative_costs, Some(Verdict::Supported));
+}
+
